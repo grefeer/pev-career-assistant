@@ -1,0 +1,104 @@
+<svg width="1200" height="720" viewBox="0 0 1200 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1200" y2="720" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8F5EF"/>
+      <stop offset="1" stop-color="#EEF7F5"/>
+    </linearGradient>
+    <linearGradient id="primary" x1="0" y1="0" x2="280" y2="90" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0F766E"/>
+      <stop offset="1" stop-color="#14B8A6"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="280" y2="90" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D97706"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+    <filter id="shadow" x="-30" y="-30" width="340" height="150" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#0F172A" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M1 1L10 6L1 11" stroke="#475569" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="720" rx="28" fill="url(#bg)"/>
+
+  <text x="60" y="68" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="700">
+    LangGraph Workflow Overview
+  </text>
+  <text x="60" y="102" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="18">
+    主流程：Supervisor → 岗位分析 → 岗位匹配 → 简历优化 → 重新匹配 → Career Coach → Supervisor → Finish
+  </text>
+
+  <g filter="url(#shadow)">
+    <rect x="90" y="170" width="230" height="86" rx="24" fill="url(#primary)"/>
+  </g>
+  <text x="205" y="205" text-anchor="middle" fill="white" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">Supervisor</text>
+  <text x="205" y="231" text-anchor="middle" fill="#D1FAE5" font-family="Inter, Arial, sans-serif" font-size="14">主智能体 / 决策调度</text>
+
+  <g filter="url(#shadow)">
+    <rect x="470" y="170" width="230" height="86" rx="24" fill="white"/>
+  </g>
+  <text x="585" y="205" text-anchor="middle" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">岗位分析</text>
+  <text x="585" y="231" text-anchor="middle" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">Job Analysis Subgraph</text>
+
+  <g filter="url(#shadow)">
+    <rect x="850" y="170" width="230" height="86" rx="24" fill="white"/>
+  </g>
+  <text x="965" y="205" text-anchor="middle" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">岗位匹配</text>
+  <text x="965" y="231" text-anchor="middle" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">Match Subgraph</text>
+
+  <path d="M320 213H468" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+  <path d="M700 213H848" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="850" y="330" width="230" height="86" rx="24" fill="url(#accent)"/>
+  </g>
+  <text x="965" y="365" text-anchor="middle" fill="white" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">简历优化</text>
+  <text x="965" y="391" text-anchor="middle" fill="#FEF3C7" font-family="Inter, Arial, sans-serif" font-size="14">Resume Optimizer</text>
+
+  <text x="1115" y="302" fill="#B45309" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="700">
+    当前轮匹配偏低
+  </text>
+  <path d="M965 258V326" stroke="#B45309" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="470" y="330" width="230" height="86" rx="24" fill="white"/>
+  </g>
+  <text x="585" y="365" text-anchor="middle" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">重新匹配</text>
+  <text x="585" y="391" text-anchor="middle" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">再次进入 Match Subgraph</text>
+
+  <path d="M850 373H702" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="470" y="500" width="230" height="86" rx="24" fill="url(#primary)"/>
+  </g>
+  <text x="585" y="535" text-anchor="middle" fill="white" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">Career Coach</text>
+  <text x="585" y="561" text-anchor="middle" fill="#D1FAE5" font-family="Inter, Arial, sans-serif" font-size="14">生成最终建议 / shortlist</text>
+
+  <path d="M585 416V496" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="90" y="500" width="230" height="86" rx="24" fill="white"/>
+  </g>
+  <text x="205" y="535" text-anchor="middle" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">回到 Supervisor</text>
+  <text x="205" y="561" text-anchor="middle" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">写入 final_report 后回调度</text>
+
+  <path d="M470 543H322" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <path d="M205 500V260" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="850" y="500" width="230" height="86" rx="24" fill="white"/>
+  </g>
+  <text x="965" y="535" text-anchor="middle" fill="#111827" font-family="Inter, Arial, sans-serif" font-size="24" font-weight="700">Finish</text>
+  <text x="965" y="561" text-anchor="middle" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">流程结束</text>
+
+  <text x="745" y="470" fill="#475569" font-family="Inter, Arial, sans-serif" font-size="14" font-weight="700">
+    已生成 final_report
+  </text>
+  <path d="M320 543H848" stroke="#475569" stroke-width="3.2" marker-end="url(#arrow)"/>
+
+  <text x="60" y="668" fill="#6B7280" font-family="Inter, Arial, sans-serif" font-size="14">
+    说明：上图只保留项目最核心的流转路径，用于 README 展示，不展开展示认证、前端、SQLite 或低层状态字段细节。
+  </text>
+</svg>
