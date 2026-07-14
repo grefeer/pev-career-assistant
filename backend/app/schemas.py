@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +17,7 @@ class RegisterRequest(AuthRequest):
 class UserProfile(BaseModel):
     account: str
     nickname: str
+    role: Literal["student", "admin"]
     created_at: str
     last_login_at: str = ""
     active_thread_id: str = ""
