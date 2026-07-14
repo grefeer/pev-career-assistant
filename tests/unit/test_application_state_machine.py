@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, delete, event, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from backend.app.db.base import Base
 from backend.app.db.models import (
@@ -20,6 +22,7 @@ from backend.app.services.applications import (
     ApplicationService,
     InvalidTransitionError,
     StaleTaskVersionError,
+    TaskNotFoundError,
 )
 
 
@@ -77,15 +80,17 @@ ALLOWED_EDGES = [
     for source, targets in EXPECTED_TRANSITIONS.items()
     for target in targets
 ]
+FORBIDDEN_EDGES = [
+    (source, target)
+    for source in ApplicationTaskStatus
+    for target in ApplicationTaskStatus
+    if target not in EXPECTED_TRANSITIONS[source]
+]
 
 
 @pytest.fixture
-def session_factory() -> Iterator[sessionmaker[Session]]:
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
+def session_factory(tmp_path: Path) -> Iterator[sessionmaker[Session]]:
+    engine = create_engine(f"sqlite+pysqlite:///{tmp_path / 'applications.db'}")
     Base.metadata.create_all(engine)
     factory = sessionmaker(engine, expire_on_commit=False)
     yield factory
@@ -194,6 +199,32 @@ def test_every_terminal_status_rejects_all_outgoing_transitions(
     assert db.scalars(select(ApplicationEvent)).all() == []
 
 
+@pytest.mark.parametrize(("source", "target"), FORBIDDEN_EDGES)
+def test_every_forbidden_transition_is_rejected_without_mutation(
+    db: Session,
+    application_service: ApplicationService,
+    source: ApplicationTaskStatus,
+    target: ApplicationTaskStatus,
+) -> None:
+    task = create_task(db, source)
+
+    with pytest.raises(InvalidTransitionError):
+        application_service.transition(
+            db,
+            task_id=task.id,
+            expected_version=0,
+            target=target,
+            actor=TaskActor.HUMAN,
+            event_type="forbidden_attempt",
+            redacted_payload={},
+        )
+
+    db.refresh(task)
+    assert task.status is source
+    assert task.state_version == 0
+    assert db.scalars(select(ApplicationEvent)).all() == []
+
+
 def test_executor_cannot_start_final_submission(
     application_service: ApplicationService, db: Session, ready_task: ApplicationTask
 ) -> None:
@@ -294,3 +325,249 @@ def test_stale_session_cannot_overwrite_authoritative_state(
         assert authoritative.status is ApplicationTaskStatus.WAITING_FOR_DEVICE
         assert authoritative.state_version == 1
         assert len(stale.scalars(select(ApplicationEvent)).all()) == 1
+
+
+def test_stale_identity_map_cannot_validate_against_old_status_with_current_version(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as setup:
+        task = create_task(setup, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+
+    with session_factory() as cached, session_factory() as writer:
+        cached_task = cached.get(ApplicationTask, task_id)
+        assert cached_task is not None
+        application_service.transition(
+            writer,
+            task_id=task_id,
+            expected_version=0,
+            target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+            actor=TaskActor.SYSTEM,
+            event_type="device_requested",
+            redacted_payload={},
+        )
+        writer.commit()
+
+        with pytest.raises(InvalidTransitionError):
+            application_service.transition(
+                cached,
+                task_id=task_id,
+                expected_version=1,
+                target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+                actor=TaskActor.SYSTEM,
+                event_type="false_self_transition",
+                redacted_payload={},
+            )
+
+        cached.expire_all()
+        authoritative = cached.get(ApplicationTask, task_id)
+        assert authoritative is not None
+        assert authoritative.status is ApplicationTaskStatus.WAITING_FOR_DEVICE
+        assert authoritative.state_version == 1
+        events = cached.scalars(select(ApplicationEvent)).all()
+        assert len(events) == 1
+        assert events[0].from_status == ApplicationTaskStatus.CREATED.value
+
+
+def test_stale_version_is_reported_before_transition_legality(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as setup:
+        task = create_task(setup, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+
+    with session_factory() as cached, session_factory() as writer:
+        assert cached.get(ApplicationTask, task_id) is not None
+        application_service.transition(
+            writer,
+            task_id=task_id,
+            expected_version=0,
+            target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+            actor=TaskActor.SYSTEM,
+            event_type="device_requested",
+            redacted_payload={},
+        )
+        writer.commit()
+
+        with pytest.raises(StaleTaskVersionError):
+            application_service.transition(
+                cached,
+                task_id=task_id,
+                expected_version=0,
+                target=ApplicationTaskStatus.CREATED,
+                actor=TaskActor.SYSTEM,
+                event_type="stale_invalid_attempt",
+                redacted_payload={},
+            )
+
+
+def test_missing_task_raises_stable_not_found_error(
+    db: Session, application_service: ApplicationService
+) -> None:
+    with pytest.raises(TaskNotFoundError, match="missing-task"):
+        application_service.transition(
+            db,
+            task_id="missing-task",
+            expected_version=0,
+            target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+            actor=TaskActor.SYSTEM,
+            event_type="device_requested",
+            redacted_payload={},
+        )
+
+
+def test_concurrent_delete_is_classified_as_not_found(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as setup:
+        task = create_task(setup, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+
+    with session_factory() as cached, session_factory() as deleter:
+        assert cached.get(ApplicationTask, task_id) is not None
+        deleter.execute(delete(ApplicationTask).where(ApplicationTask.id == task_id))
+        deleter.commit()
+
+        with pytest.raises(TaskNotFoundError, match=task_id):
+            application_service.transition(
+                cached,
+                task_id=task_id,
+                expected_version=0,
+                target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+                actor=TaskActor.SYSTEM,
+                event_type="device_requested",
+                redacted_payload={},
+            )
+
+
+def test_source_status_race_cannot_bypass_validated_source(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as setup:
+        task = create_task(setup, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+
+    engine = session_factory.kw["bind"]
+    raced = False
+
+    def change_status_before_update(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        nonlocal raced
+        if raced or not statement.lstrip().upper().startswith(
+            "UPDATE APPLICATION_TASKS"
+        ):
+            return
+        raced = True
+        with sqlite3.connect(engine.url.database) as raw:
+            raw.execute(
+                "UPDATE application_tasks SET status = ? WHERE id = ?",
+                (ApplicationTaskStatus.WAITING_FOR_DEVICE.value, task_id),
+            )
+
+    event.listen(engine, "before_cursor_execute", change_status_before_update)
+    try:
+        with session_factory() as db:
+            with pytest.raises(StaleTaskVersionError):
+                application_service.transition(
+                    db,
+                    task_id=task_id,
+                    expected_version=0,
+                    target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+                    actor=TaskActor.SYSTEM,
+                    event_type="device_requested",
+                    redacted_payload={},
+                )
+    finally:
+        event.remove(engine, "before_cursor_execute", change_status_before_update)
+
+    assert raced
+    with session_factory() as verification:
+        authoritative = verification.get(ApplicationTask, task_id)
+        assert authoritative is not None
+        assert authoritative.status is ApplicationTaskStatus.WAITING_FOR_DEVICE
+        assert authoritative.state_version == 0
+        assert verification.scalars(select(ApplicationEvent)).all() == []
+
+
+def test_delete_between_validation_and_update_is_classified_as_not_found(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as setup:
+        task = create_task(setup, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+
+    engine = session_factory.kw["bind"]
+    raced = False
+
+    def delete_before_update(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        nonlocal raced
+        if raced or not statement.lstrip().upper().startswith(
+            "UPDATE APPLICATION_TASKS"
+        ):
+            return
+        raced = True
+        with sqlite3.connect(engine.url.database) as raw:
+            raw.execute("DELETE FROM application_tasks WHERE id = ?", (task_id,))
+
+    event.listen(engine, "before_cursor_execute", delete_before_update)
+    try:
+        with session_factory() as db:
+            with pytest.raises(TaskNotFoundError, match=task_id):
+                application_service.transition(
+                    db,
+                    task_id=task_id,
+                    expected_version=0,
+                    target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+                    actor=TaskActor.SYSTEM,
+                    event_type="device_requested",
+                    redacted_payload={},
+                )
+    finally:
+        event.remove(engine, "before_cursor_execute", delete_before_update)
+
+    assert raced
+    with session_factory() as verification:
+        assert verification.get(ApplicationTask, task_id) is None
+        assert verification.scalars(select(ApplicationEvent)).all() == []
+
+
+def test_event_insert_failure_rolls_back_task_update_atomically(
+    session_factory: sessionmaker[Session], application_service: ApplicationService
+) -> None:
+    with session_factory() as db:
+        task = create_task(db, ApplicationTaskStatus.CREATED)
+        task_id = task.id
+        db.execute(
+            text(
+                """
+                CREATE TRIGGER reject_application_event
+                BEFORE INSERT ON application_events
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced application event failure');
+                END
+                """
+            )
+        )
+        db.commit()
+
+        with pytest.raises(IntegrityError, match="forced application event failure"):
+            application_service.transition(
+                db,
+                task_id=task_id,
+                expected_version=0,
+                target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+                actor=TaskActor.SYSTEM,
+                event_type="device_requested",
+                redacted_payload={},
+            )
+        db.rollback()
+
+    with session_factory() as verification:
+        authoritative = verification.get(ApplicationTask, task_id)
+        assert authoritative is not None
+        assert authoritative.status is ApplicationTaskStatus.CREATED
+        assert authoritative.state_version == 0
+        assert verification.scalars(select(ApplicationEvent)).all() == []

@@ -10,7 +10,10 @@ from backend.app.db.models import (
     TaskActor,
 )
 from backend.app.repositories import applications
-from backend.app.repositories.applications import StaleTaskVersionError
+from backend.app.repositories.applications import (
+    StaleTaskVersionError,
+    TaskNotFoundError,
+)
 
 
 class InvalidTransitionError(ValueError):
@@ -109,8 +112,10 @@ class ApplicationService:
         redacted_payload: dict[str, object],
     ) -> ApplicationTask:
         _validate_redacted_value(redacted_payload)
-        task = applications.get_by_id(db, task_id)
+        task = applications.get_authoritative(db, task_id)
         if task is None:
+            raise TaskNotFoundError(task_id)
+        if task.state_version != expected_version:
             raise StaleTaskVersionError(task_id)
         if target not in ALLOWED_TRANSITIONS[task.status]:
             raise InvalidTransitionError(
@@ -125,7 +130,8 @@ class ApplicationService:
             )
         return applications.transition(
             db,
-            task=task,
+            task_id=task_id,
+            source=task.status,
             expected_version=expected_version,
             target=target,
             actor=actor,
@@ -139,5 +145,6 @@ __all__ = [
     "ApplicationService",
     "InvalidTransitionError",
     "StaleTaskVersionError",
+    "TaskNotFoundError",
     "UnsafeAuditPayloadError",
 ]
