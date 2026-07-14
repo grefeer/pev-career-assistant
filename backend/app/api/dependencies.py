@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -38,12 +38,14 @@ def get_current_user(
         HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
     ],
     db: Annotated[Session, Depends(_get_db)],
+    request: Request = None,
 ) -> User:
     if credentials is None:
         raise _unauthorized()
 
     try:
-        claims = AuthService(get_settings()).decode_user_token(credentials.credentials)
+        settings = request.app.state.settings if request is not None else get_settings()
+        claims = AuthService(settings).decode_user_token(credentials.credentials)
         user_id = claims["sub"]
         if not isinstance(user_id, str) or not user_id:
             raise _unauthorized()

@@ -74,4 +74,3 @@ def test_list_for_user_orders_most_recent_activation_first() -> None:
         activate(db, older)
 
         assert list_for_user(db, user.id)[0] is older
-

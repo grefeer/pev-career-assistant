@@ -169,3 +169,64 @@ def test_me_rejects_missing_or_invalid_token(client: TestClient, token: str | No
     response = client.get("/api/auth/me", headers=headers)
 
     assert response.status_code == 401
+
+
+def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
+    custom_settings = Settings(
+        app_env="test",
+        app_auth_secret="different-factory-secret-at-least-32-characters",
+        object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        database_url="sqlite+pysqlite:///:memory:",
+        redis_url="redis://localhost:6379/15",
+        checkpoint_backend="sqlite",
+    )
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    def override_db() -> Iterator[Session]:
+        with session_factory() as db:
+            yield db
+
+    app = create_app(custom_settings)
+    app.dependency_overrides[dependencies._get_db] = override_db
+    with TestClient(app) as custom_client:
+        registered = custom_client.post(
+            "/api/auth/register",
+            json={
+                "account": "factory-user",
+                "nickname": "Factory",
+                "password": "secret12",
+            },
+        )
+        assert registered.status_code == 200
+        token = registered.json()["token"]
+
+        assert custom_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 200
+        assert custom_client.get(
+            "/api/sessions", headers={"Authorization": f"Bearer {token}"}
+        ).status_code == 200
+        assert custom_client.post(
+            "/api/analysis/run",
+            headers={"Authorization": f"Bearer {token}"},
+            data={"thread_id": "not-owned"},
+        ).status_code == 404
+
+        logged_in = custom_client.post(
+            "/api/auth/login",
+            json={"account": "factory-user", "password": "secret12"},
+        )
+        assert logged_in.status_code == 200
+        login_token = logged_in.json()["token"]
+        assert custom_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {login_token}"}
+        ).status_code == 200
+        assert custom_client.get(
+            "/api/sessions", headers={"Authorization": f"Bearer {login_token}"}
+        ).status_code == 200

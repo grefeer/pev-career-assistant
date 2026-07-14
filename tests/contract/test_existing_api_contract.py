@@ -4,6 +4,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -21,6 +23,7 @@ os.environ.setdefault(
 )
 
 from backend.app.main import create_app
+from src.models import InternshipAgentState
 
 
 class FakeSnapshot:
@@ -56,6 +59,18 @@ class FakeGraph:
         result = {**payload, "final_report": "完成"}
         self.values[thread_id] = result
         return result
+
+
+def build_test_compiled_graph() -> Any:
+    def finish_without_llm(state: InternshipAgentState) -> dict[str, str]:
+        run_kind = "continued" if len(state.get("messages", [])) > 1 else "new"
+        return {"final_report": f"compiled {run_kind} report"}
+
+    builder = StateGraph(InternshipAgentState)
+    builder.add_node("finish_without_llm", finish_without_llm)
+    builder.add_edge(START, "finish_without_llm")
+    builder.add_edge("finish_without_llm", END)
+    return builder.compile(checkpointer=MemorySaver())
 
 
 @pytest.fixture
@@ -232,3 +247,39 @@ def test_continue_without_checkpoint_returns_404(client: TestClient) -> None:
     )
     assert response.status_code == 404
     assert response.json()["detail"] == "当前会话没有已保存状态，无法继续。"
+
+
+def test_api_contract_with_real_compiled_state_graph(client: TestClient) -> None:
+    client.app.state.graph = build_test_compiled_graph()
+    token, thread_id = register(client, "compiled-user")
+
+    new_run = client.post(
+        "/api/analysis/run",
+        headers=auth(token),
+        data={
+            "thread_id": thread_id,
+            "user_goal": "测试真实图",
+            "resume_text": "Python",
+        },
+    )
+    assert new_run.status_code == 200
+    assert new_run.json()["result"]["final_report"] == "compiled new report"
+
+    continued = client.post(
+        "/api/analysis/run",
+        headers=auth(token),
+        data={"thread_id": thread_id, "continue_session": "true"},
+    )
+    assert continued.status_code == 200
+    assert continued.json()["result"]["final_report"] == "compiled continued report"
+
+    state = client.get(f"/api/sessions/{thread_id}", headers=auth(token))
+    assert state.status_code == 200
+    assert state.json()["values"]["final_report"] == "compiled continued report"
+
+    history = client.get(
+        f"/api/sessions/{thread_id}/history?limit=20", headers=auth(token)
+    )
+    assert history.status_code == 200
+    assert len(history.json()) >= 2
+    assert all(item["checkpoint_id"] for item in history.json())
