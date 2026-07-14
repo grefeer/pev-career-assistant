@@ -1,6 +1,7 @@
 export interface UserProfile {
   account: string;
   nickname: string;
+  role: "student" | "admin";
   created_at: string;
   last_login_at: string;
   active_thread_id: string;

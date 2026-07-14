@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -13,6 +14,7 @@ from backend.app.services.auth import AccountExistsError, AuthService
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 def serialize_profile(
@@ -56,6 +58,7 @@ def register(
         db.commit()
     except AccountExistsError as error:
         db.rollback()
+        logger.warning("registration rejected")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=str(error)
         ) from None
@@ -81,6 +84,7 @@ def login(
     )
     if user is None:
         db.rollback()
+        logger.warning("login rejected")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="账号或密码不正确。",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -13,6 +14,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 ENCRYPTION_VERSION = "v1-aes-256-gcm"
 NONCE_SIZE = 12
+logger = logging.getLogger(__name__)
 
 
 class BlobStore(Protocol):
@@ -104,12 +106,16 @@ class EncryptedObjectStore:
     def put(self, *, key: str, plaintext: bytes, content_type: str) -> StoredObject:
         nonce = os.urandom(NONCE_SIZE)
         ciphertext = self._cipher.encrypt(nonce, plaintext, key.encode("utf-8"))
-        self._blob_store.put_bytes(
-            key=key,
-            body=nonce + ciphertext,
-            content_type=content_type,
-            metadata={"encryption": ENCRYPTION_VERSION},
-        )
+        try:
+            self._blob_store.put_bytes(
+                key=key,
+                body=nonce + ciphertext,
+                content_type=content_type,
+                metadata={"encryption": ENCRYPTION_VERSION},
+            )
+        except Exception:
+            logger.error("encrypted object write failed")
+            raise
         return StoredObject(
             key=key,
             content_type=content_type,

@@ -21,7 +21,9 @@
 - 多智能体协作：`Supervisor`、`Job Analyst`、`Resume Reviewer`、`Resume Optimizer`、`Career Coach`
 - `LangGraph` 核心能力完整落地：`Command`、`Send`、子图、状态聚合、低分回路、checkpoint
 - 多模型分工：支持按角色分配不同模型，兼顾效果与成本
-- `SQLite checkpoint`：支持自定义 `thread_id`、会话恢复、历史快照读取
+- `Redis 8 checkpoint`：支持自定义 `thread_id`、跨实例会话恢复和历史快照读取
+- MySQL 权威数据：账户、会话、设备、投递任务和审计记录均以 MySQL 为准
+- 客户端加密对象存储：简历等对象在写入 S3/MinIO 前使用 AES-GCM 加密
 - 前后端分离：`FastAPI` 后端 + `Vue 3 + Vite` 前端
 - Docker 部署：支持通过 `docker compose up --build` 一键启动
 
@@ -33,7 +35,9 @@
 - FastAPI
 - Vue 3
 - Vite
-- SQLite
+- MySQL（权威数据）
+- Redis 8（LangGraph checkpoint；SQLite 仅用于开发）
+- S3/MinIO（客户端加密对象存储）
 - Docker Compose
 - Nginx
 - pypdf
@@ -129,10 +133,10 @@
 
 后端职责：
 
-- 用户认证与本地账户管理
+- 用户认证与 MySQL 账户管理
 - 会话与 `thread_id` 管理
 - 调用 LangGraph 图执行求职分析
-- 读取 SQLite checkpoint 当前状态与历史快照
+- 读取 Redis 8 checkpoint 当前状态与历史快照（开发环境可选 SQLite）
 - 处理 `txt / md / pdf` 简历上传
 
 ## 前端能力（Vue）
@@ -179,7 +183,7 @@ ANALYST_MODEL=gpt-4o-mini
 REVIEWER_MODEL=gpt-4.1
 OPTIMIZER_MODEL=gpt-4.1
 COACH_MODEL=gpt-4.1
-APP_AUTH_SECRET=replace-with-your-own-secret
+# 完整平台变量及安全生成方式见运行手册；不要提交真实密钥。
 ```
 
 ### 3. 启动后端
@@ -199,7 +203,8 @@ npm run dev -- --host 127.0.0.1 --port 5173
 访问：
 
 - 前端：`http://127.0.0.1:5173`
-- 后端健康检查：`http://127.0.0.1:8000/api/health`
+- 后端存活检查：`http://127.0.0.1:8000/api/health/live`
+- 后端就绪检查：`http://127.0.0.1:8000/api/health/ready`
 
 ## Docker 部署
 
@@ -219,7 +224,10 @@ docker compose up --build -d
 
 - 前端：`http://localhost:5173`
 - 后端：`http://localhost:8000`
-- 健康检查：`http://localhost:8000/api/health`
+- 存活检查：`http://localhost:8000/api/health/live`
+- 就绪检查：`http://localhost:8000/api/health/ready`
+
+Compose 的 MySQL、Redis、MinIO、后端和前端宿主端口均可配置。完整的环境变量生成、迁移、恢复、备份与密钥轮换步骤见[平台基础运行手册](./docs/runbooks/platform-foundation.md)。
 
 ## 运行时数据说明
 
@@ -227,7 +235,7 @@ docker compose up --build -d
 
 - `.env`
 - `checkpoints/`
-- `data/app_users.json`
+- 旧版本本地账户文件（仅遗留；不会迁移到 MySQL）
 - `frontend/node_modules/`
 - `frontend/dist/`
 
@@ -236,7 +244,13 @@ docker compose up --build -d
 ## 适合在简历和面试中展示的点
 
 - 用 `LangGraph` 把真实业务流程而不是简单问答做成状态图
-- 使用 `Command`、`Send`、子图、低分回路和 SQLite checkpoint
+- 使用 `Command`、`Send`、子图、低分回路和 Redis 8 checkpoint
 - 使用 `FastAPI` 封装工作流与会话管理接口
 - 使用 `Vue` 构建独立工作台，完成前后端联调
 - 使用 Docker Compose 做完整部署验证
+
+## 设计与实施文档
+
+- [校园招聘职业助手总体设计](./docs/superpowers/specs/2026-07-14-campus-recruitment-career-assistant-design.md)
+- [平台基础权威数据实施计划](./docs/superpowers/plans/2026-07-14-platform-foundation-authoritative-data.md)
+- [平台基础运行手册](./docs/runbooks/platform-foundation.md)

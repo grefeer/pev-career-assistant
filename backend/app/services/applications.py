@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import logging
 
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,9 @@ class InvalidTransitionError(ValueError):
 
 class UnsafeAuditPayloadError(ValueError):
     pass
+
+
+logger = logging.getLogger(__name__)
 
 
 ALLOWED_TRANSITIONS = {
@@ -118,6 +122,7 @@ class ApplicationService:
         if task.state_version != expected_version:
             raise StaleTaskVersionError(task_id)
         if target not in ALLOWED_TRANSITIONS[task.status]:
+            logger.warning("application transition rejected")
             raise InvalidTransitionError(
                 f"transition from {task.status.value} to {target.value} is not allowed"
             )
@@ -125,6 +130,7 @@ class ApplicationService:
             target is ApplicationTaskStatus.OBSERVING_USER_SUBMISSION
             and actor is not TaskActor.HUMAN
         ):
+            logger.warning("application transition rejected")
             raise InvalidTransitionError(
                 "only a human can start observation of the user's final submission"
             )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import logging
 from typing import Annotated, cast
 
 import jwt
@@ -15,6 +16,7 @@ from backend.app.services.auth import AuthService
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def _get_db() -> Iterator[Session]:
@@ -50,6 +52,7 @@ def get_current_device(
 ) -> Device:
     device = service.authenticate(db, device_token) if device_token else None
     if device is None:
+        logger.warning("device authentication rejected")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="设备令牌无效。",
