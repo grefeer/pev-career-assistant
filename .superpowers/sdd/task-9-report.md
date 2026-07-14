@@ -51,3 +51,30 @@ The focused health and checkpoint lifecycle suite passed `8/8`. The health tests
 ## Open concern
 
 Docker Desktop's local build session stalled without output or image creation for the worktree context, a `.dockerignore`-reduced context, legacy builder, and a minimal `%TEMP%` context. Docker daemon/buildx queries remained healthy and local dependency images ran normally. No shared build cache was cleared and Docker Desktop was not restarted. Therefore the backend/frontend image build, Compose `migrate` container exit, and six-container full-stack state could not be verified on this host; dependency containers were retained for the next gate.
+
+## Review fixes
+
+### Container credential boundary
+
+- Added a Linux container entrypoint that accepts only raw `DB_PASSWORD` and `REDIS_PASSWORD`, percent-encodes them in memory, sets service URLs without printing them, and preserves the Compose command via `execvp`.
+- Missing credentials return one fixed redacted error. Unit RED was the missing entrypoint module; GREEN was `4/4`, later `5/5` with the frontend and shared-image assertions.
+- Removed mandatory `DB_PASSWORD_URLENCODED`, `REDIS_PASSWORD_URLENCODED`, `DATABASE_URL`, and `REDIS_URL` Compose inputs. A programmatic resolved-config test proves Redis's real password is absent from `Config.Cmd` and that backend/migrate share one image.
+- Redis now writes an owner-only temporary config from `$$REDIS_PASSWORD` at runtime and re-enters the official image entrypoint so Redis 8 JSON/Search modules remain loaded. The recreated container was healthy and authenticated JSON/Search probes passed.
+
+### Lifespan failure cleanup and readiness timeout
+
+- RED reproduced an `ensure_bucket()` startup failure leaving the owned Redis client unclosed.
+- `AsyncExitStack` now registers Redis and S3 cleanup immediately after creation, covering create, ensure, serve, and shutdown phases. GREEN proves owned S3, Redis, and checkpointer cleanup plus state removal, while pre-injected resources remain open and present.
+- Added a validated `readiness_timeout_seconds` setting (default 2, range 1–30). Redis uses connect/socket timeouts, S3 uses connect/read timeouts with at most two attempts, and PyMySQL uses connect/read/write timeouts. SQLite receives no MySQL connect arguments.
+- Added public `S3BlobStore.check_bucket()`; readiness no longer accesses private client/bucket fields.
+
+### Reproducible frontend and final full stack
+
+- Frontend Dockerfile now copies `package*.json` and runs `npm ci`. The original lockfile produced `Invalid Version` under Node 24; regenerating it from `package.json` with the same Node 24 image fixed the reproducible install.
+- An isolated Node 24 container passed `npm ci` and the Vite production build. A subsequent frontend image build passed.
+- Backend image completed in 5 seconds. The initial combined build failed only at the old frontend lockfile; build history identified the exact `npm ci` error without another speculative build loop.
+- Compose `migrate` and `backend` now explicitly share the backend image, fixing the missing implicit migrate image found during the first full-stack start.
+- Final six-service state: MySQL, Redis, MinIO, and backend healthy; frontend running and HTTP 200; migrate exited 0. `/api/health/ready` returned all three dependencies `up`.
+- Final real-dependency integration suite passed `6/6`; full repository suite passed `276` with `4` expected external-environment skips; Ruff passed.
+
+The original build concern above is resolved by the regenerated frontend lockfile and successful full-stack verification.

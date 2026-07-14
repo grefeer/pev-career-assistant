@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     jwt_ttl_seconds: int = 604800
     database_url: str
     redis_url: str
+    readiness_timeout_seconds: int = Field(default=2, ge=1, le=30)
     checkpoint_backend: Literal["sqlite", "redis"] = "sqlite"
     checkpoint_sqlite_path: Path = (
         ROOT_DIR / "checkpoints" / "langgraph_checkpoints.sqlite"

@@ -42,8 +42,7 @@ def _redis_is_up(request: Request) -> bool:
 
 def _object_store_is_up(request: Request) -> bool:
     try:
-        blob_store = request.app.state.blob_store
-        blob_store._client.head_bucket(Bucket=blob_store._bucket)
+        request.app.state.blob_store.check_bucket()
         return True
     except Exception:
         return False

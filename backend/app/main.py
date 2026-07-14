@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
 import os
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import boto3
+from botocore.config import Config
 import redis
 
 from backend.app.api.router import api_router
@@ -24,9 +25,10 @@ load_env()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_graph: object | None = None
     owned_redis: redis.Redis | None = None
-    owned_object_store_client: object | None = None
+    owned_object_store_client: Any | None = None
     try:
         async with AsyncExitStack() as stack:
+            timeout = app.state.settings.readiness_timeout_seconds
             if not hasattr(app.state, "graph"):
                 if hasattr(app.state, "checkpointer"):
                     checkpointer = app.state.checkpointer
@@ -37,7 +39,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 owned_graph = build_graph(checkpointer=checkpointer)
                 app.state.graph = owned_graph
             if not hasattr(app.state, "redis"):
-                redis_options = {}
+                redis_options = {
+                    "socket_connect_timeout": timeout,
+                    "socket_timeout": timeout,
+                }
                 redis_password = os.environ.get("REDIS_PASSWORD")
                 if redis_password:
                     redis_options["password"] = redis_password
@@ -45,6 +50,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     app.state.settings.redis_url, **redis_options
                 )
                 app.state.redis = owned_redis
+                stack.callback(owned_redis.close)
             if not hasattr(app.state, "blob_store") and app.state.settings.app_env != "test":
                 owned_object_store_client = boto3.client(
                     "s3",
@@ -52,19 +58,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     region_name=app.state.settings.object_store_region,
                     aws_access_key_id=app.state.settings.object_store_access_key,
                     aws_secret_access_key=app.state.settings.object_store_secret_key,
+                    config=Config(
+                        connect_timeout=timeout,
+                        read_timeout=timeout,
+                        retries={"total_max_attempts": 2, "mode": "standard"},
+                    ),
                 )
                 app.state.blob_store = S3BlobStore(
                     owned_object_store_client, app.state.settings.object_store_bucket
                 )
+                stack.callback(owned_object_store_client.close)
             if hasattr(app.state, "blob_store"):
                 app.state.blob_store.ensure_bucket()
-            try:
-                yield
-            finally:
-                if owned_redis is not None:
-                    owned_redis.close()
-                if owned_object_store_client is not None:
-                    owned_object_store_client.close()
+            yield
     finally:
         if (
             owned_graph is not None

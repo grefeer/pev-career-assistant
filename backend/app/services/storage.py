@@ -33,6 +33,8 @@ class BlobStore(Protocol):
 
     def ensure_bucket(self) -> None: ...
 
+    def check_bucket(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class StoredObject:
@@ -81,6 +83,9 @@ class S3BlobStore:
             if error_code not in {"404", "NoSuchBucket", "NotFound"}:
                 raise
             self._client.create_bucket(Bucket=self._bucket)
+
+    def check_bucket(self) -> None:
+        self._client.head_bucket(Bucket=self._bucket)
 
 
 class EncryptedObjectStore:

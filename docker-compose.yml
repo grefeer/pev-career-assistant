@@ -20,7 +20,14 @@ services:
     image: redis:8.0-alpine
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD must be set}"]
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        escaped_password=$$(printf '%s' "$$REDIS_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        printf 'appendonly yes\nrequirepass "%s"\n' "$$escaped_password" > /tmp/redis.conf
+        exec /usr/local/bin/docker-entrypoint.sh redis-server /tmp/redis.conf
     ports:
       - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
@@ -49,6 +56,7 @@ services:
       retries: 20
 
   migrate:
+    image: platform-foundation-backend:latest
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -59,9 +67,14 @@ services:
     environment: &backend-environment
       APP_ENV: development
       APP_AUTH_SECRET: ${APP_AUTH_SECRET:?APP_AUTH_SECRET must be set}
-      DATABASE_URL: mysql+pymysql://root:${DB_PASSWORD_URLENCODED:?DB_PASSWORD_URLENCODED must be set}@mysql:3306/career_assistant?charset=utf8mb4
-      REDIS_URL: redis://default:${REDIS_PASSWORD_URLENCODED:?REDIS_PASSWORD_URLENCODED must be set}@redis:6379/0
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_NAME: career_assistant
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
       CHECKPOINT_BACKEND: redis
       OBJECT_STORE_ENDPOINT: http://minio:9000
       OBJECT_STORE_REGION: us-east-1
@@ -79,6 +92,7 @@ services:
       COACH_MODEL: ${COACH_MODEL:-gpt-4.1}
 
   backend:
+    image: platform-foundation-backend:latest
     build:
       context: .
       dockerfile: backend/Dockerfile

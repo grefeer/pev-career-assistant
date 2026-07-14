@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from cryptography.exceptions import InvalidTag
 
-from backend.app.services.storage import EncryptedObjectStore
+from backend.app.services.storage import EncryptedObjectStore, S3BlobStore
 
 
 @dataclass
@@ -139,3 +139,17 @@ def test_encryption_key_must_be_strict_base64_encoded_32_bytes(
 ) -> None:
     with pytest.raises(ValueError, match="32-byte base64"):
         EncryptedObjectStore(memory_blob_store, bad_key)
+
+
+def test_s3_blob_store_public_bucket_check_uses_head_bucket() -> None:
+    calls: list[dict[str, str]] = []
+
+    class S3Client:
+        def head_bucket(self, **kwargs: str) -> None:
+            calls.append(kwargs)
+
+    blob_store = S3BlobStore(S3Client(), "readiness-bucket")
+
+    blob_store.check_bucket()
+
+    assert calls == [{"Bucket": "readiness-bucket"}]
