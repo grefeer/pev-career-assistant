@@ -20,26 +20,41 @@ load_env()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    async with AsyncExitStack() as stack:
-        if not hasattr(app.state, "graph"):
-            if hasattr(app.state, "checkpointer"):
-                checkpointer = app.state.checkpointer
-            else:
-                checkpointer = stack.enter_context(
-                    checkpointer_context(app.state.settings)
+    owned_graph: object | None = None
+    owned_redis: redis.Redis | None = None
+    try:
+        async with AsyncExitStack() as stack:
+            if not hasattr(app.state, "graph"):
+                if hasattr(app.state, "checkpointer"):
+                    checkpointer = app.state.checkpointer
+                else:
+                    checkpointer = stack.enter_context(
+                        checkpointer_context(app.state.settings)
+                    )
+                owned_graph = build_graph(checkpointer=checkpointer)
+                app.state.graph = owned_graph
+            if not hasattr(app.state, "redis"):
+                redis_options = {}
+                redis_password = os.environ.get("REDIS_PASSWORD")
+                if redis_password:
+                    redis_options["password"] = redis_password
+                owned_redis = redis.Redis.from_url(
+                    app.state.settings.redis_url, **redis_options
                 )
-            app.state.graph = build_graph(checkpointer=checkpointer)
-        redis_options = {}
-        redis_password = os.environ.get("REDIS_PASSWORD")
-        if redis_password:
-            redis_options["password"] = redis_password
-        app.state.redis = redis.Redis.from_url(
-            app.state.settings.redis_url, **redis_options
-        )
-        try:
-            yield
-        finally:
-            app.state.redis.close()
+                app.state.redis = owned_redis
+            try:
+                yield
+            finally:
+                if owned_redis is not None:
+                    owned_redis.close()
+    finally:
+        if (
+            owned_graph is not None
+            and getattr(app.state, "graph", None) is owned_graph
+        ):
+            del app.state.graph
+        if owned_redis is not None and getattr(app.state, "redis", None) is owned_redis:
+            del app.state.redis
 
 
 def create_app(
