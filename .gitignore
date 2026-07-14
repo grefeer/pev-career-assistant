@@ -39,3 +39,5 @@ frontend/dist/
 
 # Logs
 *.log
+# Local isolated development worktrees
+.worktrees/
