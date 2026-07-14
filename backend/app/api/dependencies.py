@@ -4,12 +4,12 @@ from collections.abc import Iterator
 from typing import Annotated
 
 import jwt
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from backend.app.config import get_settings
-from backend.app.db.models import User, UserRole
+from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
 
@@ -31,6 +31,30 @@ def _unauthorized() -> HTTPException:
         detail="无法验证身份。",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def get_redis(request: Request):
+    return request.app.state.redis
+
+
+def get_device_service(redis_client=Depends(get_redis)):
+    from backend.app.services.devices import DeviceService
+
+    return DeviceService(redis_client)
+
+
+def get_current_device(
+    db: Annotated[Session, Depends(_get_db)],
+    service=Depends(get_device_service),
+    device_token: Annotated[str | None, Header(alias="X-Device-Token")] = None,
+) -> Device:
+    device = service.authenticate(db, device_token) if device_token else None
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="设备令牌无效。",
+        )
+    return device
 
 
 def get_current_user(

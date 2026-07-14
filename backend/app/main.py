@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import os
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import redis
 
 from backend.app.api.router import api_router
 from backend.app.config import Settings, get_settings
@@ -19,7 +21,15 @@ load_env()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not hasattr(app.state, "graph"):
         app.state.graph = build_graph()
-    yield
+    redis_options = {}
+    redis_password = os.environ.get("REDIS_PASSWORD")
+    if redis_password:
+        redis_options["password"] = redis_password
+    app.state.redis = redis.Redis.from_url(app.state.settings.redis_url, **redis_options)
+    try:
+        yield
+    finally:
+        app.state.redis.close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
