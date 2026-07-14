@@ -112,7 +112,7 @@ class ApplicationService:
         redacted_payload: dict[str, object],
     ) -> ApplicationTask:
         _validate_redacted_value(redacted_payload)
-        task = applications.get_authoritative(db, task_id)
+        task = applications.get_authoritative(db, task_id, lock=True)
         if task is None:
             raise TaskNotFoundError(task_id)
         if task.state_version != expected_version:
