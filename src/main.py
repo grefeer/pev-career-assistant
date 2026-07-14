@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from typing import Any
 
+from backend.app.config import get_settings
+from src.checkpointing import checkpointer_context
 from src.graph import build_graph
 from src.session_service import (
     DEFAULT_MESSAGE,
@@ -13,7 +16,7 @@ from src.session_service import (
     get_state_history_rows,
     resolve_resume_text,
 )
-from src.utils import get_checkpoint_db_path, load_env, load_jobs
+from src.utils import load_env, load_jobs
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +82,7 @@ def resolve_thread_id(args: argparse.Namespace) -> str:
 
 
 def print_session_summary(thread_id: str, values: dict[str, Any]) -> None:
-    print(f"checkpoint_db: {get_checkpoint_db_path()}")
+    print(f"checkpoint_backend: {get_settings().checkpoint_backend}")
     print(f"thread_id: {thread_id}")
     print("=" * 60)
     print("会话摘要")
@@ -100,7 +103,7 @@ def print_session_summary(thread_id: str, values: dict[str, Any]) -> None:
 
 def print_state_history(app, config: dict[str, Any], limit: int) -> None:
     snapshots = get_state_history_rows(app, config, limit)
-    print(f"checkpoint_db: {get_checkpoint_db_path()}")
+    print(f"checkpoint_backend: {get_settings().checkpoint_backend}")
     print(f"thread_id: {config['configurable']['thread_id']}")
     print("=" * 60)
     print("历史快照")
@@ -124,7 +127,7 @@ def print_state_history(app, config: dict[str, Any], limit: int) -> None:
 
 
 def print_result(thread_id: str, result: dict[str, Any]) -> None:
-    print(f"checkpoint_db: {get_checkpoint_db_path()}")
+    print(f"checkpoint_backend: {get_settings().checkpoint_backend}")
     print(f"thread_id: {thread_id}")
     print("=" * 60)
     print("最终投递建议")
@@ -140,12 +143,7 @@ def print_result(thread_id: str, result: dict[str, Any]) -> None:
     print(result.get("revision_notes", []))
 
 
-def main() -> None:
-    # 1. 加载环境变量、解析参数并构建图实例。
-    load_env()
-    args = parse_args()
-    app = build_graph()
-
+def run_cli_action(app: Any, args: argparse.Namespace) -> None:
     thread_id = resolve_thread_id(args)
     config = build_config(thread_id)
 
@@ -207,6 +205,15 @@ def main() -> None:
         config=config,
     )
     print_result(thread_id, result)
+
+
+def main() -> None:
+    load_env()
+    args = parse_args()
+    settings = get_settings()
+    with checkpointer_context(settings) as saver:
+        app = build_graph(checkpointer=saver)
+        run_cli_action(app, args)
 
 
 if __name__ == "__main__":

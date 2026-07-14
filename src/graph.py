@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
-from functools import lru_cache
 from statistics import mean
 from typing import Literal
 
 from langchain_core.messages import AIMessage
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.types import Command, Send
@@ -20,20 +18,6 @@ from src.agents import (
     supervisor_decide,
 )
 from src.models import InternshipAgentState, SingleJobAnalysisState, SingleMatchState
-from src.utils import get_checkpoint_db_path
-
-
-@lru_cache(maxsize=1)
-def build_sqlite_checkpointer() -> SqliteSaver:
-    # 第二版升级后的默认 checkpoint 实现：
-    # 使用 SQLite 持久化图状态，而不是仅保存在进程内存中。
-    #
-    # 这里用缓存确保整个进程里只复用一份连接，
-    # 避免多次 build_graph() 时重复打开数据库连接。
-    conn = sqlite3.connect(get_checkpoint_db_path(), check_same_thread=False)
-    return SqliteSaver(conn)
-
-
 def _get_active_matches(state: InternshipAgentState) -> list[dict]:
     # matches 会保留历史轮次的结果。
     # 第二版加入低分回路后，必须只筛出“当前轮”的匹配结果参与决策。
@@ -321,7 +305,7 @@ def build_match_subgraph():
     return graph.compile()
 
 
-def build_graph():
+def build_graph(checkpointer: BaseCheckpointSaver):
     # 主图只保留“策略调度”和“阶段节点”，
     # 单岗位分析、单岗位匹配这些细粒度工作交给子图处理。
     graph = StateGraph(InternshipAgentState)
@@ -337,6 +321,4 @@ def build_graph():
     graph.add_edge("match_flow", "supervisor")
     graph.add_edge("finish_node", END)
 
-    # 当前版本默认使用 SQLite checkpoint。
-    # 这意味着图状态会持久化到磁盘，下次运行时只要 thread_id 一样，就能恢复同一条会话。
-    return graph.compile(checkpointer=build_sqlite_checkpointer())
+    return graph.compile(checkpointer=checkpointer)
