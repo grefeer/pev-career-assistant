@@ -81,6 +81,8 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
         **os.environ,
         "DB_PASSWORD": "compose-db p@ss:/?#%",
         "REDIS_PASSWORD": redis_password,
+        "MINIO_ROOT_USER": "compose-minio-user-not-public",
+        "MINIO_ROOT_PASSWORD": "compose-minio-password-not-public",
         "APP_AUTH_SECRET": "a" * 32,
         "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
     }
@@ -103,6 +105,12 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     assert "REDIS_PASSWORD_URLENCODED" not in backend_environment
     assert "DATABASE_URL" not in backend_environment
     assert "REDIS_URL" not in backend_environment
+    assert backend_environment["OBJECT_STORE_ACCESS_KEY"] == environment[
+        "MINIO_ROOT_USER"
+    ]
+    assert backend_environment["OBJECT_STORE_SECRET_KEY"] == environment[
+        "MINIO_ROOT_PASSWORD"
+    ]
     assert config["services"]["migrate"]["image"] == config["services"]["backend"][
         "image"
     ]
@@ -112,6 +120,39 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     assert "carriage_return" in redis_script
     assert "newline" in redis_script
     assert "chmod 600" in redis_script
+
+
+def test_compose_requires_minio_credentials_without_public_defaults() -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker compose is not available")
+    environment = {
+        **os.environ,
+        "DB_PASSWORD": "compose-db-not-public",
+        "REDIS_PASSWORD": "compose-redis-not-public",
+        "APP_AUTH_SECRET": "a" * 32,
+        "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
+    }
+    environment.pop("MINIO_ROOT_USER", None)
+    environment.pop("MINIO_ROOT_PASSWORD", None)
+
+    completed = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "minioadmin" not in completed.stdout
+    assert "minioadmin" not in completed.stderr
+
+
+def test_backend_image_contract_includes_admin_script() -> None:
+    dockerfile = (ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "COPY scripts ./scripts" in dockerfile
+    assert "COPY requirements.txt ./requirements.txt" in dockerfile
 
 
 def test_frontend_dockerfile_uses_locked_reproducible_install() -> None:

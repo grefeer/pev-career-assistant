@@ -18,8 +18,8 @@ def test_encrypted_object_round_trip_against_s3() -> None:
     client = boto3.client(
         "s3",
         endpoint_url=endpoint,
-        aws_access_key_id=os.getenv("TEST_S3_ACCESS_KEY", "minioadmin"),
-        aws_secret_access_key=os.getenv("TEST_S3_SECRET_KEY", "minioadmin"),
+        aws_access_key_id=os.environ["TEST_S3_ACCESS_KEY"],
+        aws_secret_access_key=os.environ["TEST_S3_SECRET_KEY"],
         region_name="us-east-1",
     )
     bucket = os.getenv("TEST_S3_BUCKET", "career-assistant-storage-test")

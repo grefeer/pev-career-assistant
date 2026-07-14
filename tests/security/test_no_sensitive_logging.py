@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from typing import Any
 
 import fakeredis
 import pytest
@@ -11,6 +13,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+from uvicorn.config import LOGGING_CONFIG
+from uvicorn.logging import DefaultFormatter
 
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("APP_AUTH_SECRET", "test-secret-with-at-least-32-characters")
@@ -39,20 +43,99 @@ DEVICE_TOKEN = "device-token-must-never-be-logged-in-full"
 PAIRING_CODE = "pair-code-must-never-be-logged"
 OBJECT_PLAINTEXT = b"private resume plaintext must stay out of logs"
 CONFIG_SECRET = "object-config-secret-must-never-be-logged"
+SENSITIVE_VALUES = (
+    PASSWORD,
+    DEVICE_TOKEN,
+    PAIRING_CODE,
+    OBJECT_PLAINTEXT.decode(),
+    CONFIG_SECRET,
+)
 
 
-def _messages(caplog: pytest.LogCaptureFixture) -> str:
-    return "\n".join(record.getMessage() for record in caplog.records)
+def _production_formatter() -> logging.Formatter:
+    config = dict(LOGGING_CONFIG["formatters"]["default"])
+    return DefaultFormatter(
+        fmt=config.get("fmt"),
+        datefmt=config.get("datefmt"),
+        use_colors=False,
+    )
+
+
+class CaptureHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+        self.formatted: list[str] = []
+        self.setFormatter(_production_formatter())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+        self.formatted.append(self.format(record))
+
+
+@contextmanager
+def _capture_application_logs() -> Iterator[CaptureHandler]:
+    logger = logging.getLogger("backend.app")
+    handler = CaptureHandler()
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.propagate = previous_propagate
+
+
+def _contains_sensitive_value(
+    value: Any, sensitive_values: tuple[str, ...], seen: set[int] | None = None
+) -> bool:
+    if isinstance(value, str):
+        return any(sensitive in value for sensitive in sensitive_values)
+    if isinstance(value, bytes):
+        return any(sensitive.encode() in value for sensitive in sensitive_values)
+    if value is None or isinstance(value, (bool, int, float)):
+        return False
+    if isinstance(value, BaseException):
+        return _contains_sensitive_value(str(value), sensitive_values, seen)
+
+    visited = seen if seen is not None else set()
+    identity = id(value)
+    if identity in visited:
+        return False
+    visited.add(identity)
+
+    if isinstance(value, Mapping):
+        return any(
+            _contains_sensitive_value(key, sensitive_values, visited)
+            or _contains_sensitive_value(nested, sensitive_values, visited)
+            for key, nested in value.items()
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(
+            _contains_sensitive_value(item, sensitive_values, visited)
+            for item in value
+        )
+    return _contains_sensitive_value(repr(value), sensitive_values, visited)
 
 
 def _assert_safe_log(
-    caplog: pytest.LogCaptureFixture, marker: str, *secrets: str | bytes
+    capture: CaptureHandler,
+    marker: str,
+    sensitive_values: tuple[str, ...] = SENSITIVE_VALUES,
 ) -> None:
-    messages = _messages(caplog)
-    assert marker in messages
-    for secret in secrets:
-        text = secret.decode() if isinstance(secret, bytes) else secret
-        assert text not in messages
+    assert capture.records
+    assert marker in "\n".join(capture.formatted)
+    for formatted, record in zip(capture.formatted, capture.records, strict=True):
+        if _contains_sensitive_value(formatted, sensitive_values):
+            raise AssertionError("sensitive value detected")
+        if _contains_sensitive_value(record.args, sensitive_values):
+            raise AssertionError("sensitive value detected")
+        if _contains_sensitive_value(record.__dict__, sensitive_values):
+            raise AssertionError("sensitive value detected")
 
 
 @pytest.fixture
@@ -70,7 +153,7 @@ def client() -> Iterator[TestClient]:
         with session_factory() as db:
             yield db
 
-    app = create_app(settings_override())
+    app = create_app(settings_override(app_auth_secret=CONFIG_SECRET))
     app.dependency_overrides[dependencies._get_db] = override_db
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
     with TestClient(app) as test_client:
@@ -79,47 +162,44 @@ def client() -> Iterator[TestClient]:
 
 
 def test_registration_failure_logs_outcome_without_password(
-    client: TestClient, caplog: pytest.LogCaptureFixture
+    client: TestClient,
 ) -> None:
     payload = {"account": "duplicate", "nickname": "Student", "password": PASSWORD}
     assert client.post("/api/auth/register", json=payload).status_code == 200
-    caplog.clear()
-
-    with caplog.at_level(logging.WARNING, logger="backend.app"):
+    with _capture_application_logs() as capture:
         response = client.post("/api/auth/register", json=payload)
 
     assert response.status_code == 409
-    _assert_safe_log(caplog, "registration rejected", PASSWORD)
+    _assert_safe_log(capture, "registration rejected")
 
 
 def test_login_failure_logs_outcome_without_password_or_config_secret(
-    client: TestClient, caplog: pytest.LogCaptureFixture
+    client: TestClient,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="backend.app"):
+    with _capture_application_logs() as capture:
         response = client.post(
             "/api/auth/login",
             json={"account": "unknown", "password": PASSWORD},
         )
 
     assert response.status_code == 401
-    _assert_safe_log(caplog, "login rejected", PASSWORD, CONFIG_SECRET)
+    _assert_safe_log(capture, "login rejected")
 
 
 def test_invalid_device_token_logs_outcome_without_token_or_pairing_code(
-    client: TestClient, caplog: pytest.LogCaptureFixture
+    client: TestClient,
 ) -> None:
-    with caplog.at_level(logging.WARNING, logger="backend.app"):
+    with _capture_application_logs() as capture:
         response = client.get(
             "/api/devices/me",
             headers={"X-Device-Token": DEVICE_TOKEN, "X-Pairing-Code": PAIRING_CODE},
         )
 
     assert response.status_code == 401
-    _assert_safe_log(caplog, "device authentication rejected", DEVICE_TOKEN, PAIRING_CODE)
+    _assert_safe_log(capture, "device authentication rejected")
 
 
 def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     class FailingBlobStore:
         def put_bytes(self, **_kwargs: object) -> None:
@@ -130,7 +210,7 @@ def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
     encryption_key = base64.b64encode(bytes(range(32))).decode("ascii")
     store = EncryptedObjectStore(FailingBlobStore(), encryption_key)  # type: ignore[arg-type]
 
-    with caplog.at_level(logging.ERROR, logger="backend.app"):
+    with _capture_application_logs() as capture:
         with pytest.raises(RuntimeError, match="upload failed"):
             store.put(
                 key="users/u1/resume.pdf",
@@ -138,11 +218,10 @@ def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
                 content_type="application/pdf",
             )
 
-    _assert_safe_log(caplog, "encrypted object write failed", OBJECT_PLAINTEXT, CONFIG_SECRET)
+    _assert_safe_log(capture, "encrypted object write failed")
 
 
 def test_state_transition_failure_logs_outcome_without_payload_or_config_secret(
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -160,7 +239,7 @@ def test_state_transition_failure_logs_outcome_without_payload_or_config_secret(
             db.commit()
             sensitive_summary = f"{OBJECT_PLAINTEXT.decode()} {CONFIG_SECRET}"
 
-            with caplog.at_level(logging.WARNING, logger="backend.app"):
+            with _capture_application_logs() as capture:
                 with pytest.raises(InvalidTransitionError):
                     ApplicationService().transition(
                         db,
@@ -173,10 +252,32 @@ def test_state_transition_failure_logs_outcome_without_payload_or_config_secret(
                     )
 
         _assert_safe_log(
-            caplog,
+            capture,
             "application transition rejected",
-            OBJECT_PLAINTEXT,
-            CONFIG_SECRET,
         )
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("mutation", ["exception", "args", "nested_extra"])
+def test_sensitive_log_capture_detects_indirect_leaks_without_echoing_value(
+    mutation: str,
+) -> None:
+    logger = logging.getLogger("backend.app.capture_self_test")
+    with _capture_application_logs() as capture:
+        if mutation == "exception":
+            try:
+                raise RuntimeError(CONFIG_SECRET)
+            except RuntimeError:
+                logger.exception("capture mutation")
+        elif mutation == "args":
+            logger.warning("capture mutation %s", CONFIG_SECRET)
+        else:
+            logger.warning(
+                "capture mutation",
+                extra={"security_context": {"nested": [CONFIG_SECRET]}},
+            )
+
+    with pytest.raises(AssertionError, match="sensitive value detected") as error:
+        _assert_safe_log(capture, "capture mutation")
+    assert str(error.value) == "sensitive value detected"

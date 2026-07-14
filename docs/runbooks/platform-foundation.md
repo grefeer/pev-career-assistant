@@ -22,6 +22,8 @@ Copy-Item .env.example .env
 $appAuthSecret = & .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"
 $dbPassword = & .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
 $redisPassword = & .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+$minioRootUser = & .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(16))"
+$minioRootPassword = & .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(48))"
 $objectEncryptionKey = & .\.venv\Scripts\python.exe -c "import base64,secrets; print(base64.b64encode(secrets.token_bytes(32)).decode())"
 ```
 
@@ -30,6 +32,8 @@ $objectEncryptionKey = & .\.venv\Scripts\python.exe -c "import base64,secrets; p
 ```powershell
 [Environment]::SetEnvironmentVariable('DB_PASSWORD', $dbPassword, 'User')
 [Environment]::SetEnvironmentVariable('REDIS_PASSWORD', $redisPassword, 'User')
+[Environment]::SetEnvironmentVariable('MINIO_ROOT_USER', $minioRootUser, 'User')
+[Environment]::SetEnvironmentVariable('MINIO_ROOT_PASSWORD', $minioRootPassword, 'User')
 [Environment]::SetEnvironmentVariable('APP_AUTH_SECRET', $appAuthSecret, 'User')
 [Environment]::SetEnvironmentVariable('OBJECT_ENCRYPTION_KEY', $objectEncryptionKey, 'User')
 ```
@@ -90,7 +94,7 @@ docker compose up -d backend frontend
 
 ## 创建管理员
 
-管理员密码通过隐藏的交互提示输入，不要放在命令参数中：
+管理员密码通过容器内脚本的隐藏交互提示输入；保持终端交互开启，不要使用 `-T`，也不要把密码放在 argv 或环境变量中：
 
 ```powershell
 docker compose exec backend python scripts/create_admin.py --account admin --nickname Administrator
@@ -165,8 +169,8 @@ docker compose ps
 $env:TEST_MYSQL_URL = & .\.venv\Scripts\python.exe -c "import os,urllib.parse; print('mysql+pymysql://root:'+urllib.parse.quote(os.environ['DB_PASSWORD'],safe='')+'@127.0.0.1:3307/career_assistant_test?charset=utf8mb4')"
 $env:TEST_REDIS_URL = & .\.venv\Scripts\python.exe -c "import os,urllib.parse; print('redis://:'+urllib.parse.quote(os.environ['REDIS_PASSWORD'],safe='')+'@127.0.0.1:6380/0')"
 $env:TEST_S3_ENDPOINT = 'http://127.0.0.1:9000'
-$env:TEST_S3_ACCESS_KEY = $env:MINIO_ROOT_USER
-$env:TEST_S3_SECRET_KEY = $env:MINIO_ROOT_PASSWORD
+$env:TEST_S3_ACCESS_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_USER', 'User')
+$env:TEST_S3_SECRET_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_PASSWORD', 'User')
 $env:TEST_S3_BUCKET = 'career-assistant-storage-test'
 ```
 

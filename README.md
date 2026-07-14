@@ -160,44 +160,17 @@
 
 ## 本地开发
 
-### 1. 安装 Python 依赖
+推荐通过 Docker Compose 启动完整平台，避免宿主进程误用 `.env` 中的容器 DNS 名称（`mysql`、`redis`、`minio`）。
 
-```bash
-pip install -r requirements.txt
-```
+### 1. 生成环境变量
 
-### 2. 配置环境变量
+按[平台基础运行手册](./docs/runbooks/platform-foundation.md#生成和设置环境变量)生成并设置 MySQL、Redis、MinIO、认证和对象加密变量。不要在命令参数、日志或版本库中保存密码。
 
-```bash
-cp .env.example .env
-```
+### 2. 启动完整平台
 
-`.env` 示例：
-
-```bash
-OPENAI_API_KEY=your_api_key_here
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=gpt-4o-mini
-SUPERVISOR_MODEL=gpt-4.1-mini
-ANALYST_MODEL=gpt-4o-mini
-REVIEWER_MODEL=gpt-4.1
-OPTIMIZER_MODEL=gpt-4.1
-COACH_MODEL=gpt-4.1
-# 完整平台变量及安全生成方式见运行手册；不要提交真实密钥。
-```
-
-### 3. 启动后端
-
-```bash
-uvicorn backend.app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-### 4. 启动前端
-
-```bash
-cd frontend
-npm install
-npm run dev -- --host 127.0.0.1 --port 5173
+```powershell
+docker compose up --build -d
+docker compose ps
 ```
 
 访问：
