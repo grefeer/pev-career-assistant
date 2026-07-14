@@ -17,6 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from pydantic import ValidationError
 
 from backend.app.config import Settings
 from backend.app.db.models import User, UserRole
@@ -74,24 +75,38 @@ def _session_scope() -> AbstractContextManager[Session]:
     return session_scope()
 
 
+def _print_failure() -> None:
+    print("管理员账号创建失败。", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Create a controlled admin account")
     parser.add_argument("--account", required=True)
     parser.add_argument("--nickname", required=True)
     args = parser.parse_args(argv)
-    password = getpass.getpass("Password: ")
+    try:
+        password = getpass.getpass("Password: ")
+    except (EOFError, KeyboardInterrupt):
+        _print_failure()
+        return 1
+
+    try:
+        settings = _get_settings()
+    except ValidationError:
+        _print_failure()
+        return 1
 
     try:
         with _session_scope() as db:
             admin = create_admin_user(
                 db,
-                AuthService(_get_settings()),
+                AuthService(settings),
                 account=args.account,
                 nickname=args.nickname,
                 password=password,
             )
     except (AdminAccountConflictError, AccountExistsError, SQLAlchemyError):
-        print("管理员账号创建失败。", file=sys.stderr)
+        _print_failure()
         return 1
     print(f"Admin account created: {admin.account}")
     return 0

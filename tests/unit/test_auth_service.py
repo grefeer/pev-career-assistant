@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from backend.app.config import Settings
+from backend.app.config import Settings, get_settings
 from backend.app.db.base import Base
 from backend.app.db.models import User, UserRole
 from backend.app.api import dependencies
@@ -203,6 +203,58 @@ def test_decode_rejects_semantically_invalid_claims(
 
     with pytest.raises(jwt.InvalidTokenError):
         service.decode_user_token(token)
+
+
+@pytest.mark.parametrize("exp", [float("inf"), float("-inf")])
+def test_decode_rejects_non_finite_exp_as_invalid_token(exp: float) -> None:
+    settings = make_settings()
+    service = AuthService(settings)
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+            "sub": "user-id",
+            "role": "student",
+            "jti": "token-id",
+            "iat": now,
+            "exp": exp,
+        },
+        settings.app_auth_secret,
+        algorithm="HS256",
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        service.decode_user_token(token)
+
+
+def test_non_finite_exp_is_unauthorized_in_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    settings = make_settings()
+    monkeypatch.setattr(dependencies, "get_settings", lambda: settings)
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+            "sub": "user-id",
+            "role": "student",
+            "jti": "token-id",
+            "iat": now,
+            "exp": float("inf"),
+        },
+        settings.app_auth_secret,
+        algorithm="HS256",
+    )
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    with Session(engine) as db, pytest.raises(HTTPException) as exc_info:
+        dependencies.get_current_user(credentials, db)
+
+    assert exc_info.value.status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -547,3 +599,57 @@ def test_create_admin_main_rejects_existing_student_without_promotion(
         assert "管理员账号创建失败" in captured.err
         assert "input-secret" not in captured.out + captured.err
         assert student.role is UserRole.STUDENT
+
+
+def test_create_admin_main_redacts_settings_validation_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    visible_secret = "visible-test-secret"
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("APP_AUTH_SECRET", visible_secret)
+    monkeypatch.setenv(
+        "OBJECT_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    )
+    monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/15")
+    monkeypatch.setenv("CHECKPOINT_BACKEND", "sqlite")
+    get_settings.cache_clear()
+
+    @contextmanager
+    def fake_session_scope():  # type: ignore[no-untyped-def]
+        yield object()
+
+    monkeypatch.setattr(create_admin_module, "_session_scope", fake_session_scope)
+    monkeypatch.setattr(
+        create_admin_module.getpass, "getpass", lambda _prompt: "input-password"
+    )
+
+    exit_code = create_admin_module.main(["--account", "admin", "--nickname", "Admin"])
+    captured = capsys.readouterr()
+    get_settings.cache_clear()
+
+    assert exit_code == 1
+    assert captured.err.strip() == "管理员账号创建失败。"
+    assert visible_secret not in captured.out + captured.err
+    assert "input-password" not in captured.out + captured.err
+    assert "Traceback" not in captured.err
+    assert "input_value" not in captured.err
+
+
+@pytest.mark.parametrize("terminal_error", [EOFError(), KeyboardInterrupt()])
+def test_create_admin_main_redacts_terminal_input_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    terminal_error: BaseException,
+) -> None:
+    def fail_password_read(_prompt: str) -> str:
+        raise terminal_error
+
+    monkeypatch.setattr(create_admin_module.getpass, "getpass", fail_password_read)
+
+    exit_code = create_admin_module.main(["--account", "admin", "--nickname", "Admin"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.err.strip() == "管理员账号创建失败。"
+    assert "Traceback" not in captured.err

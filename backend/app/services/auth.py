@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -86,16 +87,23 @@ class AuthService:
         return jwt.encode(payload, self.settings.app_auth_secret, algorithm="HS256")
 
     def decode_user_token(self, token: str) -> dict[str, Any]:
-        claims = jwt.decode(
-            token,
-            self.settings.app_auth_secret,
-            algorithms=["HS256"],
-            audience=self.settings.jwt_audience,
-            issuer=self.settings.jwt_issuer,
-            options={"require": ["exp", "iss", "aud", "sub", "role", "jti"]},
-        )
+        try:
+            claims = jwt.decode(
+                token,
+                self.settings.app_auth_secret,
+                algorithms=["HS256"],
+                audience=self.settings.jwt_audience,
+                issuer=self.settings.jwt_issuer,
+                options={"require": ["exp", "iss", "aud", "sub", "role", "jti"]},
+            )
+        except OverflowError:
+            raise jwt.InvalidTokenError("JWT claims are invalid") from None
         exp = claims["exp"]
-        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        if (
+            isinstance(exp, bool)
+            or not isinstance(exp, (int, float))
+            or (isinstance(exp, float) and not math.isfinite(exp))
+        ):
             raise jwt.InvalidTokenError("JWT claims are invalid")
         for claim_name in ("sub", "jti"):
             value = claims[claim_name]
