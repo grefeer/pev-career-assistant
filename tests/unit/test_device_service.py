@@ -4,12 +4,18 @@ import hashlib
 
 import fakeredis
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db.base import Base
-from backend.app.db.models import AuditEvent, DevicePlatform, DeviceStatus, User
+from backend.app.db.models import (
+    AuditEvent,
+    Device,
+    DevicePlatform,
+    DeviceStatus,
+    User,
+)
 from backend.app.services.devices import DeviceService, InvalidPairingTicketError
 
 
@@ -86,13 +92,172 @@ def test_pairing_ticket_can_only_be_redeemed_once(
         )
 
 
-def test_pairing_ticket_service_interface_does_not_require_db(
-    device_service: DeviceService, user: User
+def test_pairing_ticket_audit_failure_removes_redis_ticket(
+    device_service: DeviceService, db: Session, user: User
 ) -> None:
-    ticket = device_service.create_pairing_ticket(user_id=user.id)
+    def fail_ticket_audit(*_args) -> None:
+        raise RuntimeError("audit insert failed")
 
+    event.listen(AuditEvent, "before_insert", fail_ticket_audit)
+    try:
+        with pytest.raises(RuntimeError, match="audit insert failed"):
+            device_service.create_pairing_ticket(db, user_id=user.id)
+    finally:
+        event.remove(AuditEvent, "before_insert", fail_ticket_audit)
+
+    assert list(device_service.redis.scan_iter("pairing-ticket:*")) == []
+    assert db.scalar(select(func.count()).select_from(AuditEvent)) == 0
+    assert db.is_active
+
+
+def test_redeem_audit_flush_failure_rolls_back_and_restores_ticket(
+    device_service: DeviceService, db: Session, user: User
+) -> None:
+    ticket = device_service.create_pairing_ticket(db, user_id=user.id)
     key = f"pairing-ticket:{hashlib.sha256(ticket.code.encode()).hexdigest()}"
-    assert device_service.redis.exists(key) == 1
+    original_ttl = device_service.redis.ttl(key)
+
+    def fail_paired_audit(_mapper, _connection, target: AuditEvent) -> None:
+        if target.event_type == "device.paired":
+            raise RuntimeError("paired audit failed")
+
+    event.listen(AuditEvent, "before_insert", fail_paired_audit)
+    try:
+        with pytest.raises(RuntimeError, match="paired audit failed"):
+            device_service.redeem_pairing_ticket(
+                db,
+                code=ticket.code,
+                name="Alice Windows",
+                public_key_pem=VALID_TEST_PUBLIC_KEY,
+            )
+    finally:
+        event.remove(AuditEvent, "before_insert", fail_paired_audit)
+
+    restored_ttl = device_service.redis.ttl(key)
+    assert 1 <= restored_ttl <= original_ttl
+    assert db.scalar(select(func.count()).select_from(Device)) == 0
+    assert db.scalar(select(func.count()).select_from(AuditEvent)) == 1
+    assert db.is_active
+    assert device_service.redeem_pairing_ticket(
+        db,
+        code=ticket.code,
+        name="Alice Windows retry",
+        public_key_pem=VALID_TEST_PUBLIC_KEY,
+    ).device.name == "Alice Windows retry"
+
+
+def test_redeem_explicit_commit_failure_restores_ticket_without_extending_ttl(
+    device_service: DeviceService,
+    db: Session,
+    user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticket = device_service.create_pairing_ticket(db, user_id=user.id)
+    key = f"pairing-ticket:{hashlib.sha256(ticket.code.encode()).hexdigest()}"
+    original_ttl = device_service.redis.ttl(key)
+    original_commit = db.commit
+    attempts = 0
+
+    def fail_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("commit failed before commit")
+        original_commit()
+
+    monkeypatch.setattr(db, "commit", fail_once)
+    with pytest.raises(RuntimeError, match="commit failed before commit"):
+        device_service.redeem_pairing_ticket(
+            db,
+            code=ticket.code,
+            name="Alice Windows",
+            public_key_pem=VALID_TEST_PUBLIC_KEY,
+        )
+
+    assert 1 <= device_service.redis.ttl(key) <= original_ttl
+    assert db.scalar(select(func.count()).select_from(Device)) == 0
+    assert device_service.redeem_pairing_ticket(
+        db,
+        code=ticket.code,
+        name="Retry",
+        public_key_pem=VALID_TEST_PUBLIC_KEY,
+    ).device.name == "Retry"
+
+
+def test_redeem_commit_ack_failure_returns_committed_device_without_restoring_ticket(
+    device_service: DeviceService,
+    db: Session,
+    user: User,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticket = device_service.create_pairing_ticket(db, user_id=user.id)
+    key = f"pairing-ticket:{hashlib.sha256(ticket.code.encode()).hexdigest()}"
+    original_commit = db.commit
+    attempts = 0
+
+    def commit_then_lose_ack() -> None:
+        nonlocal attempts
+        attempts += 1
+        original_commit()
+        if attempts == 1:
+            raise RuntimeError("commit acknowledgement lost")
+
+    monkeypatch.setattr(db, "commit", commit_then_lose_ack)
+    issued = device_service.redeem_pairing_ticket(
+        db,
+        code=ticket.code,
+        name="Committed Windows",
+        public_key_pem=VALID_TEST_PUBLIC_KEY,
+    )
+
+    assert issued.device.name == "Committed Windows"
+    assert device_service.redis.exists(key) == 0
+    assert db.scalar(select(func.count()).select_from(Device)) == 1
+    assert device_service.authenticate(db, issued.plaintext_token) is not None
+
+
+def test_redeem_compensation_uses_nx_and_does_not_overwrite_new_value(
+    device_service: DeviceService, db: Session, user: User
+) -> None:
+    ticket = device_service.create_pairing_ticket(db, user_id=user.id)
+    key = f"pairing-ticket:{hashlib.sha256(ticket.code.encode()).hexdigest()}"
+
+    def race_then_fail(_mapper, _connection, target: AuditEvent) -> None:
+        if target.event_type == "device.paired":
+            device_service.redis.set(key, b"new-owner-ticket", ex=60)
+            raise RuntimeError("paired audit failed")
+
+    event.listen(AuditEvent, "before_insert", race_then_fail)
+    try:
+        with pytest.raises(RuntimeError, match="paired audit failed"):
+            device_service.redeem_pairing_ticket(
+                db,
+                code=ticket.code,
+                name="Alice Windows",
+                public_key_pem=VALID_TEST_PUBLIC_KEY,
+            )
+    finally:
+        event.remove(AuditEvent, "before_insert", race_then_fail)
+
+    assert device_service.redis.get(key) == b"new-owner-ticket"
+
+
+def test_malformed_pairing_ticket_is_consumed_without_restoration(
+    device_service: DeviceService, db: Session
+) -> None:
+    code = "malformed-code"
+    key = f"pairing-ticket:{hashlib.sha256(code.encode()).hexdigest()}"
+    device_service.redis.set(key, b"not-json", ex=600)
+
+    with pytest.raises(InvalidPairingTicketError):
+        device_service.redeem_pairing_ticket(
+            db,
+            code=code,
+            name="Alice Windows",
+            public_key_pem=VALID_TEST_PUBLIC_KEY,
+        )
+
+    assert device_service.redis.exists(key) == 0
 
 
 def test_revoked_device_token_no_longer_authenticates(

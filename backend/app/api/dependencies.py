@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from typing import Annotated
+from typing import Annotated, cast
 
 import jwt
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -62,7 +62,7 @@ def get_current_user(
         HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
     ],
     db: Annotated[Session, Depends(_get_db)],
-    request: Request = None,
+    request: Request = cast(Request, None),
 ) -> User:
     if credentials is None:
         raise _unauthorized()

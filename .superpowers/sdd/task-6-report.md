@@ -31,4 +31,33 @@ Implemented the Task 6 device workflow only.
 ## Notes / concerns
 
 - Unit and contract tests use `fakeredis`; no real `redis-custom` integration was necessary for this task.
-- The service permits ticket creation without a DB argument to preserve the brief's exact service interface. The API always supplies the DB session, so production ticket creation writes the required audit event.
+- Ticket creation requires a DB session so no unaudited service-level bypass exists.
+
+## Review fix (2026-07-14)
+
+The review findings were addressed in a separate fix:
+
+- Removed the optional-DB ticket creation path. Every ticket creation now requires a database session and a successful `AuditEvent` commit.
+- If ticket audit flush/commit fails, the SQLAlchemy transaction is rolled back and the newly written Redis ticket key is deleted; no usable unaudited ticket is returned.
+- Redemption now validates `created_at` from the consumed JSON and pre-generates the device id and token digest before persistence.
+- If device/audit persistence fails after `GETDEL`, the service rolls back and queries authoritative MySQL by both device id and token digest:
+  - If both identify the same committed device (for example, commit succeeded but its acknowledgement was lost), the original issued device/token is returned and the ticket is not restored.
+  - If neither exists, the original raw ticket JSON is restored only with Redis `SET NX` and only for the integer seconds remaining in its original 600-second window.
+  - If rollback/query cannot determine the result, or id/digest results conflict, `PairingPersistenceUncertainError` is raised and the ticket is not restored, preferring no duplicate credential issuance.
+- Malformed ticket JSON is consumed and is never restored.
+- Added explicit Pydantic response models and route `response_model` declarations for pairing tickets, device summary, pair response, list response, and heartbeat response. OpenAPI confirms only the pair response exposes `device_token`; list and `/me` expose no token hash, public key, or device token.
+
+### Review TDD evidence
+
+- RED: ticket audit insert failure left a `pairing-ticket:*` key behind.
+- RED: paired audit flush failure and explicit pre-commit failure permanently consumed the code (`TTL == -2`).
+- RED: OpenAPI contained no named `PairingTicketResponse`/device response schemas.
+- GREEN: audit failure cleanup, flush compensation, explicit commit compensation, original-TTL preservation, NX race protection, malformed-ticket non-restoration, commit-ACK-loss recovery, and OpenAPI schema tests all pass.
+
+### Review final verification
+
+- Device unit/contract suite: **17 passed**.
+- Full suite: **250 passed, 2 skipped** in 47.95 seconds.
+- `ruff check` on all Task 6 production/test files: passed.
+- `mypy --explicit-package-bases --follow-imports=skip` on the Task 6 production files: passed with no issues. The flags are required by this repository's namespace-package layout and avoid unrelated pre-existing transitive modules.
+- `compileall`, `git diff --check`: passed.

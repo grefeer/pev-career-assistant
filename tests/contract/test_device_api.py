@@ -168,3 +168,49 @@ def test_invalid_device_token_returns_401(
     client: TestClient, header: dict[str, str]
 ) -> None:
     assert client.get("/api/devices/me", headers=header).status_code == 401
+
+
+def test_openapi_only_exposes_device_token_on_pair_response(
+    client: TestClient,
+) -> None:
+    schema = client.get("/openapi.json").json()
+    schemas = schema["components"]["schemas"]
+
+    assert set(schemas["PairingTicketResponse"]["properties"]) == {
+        "code",
+        "expires_at",
+    }
+    assert set(schemas["DeviceSummary"]["properties"]) == {
+        "id",
+        "name",
+        "platform",
+        "status",
+        "version",
+        "paired_at",
+        "last_seen_at",
+        "online",
+    }
+    assert set(schemas["PairDeviceResponse"]["properties"]) == {
+        "device",
+        "device_token",
+    }
+    assert set(schemas["DeviceListResponse"]["properties"]) == {"devices"}
+    assert set(schemas["HeartbeatResponse"]["properties"]) == {
+        "status",
+        "expires_in",
+    }
+    assert "device_token" not in repr(schemas["DeviceSummary"])
+    assert "device_token" not in repr(schemas["DeviceListResponse"])
+    assert "token_hash" not in repr(schemas)
+    assert "public_key_pem" not in repr(schemas["DeviceSummary"])
+
+    paths = schema["paths"]
+    assert paths["/api/devices/pair"]["post"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"].endswith("/PairDeviceResponse")
+    assert paths["/api/devices"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"].endswith("/DeviceListResponse")
+    assert paths["/api/devices/me"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]["$ref"].endswith("/DeviceSummary")

@@ -13,7 +13,7 @@ from backend.app.api.dependencies import (
     get_current_user,
     get_device_service,
 )
-from backend.app.db.models import Device, User
+from backend.app.db.models import Device, DevicePlatform, DeviceStatus, User
 from backend.app.services.devices import (
     DeviceNotFoundError,
     DeviceService,
@@ -34,35 +34,65 @@ class HeartbeatRequest(BaseModel):
     version: str = Field(min_length=1, max_length=40)
 
 
-def device_summary(device: Device, *, online: bool) -> dict[str, object]:
-    return {
-        "id": device.id,
-        "name": device.name,
-        "platform": device.platform.value,
-        "status": device.status.value,
-        "version": device.version,
-        "paired_at": device.paired_at,
-        "last_seen_at": device.last_seen_at,
-        "online": online,
-    }
+class PairingTicketResponse(BaseModel):
+    code: str
+    expires_at: datetime
 
 
-@router.post("/pairing-tickets")
+class DeviceSummary(BaseModel):
+    id: str
+    name: str
+    platform: DevicePlatform
+    status: DeviceStatus
+    version: str | None
+    paired_at: datetime
+    last_seen_at: datetime | None
+    online: bool
+
+
+class PairDeviceResponse(BaseModel):
+    device: DeviceSummary
+    device_token: str
+
+
+class DeviceListResponse(BaseModel):
+    devices: list[DeviceSummary]
+
+
+class HeartbeatResponse(BaseModel):
+    status: Literal["online"]
+    expires_in: int
+
+
+def device_summary(device: Device, *, online: bool) -> DeviceSummary:
+    return DeviceSummary(
+        id=device.id,
+        name=device.name,
+        platform=device.platform,
+        status=device.status,
+        version=device.version,
+        paired_at=device.paired_at,
+        last_seen_at=device.last_seen_at,
+        online=online,
+    )
+
+
+@router.post("/pairing-tickets", response_model=PairingTicketResponse)
 def create_pairing_ticket(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(_get_db)],
     service: Annotated[DeviceService, Depends(get_device_service)],
-) -> dict[str, str | datetime]:
+) -> PairingTicketResponse:
     ticket = service.create_pairing_ticket(db, user_id=current_user.id)
-    return {"code": ticket.code, "expires_at": ticket.expires_at}
+    return PairingTicketResponse(code=ticket.code, expires_at=ticket.expires_at)
 
 
-@router.post("/pair")
+@router.post("/pair", response_model=PairDeviceResponse)
 def pair_device(
     body: PairRequest,
     db: Annotated[Session, Depends(_get_db)],
     service: Annotated[DeviceService, Depends(get_device_service)],
-) -> dict[str, object]:
+) -> PairDeviceResponse:
     try:
         issued = service.redeem_pairing_ticket(
             db,
@@ -72,24 +102,24 @@ def pair_device(
         )
     except InvalidPairingTicketError:
         raise HTTPException(status_code=400, detail="配对码无效、已过期或已使用。") from None
-    return {
-        "device": device_summary(issued.device, online=False),
-        "device_token": issued.plaintext_token,
-    }
+    return PairDeviceResponse(
+        device=device_summary(issued.device, online=False),
+        device_token=issued.plaintext_token,
+    )
 
 
-@router.get("")
+@router.get("", response_model=DeviceListResponse)
 def list_devices(
     current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(_get_db)],
     service: Annotated[DeviceService, Depends(get_device_service)],
-) -> dict[str, object]:
-    return {
-        "devices": [
+) -> DeviceListResponse:
+    return DeviceListResponse(
+        devices=[
             device_summary(item.device, online=item.online)
             for item in service.list_for_user(db, current_user.id)
         ]
-    }
+    )
 
 
 @router.delete("/{device_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -106,24 +136,24 @@ def revoke_device(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/me")
+@router.get("/me", response_model=DeviceSummary)
 def current_device_summary(
     device: Annotated[Device, Depends(get_current_device)],
     service: Annotated[DeviceService, Depends(get_device_service)],
-) -> dict[str, object]:
+) -> DeviceSummary:
     return device_summary(
         device, online=service.redis.exists(f"device-online:{device.id}") == 1
     )
 
 
-@router.post("/heartbeat")
+@router.post("/heartbeat", response_model=HeartbeatResponse)
 def heartbeat(
     body: HeartbeatRequest,
     device_token: Annotated[str, Header(alias="X-Device-Token")],
     _device: Annotated[Device, Depends(get_current_device)],
     db: Annotated[Session, Depends(_get_db)],
     service: Annotated[DeviceService, Depends(get_device_service)],
-) -> dict[str, str | int]:
+) -> HeartbeatResponse:
     if service.heartbeat(db, device_token, version=body.version) is None:
         raise HTTPException(status_code=401, detail="设备令牌无效。")
-    return {"status": "online", "expires_in": 90}
+    return HeartbeatResponse(status="online", expires_in=90)
