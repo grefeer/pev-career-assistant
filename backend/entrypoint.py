@@ -11,6 +11,10 @@ class CredentialConfigurationError(RuntimeError):
     pass
 
 
+def _contains_control_character(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
 def run(
     argv: Sequence[str],
     environment: MutableMapping[str, str],
@@ -18,7 +22,12 @@ def run(
 ) -> None:
     database_password = environment.get("DB_PASSWORD")
     redis_password = environment.get("REDIS_PASSWORD")
-    if not database_password or not redis_password:
+    if (
+        not database_password
+        or not redis_password
+        or _contains_control_character(database_password)
+        or _contains_control_character(redis_password)
+    ):
         raise CredentialConfigurationError(
             "required service credentials are not configured"
         )

@@ -34,7 +34,7 @@ The focused health and checkpoint lifecycle suite passed `8/8`. The health tests
 
 - `docker compose config --quiet`: exit 0.
 - Service count: 6; named volume count: 3. Resolved configuration was not printed.
-- Passwords were read from Windows User-scope `DB_PASSWORD` and `REDIS_PASSWORD`, copied only to Process scope, and never printed or written.
+- Passwords were read from Windows User-scope `DB_PASSWORD` and `REDIS_PASSWORD`, copied only to Process scope, never printed, and never written to a host file or persistent volume. Redis writes its password only to the container's non-volume `/tmp/redis.conf` with mode 0600.
 - URL-encoded password variants and temporary application/encryption secrets were derived only in process.
 - Host port overrides used for verification: MySQL `3307` because a non-Docker listener occupied `3306`; Redis `6380` because the user's `redis-custom` remained on `6379`.
 - MySQL 8.4, passworded Redis 8.0, and the pinned MinIO release all reached `healthy`. The existing `redis-custom` container remained running and unchanged.
@@ -59,13 +59,13 @@ Docker Desktop's local build session stalled without output or image creation fo
 - Added a Linux container entrypoint that accepts only raw `DB_PASSWORD` and `REDIS_PASSWORD`, percent-encodes them in memory, sets service URLs without printing them, and preserves the Compose command via `execvp`.
 - Missing credentials return one fixed redacted error. Unit RED was the missing entrypoint module; GREEN was `4/4`, later `5/5` with the frontend and shared-image assertions.
 - Removed mandatory `DB_PASSWORD_URLENCODED`, `REDIS_PASSWORD_URLENCODED`, `DATABASE_URL`, and `REDIS_URL` Compose inputs. A programmatic resolved-config test proves Redis's real password is absent from `Config.Cmd` and that backend/migrate share one image.
-- Redis now writes an owner-only temporary config from `$$REDIS_PASSWORD` at runtime and re-enters the official image entrypoint so Redis 8 JSON/Search modules remain loaded. The recreated container was healthy and authenticated JSON/Search probes passed.
+- Redis now writes an owner-only mode-0600 temporary config from `$$REDIS_PASSWORD` to the container-only, non-volume `/tmp` directory at runtime and re-enters the official image entrypoint so Redis 8 JSON/Search modules remain loaded. The recreated container was healthy and authenticated JSON/Search probes passed.
 
 ### Lifespan failure cleanup and readiness timeout
 
 - RED reproduced an `ensure_bucket()` startup failure leaving the owned Redis client unclosed.
 - `AsyncExitStack` now registers Redis and S3 cleanup immediately after creation, covering create, ensure, serve, and shutdown phases. GREEN proves owned S3, Redis, and checkpointer cleanup plus state removal, while pre-injected resources remain open and present.
-- Added a validated `readiness_timeout_seconds` setting (default 2, range 1–30). Redis uses connect/socket timeouts, S3 uses connect/read timeouts with at most two attempts, and PyMySQL uses connect/read/write timeouts. SQLite receives no MySQL connect arguments.
+- Added a validated `readiness_timeout_seconds` setting (default 2, range 1–30). Redis uses connect/socket timeouts and S3 uses connect/read timeouts with at most two attempts. A lifespan-owned MySQL readiness engine alone uses PyMySQL connect/read/write timeouts; the business `SessionLocal` engine does not inherit probe deadlines. SQLite receives no MySQL connect arguments. The readiness engine and factory are created once per lifespan, disposed on startup failure/shutdown, and never replace pre-injected factories.
 - Added public `S3BlobStore.check_bucket()`; readiness no longer accesses private client/bucket fields.
 
 ### Reproducible frontend and final full stack
@@ -75,6 +75,12 @@ Docker Desktop's local build session stalled without output or image creation fo
 - Backend image completed in 5 seconds. The initial combined build failed only at the old frontend lockfile; build history identified the exact `npm ci` error without another speculative build loop.
 - Compose `migrate` and `backend` now explicitly share the backend image, fixing the missing implicit migrate image found during the first full-stack start.
 - Final six-service state: MySQL, Redis, MinIO, and backend healthy; frontend running and HTTP 200; migrate exited 0. `/api/health/ready` returned all three dependencies `up`.
-- Final real-dependency integration suite passed `6/6`; full repository suite passed `276` with `4` expected external-environment skips; Ruff passed.
+- Final real-dependency integration suite passed `6/6`; full repository suite passed `283` with `4` expected external-environment skips; Ruff passed.
 
 The original build concern above is resolved by the regenerated frontend lockfile and successful full-stack verification.
+
+### Follow-up review: credential controls and engine isolation
+
+- RED proved that both the backend entrypoint and Redis runtime helper accepted CR/LF in credentials. GREEN rejects CR/LF (the backend rejects all ASCII control characters) with fixed redacted errors that never echo values.
+- The executable Redis helper tests pass credentials containing single quotes, double quotes, and backslashes, authenticate successfully, and verify `/tmp/redis.conf` mode 0600. Separate CR/LF tests exit 78 with only the fixed error.
+- RED also proved the business MySQL engine inherited the 2-second probe timeout. GREEN separates the lifespan-owned readiness engine from the global business engine and verifies disposal during `ensure_bucket()` failure.

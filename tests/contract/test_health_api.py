@@ -109,6 +109,14 @@ class InjectedFailingBlobStore:
         self.close_calls += 1
 
 
+class TrackingReadinessEngine:
+    def __init__(self) -> None:
+        self.dispose_calls = 0
+
+    def dispose(self) -> None:
+        self.dispose_calls += 1
+
+
 def _client_with_dependencies(
     *, session_factory: Any, redis_client: Any, blob_store: Any
 ) -> TestClient:
@@ -185,6 +193,7 @@ def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
 ) -> None:
     redis_client = ClosingRedis()
     s3_client = FailingEnsureS3Client()
+    readiness_engine = TrackingReadinessEngine()
     checkpointer_closes: list[bool] = []
 
     @contextmanager
@@ -204,6 +213,10 @@ def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
     monkeypatch.setattr(
         "backend.app.main.boto3.client", lambda *args, **kwargs: s3_client
     )
+    monkeypatch.setattr(
+        "backend.app.db.session.build_readiness_engine",
+        lambda settings: readiness_engine,
+    )
     app = create_app(settings_override(app_env="development"))
 
     with pytest.raises(RuntimeError, match="object store unavailable"):
@@ -212,18 +225,30 @@ def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
 
     assert redis_client.close_calls == 1
     assert s3_client.close_calls == 1
+    assert readiness_engine.dispose_calls == 1
     assert checkpointer_closes == [True]
     assert not hasattr(app.state, "graph")
     assert not hasattr(app.state, "redis")
     assert not hasattr(app.state, "blob_store")
+    assert not hasattr(app.state, "session_factory")
 
 
-def test_ensure_bucket_failure_does_not_close_preinjected_resources() -> None:
+def test_ensure_bucket_failure_does_not_close_preinjected_resources(
+    monkeypatch: Any,
+) -> None:
     graph = object()
     redis_client = ClosingRedis()
     blob_store = InjectedFailingBlobStore()
     app = create_app(settings_override(), graph=graph, blob_store=blob_store)
     app.state.redis = redis_client
+    injected_session_factory = object()
+    app.state.session_factory = injected_session_factory
+    monkeypatch.setattr(
+        "backend.app.db.session.build_readiness_engine",
+        lambda settings: (_ for _ in ()).throw(
+            AssertionError("injected session factory must be preserved")
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="object store unavailable"):
         with TestClient(app):
@@ -235,3 +260,4 @@ def test_ensure_bucket_failure_does_not_close_preinjected_resources() -> None:
     assert app.state.graph is graph
     assert app.state.redis is redis_client
     assert app.state.blob_store is blob_store
+    assert app.state.session_factory is injected_session_factory

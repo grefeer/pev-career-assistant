@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi.testclient import TestClient
+
+os.environ.setdefault("APP_AUTH_SECRET", "test-secret-with-at-least-32-characters")
+os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
+os.environ.setdefault(
+    "OBJECT_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)
 
 from backend.app.config import Settings
 from backend.app.main import create_app
@@ -63,7 +71,7 @@ def test_lifespan_dependency_clients_use_configured_short_timeouts(
     assert client_config.retries["total_max_attempts"] <= 2
 
 
-def test_mysql_engine_uses_short_timeouts_only_for_mysql(monkeypatch: Any) -> None:
+def test_only_readiness_mysql_engine_uses_short_timeouts(monkeypatch: Any) -> None:
     from backend.app.db import session as session_module
 
     calls: list[dict[str, Any]] = []
@@ -80,11 +88,20 @@ def test_mysql_engine_uses_short_timeouts_only_for_mysql(monkeypatch: Any) -> No
             readiness_timeout_seconds=4,
         )
     )
+    session_module.build_readiness_engine(
+        _settings(
+            database_url="mysql+pymysql://root:test@mysql/career_assistant",
+            readiness_timeout_seconds=4,
+        )
+    )
     session_module.build_engine(_settings())
+    session_module.build_readiness_engine(_settings())
 
-    assert calls[0]["connect_args"] == {
+    assert "connect_args" not in calls[0]
+    assert calls[1]["connect_args"] == {
         "connect_timeout": 4,
         "read_timeout": 4,
         "write_timeout": 4,
     }
-    assert "connect_args" not in calls[1]
+    assert "connect_args" not in calls[2]
+    assert "connect_args" not in calls[3]

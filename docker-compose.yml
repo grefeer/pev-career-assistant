@@ -22,16 +22,12 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     command:
       - sh
-      - -ec
-      - |
-        umask 077
-        escaped_password=$$(printf '%s' "$$REDIS_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        printf 'appendonly yes\nrequirepass "%s"\n' "$$escaped_password" > /tmp/redis.conf
-        exec /usr/local/bin/docker-entrypoint.sh redis-server /tmp/redis.conf
+      - /usr/local/bin/start-password-redis
     ports:
       - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
+      - ./docker/redis/start.sh:/usr/local/bin/start-password-redis:ro
     healthcheck:
       test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
       interval: 5s

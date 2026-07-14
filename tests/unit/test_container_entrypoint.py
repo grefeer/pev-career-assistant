@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import time
 from typing import Any
 from urllib.parse import quote
+from uuid import uuid4
 
 import pytest
 
@@ -56,6 +58,21 @@ def test_entrypoint_missing_credential_has_fixed_redacted_error(
     assert missing_name not in str(exc_info.value)
 
 
+@pytest.mark.parametrize("credential_name", ["DB_PASSWORD", "REDIS_PASSWORD"])
+@pytest.mark.parametrize("control_character", ["\r", "\n"])
+def test_entrypoint_rejects_line_breaks_with_fixed_redacted_error(
+    credential_name: str, control_character: str
+) -> None:
+    environment = {"DB_PASSWORD": "db-value", "REDIS_PASSWORD": "redis-value"}
+    environment[credential_name] += control_character + "not-disclosed"
+
+    with pytest.raises(CredentialConfigurationError) as exc_info:
+        run(["true"], environment, lambda executable, argv: None)
+
+    assert str(exc_info.value) == "required service credentials are not configured"
+    assert "not-disclosed" not in str(exc_info.value)
+
+
 def test_compose_resolved_command_never_contains_redis_password() -> None:
     if shutil.which("docker") is None:
         pytest.skip("docker compose is not available")
@@ -81,7 +98,7 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     backend_environment = config["services"]["backend"]["environment"]
 
     assert redis_password not in " ".join(redis_command)
-    assert "$$REDIS_PASSWORD" in " ".join(redis_command)
+    assert "/usr/local/bin/start-password-redis" in " ".join(redis_command)
     assert "DB_PASSWORD_URLENCODED" not in backend_environment
     assert "REDIS_PASSWORD_URLENCODED" not in backend_environment
     assert "DATABASE_URL" not in backend_environment
@@ -89,6 +106,12 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     assert config["services"]["migrate"]["image"] == config["services"]["backend"][
         "image"
     ]
+    redis_script = (ROOT / "docker" / "redis" / "start.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "carriage_return" in redis_script
+    assert "newline" in redis_script
+    assert "chmod 600" in redis_script
 
 
 def test_frontend_dockerfile_uses_locked_reproducible_install() -> None:
@@ -100,3 +123,93 @@ def test_frontend_dockerfile_uses_locked_reproducible_install() -> None:
     assert dockerfile.index("COPY frontend/package*.json ./") < dockerfile.index(
         "COPY frontend/ ./"
     )
+
+
+def test_redis_shell_helper_accepts_quotes_and_backslashes() -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not available")
+    password = "review 'quote' \"double\" \\ slash"
+    container_name = f"task9-redis-shell-{uuid4().hex}"
+    script = ROOT / "docker" / "redis" / "start.sh"
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--rm",
+            "--name",
+            container_name,
+            "-e",
+            f"REDIS_PASSWORD={password}",
+            "-v",
+            f"{script}:/redis-start:ro",
+            "redis:8.0-alpine",
+            "sh",
+            "/redis-start",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ping = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-e",
+                    f"REDISCLI_AUTH={password}",
+                    container_name,
+                    "redis-cli",
+                    "ping",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if ping.returncode == 0:
+                break
+            time.sleep(0.5)
+        assert ping.stdout.strip() == "PONG"
+        mode = subprocess.run(
+            ["docker", "exec", container_name, "stat", "-c", "%a", "/tmp/redis.conf"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert mode.stdout.strip() == "600"
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name], capture_output=True, check=False
+        )
+
+
+@pytest.mark.parametrize("control_character", ["\r", "\n"])
+def test_redis_shell_helper_rejects_line_breaks_without_echoing_value(
+    control_character: str,
+) -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not available")
+    password = f"invalid{control_character}not-disclosed"
+    script = ROOT / "docker" / "redis" / "start.sh"
+
+    completed = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-e",
+            f"REDIS_PASSWORD={password}",
+            "-v",
+            f"{script}:/redis-start:ro",
+            "redis:8.0-alpine",
+            "sh",
+            "/redis-start",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 78
+    assert completed.stderr.strip() == "invalid redis credential configuration"
+    assert "not-disclosed" not in completed.stderr

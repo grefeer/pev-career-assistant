@@ -16,6 +16,11 @@ settings = get_settings()
 
 def build_engine(settings: Settings) -> Engine:
     options: dict[str, Any] = {"pool_pre_ping": True, "pool_recycle": 1800}
+    return create_engine(settings.database_url, **options)
+
+
+def build_readiness_engine(settings: Settings) -> Engine:
+    options: dict[str, Any] = {"pool_pre_ping": True, "pool_recycle": 1800}
     if make_url(settings.database_url).get_backend_name() == "mysql":
         timeout = settings.readiness_timeout_seconds
         options["connect_args"] = {

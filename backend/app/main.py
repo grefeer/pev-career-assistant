@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import boto3
 from botocore.config import Config
 import redis
+from sqlalchemy.orm import sessionmaker
 
 from backend.app.api.router import api_router
 from backend.app.config import Settings, get_settings
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_graph: object | None = None
     owned_redis: redis.Redis | None = None
     owned_object_store_client: Any | None = None
+    owned_session_factory: Any | None = None
     try:
         async with AsyncExitStack() as stack:
             timeout = app.state.settings.readiness_timeout_seconds
@@ -51,6 +53,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
                 app.state.redis = owned_redis
                 stack.callback(owned_redis.close)
+            if not hasattr(app.state, "session_factory"):
+                from backend.app.db.session import build_readiness_engine
+
+                readiness_engine = build_readiness_engine(app.state.settings)
+                stack.callback(readiness_engine.dispose)
+                owned_session_factory = sessionmaker(
+                    bind=readiness_engine, autoflush=False, expire_on_commit=False
+                )
+                app.state.session_factory = owned_session_factory
             if not hasattr(app.state, "blob_store") and app.state.settings.app_env != "test":
                 owned_object_store_client = boto3.client(
                     "s3",
@@ -86,6 +97,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             is owned_object_store_client
         ):
             del app.state.blob_store
+        if (
+            owned_session_factory is not None
+            and getattr(app.state, "session_factory", None) is owned_session_factory
+        ):
+            del app.state.session_factory
 
 
 def create_app(
