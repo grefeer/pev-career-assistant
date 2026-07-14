@@ -10,9 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend ./backend
 COPY src ./src
+COPY alembic ./alembic
+COPY alembic.ini ./alembic.ini
 COPY data ./data
-COPY checkpoints ./checkpoints
-COPY .env.example ./.env.example
 
 EXPOSE 8000
 
