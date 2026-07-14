@@ -17,6 +17,18 @@ def test_production_rejects_default_secrets() -> None:
         )
 
 
+def test_production_rejects_env_example_auth_secret() -> None:
+    with pytest.raises(ValidationError, match="app_auth_secret|APP_AUTH_SECRET"):
+        Settings(
+            app_env="production",
+            app_auth_secret="replace-with-a-random-secret-of-at-least-32-characters",
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="mysql+pymysql://app:app@mysql:3306/career_assistant",
+            redis_url="redis://redis:6379/0",
+            checkpoint_backend="redis",
+        )
+
+
 def test_test_environment_accepts_sqlite_and_memory_dependencies() -> None:
     settings = Settings(
         app_env="test",

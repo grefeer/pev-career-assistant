@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
+DEFAULT_APP_AUTH_SECRET = "replace-with-a-random-secret-of-at-least-32-characters"
 
 
 class Settings(BaseSettings):
@@ -57,7 +58,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
-        if self.is_production and self.app_auth_secret == "replace-with-your-own-secret":
+        if self.is_production and self.app_auth_secret == DEFAULT_APP_AUTH_SECRET:
             raise ValueError("APP_AUTH_SECRET must be replaced in production")
         if self.is_production and self.checkpoint_backend != "redis":
             raise ValueError("production requires CHECKPOINT_BACKEND=redis")
