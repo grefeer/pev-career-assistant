@@ -15,9 +15,13 @@ BUSINESS_TABLES = {
     "application_tasks",
     "application_events",
     "audit_events",
+    "job_sources",
+    "job_sync_runs",
+    "raw_job_records",
+    "job_postings",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260715_0002"
+HEAD_REVISION = "20260715_0003"
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:
@@ -49,6 +53,10 @@ def _current_revision(engine: Engine) -> str | None:
         return MigrationContext.configure(connection).get_current_revision()
 
 
+def _column_sets(items: list[dict[str, object]]) -> set[tuple[str, ...]]:
+    return {tuple(item["column_names"]) for item in items}
+
+
 def test_alembic_offline_accepts_percent_encoded_database_url() -> None:
     env = _alembic_env("mysql+pymysql://migration_user:p%40ss@127.0.0.1/migration_test")
     _run_alembic("upgrade", "head", "--sql", env=env)
@@ -78,8 +86,30 @@ def test_mysql_migration_upgrade_and_downgrade() -> None:
             _run_alembic("upgrade", "head", env=env)
             assert _tables(engine) == BUSINESS_TABLES | ALEMBIC_TABLES
             assert _current_revision(engine) == HEAD_REVISION
-            device_columns = {column["name"] for column in inspect(engine).get_columns("devices")}
+            device_columns = {
+                column["name"] for column in inspect(engine).get_columns("devices")
+            }
             assert {"expires_at", "credential_rotated_at"} <= device_columns
+            inspector = inspect(engine)
+            assert {
+                ("source_key",),
+                ("provider", "file_id", "sheet_id"),
+            } <= _column_sets(inspector.get_unique_constraints("job_sources"))
+            assert {
+                ("source_id", "external_record_id", "payload_hash")
+            } <= _column_sets(inspector.get_unique_constraints("raw_job_records"))
+            assert {("source_id", "external_record_id")} <= _column_sets(
+                inspector.get_unique_constraints("job_postings")
+            )
+            assert {("source_id", "started_at")} <= _column_sets(
+                inspector.get_indexes("job_sync_runs")
+            )
+            assert {("source_id", "external_record_id")} <= _column_sets(
+                inspector.get_indexes("raw_job_records")
+            )
+            assert {("status", "updated_at")} <= _column_sets(
+                inspector.get_indexes("job_postings")
+            )
         finally:
             _run_alembic("downgrade", "base", env=env)
             assert _tables(engine) <= ALEMBIC_TABLES
