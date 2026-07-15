@@ -2,7 +2,7 @@
 
 > 更新时间：2026-07-15
 > 对应分支：`master`
-> 完成版本：`75463aa`
+> 实现完成提交：`75463aa`
 > 适用读者：后端、前端、GUI Agent、测试和运维开发人员
 
 ## 1. 一句话说明
@@ -159,7 +159,7 @@ flowchart LR
 
 ### 3.11 真实职位同步垂直切片
 
-完成版本 `75463aa` 包含以下九类已交付工作：
+实现完成提交 `75463aa` 包含以下九类已交付工作：
 
 1. **权威模型与迁移**：迁移 `20260715_0003` 建立 `job_sources`、不可变 `raw_job_records`、`job_sync_runs` 和 `job_postings`；MySQL 是来源配置、原始快照、同步运行和职位记录的唯一权威数据源，Redis 不保存职位真相。
 2. **固定端点只读腾讯 MCP 网关**：`TencentSmartsheetGateway` 只调用固定端点的 `smartsheet.list_fields` 和 `smartsheet.list_records`，包含超时、有限重试、协议校验和稳定错误码，不调用新增、更新或删除工具，也不依赖生产 `mcporter` 子进程。
@@ -314,7 +314,7 @@ $env:TEST_BACKEND_IMAGE = 'platform-foundation-backend:latest'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-完成版本 `75463aa` 的最终本地结果是 `540 passed, 9 skipped`。`pytest -q -rs` 显示九个 skip 均为环境门禁：五个仅要求 `TEST_MYSQL_URL`，对象存储、Compose Nginx→Uvicorn 代理链和 Redis 8 集成各一个，另一个真实腾讯只读测试同时要求 `TEST_MYSQL_URL` 与 `TEST_TENCENT_DOCS_TOKEN`。因此真实腾讯来源读取仍是尚待具备专用测试库和有效测试令牌后完成的外部验证缺口，不能描述为已经通过。测试会创建并清理临时 Redis key、测试对象和代理客户端容器；如果测试被强制中断，应检查残留的 `rate-client-*` 容器和测试 bucket 对象。
+实现完成提交 `75463aa` 之后，在默认环境对最终代码运行 `pytest -q -rs` 的新鲜聚合结果是 `540 passed, 9 skipped`。五个 skip 仅要求 `TEST_MYSQL_URL`，对象存储、Compose Nginx→Uvicorn 代理链和 Redis 8 集成各一个，另一个真实腾讯只读测试同时要求 `TEST_MYSQL_URL` 与 `TEST_TENCENT_DOCS_TOKEN`。这次默认环境聚合运行没有执行上述任何 opt-in 真实依赖门禁，不能据此声称最终代码已经通过 MySQL、Redis、MinIO、代理链或真实腾讯验证；不同时间点的发布门禁证据见第 9 节。测试会创建并清理临时 Redis key、测试对象和代理客户端容器；如果测试被强制中断，应检查残留的 `rate-client-*` 容器和测试 bucket 对象。
 
 ## 7. 管理员创建
 
@@ -361,22 +361,26 @@ docker compose -p platform-foundation run --rm backend `
 | 前端 Nginx 配置 | `frontend/nginx.conf` |
 | 测试 | `tests/contract/`、`tests/unit/`、`tests/integration/`、`tests/security/` |
 
-## 9. 验收结果
+## 9. 验收结果与证据来源
 
-合并到 `master` 后的最终验证结果：
+以下两组结果来自不同时间点，不能合并成一次“最终全门禁通过”。
 
-- Ruff：通过。
-- Python 测试：`540 passed, 9 skipped`；其中五个仅缺 `TEST_MYSQL_URL`，对象存储、Compose 代理链、Redis 集成各一个，真实腾讯只读测试一个（同时缺 `TEST_MYSQL_URL` 和 `TEST_TENCENT_DOCS_TOKEN`）。
-- 真实 MySQL 8.4：通过，包含 migration upgrade/downgrade 往返。
-- 真实 Redis 8 DB 0：通过。
-- 真实 MinIO：通过。
-- Nginx 到 Uvicorn 的双客户端限流测试：通过。
-- 前端 Vite production build：通过。
-- Compose migration：exit 0。
-- readiness：MySQL、Redis、object store 均为 `up`。
-- 腾讯真实双来源只读验证：未执行；当前开发环境未设置 `TEST_TENCENT_DOCS_TOKEN`，属于明确的外部验证缺口。
-- 前端 HTTP：200。
-- 独立 senior review：无 Critical、无 Important，Approve。
+### 9.1 最终代码的合并后默认环境聚合验证
+
+- 实现完成提交 `75463aa` 后，对最终代码新鲜运行 `pytest -q -rs`：`540 passed, 9 skipped`。
+- skip 精确分布：五个仅要求 `TEST_MYSQL_URL`；对象存储、Compose 代理链、Redis 集成各一个；真实腾讯只读测试一个，同时要求 `TEST_MYSQL_URL` 和 `TEST_TENCENT_DOCS_TOKEN`。
+- 因此这次聚合运行没有执行任何 opt-in 真实依赖门禁；它证明默认环境测试通过，但不证明最终代码的 MySQL、Redis、MinIO、代理链或真实腾讯门禁通过。
+
+### 9.2 Task 8 的较早发布门禁证据
+
+这组证据产生于 Task 8 发布门禁执行期间，早于其后的最终审查与加固提交，只能说明当时版本和当时环境的结果，不能替代 9.1 对最终代码的聚合验证，也不能外推为最终代码的 opt-in 门禁已经重跑：
+
+- 配置 MySQL、Redis 和 MinIO 测试变量后，当时的完整 Python suite 为 `515 passed, 2 skipped`；真实 MySQL 8.4（包含 migration upgrade/downgrade 往返）、Redis 8 DB 0 和 MinIO 门禁在该次运行中执行并通过。
+- Compose Nginx→Uvicorn 代理链门禁另行重跑并通过 `1 passed`。
+- 当时重新执行的前端 Vite production build、Compose 启动、迁移到 `20260715_0003`、readiness（MySQL、Redis、object store 均为 `up`）和前端 HTTP 200 均通过。
+- 真实腾讯双来源只读门禁在 Task 8 仍然 skip；缺少有效 `TEST_TENCENT_DOCS_TOKEN` 的外部验证缺口至今未关闭。
+
+独立 senior review 当时结论为无 Critical、无 Important，Approve；之后的最终审查与加固仍产生了额外实现提交，因此该结论也应按其发生时间理解。
 
 Windows 合并后曾发现 shell 脚本被 `core.autocrlf=true` 转成 CRLF。现已通过根目录 `.gitattributes` 强制 `*.sh text eol=lf`，相关 Docker Redis shell 测试已纳入并通过。
 
