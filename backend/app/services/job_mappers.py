@@ -190,9 +190,12 @@ def _is_valid_hostname(hostname: str) -> bool:
         ascii_hostname = hostname.encode("idna").decode("ascii")
     except UnicodeError:
         return False
-    if len(ascii_hostname) > 253:
+    dns_hostname = (
+        ascii_hostname[:-1] if ascii_hostname.endswith(".") else ascii_hostname
+    )
+    if len(dns_hostname) > 253:
         return False
-    labels = ascii_hostname.split(".")
+    labels = dns_hostname.split(".")
     if all(label.isdigit() for label in labels):
         return False
     return all(
