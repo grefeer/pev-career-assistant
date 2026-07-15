@@ -31,10 +31,14 @@ from backend.app.db.models import (
     ApplicationTaskStatus,
     TaskActor,
     User,
+    UserRole,
 )
+from backend.app.services.auth import AuthService
 from backend.app.main import create_app
 from backend.app.services.applications import ApplicationService, InvalidTransitionError
+from backend.app.services.job_sync import JobSyncService
 from backend.app.services.storage import EncryptedObjectStore
+from backend.app.services.tencent_smartsheet import TencentUnavailableError
 from tests.conftest import settings_override
 
 
@@ -156,6 +160,7 @@ def client() -> Iterator[TestClient]:
     app.dependency_overrides[dependencies._get_db] = override_db
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
     with TestClient(app) as test_client:
+        test_client.session_factory = session_factory  # type: ignore[attr-defined]
         yield test_client
     engine.dispose()
 
@@ -258,6 +263,53 @@ def test_state_transition_failure_logs_outcome_without_payload_or_config_secret(
         )
     finally:
         engine.dispose()
+
+
+def test_job_sync_failure_redacts_gateway_details_from_logs_and_response(
+    client: TestClient,
+) -> None:
+    secret_token = "tdoc-super-secret-token"
+    raw_payload = "raw-company-private-payload"
+    upstream_body = "upstream-debug-response"
+    sensitive_values = (secret_token, raw_payload, upstream_body)
+
+    class FailingGateway:
+        def list_fields(self, _file_id: str, _sheet_id: str) -> list[object]:
+            raise TencentUnavailableError(" | ".join(sensitive_values))
+
+        def list_records(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("record listing must not follow a field-list failure")
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        admin = User(
+            account="sync-log-admin",
+            nickname="Sync Log Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
+        )
+        db.add(admin)
+        db.commit()
+        db.refresh(admin)
+        headers = {
+            "Authorization": (
+                f"Bearer {AuthService(client.app.state.settings).issue_user_token(admin)}"
+            )
+        }
+
+    client.app.state.job_sync_service = JobSyncService(FailingGateway())  # type: ignore[arg-type]
+    with _capture_application_logs() as capture:
+        response = client.post(
+            "/api/admin/job-sources/tencent-intern-referrals/sync",
+            headers=headers,
+        )
+
+    combined_output = response.text + "\n" + "\n".join(capture.formatted)
+    assert response.status_code == 503
+    assert "tencent_unavailable" in combined_output
+    assert not any(value in combined_output for value in sensitive_values)
+    for record in capture.records:
+        assert not _contains_sensitive_value(record.args, sensitive_values)
+        assert not _contains_sensitive_value(record.__dict__, sensitive_values)
 
 
 @pytest.mark.parametrize("mutation", ["exception", "args", "nested_extra"])
