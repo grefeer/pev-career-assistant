@@ -5,6 +5,7 @@ import hmac
 import json
 import secrets
 import uuid
+import jwt
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -23,6 +24,8 @@ from backend.app.repositories import devices
 
 PAIRING_TTL_SECONDS = 600
 ONLINE_TTL_SECONDS = 90
+DEVICE_CREDENTIAL_TTL_DAYS = 90
+TASK_LEASE_TTL_SECONDS = 300
 
 
 class InvalidPairingTicketError(ValueError):
@@ -34,6 +37,10 @@ class DeviceNotFoundError(LookupError):
 
 
 class PairingPersistenceUncertainError(RuntimeError):
+    pass
+
+
+class InvalidTaskLeaseError(ValueError):
     pass
 
 
@@ -82,8 +89,9 @@ def _audit(
 
 
 class DeviceService:
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(self, redis_client: Any, *, lease_secret: str | None = None) -> None:
         self.redis = redis_client
+        self.lease_secret = lease_secret
 
     def create_pairing_ticket(self, db: Session, *, user_id: str) -> PairingTicket:
         code = secrets.token_urlsafe(24)
@@ -150,6 +158,7 @@ class DeviceService:
             status=DeviceStatus.ACTIVE,
             token_hash=digest,
             public_key_pem=public_key_pem,
+            expires_at=utc_now() + timedelta(days=DEVICE_CREDENTIAL_TTL_DAYS),
         )
         try:
             db.add(device)
@@ -209,9 +218,95 @@ class DeviceService:
         device = devices.get_by_token_hash(db, digest)
         if device is None or device.status is not DeviceStatus.ACTIVE:
             return None
+        expires_at = device.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= utc_now():
+            return None
         if not hmac.compare_digest(device.token_hash, digest):
             return None
         return device
+
+    def rotate_credential(
+        self, db: Session, *, user_id: str, device_id: str
+    ) -> IssuedDevice:
+        device = devices.get_active_owned(db, user_id=user_id, device_id=device_id)
+        if device is None:
+            raise DeviceNotFoundError(device_id)
+        plaintext = secrets.token_urlsafe(32)
+        device.token_hash = token_digest(plaintext)
+        device.credential_rotated_at = utc_now()
+        device.expires_at = utc_now() + timedelta(days=DEVICE_CREDENTIAL_TTL_DAYS)
+        self.redis.delete(f"device-online:{device.id}")
+        _audit(
+            db,
+            event_type="device.credential_rotated",
+            entity_id=device.id,
+            actor_user_id=user_id,
+            payload={"result": "rotated"},
+        )
+        db.commit()
+        return IssuedDevice(device=device, plaintext_token=plaintext)
+
+    def issue_task_lease(
+        self, db: Session, *, device: Device, task_id: str, scopes: set[str]
+    ) -> str:
+        if not self.lease_secret:
+            raise InvalidTaskLeaseError("task lease signing is not configured")
+        from backend.app.db.models import ApplicationTask
+
+        task = db.get(ApplicationTask, task_id)
+        if (
+            task is None
+            or task.device_id != device.id
+            or task.user_id != device.user_id
+        ):
+            raise InvalidTaskLeaseError("task is not assigned to this device")
+        now = utc_now()
+        claims = {
+            "sub": device.id,
+            "user_id": device.user_id,
+            "task_id": task.id,
+            "scope": sorted(scopes),
+            "iat": now,
+            "exp": now + timedelta(seconds=TASK_LEASE_TTL_SECONDS),
+        }
+        return jwt.encode(claims, self.lease_secret, algorithm="HS256")
+
+    def verify_task_lease(
+        self,
+        db: Session,
+        lease: str,
+        *,
+        device: Device,
+        task_id: str,
+        required_scope: str,
+    ) -> dict[str, Any]:
+        if not self.lease_secret:
+            raise InvalidTaskLeaseError("task lease signing is not configured")
+        try:
+            claims = jwt.decode(
+                lease,
+                self.lease_secret,
+                algorithms=["HS256"],
+                options={"require": ["sub", "user_id", "task_id", "scope", "exp"]},
+            )
+        except jwt.PyJWTError as exc:
+            raise InvalidTaskLeaseError("invalid or expired task lease") from exc
+        from backend.app.db.models import ApplicationTask
+
+        task = db.get(ApplicationTask, task_id)
+        if (
+            claims.get("sub") != device.id
+            or claims.get("user_id") != device.user_id
+            or claims.get("task_id") != task_id
+            or required_scope not in claims.get("scope", [])
+            or task is None
+            or task.device_id != device.id
+            or task.user_id != device.user_id
+        ):
+            raise InvalidTaskLeaseError("task lease scope or binding is invalid")
+        return claims
 
     def heartbeat(
         self, db: Session, plaintext_token: str, *, version: str
@@ -260,6 +355,7 @@ __all__ = [
     "DeviceNotFoundError",
     "DeviceService",
     "InvalidPairingTicketError",
+    "InvalidTaskLeaseError",
     "IssuedDevice",
     "ListedDevice",
     "PairingTicket",

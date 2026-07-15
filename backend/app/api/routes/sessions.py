@@ -7,7 +7,12 @@ from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import _get_db, get_current_user
 from backend.app.db.models import AnalysisSession, User
-from backend.app.repositories.sessions import activate, create_for_user, get_owned, list_for_user
+from backend.app.repositories.sessions import (
+    activate,
+    create_for_user,
+    get_owned,
+    list_for_user,
+)
 from backend.app.schemas import (
     ActivateSessionResponse,
     HistoryItem,
@@ -43,9 +48,7 @@ def serialize_session(item: AnalysisSession) -> dict[str, str]:
     }
 
 
-def require_owned(
-    db: Session, current_user: User, thread_id: str
-) -> AnalysisSession:
+def require_owned(db: Session, current_user: User, thread_id: str) -> AnalysisSession:
     item = get_owned(db, current_user.id, thread_id)
     if item is None:
         raise HTTPException(status_code=404, detail="当前会话不存在或不属于你。")

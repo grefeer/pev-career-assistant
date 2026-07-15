@@ -97,7 +97,7 @@ docker compose up -d backend frontend
 管理员密码通过容器内脚本的隐藏交互提示输入；保持终端交互开启，不要使用 `-T`，也不要把密码放在 argv 或环境变量中：
 
 ```powershell
-docker compose exec backend python scripts/create_admin.py --account admin --nickname Administrator
+docker compose run --rm backend python scripts/create_admin.py --account admin --nickname Administrator
 ```
 
 若账号已存在且不是管理员，脚本会拒绝静默提权。

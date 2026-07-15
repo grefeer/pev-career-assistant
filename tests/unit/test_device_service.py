@@ -79,9 +79,10 @@ def test_pairing_ticket_can_only_be_redeemed_once(
 
     assert issued.device.platform is DevicePlatform.WINDOWS
     assert len(issued.plaintext_token) >= 43
-    assert issued.device.token_hash == hashlib.sha256(
-        issued.plaintext_token.encode()
-    ).hexdigest()
+    assert (
+        issued.device.token_hash
+        == hashlib.sha256(issued.plaintext_token.encode()).hexdigest()
+    )
     assert issued.plaintext_token not in issued.device.token_hash
     with pytest.raises(InvalidPairingTicketError):
         device_service.redeem_pairing_ticket(
@@ -138,12 +139,15 @@ def test_redeem_audit_flush_failure_rolls_back_and_restores_ticket(
     assert db.scalar(select(func.count()).select_from(Device)) == 0
     assert db.scalar(select(func.count()).select_from(AuditEvent)) == 1
     assert db.is_active
-    assert device_service.redeem_pairing_ticket(
-        db,
-        code=ticket.code,
-        name="Alice Windows retry",
-        public_key_pem=VALID_TEST_PUBLIC_KEY,
-    ).device.name == "Alice Windows retry"
+    assert (
+        device_service.redeem_pairing_ticket(
+            db,
+            code=ticket.code,
+            name="Alice Windows retry",
+            public_key_pem=VALID_TEST_PUBLIC_KEY,
+        ).device.name
+        == "Alice Windows retry"
+    )
 
 
 def test_redeem_explicit_commit_failure_restores_ticket_without_extending_ttl(
@@ -176,12 +180,15 @@ def test_redeem_explicit_commit_failure_restores_ticket_without_extending_ttl(
 
     assert 1 <= device_service.redis.ttl(key) <= original_ttl
     assert db.scalar(select(func.count()).select_from(Device)) == 0
-    assert device_service.redeem_pairing_ticket(
-        db,
-        code=ticket.code,
-        name="Retry",
-        public_key_pem=VALID_TEST_PUBLIC_KEY,
-    ).device.name == "Retry"
+    assert (
+        device_service.redeem_pairing_ticket(
+            db,
+            code=ticket.code,
+            name="Retry",
+            public_key_pem=VALID_TEST_PUBLIC_KEY,
+        ).device.name
+        == "Retry"
+    )
 
 
 def test_redeem_commit_ack_failure_returns_committed_device_without_restoring_ticket(

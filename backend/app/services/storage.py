@@ -47,9 +47,10 @@ class StoredObject:
 
 
 class S3BlobStore:
-    def __init__(self, client: Any, bucket: str) -> None:
+    def __init__(self, client: Any, bucket: str, *, region: str = "us-east-1") -> None:
         self._client = client
         self._bucket = bucket
+        self._region = region
 
     def put_bytes(
         self,
@@ -84,7 +85,21 @@ class S3BlobStore:
             error_code = str(exc.response.get("Error", {}).get("Code", ""))
             if error_code not in {"404", "NoSuchBucket", "NotFound"}:
                 raise
-            self._client.create_bucket(Bucket=self._bucket)
+            create_args: dict[str, Any] = {"Bucket": self._bucket}
+            if self._region != "us-east-1":
+                create_args["CreateBucketConfiguration"] = {
+                    "LocationConstraint": self._region
+                }
+            try:
+                self._client.create_bucket(**create_args)
+            except ClientError as create_exc:
+                create_code = str(create_exc.response.get("Error", {}).get("Code", ""))
+                if create_code not in {
+                    "BucketAlreadyOwnedByYou",
+                    "BucketAlreadyExists",
+                }:
+                    raise
+                self._client.head_bucket(Bucket=self._bucket)
 
     def check_bucket(self) -> None:
         self._client.head_bucket(Bucket=self._bucket)

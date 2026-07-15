@@ -18,9 +18,7 @@ def list_for_user(db: Session, user_id: str) -> list[AnalysisSession]:
     return list(db.scalars(statement))
 
 
-def get_owned(
-    db: Session, user_id: str, thread_id: str
-) -> AnalysisSession | None:
+def get_owned(db: Session, user_id: str, thread_id: str) -> AnalysisSession | None:
     return db.scalar(
         select(AnalysisSession).where(
             AnalysisSession.user_id == user_id,

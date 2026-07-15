@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -80,6 +81,21 @@ FORBIDDEN_AUDIT_KEYS = {
     "form_values",
     "resume_text",
 }
+FORBIDDEN_AUDIT_KEY_PARTS = {
+    "authorization",
+    "credential",
+    "secret",
+    "cookie",
+    "token",
+    "password",
+    "captcha",
+    "otp",
+    "verificationcode",
+    "pairingcode",
+    "idcard",
+    "formvalues",
+    "resumetext",
+}
 MAX_AUDIT_STRING_LENGTH = 500
 
 
@@ -92,7 +108,13 @@ def _validate_redacted_value(value: object) -> None:
         return
     if isinstance(value, Mapping):
         for key, nested_value in value.items():
-            if isinstance(key, str) and key.lower() in FORBIDDEN_AUDIT_KEYS:
+            normalized = (
+                re.sub(r"[^a-z0-9]", "", key.lower()) if isinstance(key, str) else ""
+            )
+            if isinstance(key, str) and (
+                key.lower() in FORBIDDEN_AUDIT_KEYS
+                or any(part in normalized for part in FORBIDDEN_AUDIT_KEY_PARTS)
+            ):
                 raise UnsafeAuditPayloadError(
                     f"audit payload key {key!r} is not allowed"
                 )

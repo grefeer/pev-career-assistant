@@ -15,6 +15,12 @@ import pytest
 from backend.entrypoint import CredentialConfigurationError, run
 
 
+def test_runbook_admin_command_uses_entrypoint_wrapper() -> None:
+    runbook = Path("docs/runbooks/platform-foundation.md").read_text(encoding="utf-8")
+    assert "docker compose run --rm backend python scripts/create_admin.py" in runbook
+    assert "docker compose exec backend python scripts/create_admin.py" not in runbook
+
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -105,18 +111,17 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     assert "REDIS_PASSWORD_URLENCODED" not in backend_environment
     assert "DATABASE_URL" not in backend_environment
     assert "REDIS_URL" not in backend_environment
-    assert backend_environment["OBJECT_STORE_ACCESS_KEY"] == environment[
-        "MINIO_ROOT_USER"
-    ]
-    assert backend_environment["OBJECT_STORE_SECRET_KEY"] == environment[
-        "MINIO_ROOT_PASSWORD"
-    ]
-    assert config["services"]["migrate"]["image"] == config["services"]["backend"][
-        "image"
-    ]
-    redis_script = (ROOT / "docker" / "redis" / "start.sh").read_text(
-        encoding="utf-8"
+    assert (
+        backend_environment["OBJECT_STORE_ACCESS_KEY"] == environment["MINIO_ROOT_USER"]
     )
+    assert (
+        backend_environment["OBJECT_STORE_SECRET_KEY"]
+        == environment["MINIO_ROOT_PASSWORD"]
+    )
+    assert (
+        config["services"]["migrate"]["image"] == config["services"]["backend"]["image"]
+    )
+    redis_script = (ROOT / "docker" / "redis" / "start.sh").read_text(encoding="utf-8")
     assert "carriage_return" in redis_script
     assert "newline" in redis_script
     assert "chmod 600" in redis_script

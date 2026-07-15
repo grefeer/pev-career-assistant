@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -119,6 +119,15 @@ class Device(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     public_key_pem: Mapped[str] = mapped_column(Text, nullable=False)
     paired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: utc_now() + timedelta(days=90),
+        index=True,
+        nullable=False,
+    )
+    credential_rotated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

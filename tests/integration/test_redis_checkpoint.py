@@ -42,7 +42,9 @@ def test_redis_checkpoint_survives_across_graph_instances() -> None:
     )
 
     try:
-        assert client.execute_command("JSON.SET", f"{thread_id}:probe", "$", "{}") == "OK"
+        assert (
+            client.execute_command("JSON.SET", f"{thread_id}:probe", "$", "{}") == "OK"
+        )
         assert isinstance(client.execute_command("FT._LIST"), list)
 
         with checkpointer_context(settings) as saver:

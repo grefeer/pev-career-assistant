@@ -2,16 +2,22 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class AuthRequest(BaseModel):
-    account: str = Field(..., min_length=3)
-    password: str = Field(..., min_length=6)
+    model_config = ConfigDict(str_strip_whitespace=True)
+    account: str = Field(..., min_length=3, max_length=120)
+    password: str = Field(..., min_length=6, max_length=1024)
+
+    @field_validator("account")
+    @classmethod
+    def normalize_account(cls, value: str) -> str:
+        return value.strip()
 
 
 class RegisterRequest(AuthRequest):
-    nickname: str = Field(..., min_length=1)
+    nickname: str = Field(..., min_length=1, max_length=120)
 
 
 class UserProfile(BaseModel):

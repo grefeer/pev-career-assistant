@@ -116,8 +116,7 @@ def _contains_sensitive_value(
         )
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(
-            _contains_sensitive_value(item, sensitive_values, visited)
-            for item in value
+            _contains_sensitive_value(item, sensitive_values, visited) for item in value
         )
     return _contains_sensitive_value(repr(value), sensitive_values, visited)
 
@@ -199,8 +198,9 @@ def test_invalid_device_token_logs_outcome_without_token_or_pairing_code(
     _assert_safe_log(capture, "device authentication rejected")
 
 
-def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
-) -> None:
+def test_object_store_failure_logs_operation_without_plaintext_or_config_secret() -> (
+    None
+):
     class FailingBlobStore:
         def put_bytes(self, **_kwargs: object) -> None:
             raise RuntimeError(
@@ -221,8 +221,9 @@ def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
     _assert_safe_log(capture, "encrypted object write failed")
 
 
-def test_state_transition_failure_logs_outcome_without_payload_or_config_secret(
-) -> None:
+def test_state_transition_failure_logs_outcome_without_payload_or_config_secret() -> (
+    None
+):
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     try:

@@ -11,15 +11,39 @@ from backend.app.db.models import AnalysisSession, User
 from backend.app.repositories.sessions import create_for_user, list_for_user
 from backend.app.schemas import AuthRequest, AuthResponse, RegisterRequest, UserProfile
 from backend.app.services.auth import AccountExistsError, AuthService
+from backend.app.services.rate_limit import (
+    RateLimitExceededError,
+    RateLimitUnavailableError,
+    RedisFixedWindowRateLimiter,
+)
 
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
-def serialize_profile(
-    user: User, sessions: list[AnalysisSession]
-) -> dict[str, object]:
+def _enforce_auth_rate_limit(request: Request, action: str) -> None:
+    if request.app.state.settings.app_env == "test" and not hasattr(
+        request.app.state, "auth_rate_limiter"
+    ):
+        return
+    limiter = getattr(
+        request.app.state,
+        "auth_rate_limiter",
+        RedisFixedWindowRateLimiter(request.app.state.redis),
+    )
+    identity = request.client.host if request.client else "unknown"
+    try:
+        limiter.check(action=action, identity=identity)
+    except RateLimitExceededError:
+        raise HTTPException(
+            status_code=429, detail="请求过于频繁，请稍后重试。"
+        ) from None
+    except RateLimitUnavailableError:
+        raise HTTPException(status_code=503, detail="认证保护服务暂不可用。") from None
+
+
+def serialize_profile(user: User, sessions: list[AnalysisSession]) -> dict[str, object]:
     ordered = sorted(sessions, key=lambda item: item.activated_at, reverse=True)
     return {
         "account": user.account,
@@ -46,6 +70,7 @@ def register(
     request: Request,
     db: Annotated[Session, Depends(_get_db)],
 ) -> AuthResponse:
+    _enforce_auth_rate_limit(request, "register")
     service = AuthService(request.app.state.settings)
     try:
         user = service.register(
@@ -78,10 +103,9 @@ def login(
     request: Request,
     db: Annotated[Session, Depends(_get_db)],
 ) -> AuthResponse:
+    _enforce_auth_rate_limit(request, "login")
     service = AuthService(request.app.state.settings)
-    user = service.authenticate(
-        db, account=payload.account, password=payload.password
-    )
+    user = service.authenticate(db, account=payload.account, password=payload.password)
     if user is None:
         db.rollback()
         logger.warning("login rejected")

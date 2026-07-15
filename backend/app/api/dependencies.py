@@ -19,12 +19,9 @@ bearer_scheme = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 
 
-def _get_db() -> Iterator[Session]:
-    # Keep engine creation lazy so importing auth dependencies does not require a
-    # live database configuration (notably in isolated unit tests).
-    from backend.app.db.session import get_db
-
-    yield from get_db()
+def _get_db(request: Request) -> Iterator[Session]:
+    with request.app.state.session_factory() as db:
+        yield db
 
 
 def _unauthorized() -> HTTPException:
@@ -39,10 +36,32 @@ def get_redis(request: Request):
     return request.app.state.redis
 
 
-def get_device_service(redis_client=Depends(get_redis)):
+def get_device_service(request: Request, redis_client=Depends(get_redis)):
     from backend.app.services.devices import DeviceService
 
-    return DeviceService(redis_client)
+    return DeviceService(
+        redis_client, lease_secret=request.app.state.settings.app_auth_secret
+    )
+
+
+def require_task_lease(
+    db: Annotated[Session, Depends(_get_db)],
+    device: Annotated[Device, Depends(get_current_device)],
+    service=Depends(get_device_service),
+    task_id: Annotated[str | None, Header(alias="X-Task-ID")] = None,
+    task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
+) -> Device:
+    from backend.app.services.devices import InvalidTaskLeaseError
+
+    if not task_id or not task_lease:
+        raise HTTPException(status_code=401, detail="任务租约无效。")
+    try:
+        service.verify_task_lease(
+            db, task_lease, device=device, task_id=task_id, required_scope="task:event"
+        )
+    except InvalidTaskLeaseError:
+        raise HTTPException(status_code=401, detail="任务租约无效。") from None
+    return device
 
 
 def get_current_device(
@@ -61,9 +80,7 @@ def get_current_device(
 
 
 def get_current_user(
-    credentials: Annotated[
-        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
-    ],
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
     db: Annotated[Session, Depends(_get_db)],
     request: Request = cast(Request, None),
 ) -> User:

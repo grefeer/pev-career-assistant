@@ -94,9 +94,10 @@ def test_register_returns_compatible_profile_and_creates_student_default_session
     with session_factory() as db:
         user = db.scalar(select(User).where(User.account == "alice"))
         assert user is not None and user.role is UserRole.STUDENT
-        assert db.scalar(
-            select(AnalysisSession).where(AnalysisSession.user_id == user.id)
-        ) is not None
+        assert (
+            db.scalar(select(AnalysisSession).where(AnalysisSession.user_id == user.id))
+            is not None
+        )
 
 
 def test_public_registration_cannot_choose_admin_role(client: TestClient) -> None:
@@ -163,7 +164,9 @@ def test_bad_account_or_password_returns_401(
 
 
 @pytest.mark.parametrize("token", [None, "invalid-token"])
-def test_me_rejects_missing_or_invalid_token(client: TestClient, token: str | None) -> None:
+def test_me_rejects_missing_or_invalid_token(
+    client: TestClient, token: str | None
+) -> None:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     response = client.get("/api/auth/me", headers=headers)
@@ -206,17 +209,26 @@ def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
         assert registered.status_code == 200
         token = registered.json()["token"]
 
-        assert custom_client.get(
-            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
-        ).status_code == 200
-        assert custom_client.get(
-            "/api/sessions", headers={"Authorization": f"Bearer {token}"}
-        ).status_code == 200
-        assert custom_client.post(
-            "/api/analysis/run",
-            headers={"Authorization": f"Bearer {token}"},
-            data={"thread_id": "not-owned"},
-        ).status_code == 404
+        assert (
+            custom_client.get(
+                "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            custom_client.get(
+                "/api/sessions", headers={"Authorization": f"Bearer {token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            custom_client.post(
+                "/api/analysis/run",
+                headers={"Authorization": f"Bearer {token}"},
+                data={"thread_id": "not-owned"},
+            ).status_code
+            == 404
+        )
 
         logged_in = custom_client.post(
             "/api/auth/login",
@@ -224,9 +236,93 @@ def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
         )
         assert logged_in.status_code == 200
         login_token = logged_in.json()["token"]
-        assert custom_client.get(
-            "/api/auth/me", headers={"Authorization": f"Bearer {login_token}"}
-        ).status_code == 200
-        assert custom_client.get(
-            "/api/sessions", headers={"Authorization": f"Bearer {login_token}"}
-        ).status_code == 200
+        assert (
+            custom_client.get(
+                "/api/auth/me", headers={"Authorization": f"Bearer {login_token}"}
+            ).status_code
+            == 200
+        )
+        assert (
+            custom_client.get(
+                "/api/sessions", headers={"Authorization": f"Bearer {login_token}"}
+            ).status_code
+            == 200
+        )
+
+
+@pytest.mark.parametrize("field", ["account", "nickname"])
+def test_register_rejects_normalized_values_over_database_limit(
+    client, field: str
+) -> None:
+    payload = {"account": "alice", "nickname": "Alice", "password": "secret12"}
+    payload[field] = " " + ("x" * 121) + " "
+    assert client.post("/api/auth/register", json=payload).status_code == 422
+
+
+def test_login_rejects_unreasonably_large_password(client) -> None:
+    response = client.post(
+        "/api/auth/login", json={"account": "alice", "password": "x" * 1025}
+    )
+    assert response.status_code == 422
+
+
+def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
+    database_path = tmp_path / "factory.sqlite"
+    url = f"sqlite+pysqlite:///{database_path.as_posix()}"
+    engine = create_engine(url)
+    Base.metadata.create_all(engine)
+    engine.dispose()
+    custom_settings = Settings(
+        app_env="test",
+        app_auth_secret="factory-database-secret-at-least-32-chars",
+        object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        database_url=url,
+        redis_url="redis://localhost/15",
+        checkpoint_backend="sqlite",
+    )
+
+    class Blob:
+        def ensure_bucket(self):
+            return None
+
+    app = create_app(custom_settings, graph=object(), blob_store=Blob())
+    app.state.redis = object()
+    with TestClient(app) as custom_client:
+        response = custom_client.post(
+            "/api/auth/register",
+            json={
+                "account": "factory-db",
+                "nickname": "Factory DB",
+                "password": "secret12",
+            },
+        )
+        assert response.status_code == 200
+
+    with Session(create_engine(url)) as db:
+        assert db.scalar(select(User).where(User.account == "factory-db")) is not None
+
+
+def test_public_auth_rate_limit_returns_429(client) -> None:
+    class Limiter:
+        calls = 0
+
+        def check(self, **kwargs):
+            from backend.app.services.rate_limit import RateLimitExceededError
+
+            self.calls += 1
+            if self.calls > 1:
+                raise RateLimitExceededError
+
+    client.app.state.auth_rate_limiter = Limiter()
+    assert (
+        client.post(
+            "/api/auth/login", json={"account": "alice", "password": "secret12"}
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            "/api/auth/login", json={"account": "alice", "password": "secret12"}
+        ).status_code
+        == 429
+    )

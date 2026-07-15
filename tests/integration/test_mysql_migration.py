@@ -17,7 +17,7 @@ BUSINESS_TABLES = {
     "audit_events",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260714_0001"
+HEAD_REVISION = "20260715_0002"
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:
@@ -78,6 +78,8 @@ def test_mysql_migration_upgrade_and_downgrade() -> None:
             _run_alembic("upgrade", "head", env=env)
             assert _tables(engine) == BUSINESS_TABLES | ALEMBIC_TABLES
             assert _current_revision(engine) == HEAD_REVISION
+            device_columns = {column["name"] for column in inspect(engine).get_columns("devices")}
+            assert {"expires_at", "credential_rotated_at"} <= device_columns
         finally:
             _run_alembic("downgrade", "base", env=env)
             assert _tables(engine) <= ALEMBIC_TABLES

@@ -55,6 +55,16 @@ class PairDeviceResponse(BaseModel):
     device_token: str
 
 
+class TaskLeaseRequest(BaseModel):
+    task_id: str = Field(min_length=1, max_length=36)
+
+
+class TaskLeaseResponse(BaseModel):
+    task_id: str
+    lease: str
+    expires_in: int = 300
+
+
 class DeviceListResponse(BaseModel):
     devices: list[DeviceSummary]
 
@@ -101,7 +111,9 @@ def pair_device(
             public_key_pem=body.public_key_pem,
         )
     except InvalidPairingTicketError:
-        raise HTTPException(status_code=400, detail="配对码无效、已过期或已使用。") from None
+        raise HTTPException(
+            status_code=400, detail="配对码无效、已过期或已使用。"
+        ) from None
     return PairDeviceResponse(
         device=device_summary(issued.device, online=False),
         device_token=issued.plaintext_token,
@@ -134,6 +146,43 @@ def revoke_device(
     except DeviceNotFoundError:
         raise HTTPException(status_code=404, detail="设备不存在。") from None
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/{device_id}/rotate", response_model=PairDeviceResponse)
+def rotate_device_credential(
+    device_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(_get_db)],
+    service: Annotated[DeviceService, Depends(get_device_service)],
+) -> PairDeviceResponse:
+    try:
+        issued = service.rotate_credential(
+            db, user_id=current_user.id, device_id=device_id
+        )
+    except DeviceNotFoundError:
+        raise HTTPException(status_code=404, detail="设备不存在。") from None
+    return PairDeviceResponse(
+        device=device_summary(issued.device, online=False),
+        device_token=issued.plaintext_token,
+    )
+
+
+@router.post("/task-lease", response_model=TaskLeaseResponse)
+def create_task_lease(
+    body: TaskLeaseRequest,
+    device: Annotated[Device, Depends(get_current_device)],
+    db: Annotated[Session, Depends(_get_db)],
+    service: Annotated[DeviceService, Depends(get_device_service)],
+) -> TaskLeaseResponse:
+    from backend.app.services.devices import InvalidTaskLeaseError
+
+    try:
+        lease = service.issue_task_lease(
+            db, device=device, task_id=body.task_id, scopes={"task:read", "task:event"}
+        )
+    except InvalidTaskLeaseError:
+        raise HTTPException(status_code=403, detail="任务未分配给当前设备。") from None
+    return TaskLeaseResponse(task_id=body.task_id, lease=lease)
 
 
 @router.get("/me", response_model=DeviceSummary)

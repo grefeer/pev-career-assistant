@@ -52,9 +52,7 @@ class FakeGraph:
         values = self.values.get(self._thread(config), {})
         return [FakeSnapshot(values)] if values and limit else []
 
-    def invoke(
-        self, payload: dict[str, Any], config: dict[str, Any]
-    ) -> dict[str, Any]:
+    def invoke(self, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         thread_id = self._thread(config)
         result = {**payload, "final_report": "完成"}
         self.values[thread_id] = result
@@ -142,15 +140,23 @@ def test_user_cannot_read_or_activate_another_users_session(client: TestClient) 
     alice_token, _ = register(client, "alice")
     _, bob_session_id = register(client, "bob")
 
-    assert client.get(
-        f"/api/sessions/{bob_session_id}", headers=auth(alice_token)
-    ).status_code == 404
-    assert client.post(
-        f"/api/sessions/{bob_session_id}/activate", headers=auth(alice_token)
-    ).status_code == 404
+    assert (
+        client.get(
+            f"/api/sessions/{bob_session_id}", headers=auth(alice_token)
+        ).status_code
+        == 404
+    )
+    assert (
+        client.post(
+            f"/api/sessions/{bob_session_id}/activate", headers=auth(alice_token)
+        ).status_code
+        == 404
+    )
 
 
-def test_create_list_activate_and_label_keep_existing_contract(client: TestClient) -> None:
+def test_create_list_activate_and_label_keep_existing_contract(
+    client: TestClient,
+) -> None:
     token, old_session_id = register(client, "alice")
     created = client.post("/api/sessions", headers=auth(token))
     assert created.status_code == 200
@@ -173,9 +179,7 @@ def test_create_list_activate_and_label_keep_existing_contract(client: TestClien
     assert listing["active_thread_id"] == old_session_id
     assert listing["sessions"][0]["thread_id"] == old_session_id
 
-    label = client.get(
-        f"/api/sessions/{old_session_id}/label", headers=auth(token)
-    )
+    label = client.get(f"/api/sessions/{old_session_id}/label", headers=auth(token))
     assert label.status_code == 200
     assert label.json() == {"label": "分析会话 1"}
 
@@ -206,7 +210,9 @@ def test_state_and_history_keep_existing_response_shape(client: TestClient) -> N
     assert history.json() == []
 
 
-def test_analysis_requires_owned_session_and_moves_it_active(client: TestClient) -> None:
+def test_analysis_requires_owned_session_and_moves_it_active(
+    client: TestClient,
+) -> None:
     alice_token, alice_old_session_id = register(client, "alice")
     alice_new_session_id = client.post(
         "/api/sessions", headers=auth(alice_token)

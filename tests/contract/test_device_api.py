@@ -6,13 +6,14 @@ import os
 import fakeredis
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.api import dependencies
 from backend.app.config import Settings
 from backend.app.db.base import Base
+from backend.app.db.models import ApplicationTask, User
 
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("APP_AUTH_SECRET", "test-secret-with-at-least-32-characters")
@@ -59,6 +60,7 @@ def client(settings: Settings) -> Iterator[TestClient]:
     app.dependency_overrides[dependencies._get_db] = override_db
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
     with TestClient(app) as value:
+        value.session_factory = session_factory  # type: ignore[attr-defined]
         yield value
 
 
@@ -135,10 +137,13 @@ def test_device_auth_heartbeat_and_revoke_are_immediate(client: TestClient) -> N
     )
     assert heartbeat.status_code == 200
     assert heartbeat.json() == {"status": "online", "expires_in": 90}
-    assert client.delete(
-        f"/api/devices/{device_id}",
-        headers={"Authorization": f"Bearer {user_token}"},
-    ).status_code == 204
+    assert (
+        client.delete(
+            f"/api/devices/{device_id}",
+            headers={"Authorization": f"Bearer {user_token}"},
+        ).status_code
+        == 204
+    )
     assert client.get("/api/devices/me", headers=device_headers).status_code == 401
     assert (
         client.post(
@@ -168,6 +173,43 @@ def test_invalid_device_token_returns_401(
     client: TestClient, header: dict[str, str]
 ) -> None:
     assert client.get("/api/devices/me", headers=header).status_code == 401
+
+
+def test_rotation_invalidates_old_token_and_task_lease_is_task_scoped(
+    client: TestClient,
+) -> None:
+    user_token = register(client, "alice")
+    issued = pair(client, user_token)
+    device_id = issued["device"]["id"]
+    old_token = issued["device_token"]
+    rotated = client.post(
+        f"/api/devices/{device_id}/rotate",
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert rotated.status_code == 200
+    new_token = rotated.json()["device_token"]
+    assert (
+        client.get("/api/devices/me", headers={"X-Device-Token": old_token}).status_code
+        == 401
+    )
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        user = db.scalar(select(User).where(User.account == "alice"))
+        task = ApplicationTask(
+            user_id=user.id, target_job_id="job", device_id=device_id
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    lease = client.post(
+        "/api/devices/task-lease",
+        headers={"X-Device-Token": new_token},
+        json={"task_id": task_id},
+    )
+    assert lease.status_code == 200
+    assert lease.json()["task_id"] == task_id
+    assert lease.json()["expires_in"] == 300
+    assert isinstance(lease.json()["lease"], str)
 
 
 def test_openapi_only_exposes_device_token_on_pair_response(

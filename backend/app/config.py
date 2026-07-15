@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import base64
+import binascii
 from pathlib import Path
 from typing import Literal
 
@@ -57,12 +59,32 @@ class Settings(BaseSettings):
             raise ValueError("APP_AUTH_SECRET must contain at least 32 characters")
         return value
 
+    @field_validator("object_encryption_key")
+    @classmethod
+    def validate_object_encryption_key(cls, value: str) -> str:
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(
+                "OBJECT_ENCRYPTION_KEY must be a 32-byte base64 value"
+            ) from exc
+        if len(decoded) != 32:
+            raise ValueError("OBJECT_ENCRYPTION_KEY must be a 32-byte base64 value")
+        return value
+
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
         if self.is_production and self.app_auth_secret == DEFAULT_APP_AUTH_SECRET:
             raise ValueError("APP_AUTH_SECRET must be replaced in production")
         if self.is_production and self.checkpoint_backend != "redis":
             raise ValueError("production requires CHECKPOINT_BACKEND=redis")
+        if self.is_production and (
+            self.object_store_access_key.lower()
+            in {"minioadmin", "replace-me", "changeme"}
+            or self.object_store_secret_key.lower()
+            in {"minioadmin", "replace-me", "changeme"}
+        ):
+            raise ValueError("OBJECT_STORE credentials must be replaced in production")
         return self
 
 

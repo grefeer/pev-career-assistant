@@ -203,9 +203,7 @@ def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
         finally:
             checkpointer_closes.append(True)
 
-    monkeypatch.setattr(
-        "backend.app.main.checkpointer_context", tracking_checkpointer
-    )
+    monkeypatch.setattr("backend.app.main.checkpointer_context", tracking_checkpointer)
     monkeypatch.setattr("backend.app.main.build_graph", lambda checkpointer: object())
     monkeypatch.setattr(
         "backend.app.main.redis.Redis.from_url", lambda *args, **kwargs: redis_client
@@ -214,7 +212,7 @@ def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
         "backend.app.main.boto3.client", lambda *args, **kwargs: s3_client
     )
     monkeypatch.setattr(
-        "backend.app.db.session.build_readiness_engine",
+        "backend.app.db.session.build_engine",
         lambda settings: readiness_engine,
     )
     app = create_app(settings_override(app_env="development"))
@@ -244,7 +242,7 @@ def test_ensure_bucket_failure_does_not_close_preinjected_resources(
     injected_session_factory = object()
     app.state.session_factory = injected_session_factory
     monkeypatch.setattr(
-        "backend.app.db.session.build_readiness_engine",
+        "backend.app.db.session.build_engine",
         lambda settings: (_ for _ in ()).throw(
             AssertionError("injected session factory must be preserved")
         ),

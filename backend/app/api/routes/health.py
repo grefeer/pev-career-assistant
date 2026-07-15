@@ -23,9 +23,7 @@ def _mysql_is_up(request: Request) -> bool:
             request.app.state, "session_factory", None
         )
         if session_factory is None:
-            from backend.app.db.session import SessionLocal
-
-            session_factory = SessionLocal
+            return False
         with session_factory() as db:
             db.execute(text("SELECT 1"))
         return True

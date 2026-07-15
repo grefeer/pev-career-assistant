@@ -43,9 +43,7 @@ def _settings(path: Path) -> Settings:
 
 def _load_create_app(monkeypatch: Any) -> Any:
     monkeypatch.setenv("APP_ENV", "test")
-    monkeypatch.setenv(
-        "APP_AUTH_SECRET", "test-secret-with-at-least-32-characters"
-    )
+    monkeypatch.setenv("APP_AUTH_SECRET", "test-secret-with-at-least-32-characters")
     monkeypatch.setenv("DATABASE_URL", "sqlite+pysqlite:///:memory:")
     monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/15")
     monkeypatch.setenv(

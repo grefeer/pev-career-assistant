@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.api.router import api_router
 from backend.app.config import Settings, get_settings
-from backend.app.services.storage import S3BlobStore
+from backend.app.services.storage import EncryptedObjectStore, S3BlobStore
 from src.checkpointing import checkpointer_context
 from src.graph import build_graph
 from src.utils import load_env
@@ -54,15 +54,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.redis = owned_redis
                 stack.callback(owned_redis.close)
             if not hasattr(app.state, "session_factory"):
-                from backend.app.db.session import build_readiness_engine
+                from backend.app.db.session import build_engine
 
-                readiness_engine = build_readiness_engine(app.state.settings)
+                readiness_engine = build_engine(app.state.settings)
                 stack.callback(readiness_engine.dispose)
                 owned_session_factory = sessionmaker(
                     bind=readiness_engine, autoflush=False, expire_on_commit=False
                 )
                 app.state.session_factory = owned_session_factory
-            if not hasattr(app.state, "blob_store") and app.state.settings.app_env != "test":
+            if (
+                not hasattr(app.state, "blob_store")
+                and app.state.settings.app_env != "test"
+            ):
                 owned_object_store_client = boto3.client(
                     "s3",
                     endpoint_url=app.state.settings.object_store_endpoint,
@@ -76,17 +79,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     ),
                 )
                 app.state.blob_store = S3BlobStore(
-                    owned_object_store_client, app.state.settings.object_store_bucket
+                    owned_object_store_client,
+                    app.state.settings.object_store_bucket,
+                    region=app.state.settings.object_store_region,
                 )
                 stack.callback(owned_object_store_client.close)
             if hasattr(app.state, "blob_store"):
                 app.state.blob_store.ensure_bucket()
+                app.state.object_store = EncryptedObjectStore(
+                    app.state.blob_store, app.state.settings.object_encryption_key
+                )
             yield
     finally:
-        if (
-            owned_graph is not None
-            and getattr(app.state, "graph", None) is owned_graph
-        ):
+        if owned_graph is not None and getattr(app.state, "graph", None) is owned_graph:
             del app.state.graph
         if owned_redis is not None and getattr(app.state, "redis", None) is owned_redis:
             del app.state.redis
@@ -102,6 +107,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             and getattr(app.state, "session_factory", None) is owned_session_factory
         ):
             del app.state.session_factory
+        if hasattr(app.state, "object_store"):
+            del app.state.object_store
 
 
 def create_app(
@@ -110,6 +117,7 @@ def create_app(
     graph: object | None = None,
     checkpointer: object | None = None,
     blob_store: object | None = None,
+    session_factory: object | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     app = FastAPI(
@@ -124,6 +132,8 @@ def create_app(
         app.state.checkpointer = checkpointer
     if blob_store is not None:
         app.state.blob_store = blob_store
+    if session_factory is not None:
+        app.state.session_factory = session_factory
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved.cors_origin_list,
