@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import threading
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base, utc_now
@@ -15,7 +18,11 @@ from backend.app.db.models import (
     RawJobRecord,
 )
 from backend.app.repositories import jobs
-from backend.app.services.job_mappers import BUILTIN_SOURCES, NormalizedJobCandidate
+from backend.app.services.job_mappers import (
+    BUILTIN_SOURCES,
+    BuiltinJobSource,
+    NormalizedJobCandidate,
+)
 
 
 @pytest.fixture
@@ -78,6 +85,91 @@ def test_builtin_source_initialization_is_idempotent(db: Session) -> None:
     jobs.ensure_builtin_sources(db, BUILTIN_SOURCES)
     db.commit()
     assert len(jobs.list_sources(db)) == 2
+
+
+def test_concurrent_first_use_initialization_is_atomic_on_sqlite(tmp_path) -> None:
+    database_path = (tmp_path / "concurrent-sources.db").as_posix()
+    engine = create_engine(
+        f"sqlite+pysqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 10},
+    )
+    Base.metadata.create_all(engine)
+    barrier = threading.Barrier(2)
+    blocked_threads = threading.local()
+
+    def synchronize_first_lookup(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("INSERT"):
+            blocked_threads.insert_seen = True
+        if (
+            statement.lstrip().upper().startswith("SELECT")
+            and "FROM job_sources" in statement
+            and not getattr(blocked_threads, "insert_seen", False)
+            and not getattr(blocked_threads, "done", False)
+        ):
+            blocked_threads.done = True
+            barrier.wait(timeout=5)
+
+    event.listen(engine, "before_cursor_execute", synchronize_first_lookup)
+
+    def initialize() -> None:
+        with Session(engine) as session:
+            jobs.ensure_builtin_sources(session, BUILTIN_SOURCES)
+            session.commit()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(initialize) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=15)
+
+    event.remove(engine, "before_cursor_execute", synchronize_first_lookup)
+    with Session(engine) as session:
+        assert len(jobs.list_sources(session)) == 2
+
+
+def test_mysql_source_initialization_compiles_as_atomic_upsert() -> None:
+    statement = jobs._builtin_source_upsert_statement(
+        BUILTIN_SOURCES[0], dialect_name="mysql"
+    )
+    sql = str(statement.compile(dialect=mysql.dialect())).lower()
+    update_clause = sql.split("on duplicate key update", maxsplit=1)[1]
+
+    assert "insert into job_sources" in sql
+    assert "on duplicate key update" in sql
+    assert {"name", "file_id", "sheet_id", "mapper_version"} <= {
+        assignment.split("=", maxsplit=1)[0].strip().split(".")[-1]
+        for assignment in update_clause.split(",")
+    }
+    assert "enabled" not in update_clause
+
+
+def test_builtin_source_refresh_preserves_disabled_state(db: Session) -> None:
+    jobs.ensure_builtin_sources(db, BUILTIN_SOURCES)
+    db.commit()
+    source = jobs.get_source(db, "tencent-intern-referrals")
+    assert source is not None
+    source.enabled = False
+    db.commit()
+    changed = BuiltinJobSource(
+        source_key=source.source_key,
+        name="更新后的来源名",
+        file_id="updated-file",
+        sheet_id="updated-sheet",
+        mapper_version="v2",
+    )
+
+    jobs.ensure_builtin_sources(db, [changed])
+    db.commit()
+    db.refresh(source)
+
+    assert source.enabled is False
+    assert (source.name, source.file_id, source.sheet_id, source.mapper_version) == (
+        changed.name,
+        changed.file_id,
+        changed.sheet_id,
+        changed.mapper_version,
+    )
 
 
 def test_active_lease_rejects_a_second_run(db: Session) -> None:

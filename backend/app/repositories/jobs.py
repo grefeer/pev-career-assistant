@@ -6,7 +6,10 @@ import json
 from typing import Any, Literal
 
 from sqlalchemy import exists, func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.dml import Insert
 
 from backend.app.db.models import (
     JobPosting,
@@ -42,26 +45,58 @@ class StaleSyncLeaseError(RuntimeError):
 def ensure_builtin_sources(
     db: Session, definitions: Sequence[BuiltinJobSource]
 ) -> None:
+    dialect_name = db.get_bind().dialect.name
     for definition in definitions:
+        db.execute(
+            _builtin_source_upsert_statement(
+                definition,
+                dialect_name=dialect_name,
+            )
+        )
         source = get_source(db, definition.source_key)
         if source is None:
-            db.add(
-                JobSource(
-                    source_key=definition.source_key,
-                    provider=JobSourceProvider.TENCENT_SMARTSHEET,
-                    name=definition.name,
-                    file_id=definition.file_id,
-                    sheet_id=definition.sheet_id,
-                    mapper_version=definition.mapper_version,
-                    enabled=True,
-                )
-            )
-            continue
+            raise SourceNotFoundError(definition.source_key)
         source.name = definition.name
         source.file_id = definition.file_id
         source.sheet_id = definition.sheet_id
         source.mapper_version = definition.mapper_version
     db.flush()
+
+
+def _builtin_source_upsert_statement(
+    definition: BuiltinJobSource, *, dialect_name: str
+) -> Insert:
+    values = {
+        "source_key": definition.source_key,
+        "provider": JobSourceProvider.TENCENT_SMARTSHEET,
+        "name": definition.name,
+        "file_id": definition.file_id,
+        "sheet_id": definition.sheet_id,
+        "mapper_version": definition.mapper_version,
+        "enabled": True,
+    }
+    if dialect_name == "mysql":
+        statement = mysql_insert(JobSource).values(**values)
+        return statement.on_duplicate_key_update(
+            name=statement.inserted.name,
+            file_id=statement.inserted.file_id,
+            sheet_id=statement.inserted.sheet_id,
+            mapper_version=statement.inserted.mapper_version,
+        )
+    if dialect_name == "sqlite":
+        statement = sqlite_insert(JobSource).values(**values)
+        return statement.on_conflict_do_update(
+            index_elements=[JobSource.source_key],
+            set_={
+                "name": statement.excluded.name,
+                "file_id": statement.excluded.file_id,
+                "sheet_id": statement.excluded.sheet_id,
+                "mapper_version": statement.excluded.mapper_version,
+            },
+        )
+    raise NotImplementedError(
+        f"atomic built-in source initialization is unsupported for {dialect_name}"
+    )
 
 
 def list_sources(db: Session) -> list[JobSource]:
