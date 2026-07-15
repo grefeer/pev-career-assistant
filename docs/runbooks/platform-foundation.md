@@ -106,6 +106,55 @@ docker compose run --rm backend python scripts/create_admin.py --account admin -
 
 若账号已存在且不是管理员，脚本会拒绝静默提权。
 
+## 腾讯智能表职位同步
+
+职位同步只读访问腾讯智能表，仅调用字段和记录查询能力；后端不会新增、更新或删除腾讯源表数据，也不依赖 `mcporter` 子进程。腾讯是外部内容源，不属于核心平台就绪依赖，因此不会出现在 `/api/health/ready` 的检查项或响应中；未配置腾讯令牌不影响应用启动、登录、已有职位查询或核心就绪状态。
+
+生产同步令牌只从 User-scope 环境变量加载到当前 PowerShell 进程，不要写入 `.env`、命令参数、日志或版本库：
+
+```powershell
+$token = [Environment]::GetEnvironmentVariable('TENCENT_DOCS_TOKEN', 'User')
+if ([string]::IsNullOrWhiteSpace($token)) {
+  throw 'Missing TENCENT_DOCS_TOKEN user environment variable'
+}
+Set-Item -Path Env:TENCENT_DOCS_TOKEN -Value $token
+```
+
+内置来源键固定为：
+
+- `tencent-27-referrals`
+- `tencent-intern-referrals`
+
+使用管理员 JWT 手动同步一个来源。JWT 只放在 `Authorization` header 中，不要放入 URL、请求体或命令行参数；以下交互式读取不会回显 JWT：
+
+```powershell
+$secureAdminJwt = Read-Host 'Administrator JWT' -AsSecureString
+$adminJwt = [System.Net.NetworkCredential]::new('', $secureAdminJwt).Password
+$headers = @{ Authorization = "Bearer $adminJwt" }
+$sourceKey = 'tencent-intern-referrals'
+$result = Invoke-RestMethod `
+  -Method Post `
+  -Uri "http://127.0.0.1:8000/api/admin/job-sources/$sourceKey/sync" `
+  -Headers $headers
+$result | Select-Object run_id, source_key, status, pages_read, records_read,
+  raw_snapshots_created, postings_created, postings_updated,
+  records_skipped_incomplete
+$adminJwt = $null
+$secureAdminJwt.Dispose()
+```
+
+同步状态与 HTTP 状态解释：
+
+- `SUCCEEDED`：全部分页已读取并提交，运行计数可用于核对本次结果。
+- `PARTIAL`：至少一页已经提交，后续页失败；已提交的不可变快照和职位保留。修复错误后重新调用同一同步端点，恢复过程会从 page 0 全量重跑，并由唯一约束和幂等更新跳过相同快照。
+- `FAILED`：第一页成功提交前同步失败；根据响应中的稳定 `error_code` 修复问题后重试。
+- HTTP `409`：同一来源存在未过期同步租约，或来源当前不可同步；等待现有运行结束或租约到期后再试。
+- HTTP `502`：腾讯响应协议不符合预期或来源字段结构改变；检查来源结构和后端映射版本，不能通过盲目重试绕过。
+- HTTP `503`：令牌缺失、鉴权失败、限流重试耗尽、腾讯服务不可用或数据库写入失败；按稳定 `error_code` 检查配置与依赖状态。
+- HTTP `504`：腾讯请求在重试后仍超时；检查网络和上游状态后重新运行。
+
+失败响应只应包含稳定 `error_code` 和 `run_id`，不得把腾讯原始响应、令牌或原始记录载荷复制到日志或工单。`GET /api/jobs` 和 `GET /api/jobs/{job_id}` 需要已认证用户，仅返回 `PENDING_COMPLETION` 职位；这些职位尚未核验，也不具备投递授权。
+
 ## 撤销设备
 
 先以用户 Bearer token 获取设备列表，再由设备所有者撤销。令牌使用隐藏输入并只保留在当前 PowerShell 进程中：
@@ -176,7 +225,10 @@ $env:TEST_S3_ENDPOINT = 'http://127.0.0.1:9000'
 $env:TEST_S3_ACCESS_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_USER', 'User')
 $env:TEST_S3_SECRET_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_PASSWORD', 'User')
 $env:TEST_S3_BUCKET = 'career-assistant-storage-test'
+$env:TEST_TENCENT_DOCS_TOKEN = [Environment]::GetEnvironmentVariable('TEST_TENCENT_DOCS_TOKEN', 'User')
 ```
+
+`TEST_TENCENT_DOCS_TOKEN` 仅用于测试环境中的真实腾讯只读门禁。只有在 `TEST_MYSQL_URL` 指向数据库名以 `_test` 结尾的专用测试库时才运行该门禁；不得对非测试数据库执行真实来源集成测试。
 
 运行全部门禁：
 

@@ -122,7 +122,9 @@
 - `POST /api/auth/register`
 - `POST /api/auth/login`
 - `GET /api/auth/me`
-- `GET /api/jobs`
+- `POST /api/admin/job-sources/{source_key}/sync`（管理员只读同步腾讯智能表来源）
+- `GET /api/jobs`（认证用户分页查询待补全职位）
+- `GET /api/jobs/{job_id}`（认证用户查询待补全职位详情）
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `POST /api/sessions/{thread_id}/activate`
@@ -226,4 +228,6 @@ Compose 的 MySQL、Redis、MinIO、后端和前端宿主端口均可配置。�
 
 - [校园招聘职业助手总体设计](./docs/superpowers/specs/2026-07-14-campus-recruitment-career-assistant-design.md)
 - [平台基础权威数据实施计划](./docs/superpowers/plans/2026-07-14-platform-foundation-authoritative-data.md)
+- [真实职位同步纵向闭环设计](./docs/superpowers/specs/2026-07-15-real-job-sync-vertical-slice-design.md)
+- [真实职位同步纵向闭环实施计划](./docs/superpowers/plans/2026-07-15-real-job-sync-vertical-slice.md)
 - [平台基础运行手册](./docs/runbooks/platform-foundation.md)
