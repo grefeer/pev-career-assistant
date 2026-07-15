@@ -8,7 +8,6 @@ import uuid
 
 import pytest
 from sqlalchemy import create_engine, delete, func, or_, select
-from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
@@ -24,6 +23,9 @@ from backend.app.db.models import (
 from backend.app.repositories import jobs
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
+from tests.integration.job_sync_gate_safety import (
+    require_dedicated_mysql_test_database,
+)
 
 
 SOURCE_KEYS = ("tencent-27-referrals", "tencent-intern-referrals")
@@ -34,13 +36,6 @@ pytestmark = pytest.mark.skipif(
     ),
     reason="requires TEST_MYSQL_URL and TEST_TENCENT_DOCS_TOKEN",
 )
-
-
-def _assert_dedicated_test_database(database_url: str) -> None:
-    database_name = make_url(database_url).database
-    assert database_name and database_name.endswith("_test"), (
-        "live sync cleanup requires a database whose name ends with _test"
-    )
 
 
 def _migrate_to_head(database_url: str) -> None:
@@ -92,7 +87,7 @@ def _count_for_source(db: Session, model: type[object], source_id: str) -> int:
 
 def test_live_tencent_sources_sync_read_only_and_idempotently() -> None:
     database_url = os.environ["TEST_MYSQL_URL"]
-    _assert_dedicated_test_database(database_url)
+    require_dedicated_mysql_test_database(database_url)
     _migrate_to_head(database_url)
     engine = create_engine(database_url, pool_pre_ping=True)
     admin_id = str(uuid.uuid4())

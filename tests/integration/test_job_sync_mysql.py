@@ -6,12 +6,12 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from threading import Barrier
+from threading import Barrier, Event
 import uuid
 
 import pytest
-from sqlalchemy import create_engine, delete
-from sqlalchemy.engine import Engine, make_url
+from sqlalchemy import create_engine, delete, event, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
@@ -24,18 +24,14 @@ from backend.app.db.models import (
     RawJobRecord,
 )
 from backend.app.repositories import jobs
-
-
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("TEST_MYSQL_URL"), reason="requires TEST_MYSQL_URL"
+from tests.integration.job_sync_gate_safety import (
+    require_dedicated_mysql_test_database,
 )
 
 
-def _assert_dedicated_test_database(database_url: str) -> None:
-    database_name = make_url(database_url).database
-    assert database_name and database_name.endswith("_test"), (
-        "TEST_MYSQL_URL must target a database whose name ends with _test"
-    )
+requires_mysql = pytest.mark.skipif(
+    not os.environ.get("TEST_MYSQL_URL"), reason="requires TEST_MYSQL_URL"
+)
 
 
 def _migrate_to_head(database_url: str) -> None:
@@ -56,10 +52,61 @@ def _migrate_to_head(database_url: str) -> None:
     )
 
 
+def test_database_guard_rejects_non_mysql_backend() -> None:
+    invalid_url = "sqlite+pysqlite:///" + "career_assistant_test"
+    with pytest.raises(ValueError, match="MySQL.*_test"):
+        require_dedicated_mysql_test_database(invalid_url)
+
+
+def test_database_guard_rejects_postgresql_backend() -> None:
+    invalid_url = "postgresql+psycopg://root@localhost/" + "career_assistant_test"
+    with pytest.raises(ValueError, match="MySQL.*_test"):
+        require_dedicated_mysql_test_database(invalid_url)
+
+
+def test_database_guard_rejects_mysql_non_test_database() -> None:
+    invalid_url = "mysql+pymysql://root@localhost/" + "career_assistant"
+    with pytest.raises(ValueError, match="MySQL.*_test"):
+        require_dedicated_mysql_test_database(invalid_url)
+
+
+def test_database_guard_accepts_dedicated_mysql_test_database() -> None:
+    valid_url = "mysql+pymysql://root@localhost/" + "career_assistant_test"
+    require_dedicated_mysql_test_database(valid_url)
+
+
+def test_database_guard_is_active_under_python_optimization() -> None:
+    env = {
+        **os.environ,
+        "TASK7_GUARD_URL": "mysql+pymysql://root@localhost/" + "career_assistant",
+    }
+    script = """
+import os
+from tests.integration.job_sync_gate_safety import require_dedicated_mysql_test_database
+
+try:
+    require_dedicated_mysql_test_database(os.environ["TASK7_GUARD_URL"])
+except ValueError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+
 @pytest.fixture(scope="module")
 def mysql_engine() -> Engine:
     database_url = os.environ["TEST_MYSQL_URL"]
-    _assert_dedicated_test_database(database_url)
+    require_dedicated_mysql_test_database(database_url)
     _migrate_to_head(database_url)
     engine = create_engine(database_url, pool_pre_ping=True)
     try:
@@ -126,6 +173,7 @@ def _cleanup_source(db: Session, source_id: str) -> None:
     db.commit()
 
 
+@requires_mysql
 def test_mysql_exact_recruitment_type_filter(mysql_engine: Engine) -> None:
     prefix = f"task7-filter-{uuid.uuid4().hex}"
     with Session(mysql_engine, expire_on_commit=False) as db:
@@ -161,6 +209,7 @@ def test_mysql_exact_recruitment_type_filter(mysql_engine: Engine) -> None:
             _cleanup_source(db, source_id)
 
 
+@requires_mysql
 def test_mysql_active_source_lease_conflicts(mysql_engine: Engine) -> None:
     prefix = f"task7-conflict-{uuid.uuid4().hex}"
     with Session(mysql_engine, expire_on_commit=False) as db:
@@ -180,6 +229,7 @@ def test_mysql_active_source_lease_conflicts(mysql_engine: Engine) -> None:
             _cleanup_source(db, source_id)
 
 
+@requires_mysql
 def test_mysql_concurrent_lease_allows_exactly_one_owner(
     mysql_engine: Engine,
 ) -> None:
@@ -189,23 +239,70 @@ def test_mysql_concurrent_lease_allows_exactly_one_owner(
         source_id = source.id
         setup.commit()
 
-    barrier = Barrier(2)
+    connections_ready = Barrier(2)
+    owner_holds_lease = Event()
+    contender_for_update_started = Event()
 
-    def attempt() -> str:
+    def owner_attempt() -> tuple[str, int]:
         with Session(mysql_engine) as db:
-            barrier.wait(timeout=10)
-            try:
-                jobs.acquire_sync_run(db, source_id, now=datetime.now(timezone.utc))
-                db.commit()
-                return "acquired"
-            except jobs.SyncConflictError:
+            connection = db.connection()
+            connection_id = int(connection.scalar(text("SELECT CONNECTION_ID()")))
+            connections_ready.wait(timeout=10)
+            jobs.acquire_sync_run(db, source_id, now=datetime.now(timezone.utc))
+            owner_holds_lease.set()
+            if not contender_for_update_started.wait(timeout=10):
                 db.rollback()
-                return "conflict"
+                raise TimeoutError("contender did not issue its lease lock query")
+            db.commit()
+            return "acquired", connection_id
+
+    def contender_attempt() -> tuple[str, int]:
+        with Session(mysql_engine) as db:
+            connection = db.connection()
+            connection_id = int(connection.scalar(text("SELECT CONNECTION_ID()")))
+            connections_ready.wait(timeout=10)
+            if not owner_holds_lease.wait(timeout=10):
+                raise TimeoutError("owner did not acquire the lease")
+
+            def signal_for_update(
+                _connection: object,
+                _cursor: object,
+                statement: str,
+                _parameters: object,
+                _context: object,
+                _executemany: bool,
+            ) -> None:
+                normalized = statement.upper()
+                if "JOB_SOURCES" in normalized and "FOR UPDATE" in normalized:
+                    contender_for_update_started.set()
+
+            event.listen(connection, "before_cursor_execute", signal_for_update)
+            try:
+                try:
+                    jobs.acquire_sync_run(
+                        db, source_id, now=datetime.now(timezone.utc)
+                    )
+                except jobs.SyncConflictError:
+                    db.rollback()
+                    return "conflict", connection_id
+                db.commit()
+                return "acquired", connection_id
+            finally:
+                event.remove(connection, "before_cursor_execute", signal_for_update)
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            outcomes = list(pool.map(lambda _index: attempt(), range(2)))
-        assert sorted(outcomes) == ["acquired", "conflict"]
+            owner_future = pool.submit(owner_attempt)
+            contender_future = pool.submit(contender_attempt)
+            results = [
+                owner_future.result(timeout=20),
+                contender_future.result(timeout=20),
+            ]
+        assert len({connection_id for _outcome, connection_id in results}) == 2
+        assert sorted(outcome for outcome, _connection_id in results) == [
+            "acquired",
+            "conflict",
+        ]
     finally:
         with Session(mysql_engine) as cleanup:
             _cleanup_source(cleanup, source_id)
