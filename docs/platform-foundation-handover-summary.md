@@ -314,7 +314,7 @@ $env:TEST_BACKEND_IMAGE = 'platform-foundation-backend:latest'
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-完成版本 `75463aa` 的最终本地结果是 `540 passed, 9 skipped`。九个 skip 来自未设置 `TEST_TENCENT_DOCS_TOKEN` 的真实腾讯双来源只读门禁，因此这是尚待具备有效测试令牌后完成的外部验证缺口，不能描述为真实腾讯读取已经通过。其余已配置的 MySQL、Redis、MinIO、代理和本地自动化门禁通过。测试会创建并清理临时 Redis key、测试对象和代理客户端容器；如果测试被强制中断，应检查残留的 `rate-client-*` 容器和测试 bucket 对象。
+完成版本 `75463aa` 的最终本地结果是 `540 passed, 9 skipped`。`pytest -q -rs` 显示九个 skip 均为环境门禁：五个仅要求 `TEST_MYSQL_URL`，对象存储、Compose Nginx→Uvicorn 代理链和 Redis 8 集成各一个，另一个真实腾讯只读测试同时要求 `TEST_MYSQL_URL` 与 `TEST_TENCENT_DOCS_TOKEN`。因此真实腾讯来源读取仍是尚待具备专用测试库和有效测试令牌后完成的外部验证缺口，不能描述为已经通过。测试会创建并清理临时 Redis key、测试对象和代理客户端容器；如果测试被强制中断，应检查残留的 `rate-client-*` 容器和测试 bucket 对象。
 
 ## 7. 管理员创建
 
@@ -366,7 +366,7 @@ docker compose -p platform-foundation run --rm backend `
 合并到 `master` 后的最终验证结果：
 
 - Ruff：通过。
-- Python 测试：`540 passed, 9 skipped`；skip 均对应缺少 `TEST_TENCENT_DOCS_TOKEN` 的真实腾讯外部门禁。
+- Python 测试：`540 passed, 9 skipped`；其中五个仅缺 `TEST_MYSQL_URL`，对象存储、Compose 代理链、Redis 集成各一个，真实腾讯只读测试一个（同时缺 `TEST_MYSQL_URL` 和 `TEST_TENCENT_DOCS_TOKEN`）。
 - 真实 MySQL 8.4：通过，包含 migration upgrade/downgrade 往返。
 - 真实 Redis 8 DB 0：通过。
 - 真实 MinIO：通过。
