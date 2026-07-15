@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, field_validator
 
 class AuthRequest(BaseModel):
     account: str = Field(..., min_length=3, max_length=120)
-    password: str = Field(..., min_length=8, max_length=1024)
+    password: str = Field(..., min_length=6, max_length=1024)
 
     @field_validator("account", mode="before")
     @classmethod
@@ -16,6 +16,7 @@ class AuthRequest(BaseModel):
 
 
 class RegisterRequest(AuthRequest):
+    password: str = Field(..., min_length=8, max_length=1024)
     nickname: str = Field(..., min_length=1, max_length=120)
 
     @field_validator("nickname", mode="before")

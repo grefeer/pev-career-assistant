@@ -11,6 +11,7 @@ from backend.app.api import dependencies
 from backend.app.config import Settings
 from backend.app.db.base import Base
 from backend.app.db.models import AnalysisSession, User, UserRole
+from backend.app.services.auth import AuthService
 
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("APP_AUTH_SECRET", "test-secret-with-at-least-32-characters")
@@ -276,6 +277,35 @@ def test_password_leading_and_trailing_spaces_are_preserved(client) -> None:
     assert registered.json()["profile"]["nickname"] == "Spaced User"
     assert client.post("/api/auth/login", json={"account": " spaced-user ", "password": password}).status_code == 200
     assert client.post("/api/auth/login", json={"account": "spaced-user", "password": password.strip()}).status_code == 401
+
+
+@pytest.mark.parametrize("password", ["sixsix", "seven77"])
+def test_legacy_six_and_seven_character_argon2_users_can_login(
+    client: TestClient, settings: Settings, password: str
+) -> None:
+    account = f"legacy-{len(password)}"
+    service = AuthService(settings)
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        db.add(User(
+            account=account,
+            nickname="Legacy User",
+            password_hash=service.password_hash.hash(password),
+            role=UserRole.STUDENT,
+        ))
+        db.commit()
+
+    response = client.post(
+        "/api/auth/login", json={"account": account, "password": password}
+    )
+    assert response.status_code == 200
+    assert response.json()["profile"]["account"] == account
+
+
+def test_new_registration_rejects_seven_character_password(client: TestClient) -> None:
+    response = client.post("/api/auth/register", json={
+        "account": "new-policy", "nickname": "New Policy", "password": "seven77",
+    })
+    assert response.status_code == 422
 
 
 def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
