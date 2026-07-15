@@ -15,6 +15,7 @@ from backend.app.services.rate_limit import (
     RateLimitExceededError,
     RateLimitUnavailableError,
     RedisFixedWindowRateLimiter,
+    resolve_client_ip,
 )
 
 
@@ -22,7 +23,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
 
-def _enforce_auth_rate_limit(request: Request, action: str) -> None:
+def _enforce_auth_rate_limit(
+    request: Request, action: str, *, account: str | None = None
+) -> None:
     if request.app.state.settings.app_env == "test" and not hasattr(
         request.app.state, "auth_rate_limiter"
     ):
@@ -32,9 +35,23 @@ def _enforce_auth_rate_limit(request: Request, action: str) -> None:
         "auth_rate_limiter",
         RedisFixedWindowRateLimiter(request.app.state.redis),
     )
-    identity = request.client.host if request.client else "unknown"
+    peer = request.client.host if request.client else "unknown"
+    identity = resolve_client_ip(
+        peer,
+        request.headers.get("X-Real-IP"),
+        request.app.state.settings.trusted_proxy_cidrs,
+    )
     try:
-        limiter.check(action=action, identity=identity)
+        if action == "register":
+            limiter.check(action="register-ip", identity=identity, limit=20)
+        else:
+            limiter.check(action="login-ip", identity=identity, limit=120)
+            if account is not None:
+                limiter.check(
+                    action="login-account",
+                    identity=account.strip().casefold(),
+                    limit=8,
+                )
     except RateLimitExceededError:
         raise HTTPException(
             status_code=429, detail="请求过于频繁，请稍后重试。"
@@ -103,7 +120,7 @@ def login(
     request: Request,
     db: Annotated[Session, Depends(_get_db)],
 ) -> AuthResponse:
-    _enforce_auth_rate_limit(request, "login")
+    _enforce_auth_rate_limit(request, "login", account=payload.account)
     service = AuthService(request.app.state.settings)
     user = service.authenticate(db, account=payload.account, password=payload.password)
     if user is None:

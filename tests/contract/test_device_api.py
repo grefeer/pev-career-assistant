@@ -230,6 +230,8 @@ def test_openapi_only_exposes_device_token_on_pair_response(
         "version",
         "paired_at",
         "last_seen_at",
+        "expires_at",
+        "credential_rotated_at",
         "online",
     }
     assert set(schemas["PairDeviceResponse"]["properties"]) == {

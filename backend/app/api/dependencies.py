@@ -44,12 +44,9 @@ def get_device_service(request: Request, redis_client=Depends(get_redis)):
     )
 
 
-def require_task_lease(
-    db: Annotated[Session, Depends(_get_db)],
-    device: Annotated[Device, Depends(get_current_device)],
-    service=Depends(get_device_service),
-    task_id: Annotated[str | None, Header(alias="X-Task-ID")] = None,
-    task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
+def _require_task_scope(
+    *, db: Session, device: Device, service, task_id: str | None,
+    task_lease: str | None, required_scope: str,
 ) -> Device:
     from backend.app.services.devices import InvalidTaskLeaseError
 
@@ -57,11 +54,41 @@ def require_task_lease(
         raise HTTPException(status_code=401, detail="任务租约无效。")
     try:
         service.verify_task_lease(
-            db, task_lease, device=device, task_id=task_id, required_scope="task:event"
+            db, task_lease, device=device, task_id=task_id,
+            required_scope=required_scope,
         )
     except InvalidTaskLeaseError:
         raise HTTPException(status_code=401, detail="任务租约无效。") from None
     return device
+
+
+def require_task_progress_lease(
+    db: Annotated[Session, Depends(_get_db)],
+    device: Annotated[Device, Depends(get_current_device)],
+    service=Depends(get_device_service),
+    task_id: Annotated[str | None, Header(alias="X-Task-ID")] = None,
+    task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
+) -> Device:
+    return _require_task_scope(
+        db=db, device=device, service=service, task_id=task_id,
+        task_lease=task_lease, required_scope="task:progress",
+    )
+
+
+def require_task_result_lease(
+    db: Annotated[Session, Depends(_get_db)],
+    device: Annotated[Device, Depends(get_current_device)],
+    service=Depends(get_device_service),
+    task_id: Annotated[str | None, Header(alias="X-Task-ID")] = None,
+    task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
+) -> Device:
+    return _require_task_scope(
+        db=db, device=device, service=service, task_id=task_id,
+        task_lease=task_lease, required_scope="task:result",
+    )
+
+
+require_task_lease = require_task_progress_lease
 
 
 def get_current_device(

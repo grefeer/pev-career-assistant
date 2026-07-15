@@ -18,6 +18,7 @@ from backend.app.db.models import (
     User,
 )
 from backend.app.services.applications import (
+    ALLOWED_TRANSITION_ACTORS,
     ALLOWED_TRANSITIONS,
     ApplicationService,
     InvalidTransitionError,
@@ -80,6 +81,11 @@ ALLOWED_EDGES = [
     for source, targets in EXPECTED_TRANSITIONS.items()
     for target in targets
 ]
+EDGE_ACTOR_CASES = [
+    (source, target, actor)
+    for source, target in ALLOWED_EDGES
+    for actor in TaskActor
+]
 FORBIDDEN_EDGES = [
     (source, target)
     for source in ApplicationTaskStatus
@@ -132,10 +138,8 @@ def ready_task(db: Session) -> ApplicationTask:
     return create_task(db, ApplicationTaskStatus.READY_FOR_REVIEW)
 
 
-def actor_for(target: ApplicationTaskStatus) -> TaskActor:
-    if target is ApplicationTaskStatus.OBSERVING_USER_SUBMISSION:
-        return TaskActor.HUMAN
-    return TaskActor.SYSTEM
+def actor_for(source: ApplicationTaskStatus, target: ApplicationTaskStatus) -> TaskActor:
+    return next(iter(ALLOWED_TRANSITION_ACTORS[(source, target)]))
 
 
 def test_transition_matrix_is_explicit_and_complete() -> None:
@@ -156,7 +160,7 @@ def test_every_allowed_transition_updates_once_and_appends_event(
         task_id=task.id,
         expected_version=0,
         target=target,
-        actor=actor_for(target),
+        actor=actor_for(source, target),
         event_type="state_changed",
         redacted_payload={"result": "summary"},
     )
@@ -167,11 +171,48 @@ def test_every_allowed_transition_updates_once_and_appends_event(
     assert updated.status is target
     assert updated.state_version == 1
     assert event is not None
-    assert event.actor is actor_for(target)
+    assert event.actor is actor_for(source, target)
     assert event.event_type == "state_changed"
     assert event.from_status == source.value
     assert event.to_status == target.value
     assert event.redacted_payload == {"result": "summary"}
+
+
+@pytest.mark.parametrize(("source", "target", "actor"), EDGE_ACTOR_CASES)
+def test_every_allowed_edge_rejects_every_unapproved_actor(
+    db: Session,
+    application_service: ApplicationService,
+    source: ApplicationTaskStatus,
+    target: ApplicationTaskStatus,
+    actor: TaskActor,
+) -> None:
+    task = create_task(db, source)
+    if actor in ALLOWED_TRANSITION_ACTORS[(source, target)]:
+        application_service.transition(
+            db, task_id=task.id, expected_version=0, target=target, actor=actor,
+            event_type="actor_matrix", redacted_payload={},
+        )
+        assert task.status is target
+        return
+    with pytest.raises(InvalidTransitionError, match="actor"):
+        application_service.transition(
+            db, task_id=task.id, expected_version=0, target=target, actor=actor,
+            event_type="actor_matrix", redacted_payload={},
+        )
+    db.refresh(task)
+    assert task.status is source
+    assert db.scalars(select(ApplicationEvent)).all() == []
+
+
+def test_executor_cannot_cancel_ready_for_review(
+    application_service: ApplicationService, db: Session, ready_task: ApplicationTask
+) -> None:
+    with pytest.raises(InvalidTransitionError):
+        application_service.transition(
+            db, task_id=ready_task.id, expected_version=0,
+            target=ApplicationTaskStatus.CANCELLED, actor=TaskActor.EXECUTOR,
+            event_type="cancelled", redacted_payload={},
+        )
 
 
 @pytest.mark.parametrize("terminal", TERMINAL_STATUSES)
@@ -228,7 +269,7 @@ def test_every_forbidden_transition_is_rejected_without_mutation(
 def test_executor_cannot_start_final_submission(
     application_service: ApplicationService, db: Session, ready_task: ApplicationTask
 ) -> None:
-    with pytest.raises(InvalidTransitionError, match="human"):
+    with pytest.raises(InvalidTransitionError, match="not allowed"):
         application_service.transition(
             db,
             task_id=ready_task.id,
@@ -248,7 +289,7 @@ def test_executor_cannot_start_final_submission(
 def test_system_cannot_start_final_submission(
     application_service: ApplicationService, db: Session, ready_task: ApplicationTask
 ) -> None:
-    with pytest.raises(InvalidTransitionError, match="human"):
+    with pytest.raises(InvalidTransitionError, match="not allowed"):
         application_service.transition(
             db,
             task_id=ready_task.id,

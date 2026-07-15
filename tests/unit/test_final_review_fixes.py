@@ -145,7 +145,10 @@ def test_device_expiry_rotation_and_scoped_task_lease(db) -> None:
     db.add(task)
     db.commit()
     lease = service.issue_task_lease(
-        db, device=authenticated, task_id=task.id, scopes={"task:event"}
+        db,
+        device=authenticated,
+        task_id=task.id,
+        scopes={"task:progress", "task:result"},
     )
     assert (
         service.verify_task_lease(
@@ -153,7 +156,7 @@ def test_device_expiry_rotation_and_scoped_task_lease(db) -> None:
             lease,
             device=authenticated,
             task_id=task.id,
-            required_scope="task:event",
+            required_scope="task:progress",
         )["sub"]
         == device.id
     )
@@ -163,7 +166,7 @@ def test_device_expiry_rotation_and_scoped_task_lease(db) -> None:
             lease,
             device=authenticated,
             task_id="other",
-            required_scope="task:event",
+            required_scope="task:progress",
         )
     with pytest.raises(InvalidTaskLeaseError):
         service.verify_task_lease(

@@ -29,47 +29,38 @@ class UnsafeAuditPayloadError(ValueError):
 logger = logging.getLogger(__name__)
 
 
+S = ApplicationTaskStatus
+A = TaskActor
+ALLOWED_TRANSITION_ACTORS = {
+    (S.CREATED, S.WAITING_FOR_DEVICE): {A.SYSTEM},
+    (S.CREATED, S.CANCELLED): {A.HUMAN},
+    (S.WAITING_FOR_DEVICE, S.DISPATCHED): {A.SYSTEM},
+    (S.WAITING_FOR_DEVICE, S.CANCELLED): {A.HUMAN},
+    (S.DISPATCHED, S.RUNNING): {A.EXECUTOR},
+    (S.DISPATCHED, S.WAITING_FOR_HUMAN): {A.EXECUTOR},
+    (S.DISPATCHED, S.FAILED): {A.EXECUTOR},
+    (S.DISPATCHED, S.CANCELLED): {A.HUMAN},
+    (S.RUNNING, S.WAITING_FOR_HUMAN): {A.EXECUTOR},
+    (S.RUNNING, S.READY_FOR_REVIEW): {A.EXECUTOR},
+    (S.RUNNING, S.FAILED): {A.EXECUTOR},
+    (S.RUNNING, S.CANCELLED): {A.HUMAN},
+    (S.WAITING_FOR_HUMAN, S.RUNNING): {A.EXECUTOR},
+    (S.WAITING_FOR_HUMAN, S.READY_FOR_REVIEW): {A.EXECUTOR},
+    (S.WAITING_FOR_HUMAN, S.FAILED): {A.EXECUTOR},
+    (S.WAITING_FOR_HUMAN, S.CANCELLED): {A.HUMAN},
+    (S.READY_FOR_REVIEW, S.OBSERVING_USER_SUBMISSION): {A.HUMAN},
+    (S.READY_FOR_REVIEW, S.CANCELLED): {A.HUMAN},
+    (S.OBSERVING_USER_SUBMISSION, S.SUBMITTED_SUCCESS): {A.EXECUTOR},
+    (S.OBSERVING_USER_SUBMISSION, S.SUBMITTED_FAILED): {A.EXECUTOR},
+    (S.OBSERVING_USER_SUBMISSION, S.RESULT_UNKNOWN): {A.EXECUTOR},
+}
 ALLOWED_TRANSITIONS = {
-    ApplicationTaskStatus.CREATED: {
-        ApplicationTaskStatus.WAITING_FOR_DEVICE,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.WAITING_FOR_DEVICE: {
-        ApplicationTaskStatus.DISPATCHED,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.DISPATCHED: {
-        ApplicationTaskStatus.RUNNING,
-        ApplicationTaskStatus.WAITING_FOR_HUMAN,
-        ApplicationTaskStatus.FAILED,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.RUNNING: {
-        ApplicationTaskStatus.WAITING_FOR_HUMAN,
-        ApplicationTaskStatus.READY_FOR_REVIEW,
-        ApplicationTaskStatus.FAILED,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.WAITING_FOR_HUMAN: {
-        ApplicationTaskStatus.RUNNING,
-        ApplicationTaskStatus.READY_FOR_REVIEW,
-        ApplicationTaskStatus.FAILED,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.READY_FOR_REVIEW: {
-        ApplicationTaskStatus.OBSERVING_USER_SUBMISSION,
-        ApplicationTaskStatus.CANCELLED,
-    },
-    ApplicationTaskStatus.OBSERVING_USER_SUBMISSION: {
-        ApplicationTaskStatus.SUBMITTED_SUCCESS,
-        ApplicationTaskStatus.SUBMITTED_FAILED,
-        ApplicationTaskStatus.RESULT_UNKNOWN,
-    },
-    ApplicationTaskStatus.SUBMITTED_SUCCESS: set(),
-    ApplicationTaskStatus.SUBMITTED_FAILED: set(),
-    ApplicationTaskStatus.RESULT_UNKNOWN: set(),
-    ApplicationTaskStatus.FAILED: set(),
-    ApplicationTaskStatus.CANCELLED: set(),
+    source: {
+        target
+        for (edge_source, target) in ALLOWED_TRANSITION_ACTORS
+        if edge_source is source
+    }
+    for source in ApplicationTaskStatus
 }
 
 FORBIDDEN_AUDIT_KEYS = {
@@ -143,18 +134,17 @@ class ApplicationService:
             raise TaskNotFoundError(task_id)
         if task.state_version != expected_version:
             raise StaleTaskVersionError(task_id)
-        if target not in ALLOWED_TRANSITIONS[task.status]:
+        allowed_actors = ALLOWED_TRANSITION_ACTORS.get((task.status, target))
+        if allowed_actors is None:
             logger.warning("application transition rejected")
             raise InvalidTransitionError(
                 f"transition from {task.status.value} to {target.value} is not allowed"
             )
-        if (
-            target is ApplicationTaskStatus.OBSERVING_USER_SUBMISSION
-            and actor is not TaskActor.HUMAN
-        ):
+        if actor not in allowed_actors:
             logger.warning("application transition rejected")
             raise InvalidTransitionError(
-                "only a human can start observation of the user's final submission"
+                f"actor {actor.value} is not allowed for transition "
+                f"from {task.status.value} to {target.value}"
             )
         return applications.transition(
             db,
@@ -170,6 +160,7 @@ class ApplicationService:
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
+    "ALLOWED_TRANSITION_ACTORS",
     "ApplicationService",
     "InvalidTransitionError",
     "StaleTaskVersionError",

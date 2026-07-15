@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     object_store_secret_key: str = "minioadmin"
     object_encryption_key: str
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    trusted_proxy_cidrs: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -78,11 +79,17 @@ class Settings(BaseSettings):
             raise ValueError("APP_AUTH_SECRET must be replaced in production")
         if self.is_production and self.checkpoint_backend != "redis":
             raise ValueError("production requires CHECKPOINT_BACKEND=redis")
-        if self.is_production and (
-            self.object_store_access_key.lower()
-            in {"minioadmin", "replace-me", "changeme"}
-            or self.object_store_secret_key.lower()
-            in {"minioadmin", "replace-me", "changeme"}
+        object_credentials = (
+            self.object_store_access_key,
+            self.object_store_secret_key,
+        )
+        if self.is_production and any(
+            value.strip().lower()
+            in {"minioadmin", "${minio_root_user}", "${minio_root_password}"}
+            or value.strip().lower().startswith(
+                ("replace-with-", "replace-me", "changeme")
+            )
+            for value in object_credentials
         ):
             raise ValueError("OBJECT_STORE credentials must be replaced in production")
         return self

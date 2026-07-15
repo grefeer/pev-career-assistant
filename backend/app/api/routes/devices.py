@@ -47,6 +47,8 @@ class DeviceSummary(BaseModel):
     version: str | None
     paired_at: datetime
     last_seen_at: datetime | None
+    expires_at: datetime
+    credential_rotated_at: datetime | None
     online: bool
 
 
@@ -83,6 +85,8 @@ def device_summary(device: Device, *, online: bool) -> DeviceSummary:
         version=device.version,
         paired_at=device.paired_at,
         last_seen_at=device.last_seen_at,
+        expires_at=device.expires_at,
+        credential_rotated_at=device.credential_rotated_at,
         online=online,
     )
 
@@ -178,7 +182,10 @@ def create_task_lease(
 
     try:
         lease = service.issue_task_lease(
-            db, device=device, task_id=body.task_id, scopes={"task:read", "task:event"}
+            db,
+            device=device,
+            task_id=body.task_id,
+            scopes={"task:progress", "task:result"},
         )
     except InvalidTaskLeaseError:
         raise HTTPException(status_code=403, detail="任务未分配给当前设备。") from None

@@ -266,6 +266,18 @@ def test_login_rejects_unreasonably_large_password(client) -> None:
     assert response.status_code == 422
 
 
+def test_password_leading_and_trailing_spaces_are_preserved(client) -> None:
+    password = "  secret12  "
+    registered = client.post("/api/auth/register", json={
+        "account": " spaced-user ", "nickname": " Spaced User ", "password": password,
+    })
+    assert registered.status_code == 200
+    assert registered.json()["profile"]["account"] == "spaced-user"
+    assert registered.json()["profile"]["nickname"] == "Spaced User"
+    assert client.post("/api/auth/login", json={"account": " spaced-user ", "password": password}).status_code == 200
+    assert client.post("/api/auth/login", json={"account": "spaced-user", "password": password.strip()}).status_code == 401
+
+
 def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
     database_path = tmp_path / "factory.sqlite"
     url = f"sqlite+pysqlite:///{database_path.as_posix()}"
@@ -304,13 +316,14 @@ def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
 
 def test_public_auth_rate_limit_returns_429(client) -> None:
     class Limiter:
-        calls = 0
+        calls: dict[str, int] = {}
 
         def check(self, **kwargs):
             from backend.app.services.rate_limit import RateLimitExceededError
 
-            self.calls += 1
-            if self.calls > 1:
+            action = kwargs["action"]
+            self.calls[action] = self.calls.get(action, 0) + 1
+            if action == "login-account" and self.calls[action] > 1:
                 raise RateLimitExceededError
 
     client.app.state.auth_rate_limiter = Limiter()

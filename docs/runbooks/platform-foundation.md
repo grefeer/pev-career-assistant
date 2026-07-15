@@ -62,6 +62,10 @@ docker compose up --build -d
 docker compose ps
 ```
 
+开发 Compose 固定使用 `APP_ENV=development`，并把后端宿主端口只绑定到 `127.0.0.1`。浏览器流量应走 Nginx 前端：前端与后端共享独立的固定 `proxy` 网络，Uvicorn 关闭通用 proxy-header 信任，应用只在连接对端属于该网络的 `TRUSTED_PROXY_CIDRS` 时读取由 Nginx 覆写的 `X-Real-IP`，并忽略客户端提供的 `X-Forwarded-For`。不得把 `TRUSTED_PROXY_CIDRS` 设置为 `0.0.0.0/0` 或在公网开放后端 8000 端口。
+
+生产部署必须使用独立 Compose overlay 或编排配置显式设置 `APP_ENV=production`，注入真实对象存储凭据并配置实际反向代理的最小 CIDR；不能直接把本开发 Compose 当作生产配置。登录限流使用“账号摘要低阈值 + 可信客户端 IP 高阈值”，注册使用 IP 桶，Redis key 不保存原账号。反向代理拓扑变化时须先通过伪造 header 和多客户端隔离测试。
+
 停止容器但保留卷：
 
 ```powershell
