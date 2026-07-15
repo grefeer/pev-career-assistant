@@ -83,6 +83,7 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     if shutil.which("docker") is None:
         pytest.skip("docker compose is not available")
     redis_password = "compose-review p@ss:/?#%"
+    tencent_token = f"compose-tencent-{uuid4().hex}"
     environment = {
         **os.environ,
         "DB_PASSWORD": "compose-db p@ss:/?#%",
@@ -91,6 +92,7 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
         "MINIO_ROOT_PASSWORD": "compose-minio-password-not-public",
         "APP_AUTH_SECRET": "a" * 32,
         "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
+        "TENCENT_DOCS_TOKEN": tencent_token,
     }
 
     completed = subprocess.run(
@@ -117,6 +119,12 @@ def test_compose_resolved_command_never_contains_redis_password() -> None:
     assert (
         backend_environment["OBJECT_STORE_SECRET_KEY"]
         == environment["MINIO_ROOT_PASSWORD"]
+    )
+    assert backend_environment["TENCENT_DOCS_TOKEN"] == tencent_token
+    assert all(
+        "TENCENT_DOCS_TOKEN" not in service.get("environment", {})
+        for service_name, service in config["services"].items()
+        if service_name != "backend"
     )
     assert (
         config["services"]["migrate"]["image"] == config["services"]["backend"]["image"]

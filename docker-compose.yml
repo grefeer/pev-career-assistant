@@ -101,7 +101,9 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-    environment: *backend-environment
+    environment:
+      <<: *backend-environment
+      TENCENT_DOCS_TOKEN: ${TENCENT_DOCS_TOKEN:-}
     networks:
       - default
       - proxy

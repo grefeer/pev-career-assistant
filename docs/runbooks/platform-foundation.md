@@ -153,7 +153,7 @@ $secureAdminJwt.Dispose()
 - HTTP `503`：令牌缺失、鉴权失败、限流重试耗尽、腾讯服务不可用或数据库写入失败；按稳定 `error_code` 检查配置与依赖状态。
 - HTTP `504`：腾讯请求在重试后仍超时；检查网络和上游状态后重新运行。
 
-失败响应只应包含稳定 `error_code` 和 `run_id`，不得把腾讯原始响应、令牌或原始记录载荷复制到日志或工单。`GET /api/jobs` 和 `GET /api/jobs/{job_id}` 需要已认证用户，仅返回 `PENDING_COMPLETION` 职位；这些职位尚未核验，也不具备投递授权。
+对于已创建同步运行后由 `JobSyncFailedError` 返回的 5xx 失败响应，`detail` 只应包含稳定 `error_code` 和 `run_id`；404、409 和认证授权错误遵循各自的标准响应。任何响应都不得包含腾讯原始响应、令牌或原始记录载荷，也不得把这些内容复制到日志或工单。`GET /api/jobs` 和 `GET /api/jobs/{job_id}` 需要已认证用户，仅返回 `PENDING_COMPLETION` 职位；这些职位尚未核验，也不具备投递授权。
 
 ## 撤销设备
 
