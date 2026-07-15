@@ -1,6 +1,9 @@
 import asyncio
+from builtins import BaseExceptionGroup, ExceptionGroup
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, contextmanager
 
+import httpx
 from mcp import types
 import pytest
 
@@ -384,4 +387,105 @@ def test_sdk_malformed_success_text_is_protocol_error_without_retry() -> None:
 
     with pytest.raises(TencentProtocolError):
         gateway.list_fields("file", "sheet")
+    assert attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("response_factory", "error_type"),
+    [
+        (
+            lambda request: httpx.Response(429, request=request),
+            TencentRateLimitError,
+        ),
+        (
+            lambda request: httpx.Response(503, request=request),
+            TencentUnavailableError,
+        ),
+        (
+            lambda request: (_ for _ in ()).throw(
+                httpx.ConnectError("connection failed", request=request)
+            ),
+            TencentUnavailableError,
+        ),
+    ],
+)
+def test_production_transport_retries_grouped_retryable_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    response_factory: Callable[[httpx.Request], httpx.Response],
+    error_type: type[Exception],
+) -> None:
+    attempts = 0
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return response_factory(request)
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(gateway_module.httpx, "AsyncClient", client_factory)
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", sleeper=lambda _seconds: None
+    )
+
+    with pytest.raises(error_type):
+        gateway.list_fields("file", "sheet")
+    assert attempts == 3
+
+
+def test_transport_group_with_unrelated_leaf_is_not_retried() -> None:
+    attempts = 0
+    request = httpx.Request("POST", "https://example.invalid")
+    grouped_error = ExceptionGroup(
+        "mixed transport failures",
+        [
+            httpx.ConnectError("connection failed", request=request),
+            ValueError("unrelated failure"),
+        ],
+    )
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise grouped_error
+
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token",
+        tool_caller=call,
+        sleeper=lambda _seconds: None,
+    )
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        gateway.list_fields("file", "sheet")
+    assert exc_info.value is grouped_error
+    assert attempts == 1
+
+
+def test_transport_group_with_unrelated_base_exception_is_not_retried() -> None:
+    attempts = 0
+    request = httpx.Request("POST", "https://example.invalid")
+    grouped_error = BaseExceptionGroup(
+        "mixed transport failures",
+        [
+            httpx.ConnectError("connection failed", request=request),
+            BaseExceptionGroup("cancellation", [KeyboardInterrupt()]),
+        ],
+    )
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise grouped_error
+
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token",
+        tool_caller=call,
+        sleeper=lambda _seconds: None,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        gateway.list_fields("file", "sheet")
+    assert exc_info.value is grouped_error
     assert attempts == 1

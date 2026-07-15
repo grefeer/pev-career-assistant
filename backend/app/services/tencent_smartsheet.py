@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from builtins import BaseExceptionGroup
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
@@ -143,15 +144,23 @@ class TencentSmartsheetGateway:
         last_error: TencentGatewayError | None = None
         for attempt in range(3):
             try:
-                payload = self.tool_caller(tool, arguments)
-                error = str(payload.get("error", ""))
-                if "400006" in error or "400007" in error:
-                    raise TencentAuthError("Tencent authorization failed")
-                if "400008" in error:
-                    raise TencentRateLimitError("Tencent rate limit exceeded")
-                if error:
-                    raise TencentUnavailableError("Tencent service unavailable")
-                return payload
+                try:
+                    payload = self.tool_caller(tool, arguments)
+                    error = str(payload.get("error", ""))
+                    if "400006" in error or "400007" in error:
+                        raise TencentAuthError("Tencent authorization failed")
+                    if "400008" in error:
+                        raise TencentRateLimitError("Tencent rate limit exceeded")
+                    if error:
+                        raise TencentUnavailableError(
+                            "Tencent service unavailable"
+                        )
+                    return payload
+                except BaseExceptionGroup as exc:
+                    retryable = _retryable_transport_leaf(exc)
+                    if retryable is None:
+                        raise
+                    raise retryable from exc
             except TencentAuthError:
                 raise
             except TencentProtocolError:
@@ -321,3 +330,46 @@ def _is_integer_code(value: object) -> bool:
         return False
     stripped = value.strip()
     return bool(stripped) and stripped.lstrip("+-").isdigit()
+
+
+def _retryable_transport_leaf(
+    group: BaseExceptionGroup[BaseException],
+) -> Exception | None:
+    leaves = _exception_group_leaves(group)
+    if not leaves or any(not _is_retryable_transport_error(leaf) for leaf in leaves):
+        return None
+    for leaf in leaves:
+        if (
+            isinstance(leaf, httpx.HTTPStatusError)
+            and leaf.response.status_code == 429
+        ):
+            return leaf
+    return leaves[0]
+
+
+def _exception_group_leaves(
+    group: BaseExceptionGroup[BaseException],
+) -> list[Exception] | None:
+    leaves: list[Exception] = []
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            nested_leaves = _exception_group_leaves(error)
+            if nested_leaves is None:
+                return None
+            leaves.extend(nested_leaves)
+        elif isinstance(error, Exception):
+            leaves.append(error)
+        else:
+            return None
+    return leaves
+
+
+def _is_retryable_transport_error(error: Exception) -> bool:
+    if isinstance(error, (TimeoutError, httpx.TimeoutException)):
+        return True
+    if isinstance(error, (httpx.ConnectError, httpx.NetworkError)):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status == 429 or 500 <= status < 600
+    return False
