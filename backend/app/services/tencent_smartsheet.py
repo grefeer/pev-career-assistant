@@ -7,6 +7,7 @@ import json
 import time
 from typing import Any, Protocol, TypeGuard
 
+from anyio import fail_after
 import httpx
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
@@ -100,25 +101,38 @@ class TencentSmartsheetGateway:
         if not self.token:
             raise TencentTokenMissingError("Tencent Docs token is not configured")
         headers = {"Authorization": self.token}
-        async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
-            async with streamable_http_client(
-                TENCENT_MCP_ENDPOINT, http_client=client
-            ) as (read_stream, write_stream, _):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool, arguments=arguments)
+        with fail_after(15.0):
+            async with httpx.AsyncClient(headers=headers, timeout=15.0) as client:
+                async with streamable_http_client(
+                    TENCENT_MCP_ENDPOINT, http_client=client
+                ) as (read_stream, write_stream, _):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        result = await session.call_tool(tool, arguments=arguments)
+        return self._parse_tool_result(result)
+
+    def _parse_tool_result(
+        self, result: types.CallToolResult
+    ) -> dict[str, object]:
         if result.isError:
-            text = " ".join(
-                block.text
-                for block in result.content
-                if isinstance(block, types.TextContent)
-            )
-            raise TencentUnavailableError(text)
+            error_code = _extract_tool_error_code(result)
+            if error_code in {400006, 400007}:
+                raise TencentAuthError("Tencent authorization failed")
+            if error_code in {400008, 429}:
+                raise TencentRateLimitError("Tencent rate limit exceeded")
+            if error_code is not None and 500 <= error_code < 600:
+                raise TencentUnavailableError("Tencent service unavailable")
+            raise TencentProtocolError("Tencent MCP returned a tool error")
         if isinstance(result.structuredContent, dict):
             return dict(result.structuredContent)
         for block in result.content:
             if isinstance(block, types.TextContent):
-                parsed = json.loads(block.text)
+                try:
+                    parsed = json.loads(block.text)
+                except json.JSONDecodeError:
+                    raise TencentProtocolError(
+                        "Tencent MCP returned malformed JSON"
+                    ) from None
                 if isinstance(parsed, dict):
                     return parsed
         raise TencentProtocolError("Tencent MCP returned no object payload")
@@ -144,6 +158,8 @@ class TencentSmartsheetGateway:
                 raise
             except TencentRateLimitError:
                 last_error = TencentRateLimitError("Tencent rate limit exceeded")
+            except TencentUnavailableError:
+                last_error = TencentUnavailableError("Tencent service unavailable")
             except (TimeoutError, httpx.TimeoutException):
                 last_error = TencentTimeoutError("Tencent request timed out")
             except (httpx.ConnectError, httpx.NetworkError):
@@ -266,3 +282,42 @@ def _is_positive_int(value: object) -> TypeGuard[int]:
 
 def _is_non_empty_string(value: object) -> TypeGuard[str]:
     return isinstance(value, str) and bool(value)
+
+
+def _extract_tool_error_code(result: types.CallToolResult) -> int | None:
+    if isinstance(result.structuredContent, Mapping):
+        code = _numeric_error_code(result.structuredContent)
+        if code is not None:
+            return code
+    for block in result.content:
+        if not isinstance(block, types.TextContent):
+            continue
+        text = block.text.strip()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+        if isinstance(parsed, Mapping):
+            code = _numeric_error_code(parsed)
+            if code is not None:
+                return code
+        elif _is_integer_code(text):
+            return int(text)
+    return None
+
+
+def _numeric_error_code(payload: Mapping[str, object]) -> int | None:
+    for key in ("code", "error_code"):
+        value = payload.get(key)
+        if _is_integer_code(value):
+            return int(value)
+    return None
+
+
+def _is_integer_code(value: object) -> bool:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return True
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    return bool(stripped) and stripped.lstrip("+-").isdigit()

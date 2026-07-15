@@ -1,11 +1,17 @@
+import asyncio
+from contextlib import AbstractAsyncContextManager, contextmanager
+
+from mcp import types
 import pytest
 
+from backend.app.services import tencent_smartsheet as gateway_module
 from backend.app.services.tencent_smartsheet import (
     TencentAuthError,
     TencentProtocolError,
     TencentRateLimitError,
     TencentSmartsheetGateway,
     TencentTokenMissingError,
+    TencentUnavailableError,
 )
 
 
@@ -188,3 +194,194 @@ def test_list_fields_parses_fields() -> None:
     assert calls == [
         ("smartsheet.list_fields", {"file_id": "file", "sheet_id": "sheet"})
     ]
+
+
+def test_mcp_lifecycle_runs_inside_fifteen_second_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deadline_active = False
+
+    @contextmanager
+    def fail_after(seconds: float):
+        nonlocal deadline_active
+        assert seconds == 15.0
+        deadline_active = True
+        try:
+            yield
+        finally:
+            deadline_active = False
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            assert deadline_active
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            assert deadline_active
+
+    class FakeStreamContext:
+        async def __aenter__(self) -> tuple[object, object, object]:
+            assert deadline_active
+            return object(), object(), object()
+
+        async def __aexit__(self, *_args: object) -> None:
+            assert deadline_active
+
+    class FakeSession:
+        def __init__(self, *_args: object) -> None:
+            assert deadline_active
+
+        async def __aenter__(self) -> "FakeSession":
+            assert deadline_active
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            assert deadline_active
+
+        async def initialize(self) -> None:
+            assert deadline_active
+
+        async def call_tool(
+            self, _tool: str, *, arguments: dict[str, object]
+        ) -> types.CallToolResult:
+            assert deadline_active
+            return types.CallToolResult(
+                content=[], structuredContent={"error": "", "fields": []}
+            )
+
+    def stream_client(
+        _endpoint: str, *, http_client: object
+    ) -> AbstractAsyncContextManager[tuple[object, object, object]]:
+        assert deadline_active
+        assert isinstance(http_client, FakeAsyncClient)
+        return FakeStreamContext()
+
+    monkeypatch.setattr(gateway_module, "fail_after", fail_after, raising=False)
+    monkeypatch.setattr(gateway_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(gateway_module, "streamable_http_client", stream_client)
+    monkeypatch.setattr(gateway_module, "ClientSession", FakeSession)
+
+    gateway = TencentSmartsheetGateway(token="placeholder-token")
+    payload = asyncio.run(gateway._mcp_call("smartsheet.list_fields", {}))
+
+    assert payload == {"error": "", "fields": []}
+    assert deadline_active is False
+
+
+@pytest.mark.parametrize(
+    ("result", "error_type"),
+    [
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[],
+                structuredContent={"code": 400006},
+            ),
+            TencentAuthError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[],
+                structuredContent={"error_code": "400007"},
+            ),
+            TencentAuthError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text='{"code": 400008}')],
+            ),
+            TencentRateLimitError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text="429")],
+            ),
+            TencentRateLimitError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text='{"code": 503}')],
+            ),
+            TencentUnavailableError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text='{"code": -32602}')],
+            ),
+            TencentProtocolError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text="service unavailable")],
+            ),
+            TencentProtocolError,
+        ),
+        (
+            types.CallToolResult(
+                isError=True,
+                content=[types.TextContent(type="text", text='"503"')],
+            ),
+            TencentProtocolError,
+        ),
+    ],
+)
+def test_sdk_tool_errors_are_classified_before_retry(
+    result: types.CallToolResult,
+    error_type: type[Exception],
+) -> None:
+    gateway = TencentSmartsheetGateway(token="placeholder-token")
+
+    with pytest.raises(error_type):
+        gateway._parse_tool_result(result)
+
+
+def test_sdk_unavailable_tool_error_retries_at_most_three_attempts() -> None:
+    attempts = 0
+    result = types.CallToolResult(
+        isError=True,
+        content=[types.TextContent(type="text", text='{"code": 503}')],
+    )
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", sleeper=lambda _seconds: None
+    )
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        return gateway._parse_tool_result(result)
+
+    gateway.tool_caller = call
+
+    with pytest.raises(TencentUnavailableError):
+        gateway.list_fields("file", "sheet")
+    assert attempts == 3
+
+
+def test_sdk_malformed_success_text_is_protocol_error_without_retry() -> None:
+    attempts = 0
+    result = types.CallToolResult(
+        content=[types.TextContent(type="text", text="{malformed")]
+    )
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", sleeper=lambda _seconds: None
+    )
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        return gateway._parse_tool_result(result)
+
+    gateway.tool_caller = call
+
+    with pytest.raises(TencentProtocolError):
+        gateway.list_fields("file", "sheet")
+    assert attempts == 1
