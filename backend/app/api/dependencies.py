@@ -13,6 +13,8 @@ from backend.app.config import get_settings
 from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
+from backend.app.services.job_sync import JobSyncService
+from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -36,6 +38,15 @@ def get_redis(request: Request):
     return request.app.state.redis
 
 
+def get_job_sync_service(request: Request) -> JobSyncService:
+    injected = getattr(request.app.state, "job_sync_service", None)
+    if injected is not None:
+        return cast(JobSyncService, injected)
+    secret = request.app.state.settings.tencent_docs_token
+    token = secret.get_secret_value() if secret is not None else None
+    return JobSyncService(TencentSmartsheetGateway(token=token))
+
+
 def get_device_service(request: Request, redis_client=Depends(get_redis)):
     from backend.app.services.devices import DeviceService
 
@@ -45,8 +56,13 @@ def get_device_service(request: Request, redis_client=Depends(get_redis)):
 
 
 def _require_task_scope(
-    *, db: Session, device: Device, service, task_id: str | None,
-    task_lease: str | None, required_scope: str,
+    *,
+    db: Session,
+    device: Device,
+    service,
+    task_id: str | None,
+    task_lease: str | None,
+    required_scope: str,
 ) -> Device:
     from backend.app.services.devices import InvalidTaskLeaseError
 
@@ -54,7 +70,10 @@ def _require_task_scope(
         raise HTTPException(status_code=401, detail="任务租约无效。")
     try:
         service.verify_task_lease(
-            db, task_lease, device=device, task_id=task_id,
+            db,
+            task_lease,
+            device=device,
+            task_id=task_id,
             required_scope=required_scope,
         )
     except InvalidTaskLeaseError:
@@ -70,8 +89,12 @@ def require_task_progress_lease(
     task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
 ) -> Device:
     return _require_task_scope(
-        db=db, device=device, service=service, task_id=task_id,
-        task_lease=task_lease, required_scope="task:progress",
+        db=db,
+        device=device,
+        service=service,
+        task_id=task_id,
+        task_lease=task_lease,
+        required_scope="task:progress",
     )
 
 
@@ -83,8 +106,12 @@ def require_task_result_lease(
     task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
 ) -> Device:
     return _require_task_scope(
-        db=db, device=device, service=service, task_id=task_id,
-        task_lease=task_lease, required_scope="task:result",
+        db=db,
+        device=device,
+        service=service,
+        task_id=task_id,
+        task_lease=task_lease,
+        required_scope="task:result",
     )
 
 
