@@ -6,7 +6,7 @@ import binascii
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     object_encryption_key: str
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     trusted_proxy_cidrs: str = ""
+    tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
 
     @property
     def is_production(self) -> bool:
