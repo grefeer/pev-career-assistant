@@ -22,18 +22,14 @@ def text(field: str, value: str) -> dict[str, object]:
 def texts(field: str, *values: str) -> dict[str, object]:
     return {
         "field": field,
-        "text_value": {
-            "items": [{"text": value, "type": "text"} for value in values]
-        },
+        "text_value": {"items": [{"text": value, "type": "text"} for value in values]},
     }
 
 
 def url(field: str, value: str) -> dict[str, object]:
     return {
         "field": field,
-        "url_value": {
-            "items": [{"text": "点击内推", "type": "url", "link": value}]
-        },
+        "url_value": {"items": [{"text": "点击内推", "type": "url", "link": value}]},
     }
 
 
@@ -73,6 +69,10 @@ def test_builtin_sources_are_fixed_and_versioned() -> None:
     ]
     assert [source.sheet_id for source in BUILTIN_SOURCES] == ["t00i2h", "BB08J2"]
     assert [source.mapper_version for source in BUILTIN_SOURCES] == ["v1", "v1"]
+    assert all(
+        source.mapper_version == MAPPERS[source.source_key].version
+        for source in BUILTIN_SOURCES
+    )
 
 
 def test_first_source_never_invents_a_title() -> None:
@@ -144,12 +144,55 @@ def test_invalid_apply_urls_are_skipped(invalid_url: str) -> None:
     ) == SkippedRecord("invalid_apply_url")
 
 
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "https://./jobs",
+        "https://-/jobs",
+        "https://example..com/jobs",
+        "https://-example.com/jobs",
+        "https://example-.com/jobs",
+        "https://exam_ple.com/jobs",
+        "https://" + "a" * 64 + ".com/jobs",
+        "https://example .com/jobs",
+        "https://999.999.999.999/jobs",
+        "https://example.com:not-a-port/jobs",
+        "https://example.com:70000/jobs",
+    ],
+)
+def test_malformed_hosts_and_ports_are_skipped(invalid_url: str) -> None:
+    assert MAPPERS["tencent-intern-referrals"].map(
+        intern_record(apply_url=invalid_url)
+    ) == SkippedRecord("invalid_apply_url")
+
+
+@pytest.mark.parametrize(
+    "apply_url",
+    [
+        "http://127.0.0.1/jobs",
+        "https://[2001:db8::1]:8443/jobs",
+        "https://例子.公司/职位",
+        "https://xn--fsqu00a.xn--55qx5d/jobs",
+    ],
+)
+def test_valid_ip_and_idna_hosts_are_allowed(apply_url: str) -> None:
+    result = MAPPERS["tencent-intern-referrals"].map(intern_record(apply_url=apply_url))
+    assert isinstance(result, NormalizedJobCandidate)
+    assert result.apply_url == apply_url
+
+
+def test_apply_url_normalizes_only_surrounding_whitespace() -> None:
+    result = MAPPERS["tencent-intern-referrals"].map(
+        intern_record(apply_url="  https://example.com/a%20b?next=a%20b  ")
+    )
+    assert isinstance(result, NormalizedJobCandidate)
+    assert result.apply_url == "https://example.com/a%20b?next=a%20b"
+
+
 def test_url_at_maximum_length_is_allowed() -> None:
     apply_url = "https://example.com/" + "a" * 4076
     assert len(apply_url) == 4096
-    result = MAPPERS["tencent-intern-referrals"].map(
-        intern_record(apply_url=apply_url)
-    )
+    result = MAPPERS["tencent-intern-referrals"].map(intern_record(apply_url=apply_url))
     assert isinstance(result, NormalizedJobCandidate)
     assert result.apply_url == apply_url
 

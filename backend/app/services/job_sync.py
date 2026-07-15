@@ -270,6 +270,19 @@ class JobSyncService:
                 committed_pages=pages_read,
             )
             raise JobSyncFailedError(run_id, status, "database_write_failed") from None
+        except Exception:
+            error_code = "job_sync_unexpected_error"
+            status = self._finish_failure(
+                db,
+                source_id=source_id,
+                source_key=persisted_source_key,
+                run_id=run_id,
+                actor_user_id=actor_user_id,
+                correlation_id=correlation_id,
+                error_code=error_code,
+                committed_pages=pages_read,
+            )
+            raise JobSyncFailedError(run_id, status, error_code) from None
 
     def _finish_failure(
         self,
@@ -327,7 +340,7 @@ class JobSyncService:
             )
             db.commit()
             return status
-        except (SQLAlchemyError, jobs.StaleSyncLeaseError):
+        except Exception:
             self._rollback_safely(db)
             status, _error_code = self._read_failure_state(
                 db,
@@ -352,7 +365,7 @@ class JobSyncService:
     def _rollback_safely(db: Session) -> None:
         try:
             db.rollback()
-        except SQLAlchemyError:
+        except Exception:
             pass
 
     @staticmethod
@@ -367,6 +380,6 @@ class JobSyncService:
             run = db.get(JobSyncRun, run_id)
             if run is not None and run.status is not JobSyncRunStatus.RUNNING:
                 return run.status, run.error_code or fallback_error_code
-        except SQLAlchemyError:
+        except Exception:
             pass
         return fallback_status, fallback_error_code

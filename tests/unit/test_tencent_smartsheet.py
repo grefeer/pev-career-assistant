@@ -390,6 +390,80 @@ def test_sdk_malformed_success_text_is_protocol_error_without_retry() -> None:
     assert attempts == 1
 
 
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_direct_http_auth_failure_is_not_retried(status_code: int) -> None:
+    attempts = 0
+    request = httpx.Request("POST", "https://example.invalid")
+    response = httpx.Response(status_code, request=request)
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.HTTPStatusError(
+            "secret rejected response", request=request, response=response
+        )
+
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", tool_caller=call, sleeper=lambda _seconds: None
+    )
+
+    with pytest.raises(TencentAuthError, match="authorization failed"):
+        gateway.list_fields("file", "sheet")
+    assert attempts == 1
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_production_transport_maps_grouped_auth_failure_without_retry(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    attempts = 0
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(status_code, request=request)
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(gateway_module.httpx, "AsyncClient", client_factory)
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", sleeper=lambda _seconds: None
+    )
+
+    with pytest.raises(TencentAuthError, match="authorization failed"):
+        gateway.list_fields("file", "sheet")
+    assert attempts == 1
+
+
+def test_grouped_auth_failure_with_unrelated_leaf_is_not_swallowed() -> None:
+    attempts = 0
+    request = httpx.Request("POST", "https://example.invalid")
+    response = httpx.Response(401, request=request)
+    grouped_error = ExceptionGroup(
+        "mixed transport failures",
+        [
+            httpx.HTTPStatusError("auth rejected", request=request, response=response),
+            ValueError("unrelated failure"),
+        ],
+    )
+
+    def call(_tool: str, _arguments: dict[str, object]) -> dict[str, object]:
+        nonlocal attempts
+        attempts += 1
+        raise grouped_error
+
+    gateway = TencentSmartsheetGateway(
+        token="placeholder-token", tool_caller=call, sleeper=lambda _seconds: None
+    )
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        gateway.list_fields("file", "sheet")
+    assert exc_info.value is grouped_error
+    assert attempts == 1
+
+
 @pytest.mark.parametrize(
     ("response_factory", "error_type"),
     [

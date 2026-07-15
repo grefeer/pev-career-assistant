@@ -112,9 +112,7 @@ class TencentSmartsheetGateway:
                         result = await session.call_tool(tool, arguments=arguments)
         return self._parse_tool_result(result)
 
-    def _parse_tool_result(
-        self, result: types.CallToolResult
-    ) -> dict[str, object]:
+    def _parse_tool_result(self, result: types.CallToolResult) -> dict[str, object]:
         if result.isError:
             error_code = _extract_tool_error_code(result)
             if error_code in {400006, 400007}:
@@ -138,9 +136,7 @@ class TencentSmartsheetGateway:
                     return parsed
         raise TencentProtocolError("Tencent MCP returned no object payload")
 
-    def _invoke(
-        self, tool: str, arguments: dict[str, object]
-    ) -> dict[str, object]:
+    def _invoke(self, tool: str, arguments: dict[str, object]) -> dict[str, object]:
         last_error: TencentGatewayError | None = None
         for attempt in range(3):
             try:
@@ -152,15 +148,13 @@ class TencentSmartsheetGateway:
                     if "400008" in error:
                         raise TencentRateLimitError("Tencent rate limit exceeded")
                     if error:
-                        raise TencentUnavailableError(
-                            "Tencent service unavailable"
-                        )
+                        raise TencentUnavailableError("Tencent service unavailable")
                     return payload
                 except BaseExceptionGroup as exc:
-                    retryable = _retryable_transport_leaf(exc)
-                    if retryable is None:
+                    transport_error = _classified_transport_leaf(exc)
+                    if transport_error is None:
                         raise
-                    raise retryable from exc
+                    raise transport_error from exc
             except TencentAuthError:
                 raise
             except TencentProtocolError:
@@ -175,12 +169,12 @@ class TencentSmartsheetGateway:
                 last_error = TencentUnavailableError("Tencent service unavailable")
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
+                if status in {401, 403}:
+                    raise TencentAuthError("Tencent authorization failed") from None
                 if status == 429:
                     last_error = TencentRateLimitError("Tencent rate limit exceeded")
                 elif 500 <= status < 600:
-                    last_error = TencentUnavailableError(
-                        "Tencent service unavailable"
-                    )
+                    last_error = TencentUnavailableError("Tencent service unavailable")
                 else:
                     raise TencentProtocolError(
                         "Tencent MCP request was rejected"
@@ -212,9 +206,7 @@ class TencentSmartsheetGateway:
             ):
                 raise TencentProtocolError("Tencent MCP returned malformed fields")
             parsed_fields.append(
-                TencentField(
-                    field_id=field_id, title=title, field_type=field_type
-                )
+                TencentField(field_id=field_id, title=title, field_type=field_type)
             )
         return parsed_fields
 
@@ -259,9 +251,7 @@ class TencentSmartsheetGateway:
             parsed_field_values: list[dict[str, Any]] = []
             for field_value in field_values:
                 if not isinstance(field_value, Mapping):
-                    raise TencentProtocolError(
-                        "Tencent MCP returned malformed records"
-                    )
+                    raise TencentProtocolError("Tencent MCP returned malformed records")
                 parsed_field_values.append(dict(field_value))
             parsed_records.append(
                 TencentRecord(
@@ -278,7 +268,9 @@ class TencentSmartsheetGateway:
 
 
 def _is_object_sequence(value: object) -> TypeGuard[Sequence[object]]:
-    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+    return isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    )
 
 
 def _is_non_negative_int(value: object) -> TypeGuard[int]:
@@ -332,19 +324,27 @@ def _is_integer_code(value: object) -> bool:
     return bool(stripped) and stripped.lstrip("+-").isdigit()
 
 
-def _retryable_transport_leaf(
+def _classified_transport_leaf(
     group: BaseExceptionGroup[BaseException],
 ) -> Exception | None:
     leaves = _exception_group_leaves(group)
-    if not leaves or any(not _is_retryable_transport_error(leaf) for leaf in leaves):
+    if not leaves:
+        return None
+    if all(_is_auth_transport_error(leaf) for leaf in leaves):
+        return leaves[0]
+    if any(not _is_retryable_transport_error(leaf) for leaf in leaves):
         return None
     for leaf in leaves:
-        if (
-            isinstance(leaf, httpx.HTTPStatusError)
-            and leaf.response.status_code == 429
-        ):
+        if isinstance(leaf, httpx.HTTPStatusError) and leaf.response.status_code == 429:
             return leaf
     return leaves[0]
+
+
+def _is_auth_transport_error(error: Exception) -> bool:
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {
+        401,
+        403,
+    }
 
 
 def _exception_group_leaves(

@@ -273,6 +273,30 @@ def test_job_detail_whitelists_fields(
         assert forbidden not in serialized
 
 
+def test_job_api_serializes_naive_database_datetimes_as_utc(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    naive = datetime(2026, 7, 15, 10, 30)
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        persisted.updated_at = naive
+        persisted.source_updated_at = naive
+        db.commit()
+
+    detail = client.get(f"/api/jobs/{posting.id}", headers=seeded["student_headers"])
+    listed = client.get("/api/jobs", headers=seeded["student_headers"])
+
+    assert detail.status_code == 200
+    assert detail.json()["updated_at"] == "2026-07-15T10:30:00Z"
+    assert detail.json()["source_updated_at"] == "2026-07-15T10:30:00Z"
+    listed_posting = next(
+        job for job in listed.json()["jobs"] if job["id"] == posting.id
+    )
+    assert listed_posting["updated_at"] == "2026-07-15T10:30:00Z"
+
+
 def test_unknown_job_returns_404(client: TestClient, seeded: dict[str, Any]) -> None:
     response = client.get("/api/jobs/not-a-job", headers=seeded["student_headers"])
     assert response.status_code == 404
@@ -309,6 +333,7 @@ def test_sync_maps_source_errors(
         ("tencent_rate_limited", 503),
         ("tencent_unavailable", 503),
         ("database_write_failed", 503),
+        ("job_sync_unexpected_error", 503),
         ("tencent_timeout", 504),
     ],
 )

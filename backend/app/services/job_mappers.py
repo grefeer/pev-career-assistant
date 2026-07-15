@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import ipaddress
 import re
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -154,19 +155,52 @@ def _source_updated_at(record: TencentRecord) -> datetime | None:
         return None
 
 
-def _is_valid_url(value: str) -> bool:
-    if len(value) > 4096 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+def _normalize_url(value: str) -> str | None:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    normalized = value.strip()
+    if not normalized or len(normalized) > 4096:
+        return None
+    try:
+        parsed = urlsplit(normalized)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _is_valid_hostname(hostname)
+    ):
+        return None
+    return normalized
+
+
+def _is_valid_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    if ":" in hostname:
         return False
     try:
-        parsed = urlsplit(value)
-        hostname = parsed.hostname
-    except ValueError:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
         return False
-    return (
-        parsed.scheme.lower() in {"http", "https"}
-        and hostname is not None
-        and parsed.username is None
-        and parsed.password is None
+    if len(ascii_hostname) > 253:
+        return False
+    labels = ascii_hostname.split(".")
+    if all(label.isdigit() for label in labels):
+        return False
+    return all(
+        1 <= len(label) <= 63
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
     )
 
 
@@ -216,7 +250,8 @@ class TencentInternReferralsMapper:
         apply_url = _url(record, "投递链接")
         if apply_url is None:
             return SkippedRecord("missing_apply_url")
-        if not _is_valid_url(apply_url):
+        apply_url = _normalize_url(apply_url)
+        if apply_url is None:
             return SkippedRecord("invalid_apply_url")
         return NormalizedJobCandidate(
             company_name=company_name,

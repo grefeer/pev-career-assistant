@@ -484,3 +484,96 @@ def test_cleanup_database_failure_does_not_mask_gateway_error(
 
     assert caught.value.error_code == "source_schema_changed"
     assert caught.value.status is JobSyncRunStatus.FAILED
+
+
+def test_unexpected_gateway_error_is_sanitized_and_finalizes_owned_run(
+    db: Session,
+) -> None:
+    gateway = FakeGateway(fields=intern_fields(), pages={})
+
+    def fail_unexpectedly(_file_id: str, _sheet_id: str) -> list[TencentField]:
+        raise RuntimeError("secret unexpected upstream detail")
+
+    gateway.list_fields = fail_unexpectedly  # type: ignore[method-assign]
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.args == ("job_sync_unexpected_error",)
+    assert caught.value.__cause__ is None
+    assert caught.value.error_code == "job_sync_unexpected_error"
+    assert caught.value.status is JobSyncRunStatus.FAILED
+    run = db.get(JobSyncRun, caught.value.run_id)
+    assert run is not None
+    assert run.status is JobSyncRunStatus.FAILED
+    assert run.error_code == "job_sync_unexpected_error"
+    source = jobs.get_source(db, INTERN_SOURCE)
+    assert source is not None
+    assert source.active_sync_run_id is None
+    assert source.sync_lease_expires_at is None
+    finished = db.scalar(
+        select(AuditEvent).where(AuditEvent.event_type == "job_sync.finished")
+    )
+    assert finished is not None
+    assert finished.redacted_payload["error_code"] == "job_sync_unexpected_error"
+    assert "secret unexpected upstream detail" not in repr(finished.redacted_payload)
+
+
+def test_unexpected_error_after_committed_page_remains_partial(db: Session) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 2, True, 1)},
+    )
+
+    def fail_second_page(
+        _file_id: str, _sheet_id: str, *, offset: int, limit: int
+    ) -> TencentRecordPage:
+        if offset == 0:
+            return gateway.pages[0]
+        raise ValueError("secret mapper-adjacent detail")
+
+    gateway.list_records = fail_second_page  # type: ignore[method-assign]
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.error_code == "job_sync_unexpected_error"
+    assert caught.value.status is JobSyncRunStatus.PARTIAL
+    assert scalar_count(db, JobPosting) == 1
+
+
+def test_unexpected_cleanup_error_does_not_mask_sanitized_failure(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = FakeGateway(fields=intern_fields(), pages={})
+    gateway.list_fields = lambda *_: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("secret original detail")
+    )
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> JobSyncRun:
+        raise RuntimeError("secret cleanup detail")
+
+    monkeypatch.setattr(jobs, "finish_sync_run", fail_cleanup)
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.args == ("job_sync_unexpected_error",)
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt(), SystemExit()])
+def test_process_control_exceptions_are_not_wrapped(
+    db: Session, signal: BaseException
+) -> None:
+    gateway = FakeGateway(fields=intern_fields(), pages={})
+
+    def interrupt(_file_id: str, _sheet_id: str) -> list[TencentField]:
+        raise signal
+
+    gateway.list_fields = interrupt  # type: ignore[method-assign]
+
+    with pytest.raises(type(signal)) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value is signal

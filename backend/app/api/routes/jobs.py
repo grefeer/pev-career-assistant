@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import (
@@ -27,6 +27,14 @@ from backend.app.services.job_sync import JobSyncFailedError, JobSyncService
 router = APIRouter(tags=["jobs"])
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class JobSyncResponse(BaseModel):
     run_id: str
     source_key: str
@@ -39,6 +47,10 @@ class JobSyncResponse(BaseModel):
     records_skipped_incomplete: int
     started_at: datetime
     finished_at: datetime
+
+    _normalize_datetimes = field_validator("started_at", "finished_at", mode="before")(
+        _as_utc
+    )
 
 
 class JobSummary(BaseModel):
@@ -55,6 +67,8 @@ class JobSummary(BaseModel):
     source_name: str
     updated_at: datetime
 
+    _normalize_updated_at = field_validator("updated_at", mode="before")(_as_utc)
+
 
 class JobListResponse(BaseModel):
     total: int
@@ -65,6 +79,10 @@ class JobDetail(JobSummary):
     referral_code: str | None
     source_updated_at: datetime | None
     mapper_version: str
+
+    _normalize_source_updated_at = field_validator("source_updated_at", mode="before")(
+        _as_utc
+    )
 
 
 def _job_summary(posting: JobPosting, source: JobSource) -> JobSummary:

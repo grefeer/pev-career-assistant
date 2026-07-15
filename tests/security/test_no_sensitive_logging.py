@@ -312,6 +312,50 @@ def test_job_sync_failure_redacts_gateway_details_from_logs_and_response(
         assert not _contains_sensitive_value(record.__dict__, sensitive_values)
 
 
+def test_unexpected_job_sync_failure_redacts_details_from_logs_and_response(
+    client: TestClient,
+) -> None:
+    sensitive_detail = "ordinary-exception-secret-upstream-detail"
+
+    class FailingGateway:
+        def list_fields(self, _file_id: str, _sheet_id: str) -> list[object]:
+            raise RuntimeError(sensitive_detail)
+
+        def list_records(self, *_args: object, **_kwargs: object) -> object:
+            raise AssertionError("record listing must not follow a field-list failure")
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        admin = User(
+            account="unexpected-sync-log-admin",
+            nickname="Unexpected Sync Log Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
+        )
+        db.add(admin)
+        db.commit()
+        db.refresh(admin)
+        headers = {
+            "Authorization": (
+                f"Bearer {AuthService(client.app.state.settings).issue_user_token(admin)}"
+            )
+        }
+
+    client.app.state.job_sync_service = JobSyncService(FailingGateway())  # type: ignore[arg-type]
+    with _capture_application_logs() as capture:
+        response = client.post(
+            "/api/admin/job-sources/tencent-intern-referrals/sync",
+            headers=headers,
+        )
+
+    combined_output = response.text + "\n" + "\n".join(capture.formatted)
+    assert response.status_code == 503
+    assert response.json()["detail"]["error_code"] == "job_sync_unexpected_error"
+    assert sensitive_detail not in combined_output
+    for record in capture.records:
+        assert not _contains_sensitive_value(record.args, (sensitive_detail,))
+        assert not _contains_sensitive_value(record.__dict__, (sensitive_detail,))
+
+
 @pytest.mark.parametrize("mutation", ["exception", "args", "nested_extra"])
 def test_sensitive_log_capture_detects_indirect_leaks_without_echoing_value(
     mutation: str,
