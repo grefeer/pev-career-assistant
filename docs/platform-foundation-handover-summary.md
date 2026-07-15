@@ -373,14 +373,14 @@ docker compose -p platform-foundation run --rm backend `
 
 ### 9.2 Task 8 的较早发布门禁证据
 
-这组证据产生于 Task 8 发布门禁执行期间，早于其后的最终审查与加固提交，只能说明当时版本和当时环境的结果，不能替代 9.1 对最终代码的聚合验证，也不能外推为最终代码的 opt-in 门禁已经重跑：
+这组证据产生于 Task 8 发布门禁执行期间，早于其后的最终审查与加固提交；当次运行对应的精确 SHA 和时间没有被保留。它只能作为历史执行记录，不能替代 9.1 对最终代码的聚合验证，不能外推为最终代码的 opt-in 门禁已经重跑，也不是 `75463aa` 或当前 `HEAD` 的发布证明：
 
 - 配置 MySQL、Redis 和 MinIO 测试变量后，当时的完整 Python suite 为 `515 passed, 2 skipped`；真实 MySQL 8.4（包含 migration upgrade/downgrade 往返）、Redis 8 DB 0 和 MinIO 门禁在该次运行中执行并通过。
 - Compose Nginx→Uvicorn 代理链门禁另行重跑并通过 `1 passed`。
 - 当时重新执行的前端 Vite production build、Compose 启动、迁移到 `20260715_0003`、readiness（MySQL、Redis、object store 均为 `up`）和前端 HTTP 200 均通过。
 - 真实腾讯双来源只读门禁在 Task 8 仍然 skip；缺少有效 `TEST_TENCENT_DOCS_TOKEN` 的外部验证缺口至今未关闭。
 
-独立 senior review 当时结论为无 Critical、无 Important，Approve；之后的最终审查与加固仍产生了额外实现提交，因此该结论也应按其发生时间理解。
+独立 senior review 当时结论为无 Critical、无 Important，Approve；但其持久 review artifact 和被评审 SHA 没有被保留，且之后仍产生了额外实现提交。因此这条历史摘要不得视为对 `75463aa` 或当前 `HEAD` 的批准。
 
 Windows 合并后曾发现 shell 脚本被 `core.autocrlf=true` 转成 CRLF。现已通过根目录 `.gitattributes` 强制 `*.sh text eol=lf`，相关 Docker Redis shell 测试已纳入并通过。
 
