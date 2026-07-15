@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, func, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base
@@ -16,6 +17,7 @@ from backend.app.db.models import (
     User,
     UserRole,
 )
+from backend.app.repositories import jobs
 from backend.app.services import job_sync
 from backend.app.services.job_sync import JobSyncFailedError, JobSyncService
 from backend.app.services.tencent_smartsheet import (
@@ -355,3 +357,130 @@ def test_failed_audit_contains_only_safe_ids_counters_and_error(db: Session) -> 
     run = db.get(JobSyncRun, caught.value.run_id)
     assert run is not None
     assert run.error_code == "source_schema_changed"
+
+
+def _install_takeover(db: Session, *, source_id: str, old_run_id: str) -> JobSyncRun:
+    old_run = db.get(JobSyncRun, old_run_id)
+    source = next(source for source in jobs.list_sources(db) if source.id == source_id)
+    assert old_run is not None
+    old_run.status = JobSyncRunStatus.FAILED
+    old_run.error_code = "sync_lease_expired"
+    old_run.finished_at = NOW
+    replacement = JobSyncRun(
+        source_id=source_id,
+        status=JobSyncRunStatus.RUNNING,
+        started_at=NOW,
+    )
+    db.add(replacement)
+    db.flush()
+    source.active_sync_run_id = replacement.id
+    source.sync_lease_expires_at = NOW + timedelta(minutes=10)
+    db.commit()
+    return replacement
+
+
+def test_stale_page_refresh_rolls_back_page_and_preserves_new_owner(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 1, False, 0)},
+    )
+    replacement_id: str | None = None
+
+    def lose_lease(
+        session: Session, source_id: str, run_id: str, *, now: datetime
+    ) -> None:
+        del now
+        nonlocal replacement_id
+        session.rollback()
+        replacement_id = _install_takeover(
+            session, source_id=source_id, old_run_id=run_id
+        ).id
+        raise jobs.StaleSyncLeaseError(run_id)
+
+    monkeypatch.setattr(jobs, "refresh_sync_lease", lose_lease)
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.status is JobSyncRunStatus.FAILED
+    assert caught.value.error_code == "sync_lease_expired"
+    assert scalar_count(db, RawJobRecord) == 0
+    source = jobs.get_source(db, INTERN_SOURCE)
+    assert source is not None
+    assert source.active_sync_run_id == replacement_id
+    assert source.sync_lease_expires_at is not None
+
+
+def test_stale_finalization_preserves_committed_page_and_new_owner(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 1, False, 0)},
+    )
+    replacement_id: str | None = None
+
+    def lose_lease(
+        session: Session,
+        source_id: str,
+        run_id: str,
+        *,
+        status: JobSyncRunStatus,
+        now: datetime,
+        error_code: str | None,
+    ) -> JobSyncRun:
+        del status, now, error_code
+        nonlocal replacement_id
+        session.rollback()
+        replacement_id = _install_takeover(
+            session, source_id=source_id, old_run_id=run_id
+        ).id
+        raise jobs.StaleSyncLeaseError(run_id)
+
+    monkeypatch.setattr(jobs, "finish_sync_run", lose_lease)
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.status is JobSyncRunStatus.FAILED
+    assert caught.value.error_code == "sync_lease_expired"
+    assert scalar_count(db, RawJobRecord) == 1
+    source = jobs.get_source(db, INTERN_SOURCE)
+    assert source is not None
+    assert source.active_sync_run_id == replacement_id
+    assert source.sync_lease_expires_at is not None
+
+
+def test_gateway_failure_after_session_detach_keeps_stable_error(db: Session) -> None:
+    gateway = FakeGateway(fields=intern_fields(), pages={})
+
+    def detach_then_fail(_file_id: str, _sheet_id: str) -> list[TencentField]:
+        db.expunge_all()
+        raise TencentTimeoutError("secret upstream detail")
+
+    gateway.list_fields = detach_then_fail  # type: ignore[method-assign]
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.error_code == "tencent_timeout"
+    assert caught.value.status is JobSyncRunStatus.FAILED
+
+
+def test_cleanup_database_failure_does_not_mask_gateway_error(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gateway = FakeGateway(fields=[], pages={})
+
+    def fail_cleanup(*_args: object, **_kwargs: object) -> JobSyncRun:
+        raise OperationalError("UPDATE job_sync_runs", {}, ConnectionError("offline"))
+
+    monkeypatch.setattr(jobs, "finish_sync_run", fail_cleanup)
+
+    with pytest.raises(JobSyncFailedError) as caught:
+        service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+
+    assert caught.value.error_code == "source_schema_changed"
+    assert caught.value.status is JobSyncRunStatus.FAILED

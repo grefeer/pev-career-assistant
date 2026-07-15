@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from backend.app.db.base import utc_now
 from backend.app.db.models import (
     AuditEvent,
-    JobSource,
     JobSyncRun,
     JobSyncRunStatus,
 )
@@ -90,30 +89,43 @@ class JobSyncService:
             raise jobs.SourceNotFoundError(source_key)
         run = jobs.acquire_sync_run(db, source.id, now=self.now())
         correlation_id = self.correlation_id_factory()
+        source_id = source.id
+        persisted_source_key = source.source_key
+        file_id = source.file_id
+        sheet_id = source.sheet_id
+        run_id = run.id
+        started_at = run.started_at
         db.add(
             AuditEvent(
                 actor_user_id=actor_user_id,
                 event_type="job_sync.started",
                 entity_type="job_sync_run",
-                entity_id=run.id,
+                entity_id=run_id,
                 correlation_id=correlation_id,
-                redacted_payload={"source_key": source.source_key, "run_id": run.id},
+                redacted_payload={
+                    "source_key": persisted_source_key,
+                    "run_id": run_id,
+                },
             )
         )
         db.commit()
         mapper = MAPPERS[source_key]
+        pages_read = 0
+        records_read = 0
+        raw_snapshots_created = 0
+        postings_created = 0
+        postings_updated = 0
+        records_skipped_incomplete = 0
         try:
-            mapper.validate_schema(
-                self.gateway.list_fields(source.file_id, source.sheet_id)
-            )
+            mapper.validate_schema(self.gateway.list_fields(file_id, sheet_id))
             offset = 0
             expected_total: int | None = None
             while True:
-                if run.pages_read >= MAX_PAGES:
+                if pages_read >= MAX_PAGES:
                     raise TencentProtocolError("Tencent page limit exceeded")
                 page = self.gateway.list_records(
-                    source.file_id,
-                    source.sheet_id,
+                    file_id,
+                    sheet_id,
                     offset=offset,
                     limit=PAGE_SIZE,
                 )
@@ -121,17 +133,21 @@ class JobSyncService:
                     expected_total = page.total
                 elif page.total != expected_total:
                     raise TencentProtocolError("Tencent total changed during sync")
-                prospective_records_read = run.records_read + len(page.records)
+                prospective_records_read = records_read + len(page.records)
                 if prospective_records_read > MAX_RECORDS:
                     raise TencentProtocolError("Tencent record limit exceeded")
                 if prospective_records_read > expected_total:
                     raise TencentProtocolError(
                         "Tencent records exceeded declared total"
                     )
+                page_raw_snapshots_created = 0
+                page_postings_created = 0
+                page_postings_updated = 0
+                page_records_skipped = 0
                 for record in page.records:
                     raw, created = jobs.insert_raw_snapshot(
                         db,
-                        source_id=source.id,
+                        source_id=source_id,
                         external_record_id=record.record_id,
                         raw_fields=record.field_values,
                         payload_hash=canonical_payload_hash(record.field_values),
@@ -139,10 +155,10 @@ class JobSyncService:
                         observed_at=self.now(),
                     )
                     if created:
-                        run.raw_snapshots_created += 1
+                        page_raw_snapshots_created += 1
                     mapped = mapper.map(record)
                     if isinstance(mapped, SkippedRecord):
-                        run.records_skipped_incomplete += 1
+                        page_records_skipped += 1
                         continue
                     _posting, action = jobs.upsert_posting(
                         db,
@@ -151,15 +167,32 @@ class JobSyncService:
                         candidate=mapped,
                     )
                     if action == "created":
-                        run.postings_created += 1
+                        page_postings_created += 1
                     elif action == "updated":
-                        run.postings_updated += 1
-                run.pages_read += 1
+                        page_postings_updated += 1
+                run = db.get(JobSyncRun, run_id)
+                if run is None:
+                    raise jobs.StaleSyncLeaseError(run_id)
+                run.pages_read = pages_read + 1
                 run.records_read = prospective_records_read
-                jobs.refresh_sync_lease(db, source.id, run.id, now=self.now())
+                run.raw_snapshots_created = (
+                    raw_snapshots_created + page_raw_snapshots_created
+                )
+                run.postings_created = postings_created + page_postings_created
+                run.postings_updated = postings_updated + page_postings_updated
+                run.records_skipped_incomplete = (
+                    records_skipped_incomplete + page_records_skipped
+                )
+                jobs.refresh_sync_lease(db, source_id, run_id, now=self.now())
                 db.commit()
+                pages_read += 1
+                records_read = prospective_records_read
+                raw_snapshots_created += page_raw_snapshots_created
+                postings_created += page_postings_created
+                postings_updated += page_postings_updated
+                records_skipped_incomplete += page_records_skipped
                 if not page.has_more:
-                    if run.records_read != expected_total:
+                    if records_read != expected_total:
                         raise TencentProtocolError(
                             "Tencent total did not match records read"
                         )
@@ -168,114 +201,172 @@ class JobSyncService:
 
             finished = jobs.finish_sync_run(
                 db,
-                source.id,
-                run.id,
+                source_id,
+                run_id,
                 status=JobSyncRunStatus.SUCCEEDED,
                 now=self.now(),
                 error_code=None,
+            )
+            assert finished.finished_at is not None
+            outcome = SyncOutcome(
+                run_id=run_id,
+                source_key=persisted_source_key,
+                status=JobSyncRunStatus.SUCCEEDED,
+                pages_read=pages_read,
+                records_read=records_read,
+                raw_snapshots_created=raw_snapshots_created,
+                postings_created=postings_created,
+                postings_updated=postings_updated,
+                records_skipped_incomplete=records_skipped_incomplete,
+                started_at=started_at,
+                finished_at=finished.finished_at,
             )
             db.add(
                 AuditEvent(
                     actor_user_id=actor_user_id,
                     event_type="job_sync.finished",
                     entity_type="job_sync_run",
-                    entity_id=run.id,
+                    entity_id=run_id,
                     correlation_id=correlation_id,
                     redacted_payload={
-                        "source_key": source.source_key,
-                        "run_id": run.id,
+                        "source_key": persisted_source_key,
+                        "run_id": run_id,
                         "status": "succeeded",
-                        "pages_read": run.pages_read,
-                        "records_read": run.records_read,
-                        "raw_snapshots_created": run.raw_snapshots_created,
-                        "postings_created": run.postings_created,
-                        "postings_updated": run.postings_updated,
-                        "records_skipped_incomplete": (run.records_skipped_incomplete),
+                        "pages_read": pages_read,
+                        "records_read": records_read,
+                        "raw_snapshots_created": raw_snapshots_created,
+                        "postings_created": postings_created,
+                        "postings_updated": postings_updated,
+                        "records_skipped_incomplete": records_skipped_incomplete,
                     },
                 )
             )
             db.commit()
-            assert finished.finished_at is not None
-            return SyncOutcome(
-                run_id=finished.id,
-                source_key=source.source_key,
-                status=finished.status,
-                pages_read=finished.pages_read,
-                records_read=finished.records_read,
-                raw_snapshots_created=finished.raw_snapshots_created,
-                postings_created=finished.postings_created,
-                postings_updated=finished.postings_updated,
-                records_skipped_incomplete=finished.records_skipped_incomplete,
-                started_at=finished.started_at,
-                finished_at=finished.finished_at,
-            )
+            return outcome
+        except jobs.StaleSyncLeaseError:
+            status, error_code = self._stale_failure(db, run_id=run_id)
+            raise JobSyncFailedError(run_id, status, error_code) from None
         except (TencentGatewayError, SourceSchemaChangedError) as exc:
-            self._finish_failure(
+            status = self._finish_failure(
                 db,
-                source=source,
-                run_id=run.id,
+                source_id=source_id,
+                source_key=persisted_source_key,
+                run_id=run_id,
                 actor_user_id=actor_user_id,
                 correlation_id=correlation_id,
                 error_code=exc.error_code,
+                committed_pages=pages_read,
             )
-            failed = db.get(JobSyncRun, run.id)
-            assert failed is not None
-            raise JobSyncFailedError(run.id, failed.status, exc.error_code) from None
+            raise JobSyncFailedError(run_id, status, exc.error_code) from None
         except SQLAlchemyError:
-            self._finish_failure(
+            status = self._finish_failure(
                 db,
-                source=source,
-                run_id=run.id,
+                source_id=source_id,
+                source_key=persisted_source_key,
+                run_id=run_id,
                 actor_user_id=actor_user_id,
                 correlation_id=correlation_id,
                 error_code="database_write_failed",
+                committed_pages=pages_read,
             )
-            failed = db.get(JobSyncRun, run.id)
-            assert failed is not None
-            raise JobSyncFailedError(
-                run.id, failed.status, "database_write_failed"
-            ) from None
+            raise JobSyncFailedError(run_id, status, "database_write_failed") from None
 
     def _finish_failure(
         self,
         db: Session,
         *,
-        source: JobSource,
+        source_id: str,
+        source_key: str,
         run_id: str,
         actor_user_id: str,
         correlation_id: str,
         error_code: str,
-    ) -> None:
-        db.rollback()
-        run = db.get(JobSyncRun, run_id)
-        if run is None:
-            raise RuntimeError("authoritative sync run disappeared")
-        status = (
-            JobSyncRunStatus.PARTIAL if run.pages_read > 0 else JobSyncRunStatus.FAILED
+        committed_pages: int,
+    ) -> JobSyncRunStatus:
+        fallback_status = (
+            JobSyncRunStatus.PARTIAL if committed_pages > 0 else JobSyncRunStatus.FAILED
         )
-        jobs.finish_sync_run(
-            db,
-            source.id,
-            run.id,
-            status=status,
-            now=self.now(),
-            error_code=error_code,
-        )
-        db.add(
-            AuditEvent(
-                actor_user_id=actor_user_id,
-                event_type="job_sync.finished",
-                entity_type="job_sync_run",
-                entity_id=run.id,
-                correlation_id=correlation_id,
-                redacted_payload={
-                    "source_key": source.source_key,
-                    "run_id": run.id,
-                    "status": status.value,
-                    "pages_read": run.pages_read,
-                    "records_read": run.records_read,
-                    "error_code": error_code,
-                },
+        self._rollback_safely(db)
+        try:
+            run = db.get(JobSyncRun, run_id)
+            if run is None:
+                return fallback_status
+            if run.status is not JobSyncRunStatus.RUNNING:
+                return run.status
+            status = (
+                JobSyncRunStatus.PARTIAL
+                if run.pages_read > 0
+                else JobSyncRunStatus.FAILED
             )
+            pages_read = run.pages_read
+            records_read = run.records_read
+            jobs.finish_sync_run(
+                db,
+                source_id,
+                run_id,
+                status=status,
+                now=self.now(),
+                error_code=error_code,
+            )
+            db.add(
+                AuditEvent(
+                    actor_user_id=actor_user_id,
+                    event_type="job_sync.finished",
+                    entity_type="job_sync_run",
+                    entity_id=run_id,
+                    correlation_id=correlation_id,
+                    redacted_payload={
+                        "source_key": source_key,
+                        "run_id": run_id,
+                        "status": status.value,
+                        "pages_read": pages_read,
+                        "records_read": records_read,
+                        "error_code": error_code,
+                    },
+                )
+            )
+            db.commit()
+            return status
+        except (SQLAlchemyError, jobs.StaleSyncLeaseError):
+            self._rollback_safely(db)
+            status, _error_code = self._read_failure_state(
+                db,
+                run_id=run_id,
+                fallback_status=fallback_status,
+                fallback_error_code=error_code,
+            )
+            return status
+
+    def _stale_failure(
+        self, db: Session, *, run_id: str
+    ) -> tuple[JobSyncRunStatus, str]:
+        self._rollback_safely(db)
+        return self._read_failure_state(
+            db,
+            run_id=run_id,
+            fallback_status=JobSyncRunStatus.FAILED,
+            fallback_error_code="sync_lease_expired",
         )
-        db.commit()
+
+    @staticmethod
+    def _rollback_safely(db: Session) -> None:
+        try:
+            db.rollback()
+        except SQLAlchemyError:
+            pass
+
+    @staticmethod
+    def _read_failure_state(
+        db: Session,
+        *,
+        run_id: str,
+        fallback_status: JobSyncRunStatus,
+        fallback_error_code: str,
+    ) -> tuple[JobSyncRunStatus, str]:
+        try:
+            run = db.get(JobSyncRun, run_id)
+            if run is not None and run.status is not JobSyncRunStatus.RUNNING:
+                return run.status, run.error_code or fallback_error_code
+        except SQLAlchemyError:
+            pass
+        return fallback_status, fallback_error_code
