@@ -9,7 +9,22 @@ import type {
 
 const API_BASE = "/api";
 
-async function request<T>(path: string, init: RequestInit = {}, token?: string): Promise<T> {
+export class ApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly detail: unknown,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+export async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  token?: string,
+): Promise<T> {
   const headers = new Headers(init.headers || {});
   if (!(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
@@ -24,14 +39,28 @@ async function request<T>(path: string, init: RequestInit = {}, token?: string):
   });
 
   if (!response.ok) {
+    let detail: unknown = null;
     let message = `请求失败：${response.status}`;
     try {
-      const data = await response.json();
-      message = data.detail || data.message || message;
+      const data = (await response.json()) as unknown;
+      if (data && typeof data === "object") {
+        const body = data as Record<string, unknown>;
+        detail = body.detail ?? body.message ?? null;
+      }
+      if (typeof detail === "string" && detail.trim()) {
+        message = detail;
+      } else if (detail && typeof detail === "object") {
+        const structuredDetail = detail as Record<string, unknown>;
+        if (typeof structuredDetail.message === "string" && structuredDetail.message.trim()) {
+          message = structuredDetail.message;
+        } else if (structuredDetail.error_code != null) {
+          message = String(structuredDetail.error_code);
+        }
+      }
     } catch {
-      // ignore
+      detail = null;
     }
-    throw new Error(message);
+    throw new ApiError(response.status, detail, message);
   }
 
   return (await response.json()) as T;

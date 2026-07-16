@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import {
   activateSession,
   createSession,
@@ -11,6 +11,7 @@ import {
   register,
   runAnalysis,
 } from "./api";
+import JobCenter from "./features/jobs/JobCenter.vue";
 import type {
   AnalysisResponse,
   HistoryItem,
@@ -34,6 +35,7 @@ const loading = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
 const authMode = ref<"login" | "register">("login");
+const workspaceView = ref<"analysis" | "jobs">("analysis");
 
 const authForm = reactive({
   account: "",
@@ -220,6 +222,7 @@ function onFileChange(event: Event) {
 }
 
 function logout() {
+  workspaceView.value = "analysis";
   token.value = "";
   profile.value = null;
   sessions.value = [];
@@ -230,6 +233,15 @@ function logout() {
   localStorage.removeItem("job_assistant_token");
   setSuccess("已退出登录。");
 }
+
+watch(
+  () => profile.value?.role,
+  () => {
+    if (!profile.value) {
+      workspaceView.value = "analysis";
+    }
+  },
+);
 
 onMounted(() => {
   bootstrap();
@@ -341,6 +353,34 @@ onMounted(() => {
       </aside>
 
       <main class="workspace">
+        <nav class="workspace-tabs" aria-label="工作台功能">
+          <button
+            type="button"
+            data-test="analysis-view"
+            :class="{ active: workspaceView === 'analysis' }"
+            :aria-current="workspaceView === 'analysis' ? 'page' : undefined"
+            @click="workspaceView = 'analysis'"
+          >
+            分析工作台
+          </button>
+          <button
+            type="button"
+            data-test="jobs-view"
+            :class="{ active: workspaceView === 'jobs' }"
+            :aria-current="workspaceView === 'jobs' ? 'page' : undefined"
+            @click="workspaceView = 'jobs'"
+          >
+            职位中心
+          </button>
+        </nav>
+
+        <JobCenter v-if="workspaceView === 'jobs'" :token="token" />
+
+        <div
+          v-show="workspaceView === 'analysis'"
+          class="analysis-workspace"
+          data-test="analysis-workspace"
+        >
         <header class="workspace-header">
           <div>
             <p class="eyebrow">Vue Workspace</p>
@@ -537,6 +577,7 @@ onMounted(() => {
             <span v-for="(note, idx) in revisionNotes" :key="idx" class="chip chip-accent">{{ note }}</span>
           </div>
         </section>
+        </div>
       </main>
     </template>
   </div>
@@ -756,6 +797,38 @@ onMounted(() => {
 .workspace {
   flex: 1;
   padding: 1.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.workspace-tabs {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 0.35rem;
+  padding: 0.35rem;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #dbe3ea;
+  border-radius: 16px;
+  box-shadow: 0 8px 22px rgba(15, 23, 42, 0.06);
+}
+
+.workspace-tabs button {
+  padding: 0.68rem 1rem;
+  color: #52615d;
+  background: transparent;
+  border: 0;
+  border-radius: 12px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.workspace-tabs button.active {
+  color: white;
+  background: #17634e;
+}
+
+.analysis-workspace {
   display: flex;
   flex-direction: column;
   gap: 1rem;
