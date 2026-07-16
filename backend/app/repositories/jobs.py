@@ -221,6 +221,19 @@ def insert_raw_snapshot(
     return record, True
 
 
+def candidate_payload(candidate: NormalizedJobCandidate) -> dict[str, Any]:
+    return {
+        "company_name": candidate.company_name,
+        "title": candidate.title,
+        "locations": list(candidate.locations),
+        "recruitment_types": list(candidate.recruitment_types),
+        "industries": list(candidate.industries),
+        "apply_url": candidate.apply_url,
+        "referral_code": candidate.referral_code,
+        "deadline_text": candidate.deadline_text,
+    }
+
+
 def upsert_posting(
     db: Session,
     *,
@@ -228,20 +241,31 @@ def upsert_posting(
     raw_record: RawJobRecord,
     candidate: NormalizedJobCandidate,
 ) -> tuple[JobPosting, Literal["created", "updated", "unchanged"]]:
+    payload = candidate_payload(candidate)
     posting = db.scalar(
-        select(JobPosting).where(
+        select(JobPosting)
+        .where(
             JobPosting.source_id == source.id,
             JobPosting.external_record_id == raw_record.external_record_id,
         )
+        .with_for_update()
     )
     if (
         posting is not None
         and posting.raw_record_id == raw_record.id
         and posting.mapper_version == source.mapper_version
     ):
+        if not posting.source_candidate:
+            posting.source_candidate = payload
+            db.flush()
         return posting, "unchanged"
-    values: dict[str, Any] = {
+    source_values: dict[str, Any] = {
         "raw_record_id": raw_record.id,
+        "source_updated_at": candidate.source_updated_at,
+        "mapper_version": source.mapper_version,
+        "source_candidate": payload,
+    }
+    canonical_values: dict[str, Any] = {
         "company_name": candidate.company_name,
         "title": candidate.title,
         "locations": candidate.locations,
@@ -250,21 +274,28 @@ def upsert_posting(
         "apply_url": candidate.apply_url,
         "referral_code": candidate.referral_code,
         "deadline_text": candidate.deadline_text,
-        "source_updated_at": candidate.source_updated_at,
-        "mapper_version": source.mapper_version,
     }
     if posting is None:
         posting = JobPosting(
             source_id=source.id,
             external_record_id=raw_record.external_record_id,
             status=JobPostingStatus.PENDING_COMPLETION,
-            **values,
+            **source_values,
+            **canonical_values,
         )
         db.add(posting)
         db.flush()
         return posting, "created"
-    for name, value in values.items():
+    for name, value in source_values.items():
         setattr(posting, name, value)
+    if (
+        posting.status is JobPostingStatus.PENDING_COMPLETION
+        and posting.review_version == 0
+    ):
+        for name, value in canonical_values.items():
+            setattr(posting, name, value)
+    else:
+        posting.source_changed_since_review = True
     db.flush()
     return posting, "updated"
 
@@ -331,4 +362,114 @@ def get_posting(db: Session, job_id: str) -> tuple[JobPosting, JobSource] | None
             JobPosting.status == JobPostingStatus.PENDING_COMPLETION,
         )
     ).one_or_none()
+    return (row[0], row[1]) if row is not None else None
+
+
+def list_public_postings(
+    db: Session,
+    *,
+    limit: int,
+    offset: int,
+    source_key: str | None,
+    company: str | None,
+    recruitment_type: str | None,
+) -> tuple[int, list[tuple[JobPosting, JobSource]]]:
+    filters: list[Any] = [JobPosting.status == JobPostingStatus.VERIFIED]
+    if source_key:
+        filters.append(JobSource.source_key == source_key)
+    if company:
+        escaped = company.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        filters.append(JobPosting.company_name.like(f"%{escaped}%", escape="\\"))
+    if recruitment_type:
+        if db.get_bind().dialect.name == "mysql":
+            filters.append(
+                func.json_contains(
+                    JobPosting.recruitment_types, json.dumps(recruitment_type)
+                )
+                == 1
+            )
+        else:
+            labels = (
+                func.json_each(JobPosting.recruitment_types)
+                .table_valued("key", "value")
+                .alias("recruitment_labels")
+            )
+            filters.append(
+                exists(
+                    select(1)
+                    .select_from(labels)
+                    .where(labels.c.value == recruitment_type)
+                )
+            )
+    total = (
+        db.scalar(
+            select(func.count()).select_from(JobPosting).join(JobSource).where(*filters)
+        )
+        or 0
+    )
+    statement = (
+        select(JobPosting, JobSource)
+        .join(JobSource)
+        .where(*filters)
+        .order_by(JobPosting.updated_at.desc(), JobPosting.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return int(total), [(posting, source) for posting, source in db.execute(statement)]
+
+
+def get_public_posting(db: Session, job_id: str) -> tuple[JobPosting, JobSource] | None:
+    row = db.execute(
+        select(JobPosting, JobSource)
+        .join(JobSource)
+        .where(
+            JobPosting.id == job_id,
+            JobPosting.status == JobPostingStatus.VERIFIED,
+        )
+    ).one_or_none()
+    return (row[0], row[1]) if row is not None else None
+
+
+def list_review_queue(
+    db: Session,
+    *,
+    statuses: set[JobPostingStatus],
+    limit: int,
+    offset: int,
+) -> tuple[int, list[tuple[JobPosting, JobSource]]]:
+    allowed = {
+        JobPostingStatus.PENDING_COMPLETION,
+        JobPostingStatus.PENDING_REVIEW,
+        JobPostingStatus.REJECTED,
+    }
+    invalid = statuses - allowed
+    if invalid:
+        invalid_values = ", ".join(sorted(status.value for status in invalid))
+        raise ValueError(f"invalid review queue status: {invalid_values}")
+    selected = statuses or allowed
+    filters = [JobPosting.status.in_(selected)]
+    total = db.scalar(select(func.count()).select_from(JobPosting).where(*filters)) or 0
+    statement = (
+        select(JobPosting, JobSource)
+        .join(JobSource)
+        .where(*filters)
+        .order_by(JobPosting.updated_at.asc(), JobPosting.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return int(total), [(posting, source) for posting, source in db.execute(statement)]
+
+
+def get_posting_for_review(
+    db: Session, job_id: str, *, lock: bool = False
+) -> tuple[JobPosting, JobSource] | None:
+    statement = (
+        select(JobPosting, JobSource)
+        .join(JobSource)
+        .where(JobPosting.id == job_id)
+        .execution_options(populate_existing=True)
+    )
+    if lock:
+        statement = statement.with_for_update()
+    row = db.execute(statement).one_or_none()
     return (row[0], row[1]) if row is not None else None

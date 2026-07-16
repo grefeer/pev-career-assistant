@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import threading
 
 import pytest
-from sqlalchemy import create_engine, event, func, select
+from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Session
 
@@ -297,6 +297,95 @@ def test_posting_upsert_points_to_new_snapshot_without_deleting_history(
     assert db.scalar(select(func.count()).select_from(RawJobRecord)) == 2
 
 
+def test_sync_does_not_overwrite_reviewed_canonical_fields(db: Session) -> None:
+    source = seeded_source(db)
+    first_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="a" * 64
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=first_raw, candidate=candidate(title="来源岗位")
+    )
+    posting.status = JobPostingStatus.PENDING_REVIEW
+    posting.title = "人工确认岗位"
+    posting.description_text = "人工补全的完整 JD"
+    posting.review_version = 1
+    db.flush()
+
+    changed_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="b" * 64
+    )
+    updated, action = jobs.upsert_posting(
+        db,
+        source=source,
+        raw_record=changed_raw,
+        candidate=candidate(title="来源新岗位"),
+    )
+
+    assert action == "updated"
+    assert updated.title == "人工确认岗位"
+    assert updated.description_text == "人工补全的完整 JD"
+    assert updated.source_candidate["title"] == "来源新岗位"
+    assert updated.source_changed_since_review is True
+
+
+def test_sync_does_not_overwrite_versioned_posting_with_reset_status(
+    db: Session,
+) -> None:
+    source = seeded_source(db)
+    first_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="a" * 64
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=first_raw, candidate=candidate(title="来源岗位")
+    )
+    posting.title = "人工确认岗位"
+    posting.review_version = 1
+    db.flush()
+
+    changed_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="b" * 64
+    )
+    updated, action = jobs.upsert_posting(
+        db,
+        source=source,
+        raw_record=changed_raw,
+        candidate=candidate(title="来源新岗位"),
+    )
+
+    assert action == "updated"
+    assert updated.title == "人工确认岗位"
+    assert updated.source_candidate["title"] == "来源新岗位"
+    assert updated.source_changed_since_review is True
+
+
+def test_unchanged_sync_backfills_empty_source_candidate(db: Session) -> None:
+    source = seeded_source(db)
+    raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="a" * 64
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=raw, candidate=candidate(title="来源岗位")
+    )
+    posting.source_candidate = {}
+    db.flush()
+
+    unchanged, action = jobs.upsert_posting(
+        db, source=source, raw_record=raw, candidate=candidate(title="来源岗位")
+    )
+
+    assert action == "unchanged"
+    assert unchanged.source_candidate == {
+        "company_name": "示例公司",
+        "title": "来源岗位",
+        "locations": ["北京"],
+        "recruitment_types": ["暑期实习"],
+        "industries": ["互联网"],
+        "apply_url": "https://example.com/jobs",
+        "referral_code": None,
+        "deadline_text": None,
+    }
+
+
 def test_mapper_version_change_reprocesses_unchanged_snapshot(db: Session) -> None:
     source = seeded_source(db)
     raw = snapshot(
@@ -497,6 +586,136 @@ def test_get_posting_excludes_non_pending_statuses(db: Session) -> None:
     )
     assert posting.status is JobPostingStatus.PENDING_COMPLETION
     assert jobs.get_posting(db, posting.id) == (posting, source)
+
+
+def test_public_query_only_returns_verified_jobs(db: Session) -> None:
+    source = seeded_source(db)
+    pending_raw = snapshot(
+        db,
+        source_id=source.id,
+        external_record_id="pending",
+        payload_hash="a" * 64,
+    )
+    verified_raw = snapshot(
+        db,
+        source_id=source.id,
+        external_record_id="verified",
+        payload_hash="b" * 64,
+    )
+    pending, _ = jobs.upsert_posting(
+        db, source=source, raw_record=pending_raw, candidate=candidate()
+    )
+    verified, _ = jobs.upsert_posting(
+        db, source=source, raw_record=verified_raw, candidate=candidate()
+    )
+    verified.status = JobPostingStatus.VERIFIED
+    db.flush()
+
+    total, rows = jobs.list_public_postings(
+        db,
+        limit=20,
+        offset=0,
+        source_key=None,
+        company=None,
+        recruitment_type=None,
+    )
+
+    assert total == 1
+    assert [posting.id for posting, _source in rows] == [verified.id]
+    assert jobs.get_public_posting(db, verified.id) == (verified, source)
+    assert jobs.get_public_posting(db, pending.id) is None
+
+
+def test_review_queue_filters_pending_statuses(db: Session) -> None:
+    source = seeded_source(db)
+    raw = snapshot(
+        db,
+        source_id=source.id,
+        external_record_id="review",
+        payload_hash="c" * 64,
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=raw, candidate=candidate()
+    )
+    posting.status = JobPostingStatus.PENDING_REVIEW
+    db.flush()
+
+    total, rows = jobs.list_review_queue(
+        db, statuses={JobPostingStatus.PENDING_REVIEW}, limit=20, offset=0
+    )
+
+    assert total == 1
+    assert rows[0][0].id == posting.id
+    assert jobs.get_posting_for_review(db, posting.id) == (posting, source)
+
+
+def test_locked_review_read_refreshes_loaded_posting(db: Session) -> None:
+    source = seeded_source(db)
+    raw = snapshot(
+        db,
+        source_id=source.id,
+        external_record_id="stale-review",
+        payload_hash="d" * 64,
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=raw, candidate=candidate(title="陈旧岗位")
+    )
+    db.execute(
+        update(JobPosting)
+        .where(JobPosting.id == posting.id)
+        .values(title="数据库最新岗位"),
+        execution_options={"synchronize_session": False},
+    )
+    assert posting.title == "陈旧岗位"
+
+    locked = jobs.get_posting_for_review(db, posting.id, lock=True)
+
+    assert locked is not None
+    assert locked[0] is posting
+    assert locked[0].title == "数据库最新岗位"
+
+
+def test_empty_review_queue_statuses_include_all_reviewable_but_not_expired(
+    db: Session,
+) -> None:
+    source = seeded_source(db)
+    statuses = [
+        JobPostingStatus.PENDING_COMPLETION,
+        JobPostingStatus.PENDING_REVIEW,
+        JobPostingStatus.REJECTED,
+        JobPostingStatus.EXPIRED,
+    ]
+    postings: list[JobPosting] = []
+    for index, status in enumerate(statuses):
+        raw = snapshot(
+            db,
+            source_id=source.id,
+            external_record_id=f"queue-{index}",
+            payload_hash=str(index) * 64,
+        )
+        posting, _ = jobs.upsert_posting(
+            db, source=source, raw_record=raw, candidate=candidate()
+        )
+        posting.status = status
+        postings.append(posting)
+    db.flush()
+
+    total, rows = jobs.list_review_queue(db, statuses=set(), limit=20, offset=0)
+
+    assert total == 3
+    assert {posting.id for posting, _source in rows} == {
+        posting.id for posting in postings[:3]
+    }
+
+
+def test_review_queue_rejects_non_reviewable_statuses(db: Session) -> None:
+    with pytest.raises(ValueError, match="review queue status"):
+        jobs.list_review_queue(
+            db,
+            statuses={JobPostingStatus.PENDING_REVIEW, JobPostingStatus.VERIFIED},
+            limit=20,
+            offset=0,
+        )
 
 
 def test_acquire_rejects_missing_or_disabled_source(db: Session) -> None:

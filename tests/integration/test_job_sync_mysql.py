@@ -24,6 +24,7 @@ from backend.app.db.models import (
     RawJobRecord,
 )
 from backend.app.repositories import jobs
+from backend.app.services.job_mappers import NormalizedJobCandidate
 from tests.integration.job_sync_gate_safety import (
     require_dedicated_mysql_test_database,
 )
@@ -217,9 +218,7 @@ def test_mysql_active_source_lease_conflicts(mysql_engine: Engine) -> None:
         source_id = source.id
         db.commit()
         try:
-            first = jobs.acquire_sync_run(
-                db, source.id, now=datetime.now(timezone.utc)
-            )
+            first = jobs.acquire_sync_run(db, source.id, now=datetime.now(timezone.utc))
             db.commit()
             with pytest.raises(jobs.SyncConflictError):
                 jobs.acquire_sync_run(db, source.id, now=datetime.now(timezone.utc))
@@ -279,9 +278,7 @@ def test_mysql_concurrent_lease_allows_exactly_one_owner(
             event.listen(connection, "before_cursor_execute", signal_for_update)
             try:
                 try:
-                    jobs.acquire_sync_run(
-                        db, source_id, now=datetime.now(timezone.utc)
-                    )
+                    jobs.acquire_sync_run(db, source_id, now=datetime.now(timezone.utc))
                 except jobs.SyncConflictError:
                     db.rollback()
                     return "conflict", connection_id
@@ -303,6 +300,122 @@ def test_mysql_concurrent_lease_allows_exactly_one_owner(
             "acquired",
             "conflict",
         ]
+    finally:
+        with Session(mysql_engine) as cleanup:
+            _cleanup_source(cleanup, source_id)
+
+
+@requires_mysql
+def test_mysql_sync_waits_for_review_lock_and_preserves_reviewed_fields(
+    mysql_engine: Engine,
+) -> None:
+    prefix = f"task2-review-lock-{uuid.uuid4().hex}"
+    with Session(mysql_engine, expire_on_commit=False) as setup:
+        source = _seed_source(setup, prefix)
+        posting = _seed_posting(
+            setup,
+            source,
+            record_id=f"{prefix}-record",
+            recruitment_types=["暑期实习"],
+        )
+        changed_raw = RawJobRecord(
+            source_id=source.id,
+            external_record_id=posting.external_record_id,
+            payload_hash="b" * 64,
+            raw_fields=[{"field": "招聘岗位", "value": "来源新岗位"}],
+            observed_at=datetime.now(timezone.utc),
+        )
+        setup.add(changed_raw)
+        setup.commit()
+        source_id = source.id
+        posting_id = posting.id
+        raw_id = changed_raw.id
+
+    reviewer_holds_lock = Event()
+    sync_lock_started = Event()
+
+    def review_attempt() -> None:
+        with Session(mysql_engine) as db:
+            row = jobs.get_posting_for_review(db, posting_id, lock=True)
+            assert row is not None
+            posting, _source = row
+            posting.status = JobPostingStatus.PENDING_REVIEW
+            posting.review_version = 1
+            posting.title = "人工确认岗位"
+            posting.description_text = "人工补全的完整 JD"
+            db.flush()
+            reviewer_holds_lock.set()
+            if not sync_lock_started.wait(timeout=10):
+                db.rollback()
+                raise TimeoutError("sync did not issue its posting lock query")
+            db.commit()
+
+    def sync_attempt() -> tuple[str, str, str | None, bool]:
+        with Session(mysql_engine) as db:
+            if not reviewer_holds_lock.wait(timeout=10):
+                raise TimeoutError("reviewer did not acquire the posting lock")
+            connection = db.connection()
+
+            def signal_for_update(
+                _connection: object,
+                _cursor: object,
+                statement: str,
+                _parameters: object,
+                _context: object,
+                _executemany: bool,
+            ) -> None:
+                normalized = statement.upper()
+                if "JOB_POSTINGS" in normalized and "FOR UPDATE" in normalized:
+                    sync_lock_started.set()
+
+            event.listen(connection, "before_cursor_execute", signal_for_update)
+            try:
+                source = db.get(JobSource, source_id)
+                raw = db.get(RawJobRecord, raw_id)
+                assert source is not None
+                assert raw is not None
+                updated, action = jobs.upsert_posting(
+                    db,
+                    source=source,
+                    raw_record=raw,
+                    candidate=NormalizedJobCandidate(
+                        company_name="来源公司",
+                        title="来源新岗位",
+                        locations=["北京"],
+                        recruitment_types=["暑期实习"],
+                        industries=["互联网"],
+                        apply_url="https://example.com/changed",
+                        referral_code=None,
+                        deadline_text=None,
+                        source_updated_at=None,
+                    ),
+                )
+                db.commit()
+                return (
+                    action,
+                    updated.title,
+                    updated.description_text,
+                    updated.source_changed_since_review,
+                )
+            finally:
+                event.remove(connection, "before_cursor_execute", signal_for_update)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reviewer = pool.submit(review_attempt)
+            syncer = pool.submit(sync_attempt)
+            reviewer.result(timeout=20)
+            result = syncer.result(timeout=20)
+        assert result == (
+            "updated",
+            "人工确认岗位",
+            "人工补全的完整 JD",
+            True,
+        )
+        with Session(mysql_engine) as verification:
+            posting = verification.get(JobPosting, posting_id)
+            assert posting is not None
+            assert posting.source_candidate["title"] == "来源新岗位"
     finally:
         with Session(mysql_engine) as cleanup:
             _cleanup_source(cleanup, source_id)

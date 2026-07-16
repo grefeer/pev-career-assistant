@@ -11,6 +11,7 @@ from backend.app.db.base import Base
 from backend.app.db.models import (
     AuditEvent,
     JobPosting,
+    JobPostingStatus,
     JobSyncRun,
     JobSyncRunStatus,
     RawJobRecord,
@@ -149,6 +150,36 @@ def test_sync_commits_each_page_and_is_idempotent(db: Session) -> None:
     assert second.postings_created == 0
     assert second.postings_updated == 0
     assert gateway.calls == [0, 1, 0, 1]
+
+
+def test_sync_preserves_reviewed_canonical_fields_when_source_changes(
+    db: Session,
+) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 1, False, 0)},
+    )
+    sync = service(gateway)
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    posting = db.scalar(select(JobPosting))
+    assert posting is not None
+    posting.status = JobPostingStatus.PENDING_REVIEW
+    posting.title = "人工确认岗位"
+    posting.description_text = "人工补全的完整 JD"
+    posting.review_version = 1
+    db.commit()
+    gateway.pages = {
+        0: TencentRecordPage([complete_record("r1", title="来源新岗位")], 1, False, 0)
+    }
+
+    outcome = sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+
+    assert outcome.postings_updated == 1
+    assert posting.title == "人工确认岗位"
+    assert posting.description_text == "人工补全的完整 JD"
+    assert posting.source_candidate["title"] == "来源新岗位"
+    assert posting.source_changed_since_review is True
 
 
 def test_second_page_failure_preserves_first_page(db: Session) -> None:
