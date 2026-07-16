@@ -20,6 +20,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from backend.app.domain.feedbacks import JobFeedbackCategory
+
 from backend.app.domain.profiles import (
     EvidenceDecisionAction,
     ResumeAssetStatus,
@@ -617,6 +619,29 @@ class ConfirmedProfileVersion(UUIDPrimaryKeyMixin, Base):
     local_sensitive_references: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class JobFeedback(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_feedback"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_job_feedback_idempotency_key"),
+        Index("ix_job_feedback_job_created", "job_id", "created_at"),
+        Index("ix_job_feedback_user_created", "user_id", "created_at"),
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    category: Mapped[JobFeedbackCategory] = mapped_column(
+        Enum(JobFeedbackCategory, **enum_kwargs), nullable=False
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
