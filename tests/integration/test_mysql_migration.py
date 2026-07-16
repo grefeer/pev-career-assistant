@@ -23,8 +23,17 @@ BUSINESS_TABLES = {
     "job_postings",
     "job_verifications",
 }
+PROFILE_TABLES = {
+    "profiles",
+    "resume_assets",
+    "resume_imports",
+    "profile_field_evidence",
+    "profile_field_decisions",
+    "confirmed_profile_versions",
+}
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260716_0004"
+HEAD_REVISION = "20260717_0005"
+BUSINESS_TABLES |= PROFILE_TABLES
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:
