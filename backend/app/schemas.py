@@ -85,8 +85,3 @@ class AnalysisResponse(BaseModel):
 class ActivateSessionResponse(BaseModel):
     ok: bool
     active_thread_id: str
-
-
-class JobListResponse(BaseModel):
-    total: int
-    jobs: list[dict[str, Any]]

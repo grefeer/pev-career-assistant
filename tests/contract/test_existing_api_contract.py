@@ -136,6 +136,17 @@ def test_cors_and_jobs_path_keep_frontend_contract(client: TestClient) -> None:
     assert jobs.json()["total"] == len(jobs.json()["jobs"])
 
 
+def test_app_registers_exactly_one_get_jobs_route(client: TestClient) -> None:
+    matching_routes = [
+        route
+        for route in client.app.routes
+        if getattr(route, "path", None) == "/api/jobs"
+        and "GET" in getattr(route, "methods", set())
+    ]
+
+    assert len(matching_routes) == 1
+
+
 def test_user_cannot_read_or_activate_another_users_session(client: TestClient) -> None:
     alice_token, _ = register(client, "alice")
     _, bob_session_id = register(client, "bob")

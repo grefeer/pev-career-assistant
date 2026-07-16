@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import os
 from typing import Any
@@ -9,7 +9,7 @@ from typing import Any
 import fakeredis
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -22,16 +22,20 @@ from backend.app.db.models import (
     JobSource,
     JobSourceProvider,
     JobSyncRunStatus,
+    JobVerification,
     RawJobRecord,
     User,
     UserRole,
 )
+from backend.app.repositories import jobs as job_repository
 from backend.app.repositories.jobs import (
     SourceDisabledError,
     SourceNotFoundError,
     SyncConflictError,
 )
 from backend.app.services.auth import AuthService
+from backend.app.services.job_mappers import NormalizedJobCandidate
+from backend.app.services.job_review import JobCompletionInput, JobReviewService
 from backend.app.services.job_sync import JobSyncFailedError
 
 os.environ.setdefault("APP_ENV", "test")
@@ -46,6 +50,51 @@ from backend.app.main import create_app
 
 
 NOW = datetime(2026, 7, 15, 10, tzinfo=timezone.utc)
+
+COMPLETION_BODY = {
+    "expected_version": 0,
+    "company_name": "Acme",
+    "title": "后端实习生",
+    "description_text": "负责服务端功能开发。",
+    "locations": ["上海"],
+    "recruitment_types": ["实习"],
+    "industries": ["互联网"],
+    "apply_url": "https://example.com/apply/1",
+    "referral_code": None,
+    "deadline_text": "2026-09-01",
+}
+
+ADMIN_DETAIL_FIELDS = {
+    "id",
+    "company_name",
+    "title",
+    "locations",
+    "recruitment_types",
+    "industries",
+    "apply_url",
+    "deadline_text",
+    "status",
+    "gui_eligible",
+    "source_key",
+    "source_name",
+    "updated_at",
+    "description_text",
+    "referral_code",
+    "source_candidate",
+    "source_changed_since_review",
+    "review_version",
+}
+
+SOURCE_CANDIDATE_FIELDS = {
+    "company_name",
+    "title",
+    "locations",
+    "recruitment_types",
+    "industries",
+    "apply_url",
+    "referral_code",
+    "deadline_text",
+}
 
 
 @pytest.fixture
@@ -179,6 +228,20 @@ def seeded(client: TestClient) -> dict[str, Any]:
                 deadline_text="2026-12-31",
                 source_updated_at=NOW - timedelta(hours=index),
                 mapper_version=job_source.mapper_version,
+                source_candidate={
+                    "company_name": company,
+                    "title": f"Role {index}",
+                    "locations": ["深圳"],
+                    "recruitment_types": recruitment_types,
+                    "industries": ["互联网"],
+                    "apply_url": f"https://example.com/apply/{index}",
+                    "referral_code": f"REF-{index}",
+                    "deadline_text": "2026-12-31",
+                    "raw_fields": [{"token": "nested secret token"}],
+                    "payload_hash": "nested secret payload hash",
+                    "mcp_trace": "nested secret trace",
+                    "upstream_response": "nested upstream response",
+                },
                 updated_at=updated_at,
             )
             db.add(posting)
@@ -201,6 +264,58 @@ def seeded(client: TestClient) -> dict[str, Any]:
     client.app.state.job_sync_service = service
     result["service"] = service
     return result
+
+
+def _completion_values(posting: JobPosting) -> JobCompletionInput:
+    return JobCompletionInput(
+        company_name=posting.company_name,
+        title=posting.title,
+        description_text=posting.description_text or f"{posting.title} 完整 JD",
+        locations=list(posting.locations),
+        recruitment_types=list(posting.recruitment_types),
+        industries=list(posting.industries),
+        apply_url=posting.apply_url,
+        referral_code=posting.referral_code,
+        deadline_text=posting.deadline_text,
+    )
+
+
+def _verify_postings(
+    client: TestClient,
+    seeded: dict[str, Any],
+    *posting_ids: str,
+    gui_eligible: bool = True,
+) -> None:
+    service = JobReviewService(now=lambda: NOW + timedelta(hours=1))
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        for posting_id in posting_ids:
+            posting = db.get(JobPosting, posting_id)
+            assert posting is not None
+            saved = service.save_completion(
+                db,
+                job_id=posting.id,
+                actor_user_id=seeded["admin_id"],
+                expected_version=posting.review_version,
+                values=_completion_values(posting),
+            )
+            service.verify(
+                db,
+                job_id=posting.id,
+                actor_user_id=seeded["admin_id"],
+                expected_version=saved.review_version,
+                gui_eligible=gui_eligible,
+            )
+        db.commit()
+
+
+def _events_for(db: Session, job_id: str) -> list[JobVerification]:
+    return list(
+        db.scalars(
+            select(JobVerification)
+            .where(JobVerification.job_id == job_id)
+            .order_by(JobVerification.review_version)
+        )
+    )
 
 
 def test_admin_can_sync(client: TestClient, seeded: dict[str, Any]) -> None:
@@ -229,20 +344,54 @@ def test_student_cannot_sync(client: TestClient, seeded: dict[str, Any]) -> None
     assert seeded["service"].calls == []
 
 
-def test_anonymous_user_cannot_list_jobs(client: TestClient) -> None:
+def test_anonymous_user_cannot_read_verified_jobs(client: TestClient) -> None:
     assert client.get("/api/jobs").status_code == 401
+    assert client.get("/api/jobs/not-a-job").status_code == 401
+
+
+def test_student_list_only_returns_verified_jobs(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    verified = seeded["postings"][0]
+    _verify_postings(client, seeded, verified.id)
+
+    response = client.get("/api/jobs", headers=seeded["student_headers"])
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["id"] for item in response.json()["jobs"]] == [verified.id]
+    assert set(response.json()["jobs"][0]) == {
+        "id",
+        "company_name",
+        "title",
+        "locations",
+        "recruitment_types",
+        "industries",
+        "apply_url",
+        "deadline_text",
+        "status",
+        "gui_eligible",
+        "source_key",
+        "source_name",
+        "updated_at",
+    }
 
 
 def test_job_detail_whitelists_fields(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:
     posting = seeded["postings"][0]
+    _verify_postings(client, seeded, posting.id)
     response = client.get(f"/api/jobs/{posting.id}", headers=seeded["student_headers"])
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "pending_completion"
+    assert payload["status"] == "verified"
+    assert payload["gui_eligible"] is True
+    assert payload["description_text"] == "Role 1 完整 JD"
     assert payload["referral_code"] == "REF-1"
+    assert payload["updated_at"].endswith("Z")
+    assert payload["verified_at"] == "2026-07-15T11:00:00Z"
     assert set(payload) == {
         "id",
         "company_name",
@@ -253,12 +402,13 @@ def test_job_detail_whitelists_fields(
         "apply_url",
         "deadline_text",
         "status",
+        "gui_eligible",
         "source_key",
         "source_name",
         "updated_at",
+        "description_text",
         "referral_code",
-        "source_updated_at",
-        "mapper_version",
+        "verified_at",
     }
     serialized = repr(payload)
     for forbidden in (
@@ -269,6 +419,8 @@ def test_job_detail_whitelists_fields(
         "secret-record",
         "secret token",
         "secret trace",
+        "nested secret",
+        "upstream_response",
     ):
         assert forbidden not in serialized
 
@@ -277,12 +429,13 @@ def test_job_api_serializes_naive_database_datetimes_as_utc(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:
     posting = seeded["postings"][0]
+    _verify_postings(client, seeded, posting.id)
     naive = datetime(2026, 7, 15, 10, 30)
     with client.session_factory() as db:  # type: ignore[attr-defined]
         persisted = db.get(JobPosting, posting.id)
         assert persisted is not None
         persisted.updated_at = naive
-        persisted.source_updated_at = naive
+        persisted.verified_at = naive
         db.commit()
 
     detail = client.get(f"/api/jobs/{posting.id}", headers=seeded["student_headers"])
@@ -290,7 +443,7 @@ def test_job_api_serializes_naive_database_datetimes_as_utc(
 
     assert detail.status_code == 200
     assert detail.json()["updated_at"] == "2026-07-15T10:30:00Z"
-    assert detail.json()["source_updated_at"] == "2026-07-15T10:30:00Z"
+    assert detail.json()["verified_at"] == "2026-07-15T10:30:00Z"
     listed_posting = next(
         job for job in listed.json()["jobs"] if job["id"] == posting.id
     )
@@ -299,6 +452,15 @@ def test_job_api_serializes_naive_database_datetimes_as_utc(
 
 def test_unknown_job_returns_404(client: TestClient, seeded: dict[str, Any]) -> None:
     response = client.get("/api/jobs/not-a-job", headers=seeded["student_headers"])
+    assert response.status_code == 404
+
+
+def test_unverified_job_detail_returns_404(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    response = client.get(f"/api/jobs/{posting.id}", headers=seeded["student_headers"])
+
     assert response.status_code == 404
 
 
@@ -358,6 +520,371 @@ def test_sync_failure_has_stable_safe_detail(
     assert "upstream" not in response.text
 
 
+def test_admin_review_queue_uses_strict_whitelist(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    response = client.get(
+        "/api/admin/jobs/review-queue", headers=seeded["admin_headers"]
+    )
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 3
+    assert len(response.json()["jobs"]) == 3
+    first = response.json()["jobs"][0]
+    assert set(first) == ADMIN_DETAIL_FIELDS
+    assert set(first["source_candidate"]) == SOURCE_CANDIDATE_FIELDS
+    serialized = repr(response.json())
+    for forbidden in (
+        "raw_fields",
+        "payload_hash",
+        "external_record_id",
+        "mcp_trace",
+        "secret-record",
+        "secret token",
+        "secret trace",
+        "upstream_response",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize("review_status", ["verified", "expired", "unknown"])
+def test_admin_review_queue_rejects_terminal_or_unknown_status(
+    client: TestClient, seeded: dict[str, Any], review_status: str
+) -> None:
+    response = client.get(
+        f"/api/admin/jobs/review-queue?review_status={review_status}",
+        headers=seeded["admin_headers"],
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "review_status", ["pending_completion", "pending_review", "rejected"]
+)
+def test_admin_review_queue_accepts_only_nonterminal_statuses(
+    client: TestClient, seeded: dict[str, Any], review_status: str
+) -> None:
+    response = client.get(
+        f"/api/admin/jobs/review-queue?review_status={review_status}",
+        headers=seeded["admin_headers"],
+    )
+
+    assert response.status_code == 200
+
+
+def test_student_cannot_use_any_job_review_endpoint(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    responses = [
+        client.get("/api/admin/jobs/review-queue", headers=seeded["student_headers"]),
+        client.patch(
+            f"/api/admin/jobs/{posting.id}/completion",
+            headers=seeded["student_headers"],
+            json=COMPLETION_BODY,
+        ),
+        client.post(
+            f"/api/admin/jobs/{posting.id}/decision",
+            headers=seeded["student_headers"],
+            json={
+                "expected_version": 0,
+                "decision": "reject",
+                "gui_eligible": False,
+                "reason_code": "invalid_source",
+            },
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [403, 403, 403]
+
+
+def test_anonymous_user_cannot_use_any_job_review_endpoint(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    responses = [
+        client.get("/api/admin/jobs/review-queue"),
+        client.patch(f"/api/admin/jobs/{posting.id}/completion", json=COMPLETION_BODY),
+        client.post(
+            f"/api/admin/jobs/{posting.id}/decision",
+            json={
+                "expected_version": 0,
+                "decision": "reject",
+                "gui_eligible": False,
+                "reason_code": "invalid_source",
+            },
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [401, 401, 401]
+
+
+def test_admin_can_save_and_verify_job_with_authenticated_actor(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    original_updated_at = posting.updated_at
+    completion_body = {**COMPLETION_BODY, "actor_user_id": "forged-user-id"}
+    saved = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json=completion_body,
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["status"] == "pending_review"
+    assert saved.json()["review_version"] == 1
+    assert set(saved.json()) == ADMIN_DETAIL_FIELDS
+    assert saved.json()["updated_at"].endswith("Z")
+    assert saved.json()["updated_at"] != original_updated_at.isoformat().replace(
+        "+00:00", "Z"
+    )
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted_after_save = db.get(JobPosting, posting.id)
+        assert persisted_after_save is not None
+        persisted_updated_at = persisted_after_save.updated_at
+        if persisted_updated_at.tzinfo is None:
+            persisted_updated_at = persisted_updated_at.replace(tzinfo=timezone.utc)
+        assert saved.json()["updated_at"] == persisted_updated_at.isoformat().replace(
+            "+00:00", "Z"
+        )
+
+    verified = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": saved.json()["review_version"],
+            "decision": "verify",
+            "gui_eligible": True,
+            "reason_code": None,
+            "actor_user_id": "forged-user-id",
+        },
+    )
+
+    assert verified.status_code == 200
+    assert verified.json()["status"] == "verified"
+    assert verified.json()["gui_eligible"] is True
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert [event.actor_user_id for event in _events_for(db, posting.id)] == [
+            seeded["admin_id"],
+            seeded["admin_id"],
+        ]
+
+
+def test_admin_can_reject_and_expire_jobs(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    rejected_posting, expired_posting = seeded["postings"][:2]
+    rejected = client.post(
+        f"/api/admin/jobs/{rejected_posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": 0,
+            "decision": "reject",
+            "reason_code": "invalid_source",
+        },
+    )
+    _verify_postings(client, seeded, expired_posting.id)
+    expired = client.post(
+        f"/api/admin/jobs/{expired_posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": 2,
+            "decision": "expire",
+            "reason_code": "closed",
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "rejected"
+    assert expired.status_code == 200
+    assert expired.json()["status"] == "expired"
+    assert expired.json()["gui_eligible"] is False
+
+
+def test_missing_admin_review_job_returns_stable_404(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    completion = client.patch(
+        "/api/admin/jobs/not-a-job/completion",
+        headers=seeded["admin_headers"],
+        json=COMPLETION_BODY,
+    )
+    decision = client.post(
+        "/api/admin/jobs/not-a-job/decision",
+        headers=seeded["admin_headers"],
+        json={"expected_version": 0, "decision": "reject"},
+    )
+
+    expected = {"detail": {"error_code": "job_not_found", "message": "职位不存在。"}}
+    assert completion.status_code == 404
+    assert completion.json() == expected
+    assert decision.status_code == 404
+    assert decision.json() == expected
+
+
+def test_stale_admin_review_returns_409_without_mutation_or_event(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    response = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "expected_version": 99},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "error_code": "stale_job_review",
+            "message": "职位审核版本已过期，请重新加载。",
+        }
+    }
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_COMPLETION
+        assert persisted.review_version == 0
+        assert persisted.company_name == "Acme_One"
+        assert persisted.description_text is None
+        assert _events_for(db, posting.id) == []
+
+
+def test_invalid_transition_returns_409_without_mutation_or_event(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    response = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={"expected_version": 0, "decision": "verify", "gui_eligible": True},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "error_code": "invalid_job_transition",
+            "message": "当前职位状态不允许执行此审核操作。",
+        }
+    }
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_COMPLETION
+        assert persisted.review_version == 0
+        assert _events_for(db, posting.id) == []
+
+
+def test_invalid_application_data_returns_422_without_mutation_or_event(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    response = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "apply_url": "not a valid application URL"},
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {
+            "error_code": "incomplete_job",
+            "message": "职位信息不完整或投递方式无效。",
+        }
+    }
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_COMPLETION
+        assert persisted.review_version == 0
+        assert persisted.apply_url == "https://example.com/apply/1"
+        assert _events_for(db, posting.id) == []
+
+
+def test_source_sync_makes_read_version_stale_without_overwriting_canonical_fields(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    saved = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "company_name": "Reviewed Company"},
+    )
+    assert saved.status_code == 200
+
+    queue = client.get(
+        "/api/admin/jobs/review-queue?review_status=pending_review",
+        headers=seeded["admin_headers"],
+    )
+    read_version = queue.json()["jobs"][0]["review_version"]
+    assert read_version == 1
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        source = db.get(JobSource, persisted.source_id)
+        assert source is not None
+        raw, created = job_repository.insert_raw_snapshot(
+            db,
+            source_id=source.id,
+            external_record_id=persisted.external_record_id,
+            raw_fields=[{"source": "changed"}],
+            payload_hash="f" * 64,
+            source_updated_at=NOW + timedelta(days=1),
+            observed_at=NOW + timedelta(days=1),
+        )
+        assert created is True
+        job_repository.upsert_posting(
+            db,
+            source=source,
+            raw_record=raw,
+            candidate=NormalizedJobCandidate(
+                company_name="Upstream Company",
+                title="Upstream Role",
+                locations=["北京"],
+                recruitment_types=["校招"],
+                industries=["硬件"],
+                apply_url="https://upstream.example.com/apply",
+                referral_code="UPSTREAM",
+                deadline_text="2027-01-01",
+                source_updated_at=NOW + timedelta(days=1),
+            ),
+        )
+        db.commit()
+
+    response = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={
+            **COMPLETION_BODY,
+            "expected_version": read_version,
+            "company_name": "Stale Overwrite",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "error_code": "stale_job_review",
+            "message": "职位审核版本已过期，请重新加载。",
+        }
+    }
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_REVIEW
+        assert persisted.review_version == read_version + 1
+        assert persisted.company_name == "Reviewed Company"
+        assert persisted.title == "后端实习生"
+        assert persisted.source_changed_since_review is True
+        assert [event.action for event in _events_for(db, posting.id)] == [
+            "completion_saved"
+        ]
+
+
 @pytest.mark.parametrize(
     "query",
     ["limit=0", "limit=101", "offset=-1"],
@@ -386,6 +913,11 @@ def test_list_filters_jobs(
     query: str,
     expected_companies: list[str],
 ) -> None:
+    _verify_postings(
+        client,
+        seeded,
+        *(posting.id for posting in seeded["postings"]),
+    )
     response = client.get(f"/api/jobs?{query}", headers=seeded["student_headers"])
     assert response.status_code == 200
     assert sorted(job["company_name"] for job in response.json()["jobs"]) == sorted(
@@ -397,16 +929,22 @@ def test_list_filters_jobs(
 def test_list_has_stable_order_and_pagination(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:
+    _verify_postings(
+        client,
+        seeded,
+        *(posting.id for posting in seeded["postings"]),
+    )
     first = client.get("/api/jobs?limit=2", headers=seeded["student_headers"]).json()
     second = client.get(
         "/api/jobs?limit=2&offset=2", headers=seeded["student_headers"]
     ).json()
 
-    expected = sorted(
-        seeded["postings"],
-        key=lambda posting: (posting.updated_at, posting.id),
-        reverse=True,
-    )
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        expected = sorted(
+            [db.get(JobPosting, posting.id) for posting in seeded["postings"]],
+            key=lambda posting: (posting.updated_at, posting.id),
+            reverse=True,
+        )
     assert first["total"] == 3
     assert [job["id"] for job in first["jobs"] + second["jobs"]] == [
         posting.id for posting in expected

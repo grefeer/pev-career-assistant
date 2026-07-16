@@ -9,7 +9,7 @@ from backend.app.api.dependencies import _get_db, get_current_user
 from backend.app.api.routes.sessions import require_owned, summarize_session
 from backend.app.db.models import User
 from backend.app.repositories.sessions import activate
-from backend.app.schemas import AnalysisResponse, JobListResponse
+from backend.app.schemas import AnalysisResponse
 from src.resume_parser import parse_resume_file
 from src.session_service import (
     DEFAULT_MESSAGE,
@@ -23,15 +23,6 @@ from src.utils import load_jobs, load_sample_resume
 
 
 router = APIRouter(tags=["analysis"])
-
-
-@router.get("/jobs", response_model=JobListResponse)
-def jobs(
-    current_user: Annotated[User, Depends(get_current_user)],
-) -> JobListResponse:
-    del current_user
-    items = load_jobs()
-    return JobListResponse(total=len(items), jobs=items)
 
 
 @router.post("/analysis/run", response_model=AnalysisResponse)
