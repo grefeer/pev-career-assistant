@@ -26,6 +26,12 @@ PAIRING_TTL_SECONDS = 600
 ONLINE_TTL_SECONDS = 90
 DEVICE_CREDENTIAL_TTL_DAYS = 90
 TASK_LEASE_TTL_SECONDS = 300
+ALLOWED_TASK_LEASE_SCOPES = frozenset({"task:progress", "task:result"})
+
+
+def _validate_task_lease_scopes(scopes: set[str]) -> None:
+    if not scopes or not scopes <= ALLOWED_TASK_LEASE_SCOPES:
+        raise InvalidTaskLeaseError("task lease scope is not allowed")
 
 
 class InvalidPairingTicketError(ValueError):
@@ -251,6 +257,7 @@ class DeviceService:
     def issue_task_lease(
         self, db: Session, *, device: Device, task_id: str, scopes: set[str]
     ) -> str:
+        _validate_task_lease_scopes(scopes)
         if not self.lease_secret:
             raise InvalidTaskLeaseError("task lease signing is not configured")
         from backend.app.db.models import ApplicationTask
@@ -352,6 +359,7 @@ class DeviceService:
 
 
 __all__ = [
+    "ALLOWED_TASK_LEASE_SCOPES",
     "DeviceNotFoundError",
     "DeviceService",
     "InvalidPairingTicketError",

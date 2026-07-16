@@ -1,0 +1,24 @@
+{
+  "protocol_version": "executor.v1",
+  "task_id": "11111111-1111-4111-8111-111111111111",
+  "state_version": 0,
+  "target_url": "http://127.0.0.1:8765/single-page",
+  "fields": [
+    {
+      "field_key": "full_name",
+      "label": "\u59d3\u540d",
+      "value": "Alice Example",
+      "confidence": "confirmed",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "field_key": "portfolio_url",
+      "label": "\u4f5c\u54c1\u94fe\u63a5",
+      "value": null,
+      "confidence": "missing",
+      "required": false,
+      "sensitive": false
+    }
+  ]
+}
