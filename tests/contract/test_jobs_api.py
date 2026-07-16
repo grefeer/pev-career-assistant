@@ -573,6 +573,220 @@ def test_admin_review_queue_accepts_only_nonterminal_statuses(
     assert response.status_code == 200
 
 
+def test_admin_verified_jobs_requires_admin(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    anonymous = client.get("/api/admin/jobs/verified")
+    student = client.get("/api/admin/jobs/verified", headers=seeded["student_headers"])
+
+    assert anonymous.status_code == 401
+    assert student.status_code == 403
+
+
+def test_admin_verified_jobs_are_verified_only_with_strict_current_detail(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    verified = seeded["postings"][0]
+    _verify_postings(client, seeded, verified.id)
+
+    response = client.get("/api/admin/jobs/verified", headers=seeded["admin_headers"])
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert [item["id"] for item in response.json()["jobs"]] == [verified.id]
+    detail = response.json()["jobs"][0]
+    assert detail["status"] == "verified"
+    assert detail["review_version"] == 2
+    assert set(detail) == ADMIN_DETAIL_FIELDS
+    assert set(detail["source_candidate"]) == SOURCE_CANDIDATE_FIELDS
+    serialized = repr(detail)
+    for forbidden in (
+        "raw_fields",
+        "payload_hash",
+        "external_record_id",
+        "mcp_trace",
+        "secret-record",
+        "secret token",
+        "secret trace",
+        "upstream_response",
+        "credential",
+    ):
+        assert forbidden not in serialized
+
+
+@pytest.mark.parametrize("query", ["limit=0", "limit=101", "offset=-1"])
+def test_admin_verified_jobs_reject_invalid_pagination(
+    client: TestClient, seeded: dict[str, Any], query: str
+) -> None:
+    response = client.get(
+        f"/api/admin/jobs/verified?{query}", headers=seeded["admin_headers"]
+    )
+
+    assert response.status_code == 422
+
+
+def test_admin_verified_jobs_have_public_total_order_and_pagination(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    _verify_postings(
+        client,
+        seeded,
+        *(posting.id for posting in seeded["postings"]),
+    )
+
+    first = client.get(
+        "/api/admin/jobs/verified?limit=2&offset=0",
+        headers=seeded["admin_headers"],
+    ).json()
+    second = client.get(
+        "/api/admin/jobs/verified?limit=2&offset=2",
+        headers=seeded["admin_headers"],
+    ).json()
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        expected = sorted(
+            [db.get(JobPosting, posting.id) for posting in seeded["postings"]],
+            key=lambda posting: (posting.updated_at, posting.id),
+            reverse=True,
+        )
+
+    assert first["total"] == 3
+    assert second["total"] == 3
+    assert [item["id"] for item in first["jobs"] + second["jobs"]] == [
+        posting.id for posting in expected
+    ]
+
+
+def test_admin_can_reload_verified_version_and_expire_job(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    saved = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json=COMPLETION_BODY,
+    )
+    verified = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": saved.json()["review_version"],
+            "decision": "verify",
+            "gui_eligible": True,
+        },
+    )
+    reloaded = client.get("/api/admin/jobs/verified", headers=seeded["admin_headers"])
+
+    assert saved.status_code == 200
+    assert verified.status_code == 200
+    assert reloaded.status_code == 200
+    lifecycle_job = reloaded.json()["jobs"][0]
+    assert lifecycle_job["id"] == posting.id
+    assert lifecycle_job["review_version"] == verified.json()["review_version"] == 2
+
+    expired = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": lifecycle_job["review_version"],
+            "decision": "expire",
+            "reason_code": "closed",
+        },
+    )
+    after_expiry = client.get(
+        "/api/admin/jobs/verified", headers=seeded["admin_headers"]
+    )
+
+    assert expired.status_code == 200
+    assert expired.json()["status"] == "expired"
+    assert after_expiry.json() == {"total": 0, "jobs": []}
+
+
+def test_source_sync_makes_reloaded_expire_version_stale_without_extra_event(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    saved = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "company_name": "Reviewed Company"},
+    )
+    verified = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": saved.json()["review_version"],
+            "decision": "verify",
+            "gui_eligible": True,
+        },
+    )
+    assert verified.status_code == 200
+    reloaded = client.get("/api/admin/jobs/verified", headers=seeded["admin_headers"])
+    read_version = reloaded.json()["jobs"][0]["review_version"]
+    assert read_version == 2
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        source = db.get(JobSource, persisted.source_id)
+        assert source is not None
+        raw, created = job_repository.insert_raw_snapshot(
+            db,
+            source_id=source.id,
+            external_record_id=persisted.external_record_id,
+            raw_fields=[{"source": "changed-before-expiry"}],
+            payload_hash="e" * 64,
+            source_updated_at=NOW + timedelta(days=2),
+            observed_at=NOW + timedelta(days=2),
+        )
+        assert created is True
+        job_repository.upsert_posting(
+            db,
+            source=source,
+            raw_record=raw,
+            candidate=NormalizedJobCandidate(
+                company_name="Upstream Company",
+                title="Upstream Role",
+                locations=["北京"],
+                recruitment_types=["校招"],
+                industries=["硬件"],
+                apply_url="https://upstream.example.com/apply",
+                referral_code="UPSTREAM",
+                deadline_text="2027-01-01",
+                source_updated_at=NOW + timedelta(days=2),
+            ),
+        )
+        db.commit()
+
+    stale = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": read_version,
+            "decision": "expire",
+            "reason_code": "closed",
+        },
+    )
+
+    assert stale.status_code == 409
+    assert stale.json() == {
+        "detail": {
+            "error_code": "stale_job_review",
+            "message": "职位审核版本已过期，请重新加载。",
+        }
+    }
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.VERIFIED
+        assert persisted.review_version == read_version + 1
+        assert persisted.company_name == "Reviewed Company"
+        assert persisted.source_changed_since_review is True
+        assert [event.action for event in _events_for(db, posting.id)] == [
+            "completion_saved",
+            "verified",
+        ]
+
+
 def test_student_cannot_use_any_job_review_endpoint(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:

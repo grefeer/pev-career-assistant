@@ -195,6 +195,28 @@ def review_queue(
     )
 
 
+@router.get("/admin/jobs/verified", response_model=AdminJobListResponse)
+def list_verified_jobs(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(_get_db)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdminJobListResponse:
+    del admin
+    total, rows = jobs.list_public_postings(
+        db,
+        limit=limit,
+        offset=offset,
+        source_key=None,
+        company=None,
+        recruitment_type=None,
+    )
+    return AdminJobListResponse(
+        total=total,
+        jobs=[_admin_detail(posting, source) for posting, source in rows],
+    )
+
+
 @router.patch("/admin/jobs/{job_id}/completion", response_model=AdminJobDetail)
 def save_job_completion(
     job_id: str,
