@@ -101,6 +101,36 @@ def test_job_decision_requires_explicit_reason_contract(
         JobDecisionRequest.model_validate(payload)
 
 
+from backend.app.db.models import (
+    JobDuplicateCandidate,
+    JobSourceLink,
+    JobSourceProvider,
+    UserJobSubmission,
+)
+
+
+def test_manual_job_entities_use_uuid_and_versioned_private_ownership() -> None:
+    assert JobSourceProvider.USER_SUBMISSION.value == "user_submission"
+    assert {
+        "user_id", "input_type", "original_url", "original_jd", "input_preview",
+        "normalized_url", "content_sha256", "status", "version",
+        "deduplication_status", "deduplication_error_code", "promoted_job_id",
+        "rejected_reason_code",
+    } <= set(UserJobSubmission.__table__.columns.keys())
+    assert UserJobSubmission.__table__.columns.id.type.length == 36
+
+
+def test_duplicate_candidate_and_source_link_preserve_explanations() -> None:
+    assert {
+        "submission_id", "candidate_job_id", "generated_for_version",
+        "score_basis_points", "reasons", "score_components", "algorithm_version",
+    } <= set(JobDuplicateCandidate.__table__.columns.keys())
+    assert {
+        "job_id", "source_type", "source_id", "submission_id",
+        "source_record_ref", "normalized_url", "created_at",
+    } <= set(JobSourceLink.__table__.columns.keys())
+
+
 def test_job_decision_accepts_only_matching_reason_shape() -> None:
     rejected = JobDecisionRequest.model_validate(
         {"expected_version": 0, "decision": "reject", "reason_code": "invalid_source"}

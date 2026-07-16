@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -23,6 +24,13 @@ from backend.app.domain.profiles import (
     EvidenceDecisionAction,
     ResumeAssetStatus,
     ResumeImportStatus,
+)
+
+from backend.app.domain.job_submissions import (
+    DeduplicationStatus,
+    JobSourceLinkType,
+    SubmissionInputType,
+    SubmissionStatus,
 )
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
@@ -216,6 +224,7 @@ class AuditEvent(Base):
 
 class JobSourceProvider(StrEnum):
     TENCENT_SMARTSHEET = "tencent_smartsheet"
+    USER_SUBMISSION = "user_submission"
 
 
 class JobSyncRunStatus(StrEnum):
@@ -375,6 +384,102 @@ class JobVerification(UUIDPrimaryKeyMixin, Base):
     review_version: Mapped[int] = mapped_column(Integer, nullable=False)
     field_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class UserJobSubmission(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "user_job_submissions"
+    __table_args__ = (
+        Index("ix_user_job_submissions_user_status_updated", "user_id", "status", "updated_at"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    input_type: Mapped[SubmissionInputType] = mapped_column(
+        Enum(SubmissionInputType, name="job_submission_input_type", **enum_kwargs),
+        nullable=False,
+    )
+    original_url: Mapped[str | None] = mapped_column(Text)
+    original_jd: Mapped[str | None] = mapped_column(Text)
+    input_preview: Mapped[str] = mapped_column(String(240), nullable=False)
+    normalized_url: Mapped[str | None] = mapped_column(Text)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[SubmissionStatus] = mapped_column(
+        Enum(SubmissionStatus, name="job_submission_status", **enum_kwargs),
+        default=SubmissionStatus.DRAFT,
+        nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    deduplication_status: Mapped[DeduplicationStatus] = mapped_column(
+        Enum(DeduplicationStatus, name="job_deduplication_status", **enum_kwargs),
+        default=DeduplicationStatus.PENDING,
+        nullable=False,
+    )
+    deduplication_error_code: Mapped[str | None] = mapped_column(String(80))
+    promoted_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="SET NULL"), index=True
+    )
+    rejected_reason_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class JobDuplicateCandidate(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_duplicate_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "submission_id", "candidate_job_id", "generated_for_version",
+            "algorithm_version", name="uq_job_duplicate_candidate_version",
+        ),
+        CheckConstraint(
+            "score_basis_points >= 0 AND score_basis_points <= 10000",
+            name="ck_job_duplicate_candidate_score",
+        ),
+        Index("ix_job_duplicate_candidates_submission_version", "submission_id", "generated_for_version"),
+    )
+    submission_id: Mapped[str] = mapped_column(
+        ForeignKey("user_job_submissions.id", ondelete="CASCADE"), nullable=False
+    )
+    candidate_job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    generated_for_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    score_basis_points: Mapped[int] = mapped_column(Integer, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    score_components: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class JobSourceLink(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_source_links"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "source_type", "source_record_ref", name="uq_job_source_link_record"
+        ),
+        CheckConstraint(
+            "(source_type = 'tencent_smartsheet' AND source_id IS NOT NULL AND submission_id IS NULL) OR "
+            "(source_type = 'user_submission' AND source_id IS NULL AND submission_id IS NOT NULL)",
+            name="ck_job_source_link_reference",
+        ),
+        Index("ix_job_source_links_job_created", "job_id", "created_at"),
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    source_type: Mapped[JobSourceLinkType] = mapped_column(
+        Enum(JobSourceLinkType, name="job_source_link_type", **enum_kwargs), nullable=False
+    )
+    source_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_sources.id", ondelete="RESTRICT")
+    )
+    submission_id: Mapped[str | None] = mapped_column(
+        ForeignKey("user_job_submissions.id", ondelete="RESTRICT")
+    )
+    source_record_ref: Mapped[str] = mapped_column(String(200), nullable=False)
+    normalized_url: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
