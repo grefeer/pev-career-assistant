@@ -221,6 +221,10 @@ class JobSyncRunStatus(StrEnum):
 
 class JobPostingStatus(StrEnum):
     PENDING_COMPLETION = "pending_completion"
+    PENDING_REVIEW = "pending_review"
+    VERIFIED = "verified"
+    EXPIRED = "expired"
+    REJECTED = "rejected"
 
 
 class JobSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -324,6 +328,7 @@ class JobPosting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     company_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
+    description_text: Mapped[str | None] = mapped_column(Text)
     locations: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     recruitment_types: Mapped[list[str]] = mapped_column(
         JSON, default=list, nullable=False
@@ -334,3 +339,36 @@ class JobPosting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     deadline_text: Mapped[str | None] = mapped_column(String(255))
     source_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     mapper_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_candidate: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    source_changed_since_review: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+    gui_eligible: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    review_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class JobVerification(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_verifications"
+    __table_args__ = (
+        Index("ix_job_verifications_job_created", "job_id", "created_at"),
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(40), nullable=False)
+    from_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    review_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    field_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )

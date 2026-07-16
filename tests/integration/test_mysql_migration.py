@@ -19,9 +19,10 @@ BUSINESS_TABLES = {
     "job_sync_runs",
     "raw_job_records",
     "job_postings",
+    "job_verifications",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260715_0003"
+HEAD_REVISION = "20260716_0004"
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:
@@ -91,6 +92,12 @@ def test_mysql_migration_upgrade_and_downgrade() -> None:
             }
             assert {"expires_at", "credential_rotated_at"} <= device_columns
             inspector = inspect(engine)
+            job_columns = {
+                column["name"]
+                for column in inspector.get_columns("job_postings")
+            }
+            assert {"review_version", "source_candidate", "gui_eligible"} <= job_columns
+            assert "job_verifications" in inspector.get_table_names()
             assert {
                 ("source_key",),
                 ("provider", "file_id", "sheet_id"),
