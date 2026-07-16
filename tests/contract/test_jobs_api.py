@@ -689,7 +689,7 @@ def test_admin_can_reload_verified_version_and_expire_job(
         json={
             "expected_version": lifecycle_job["review_version"],
             "decision": "expire",
-            "reason_code": "closed",
+            "reason_code": "closed_on_official_site",
         },
     )
     after_expiry = client.get(
@@ -763,7 +763,7 @@ def test_source_sync_makes_reloaded_expire_version_stale_without_extra_event(
         json={
             "expected_version": read_version,
             "decision": "expire",
-            "reason_code": "closed",
+            "reason_code": "closed_on_official_site",
         },
     )
 
@@ -939,7 +939,7 @@ def test_admin_can_reject_and_expire_jobs(
         json={
             "expected_version": 2,
             "decision": "expire",
-            "reason_code": "closed",
+            "reason_code": "closed_on_official_site",
         },
     )
 
@@ -983,6 +983,17 @@ def test_missing_admin_review_job_returns_stable_404(
         {"expected_version": 0, "decision": "expire", "reason_code": "   "},
         {"expected_version": 0, "decision": "verify", "reason_code": "unexpected"},
         {"expected_version": 0, "decision": "verify", "reason_code": ""},
+        {"expected_version": 0, "decision": "reject", "reason_code": "unknown"},
+        {
+            "expected_version": 0,
+            "decision": "reject",
+            "reason_code": "closed_on_official_site",
+        },
+        {
+            "expected_version": 0,
+            "decision": "expire",
+            "reason_code": "invalid_source",
+        },
     ],
 )
 def test_admin_decision_rejects_missing_or_mismatched_reason(

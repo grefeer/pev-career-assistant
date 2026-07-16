@@ -81,6 +81,17 @@ def test_job_verification_is_an_immutable_review_record() -> None:
         {"expected_version": 0, "decision": "expire", "reason_code": "   "},
         {"expected_version": 0, "decision": "verify", "reason_code": "unused"},
         {"expected_version": 0, "decision": "verify", "reason_code": ""},
+        {"expected_version": 0, "decision": "reject", "reason_code": "unknown"},
+        {
+            "expected_version": 0,
+            "decision": "reject",
+            "reason_code": "closed_on_official_site",
+        },
+        {
+            "expected_version": 0,
+            "decision": "expire",
+            "reason_code": "invalid_source",
+        },
     ],
 )
 def test_job_decision_requires_explicit_reason_contract(
@@ -95,12 +106,16 @@ def test_job_decision_accepts_only_matching_reason_shape() -> None:
         {"expected_version": 0, "decision": "reject", "reason_code": "invalid_source"}
     )
     expired = JobDecisionRequest.model_validate(
-        {"expected_version": 1, "decision": "expire", "reason_code": "closed"}
+        {
+            "expected_version": 1,
+            "decision": "expire",
+            "reason_code": "closed_on_official_site",
+        }
     )
     verified = JobDecisionRequest.model_validate(
         {"expected_version": 2, "decision": "verify", "reason_code": None}
     )
 
     assert rejected.reason_code == "invalid_source"
-    assert expired.reason_code == "closed"
+    assert expired.reason_code == "closed_on_official_site"
     assert verified.reason_code is None

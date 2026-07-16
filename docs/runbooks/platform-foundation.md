@@ -293,12 +293,22 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 
 ## 测试和发布前门禁
 
-先在当前进程构造真实 integration URL。MySQL 使用 `root` 与 User-scope `DB_PASSWORD`；Redis 8 使用 User-scope `REDIS_PASSWORD` 和 DB 0。以下赋值不会回显 URL：
+从仓库根目录运行以下门禁。先把根目录和根 `.venv` 解释器解析为绝对路径，再在当前
+进程中按 Compose 宿主端口构造真实 integration URL。未覆盖时，MySQL、Redis 和 MinIO
+分别使用 Compose 默认宿主端口 `3306`、`6379` 和 `9000`。MySQL 使用 `root` 与
+User-scope `DB_PASSWORD`；Redis 8 使用 User-scope `REDIS_PASSWORD` 和 DB 0。以下赋值
+不会回显 URL：
 
 ```powershell
-$env:TEST_MYSQL_URL = & .\.venv\Scripts\python.exe -c "import os,urllib.parse; print('mysql+pymysql://root:'+urllib.parse.quote(os.environ['DB_PASSWORD'],safe='')+'@127.0.0.1:3307/career_assistant_test?charset=utf8mb4')"
-$env:TEST_REDIS_URL = & .\.venv\Scripts\python.exe -c "import os,urllib.parse; print('redis://:'+urllib.parse.quote(os.environ['REDIS_PASSWORD'],safe='')+'@127.0.0.1:6380/0')"
-$env:TEST_S3_ENDPOINT = 'http://127.0.0.1:9000'
+$repoRoot = (Resolve-Path '.').Path
+$python = (Resolve-Path (Join-Path $repoRoot '.venv\Scripts\python.exe')).Path
+Set-Location $repoRoot
+$mysqlHostPort = if ($env:MYSQL_HOST_PORT) { $env:MYSQL_HOST_PORT } else { '3306' }
+$redisHostPort = if ($env:REDIS_HOST_PORT) { $env:REDIS_HOST_PORT } else { '6379' }
+$minioHostPort = if ($env:MINIO_HOST_PORT) { $env:MINIO_HOST_PORT } else { '9000' }
+$env:TEST_MYSQL_URL = & $python -c "import os,sys,urllib.parse; print('mysql+pymysql://root:'+urllib.parse.quote(os.environ['DB_PASSWORD'],safe='')+'@127.0.0.1:'+sys.argv[1]+'/career_assistant_test?charset=utf8mb4')" $mysqlHostPort
+$env:TEST_REDIS_URL = & $python -c "import os,sys,urllib.parse; print('redis://:'+urllib.parse.quote(os.environ['REDIS_PASSWORD'],safe='')+'@127.0.0.1:'+sys.argv[1]+'/0')" $redisHostPort
+$env:TEST_S3_ENDPOINT = "http://127.0.0.1:$minioHostPort"
 $env:TEST_S3_ACCESS_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_USER', 'User')
 $env:TEST_S3_SECRET_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_PASSWORD', 'User')
 $env:TEST_S3_BUCKET = 'career-assistant-storage-test'
@@ -315,10 +325,11 @@ $env:ALLOW_DESTRUCTIVE_MYSQL_TESTS = '1'
 运行全部门禁：
 
 ```powershell
-.\.venv\Scripts\python.exe -m ruff check backend src tests scripts
-.\.venv\Scripts\python.exe -m pytest -v
-npm --prefix frontend run build
-npm --prefix frontend run typecheck
+& $python -m ruff check backend src tests scripts
+& $python -m pytest -v
+& npm.cmd --prefix (Join-Path $repoRoot 'frontend') run test
+& npm.cmd --prefix (Join-Path $repoRoot 'frontend') run typecheck
+& npm.cmd --prefix (Join-Path $repoRoot 'frontend') run build
 rg "app_users.json|USER_STORE_PATH|replace-with-your-own-secret|password_hash.*sha256|postgres" backend src frontend docker-compose.yml README.md
 ```
 
@@ -334,5 +345,5 @@ rg -n "app_users.json" docs/runbooks/platform-foundation.md
 $env:APP_ENV='production'
 $env:APP_AUTH_SECRET='replace-with-your-own-secret'
 $env:CHECKPOINT_BACKEND='sqlite'
-.\.venv\Scripts\python.exe -c "from backend.app.config import Settings; Settings()"
+& $python -c "from backend.app.config import Settings; Settings()"
 ```

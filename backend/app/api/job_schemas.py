@@ -6,6 +6,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.db.models import JobPostingStatus
+from backend.app.domain.job_review import EXPIRE_REASON_CODES, REJECT_REASON_CODES
 
 
 ReviewQueueStatus = Literal[
@@ -106,4 +107,9 @@ class JobDecisionRequest(BaseModel):
         if self.reason_code is None or not self.reason_code.strip():
             raise ValueError(f"{self.decision} requires a stable reason_code")
         self.reason_code = self.reason_code.strip()
+        allowed_reasons = (
+            REJECT_REASON_CODES if self.decision == "reject" else EXPIRE_REASON_CODES
+        )
+        if self.reason_code not in allowed_reasons:
+            raise ValueError(f"invalid reason_code for {self.decision}")
         return self

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.base import utc_now
 from backend.app.db.models import JobPosting, JobPostingStatus, JobVerification
+from backend.app.domain.job_review import EXPIRE_REASON_CODES, REJECT_REASON_CODES
 from backend.app.repositories import jobs
 
 
@@ -339,7 +340,7 @@ class JobReviewService:
         normalized_reason = reason_code.strip()
 
         def validate(_posting: JobPosting) -> None:
-            if not normalized_reason:
+            if normalized_reason not in REJECT_REASON_CODES:
                 raise IncompleteJobError("reason_code")
 
         return self._transition(
@@ -371,7 +372,7 @@ class JobReviewService:
         normalized_reason = reason_code.strip()
 
         def validate(_posting: JobPosting) -> None:
-            if not normalized_reason:
+            if normalized_reason not in EXPIRE_REASON_CODES:
                 raise IncompleteJobError("reason_code")
 
         return self._transition(

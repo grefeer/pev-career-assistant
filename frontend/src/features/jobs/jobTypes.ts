@@ -85,9 +85,34 @@ export interface JobCompletionPayload {
   deadline_text: string | null;
 }
 
-export interface JobDecisionPayload {
+interface JobDecisionPayloadBase {
   expected_version: number;
-  decision: "verify" | "reject" | "expire";
   gui_eligible: boolean;
-  reason_code: string | null;
 }
+
+export type RejectReasonCode =
+  | "invalid_source"
+  | "wrong_company"
+  | "insufficient_job_details"
+  | "unsafe_or_invalid_apply_channel";
+
+export type ExpireReasonCode =
+  | "closed_on_official_site"
+  | "deadline_passed"
+  | "application_channel_unavailable";
+
+export type JobDecisionPayload =
+  | (JobDecisionPayloadBase & {
+      decision: "verify";
+      reason_code: null;
+    })
+  | (JobDecisionPayloadBase & {
+      decision: "reject";
+      gui_eligible: false;
+      reason_code: RejectReasonCode;
+    })
+  | (JobDecisionPayloadBase & {
+      decision: "expire";
+      gui_eligible: false;
+      reason_code: ExpireReasonCode;
+    });

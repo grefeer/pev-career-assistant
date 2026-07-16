@@ -17,8 +17,10 @@ import {
 } from "./jobsApi";
 import type {
   AdminJobDetail,
+  ExpireReasonCode,
   JobCompletionPayload,
   JobSourceCandidate,
+  RejectReasonCode,
   ReviewQueueStatus,
 } from "./jobTypes";
 
@@ -44,12 +46,12 @@ const rejectReasons = [
   { code: "wrong_company", label: "公司归属错误" },
   { code: "insufficient_job_details", label: "无法形成可信职位" },
   { code: "unsafe_or_invalid_apply_channel", label: "投递渠道无效或不安全" },
-] as const;
+] as const satisfies ReadonlyArray<{ code: RejectReasonCode; label: string }>;
 const expireReasons = [
   { code: "closed_on_official_site", label: "官网已关闭" },
   { code: "deadline_passed", label: "截止日期已过" },
   { code: "application_channel_unavailable", label: "投递渠道不可用" },
-] as const;
+] as const satisfies ReadonlyArray<{ code: ExpireReasonCode; label: string }>;
 
 const mode = ref<"review" | "verified">("review");
 const queueJobs = ref<AdminJobDetail[]>([]);
@@ -67,8 +69,8 @@ const listError = ref("");
 const error = ref("");
 const message = ref("");
 const guiChoice = ref<"" | "yes" | "no">("");
-const rejectReason = ref("");
-const expireReason = ref("");
+const rejectReason = ref<"" | RejectReasonCode>("");
+const expireReason = ref<"" | ExpireReasonCode>("");
 const baseline = ref("");
 let listRequestVersion = 0;
 

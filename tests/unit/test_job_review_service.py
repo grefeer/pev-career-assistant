@@ -458,6 +458,51 @@ def test_expire_rejects_empty_reason(
         )
 
 
+@pytest.mark.parametrize(
+    "reason_code",
+    ["unknown", "closed_on_official_site"],
+)
+def test_reject_rejects_unknown_or_expire_reason_codes(
+    reason_code: str,
+    db: Session,
+    pending_job: JobPosting,
+    admin: User,
+) -> None:
+    with pytest.raises(IncompleteJobError, match="reason_code"):
+        JobReviewService().reject(
+            db,
+            job_id=pending_job.id,
+            actor_user_id=admin.id,
+            expected_version=0,
+            reason_code=reason_code,
+        )
+
+
+@pytest.mark.parametrize("reason_code", ["unknown", "invalid_source"])
+def test_expire_rejects_unknown_or_reject_reason_codes(
+    reason_code: str,
+    db: Session,
+    pending_review_job: JobPosting,
+    admin: User,
+) -> None:
+    verified = JobReviewService().verify(
+        db,
+        job_id=pending_review_job.id,
+        actor_user_id=admin.id,
+        expected_version=1,
+        gui_eligible=True,
+    )
+
+    with pytest.raises(IncompleteJobError, match="reason_code"):
+        JobReviewService().expire(
+            db,
+            job_id=verified.id,
+            actor_user_id=admin.id,
+            expected_version=2,
+            reason_code=reason_code,
+        )
+
+
 def test_expire_only_accepts_verified_job(
     db: Session, pending_job: JobPosting, admin: User
 ) -> None:
@@ -522,13 +567,13 @@ def test_terminal_timestamps_and_gui_flags_follow_status_invariants(
         job_id=verified.id,
         actor_user_id=admin.id,
         expected_version=2,
-        reason_code="  closed  ",
+        reason_code="  closed_on_official_site  ",
     )
     assert timezone_agnostic(expired.verified_at) == timezone_agnostic(calls[1])
     assert timezone_agnostic(expired.expired_at) == timezone_agnostic(calls[2])
     assert expired.rejected_at is None
     assert expired.gui_eligible is False
-    assert events_for(db, expired.id)[-1].reason_code == "closed"
+    assert events_for(db, expired.id)[-1].reason_code == "closed_on_official_site"
     assert len(calls) == 3
     assert [
         timezone_agnostic(item.created_at) for item in events_for(db, expired.id)
@@ -661,7 +706,7 @@ def test_every_transition_requests_the_authoritative_row_lock(
         job_id=verified.id,
         actor_user_id=admin.id,
         expected_version=2,
-        reason_code="closed",
+        reason_code="closed_on_official_site",
     )
 
     assert lock_values == [True, True, True]
