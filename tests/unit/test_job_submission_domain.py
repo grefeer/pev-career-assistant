@@ -95,3 +95,31 @@ def test_jd_overlap_below_threshold_is_not_a_candidate() -> None:
     assert [item.job_id for item in matches] == ["job-match"]
     assert matches[0].reasons == ("jd_token_overlap",)
     assert matches[0].score_basis_points >= 7200
+
+
+from pydantic import ValidationError
+
+from backend.app.api.job_submission_schemas import (
+    AdminJobSubmissionDecisionRequest,
+    JobSubmissionCreateRequest,
+)
+
+
+def test_create_request_requires_exactly_one_matching_input() -> None:
+    request = JobSubmissionCreateRequest(input_type="url", url="https://jobs.example.com/1")
+    assert request.jd_text is None
+    with pytest.raises(ValidationError):
+        JobSubmissionCreateRequest(input_type="url", url=None, jd_text="JD")
+
+
+def test_admin_decision_is_discriminated_and_complete() -> None:
+    request = AdminJobSubmissionDecisionRequest(
+        expected_version=2,
+        action="create_pending",
+        company_name="示例科技",
+        title="后端实习生",
+        apply_url="https://jobs.example.com/1",
+    )
+    assert request.job_id is None
+    with pytest.raises(ValidationError):
+        AdminJobSubmissionDecisionRequest(expected_version=2, action="link_existing")
