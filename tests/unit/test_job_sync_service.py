@@ -12,6 +12,8 @@ from backend.app.db.models import (
     AuditEvent,
     JobPosting,
     JobPostingStatus,
+    JobSourceLink,
+    JobSourceLinkType,
     JobSyncRun,
     JobSyncRunStatus,
     JobVerification,
@@ -19,6 +21,7 @@ from backend.app.db.models import (
     User,
     UserRole,
 )
+from backend.app.db.models import DeduplicationStatus, SubmissionInputType, SubmissionStatus, UserJobSubmission
 from backend.app.repositories import jobs
 from backend.app.services import job_sync
 from backend.app.services.job_review import (
@@ -791,3 +794,42 @@ def test_process_control_exceptions_are_not_wrapped(
         service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
 
     assert caught.value is signal
+
+
+def seeded_private_submission(db: Session) -> UserJobSubmission:
+    owner = db.scalar(select(User).where(User.account == "admin"))
+    assert owner is not None
+    item = UserJobSubmission(
+        user_id=owner.id, input_type=SubmissionInputType.URL,
+        original_url="https://example.com/jobs", original_jd=None,
+        input_preview="https://example.com/jobs",
+        normalized_url="https://example.com/jobs",
+        content_sha256="a" * 64, status=SubmissionStatus.DRAFT, version=0,
+        deduplication_status=DeduplicationStatus.PENDING,
+    )
+    db.add(item)
+    db.flush()
+    return item
+
+
+def test_tencent_resync_preserves_manual_source_link(db: Session) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 1, False, 0)},
+    )
+    _outcome = service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    posting = db.scalar(select(JobPosting))
+    assert posting is not None
+    manual = seeded_private_submission(db)
+    db.add(JobSourceLink(
+        job_id=posting.id, source_type=JobSourceLinkType.USER_SUBMISSION,
+        source_id=None, submission_id=manual.id,
+        source_record_ref=manual.id, normalized_url=manual.normalized_url,
+    ))
+    db.commit()
+    service(gateway).sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    links = db.scalars(select(JobSourceLink).where(JobSourceLink.job_id == posting.id)).all()
+    assert {link.source_type for link in links} == {
+        JobSourceLinkType.TENCENT_SMARTSHEET,
+        JobSourceLinkType.USER_SUBMISSION,
+    }
