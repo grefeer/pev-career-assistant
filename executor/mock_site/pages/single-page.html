@@ -4,7 +4,7 @@
 <body>
 <main data-topology="single">
   <label>姓名 <input data-field-key="full_name" name="full_name"></label>
-  <button type="button" data-action-kind="final" id="final-submit">提交申请</button>
+  <button type="button" data-action-kind="save" id="save-btn">保存</button>
 </main>
 <script>
 document.querySelectorAll("[data-field-key]").forEach(function(el) {
@@ -12,7 +12,7 @@ document.querySelectorAll("[data-field-key]").forEach(function(el) {
     fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"field", key:el.getAttribute("data-field-key")})});
   });
 });
-document.getElementById("final-submit").addEventListener("click", function() {
+document.getElementById("save-btn").addEventListener("click", function() {
   fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"final"})});
 });
 </script>
