@@ -37,6 +37,10 @@ checkpoints/
 data/app_users.json
 data/minio/
 minio-data/
+executor-data/checkpoints/
+executor-data/chrome-profile/
+test-results/
+playwright-report/
 frontend/node_modules/
 frontend/dist/
 
