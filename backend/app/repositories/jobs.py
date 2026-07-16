@@ -248,6 +248,7 @@ def upsert_posting(
             JobPosting.source_id == source.id,
             JobPosting.external_record_id == raw_record.external_record_id,
         )
+        .execution_options(populate_existing=True)
         .with_for_update()
     )
     if (

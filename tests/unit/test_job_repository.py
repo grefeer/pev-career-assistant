@@ -328,6 +328,50 @@ def test_sync_does_not_overwrite_reviewed_canonical_fields(db: Session) -> None:
     assert updated.source_changed_since_review is True
 
 
+def test_sync_refreshes_cached_posting_before_protecting_reviewed_fields(
+    db: Session,
+) -> None:
+    source = seeded_source(db)
+    first_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="a" * 64
+    )
+    cached, _ = jobs.upsert_posting(
+        db, source=source, raw_record=first_raw, candidate=candidate(title="来源岗位")
+    )
+    db.execute(
+        update(JobPosting)
+        .where(JobPosting.id == cached.id)
+        .values(
+            status=JobPostingStatus.PENDING_REVIEW,
+            review_version=1,
+            title="人工确认岗位",
+            description_text="人工补全的完整 JD",
+        ),
+        execution_options={"synchronize_session": False},
+    )
+    assert cached.status is JobPostingStatus.PENDING_COMPLETION
+    assert cached.review_version == 0
+    assert cached.title == "来源岗位"
+    changed_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="b" * 64
+    )
+
+    updated, action = jobs.upsert_posting(
+        db,
+        source=source,
+        raw_record=changed_raw,
+        candidate=candidate(title="来源新岗位"),
+    )
+
+    assert action == "updated"
+    assert updated.status is JobPostingStatus.PENDING_REVIEW
+    assert updated.review_version == 1
+    assert updated.title == "人工确认岗位"
+    assert updated.description_text == "人工补全的完整 JD"
+    assert updated.source_candidate["title"] == "来源新岗位"
+    assert updated.source_changed_since_review is True
+
+
 def test_sync_does_not_overwrite_versioned_posting_with_reset_status(
     db: Session,
 ) -> None:
