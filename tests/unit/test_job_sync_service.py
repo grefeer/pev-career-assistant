@@ -20,6 +20,11 @@ from backend.app.db.models import (
 )
 from backend.app.repositories import jobs
 from backend.app.services import job_sync
+from backend.app.services.job_review import (
+    JobCompletionInput,
+    JobReviewService,
+    StaleJobReviewError,
+)
 from backend.app.services.job_sync import JobSyncFailedError, JobSyncService
 from backend.app.services.tencent_smartsheet import (
     TencentField,
@@ -179,6 +184,81 @@ def test_sync_preserves_reviewed_canonical_fields_when_source_changes(
     assert posting.title == "人工确认岗位"
     assert posting.description_text == "人工补全的完整 JD"
     assert posting.source_candidate["title"] == "来源新岗位"
+    assert posting.source_changed_since_review is True
+
+
+def test_source_change_invalidates_loaded_admin_completion(db: Session) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("r1")], 1, False, 0)},
+    )
+    sync = service(gateway)
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    posting = db.scalar(select(JobPosting))
+    assert posting is not None
+    review = JobReviewService(now=lambda: NOW)
+    reviewed = review.save_completion(
+        db,
+        job_id=posting.id,
+        actor_user_id="admin",
+        expected_version=0,
+        values=JobCompletionInput(
+            company_name="人工确认公司",
+            title="人工确认岗位",
+            description_text="人工补全的完整 JD",
+            locations=["上海"],
+            recruitment_types=["实习"],
+            industries=["软件"],
+            apply_url="https://example.com/reviewed",
+            referral_code=None,
+            deadline_text=None,
+        ),
+    )
+    stale_version = reviewed.review_version
+    assert stale_version == 1
+    db.commit()
+
+    unchanged = sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+    assert unchanged.postings_updated == 0
+    assert posting.review_version == stale_version
+
+    gateway.pages = {
+        0: TencentRecordPage([complete_record("r1", title="来源新岗位")], 1, False, 0)
+    }
+    changed = sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+
+    assert changed.postings_updated == 1
+    assert posting.review_version == stale_version + 1
+    assert posting.title == "人工确认岗位"
+    assert posting.source_changed_since_review is True
+
+    repeated = sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+    assert repeated.postings_updated == 0
+    assert posting.review_version == stale_version + 1
+
+    with pytest.raises(StaleJobReviewError):
+        review.save_completion(
+            db,
+            job_id=posting.id,
+            actor_user_id="admin",
+            expected_version=stale_version,
+            values=JobCompletionInput(
+                company_name="旧表单公司",
+                title="旧表单覆盖岗位",
+                description_text="旧表单覆盖 JD",
+                locations=["北京"],
+                recruitment_types=["校招"],
+                industries=["旧行业"],
+                apply_url="https://example.com/stale",
+                referral_code=None,
+                deadline_text=None,
+            ),
+        )
+    assert posting.title == "人工确认岗位"
+    assert posting.description_text == "人工补全的完整 JD"
     assert posting.source_changed_since_review is True
 
 

@@ -293,6 +293,7 @@ def test_posting_upsert_points_to_new_snapshot_without_deleting_history(
     assert (first_action, second_action) == ("created", "updated")
     assert updated.id == posting.id
     assert updated.raw_record_id == second_raw.id
+    assert updated.review_version == 0
     assert db.get(RawJobRecord, first_raw.id) is first_raw
     assert db.scalar(select(func.count()).select_from(RawJobRecord)) == 2
 
@@ -326,6 +327,35 @@ def test_sync_does_not_overwrite_reviewed_canonical_fields(db: Session) -> None:
     assert updated.description_text == "人工补全的完整 JD"
     assert updated.source_candidate["title"] == "来源新岗位"
     assert updated.source_changed_since_review is True
+
+
+def test_protected_posting_ignores_equivalent_candidate_for_review_version(
+    db: Session,
+) -> None:
+    source = seeded_source(db)
+    first_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="a" * 64
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=first_raw, candidate=candidate(title="来源岗位")
+    )
+    posting.status = JobPostingStatus.PENDING_REVIEW
+    posting.review_version = 1
+    db.flush()
+    changed_raw = snapshot(
+        db, source_id=source.id, external_record_id="r1", payload_hash="b" * 64
+    )
+
+    updated, action = jobs.upsert_posting(
+        db,
+        source=source,
+        raw_record=changed_raw,
+        candidate=candidate(title="来源岗位"),
+    )
+
+    assert action == "updated"
+    assert updated.review_version == 1
+    assert updated.source_changed_since_review is False
 
 
 def test_sync_refreshes_cached_posting_before_protecting_reviewed_fields(
@@ -365,7 +395,7 @@ def test_sync_refreshes_cached_posting_before_protecting_reviewed_fields(
 
     assert action == "updated"
     assert updated.status is JobPostingStatus.PENDING_REVIEW
-    assert updated.review_version == 1
+    assert updated.review_version == 2
     assert updated.title == "人工确认岗位"
     assert updated.description_text == "人工补全的完整 JD"
     assert updated.source_candidate["title"] == "来源新岗位"

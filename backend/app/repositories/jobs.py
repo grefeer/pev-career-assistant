@@ -287,6 +287,7 @@ def upsert_posting(
         db.add(posting)
         db.flush()
         return posting, "created"
+    source_candidate_changed = posting.source_candidate != payload
     for name, value in source_values.items():
         setattr(posting, name, value)
     if (
@@ -295,8 +296,9 @@ def upsert_posting(
     ):
         for name, value in canonical_values.items():
             setattr(posting, name, value)
-    else:
+    elif source_candidate_changed:
         posting.source_changed_since_review = True
+        posting.review_version += 1
     db.flush()
     return posting, "updated"
 
