@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Single Page</title></head>
+<body>
+<main data-topology="single">
+  <label>姓名 <input data-field-key="full_name" name="full_name"></label>
+  <button type="button" data-action-kind="final" id="final-submit">提交申请</button>
+</main>
+<script>
+document.querySelectorAll("[data-field-key]").forEach(function(el) {
+  el.addEventListener("input", function() {
+    fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"field", key:el.getAttribute("data-field-key")})});
+  });
+});
+document.getElementById("final-submit").addEventListener("click", function() {
+  fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"final"})});
+});
+</script>
+</body>
+</html>
