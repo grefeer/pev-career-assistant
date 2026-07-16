@@ -11,8 +11,17 @@ import uvicorn
 from fastapi.testclient import TestClient
 
 from executor.browser import BrowserSession
+from executor.checkpoints import CheckpointStore
+from executor.engine import ExecutorEngine
 from executor.mock_site.app import app as mock_app, telemetry
-from executor.protocol import ExecutorField, ExecutorTaskPayload, FieldConfidence
+from executor.protocol import (
+    ExecutorField,
+    ExecutorTaskDetail,
+    ExecutorTaskPayload,
+    ExecutorTaskState,
+    FieldConfidence,
+    TaskStatus,
+)
 
 
 def _free_port() -> int:
@@ -132,3 +141,249 @@ def test_ambiguous_and_final_buttons_are_never_clicked(
     current = _telemetry()
     assert current["ambiguous_clicks"] == 0
     assert current["final_clicks"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Engine-level integration tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeApiClient:
+    """In-memory fake of ExecutorApiClient for engine tests.
+
+    Tracks all calls and returns controlled responses based on the
+    ``ExecutorTaskDetail`` passed at construction time.
+    """
+
+    def __init__(self, detail: ExecutorTaskDetail) -> None:
+        self._detail = detail
+        self.state_version: int = 0
+        self.heartbeat_calls: list[str] = []
+        self.lease_calls: list[tuple[str, str]] = []
+        self.get_task_calls: list[tuple[str, str]] = []
+        self.progress_calls: list[dict[str, object]] = []
+        self.result_calls: list[dict[str, object]] = []
+
+    def heartbeat(self, version: str) -> None:
+        self.heartbeat_calls.append(version)
+
+    def issue_lease(self, task_id: str) -> str:
+        lease = f"lease-{task_id}"
+        self.lease_calls.append((task_id, lease))
+        return lease
+
+    def get_task(self, task_id: str, lease: str) -> ExecutorTaskDetail:
+        self.get_task_calls.append((task_id, lease))
+        return self._detail
+
+    def report_progress(
+        self,
+        *,
+        task_id: str,
+        lease: str,
+        expected_version: int,
+        target_status: str,
+        page_fingerprint: str,
+        page_index: int | None,
+        field_counts: dict[str, int],
+        reason_code: str | None,
+    ) -> ExecutorTaskState:
+        self.progress_calls.append({
+            "task_id": task_id,
+            "target_status": target_status,
+            "expected_version": expected_version,
+            "reason_code": reason_code,
+        })
+        self.state_version += 1
+        return ExecutorTaskState(
+            protocol_version="executor.v1",
+            task_id=task_id,
+            status=TaskStatus(target_status),
+            state_version=self.state_version,
+        )
+
+    def report_result(
+        self,
+        *,
+        task_id: str,
+        lease: str,
+        expected_version: int,
+        target_status: str,
+        page_fingerprint: str,
+        reason_code: str,
+    ) -> ExecutorTaskState:
+        self.result_calls.append({
+            "task_id": task_id,
+            "target_status": target_status,
+            "reason_code": reason_code,
+        })
+        self.state_version += 1
+        return ExecutorTaskState(
+            protocol_version="executor.v1",
+            task_id=task_id,
+            status=TaskStatus(target_status),
+            state_version=self.state_version,
+        )
+
+
+def _make_detail(
+    url: str,
+    fields: list[ExecutorField],
+    *,
+    status: TaskStatus = TaskStatus.DISPATCHED,
+) -> ExecutorTaskDetail:
+    """Build an ExecutorTaskDetail pointing at *url*."""
+    payload = ExecutorTaskPayload(
+        task_id="00000000-0000-0000-0000-000000000001",
+        state_version=0,
+        target_url=url,
+        fields=fields,
+    )
+    return ExecutorTaskDetail(
+        protocol_version="executor.v1",
+        task_id=payload.task_id,
+        target_job_id="job-001",
+        snapshot_id=None,
+        status=status,
+        state_version=0,
+        payload=payload,
+    )
+
+
+def test_single_page_ends_in_review_without_final_click(
+    browser: BrowserSession,
+    mock_site_url: str,
+    payload_fields: list[ExecutorField],
+    tmp_path: Any,
+) -> None:
+    """Single page: fill confirmed fields, stop before final click."""
+    url = f"{mock_site_url}/single-page"
+    detail = _make_detail(url, payload_fields)
+    fake = _FakeApiClient(detail)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    engine = ExecutorEngine(client=fake, browser=browser, checkpoints=checkpoints)
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "ready_for_review"
+    assert outcome.reason_code == "single_page_bottom_action"
+    assert fake.heartbeat_calls == ["0.1.0"]
+    assert len(fake.lease_calls) == 1
+    assert len(fake.get_task_calls) == 1
+    # Expect at least one progress report (failed safety)
+    assert any(
+        c["target_status"] == "ready_for_review" for c in fake.progress_calls
+    )
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_login_gate_waits_for_explicit_user_resume(
+    browser: BrowserSession,
+    mock_site_url: str,
+    payload_fields: list[ExecutorField],
+    tmp_path: Any,
+) -> None:
+    """Human gate page should yield waiting_for_human without filling."""
+    url = f"{mock_site_url}/human-gate"
+    detail = _make_detail(url, payload_fields)
+    fake = _FakeApiClient(detail)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    engine = ExecutorEngine(client=fake, browser=browser, checkpoints=checkpoints)
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "waiting_for_human"
+    assert outcome.reason_code == "login_required"
+    # No progress call for ready_for_review -- engine stops at human gate
+    assert all(
+        c["target_status"] != "ready_for_review" for c in fake.progress_calls
+    )
+
+
+def test_multi_step_intermediate_safe_click(
+    browser: BrowserSession,
+    mock_site_url: str,
+    payload_fields: list[ExecutorField],
+    tmp_path: Any,
+) -> None:
+    """Multi-step: fill, click safe next, navigate, end in review."""
+    url = f"{mock_site_url}/multi-step/1"
+    detail = _make_detail(url, payload_fields)
+    fake = _FakeApiClient(detail)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    engine = ExecutorEngine(client=fake, browser=browser, checkpoints=checkpoints)
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "ready_for_review"
+    assert outcome.reason_code == "navigated"
+    # Should have reported progress at least for running and ready_for_review
+    statuses = [c["target_status"] for c in fake.progress_calls]
+    assert "running" in statuses
+    assert "ready_for_review" in statuses
+    # The intermediate button was clicked -- mock site records it
+    assert _telemetry()["intermediate_clicks"] == 1
+    # The final page button must NOT have been clicked
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_readback_mismatch_triggers_review(
+    browser: BrowserSession,
+    mock_site_url: str,
+    payload_fields: list[ExecutorField],
+    tmp_path: Any,
+) -> None:
+    """Readback-mismatch page: field value gets reset after fill -> review."""
+    url = f"{mock_site_url}/readback-mismatch"
+    detail = _make_detail(url, payload_fields)
+    fake = _FakeApiClient(detail)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    engine = ExecutorEngine(client=fake, browser=browser, checkpoints=checkpoints)
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "ready_for_review"
+    assert outcome.reason_code == "readback_mismatch"
+    # Should have reported ready_for_review with readback_mismatch reason
+    mismatch_reports = [
+        c for c in fake.progress_calls
+        if c["target_status"] == "ready_for_review"
+        and c["reason_code"] == "readback_mismatch"
+    ]
+    assert len(mismatch_reports) >= 1
+    assert _telemetry()["final_clicks"] == 0
+
+
+@pytest.mark.parametrize(
+    "path, expected_target",
+    [
+        ("/submission-success", "submitted_success"),
+        ("/submission-failed", "submitted_failed"),
+        ("/submission-unknown", "result_unknown"),
+    ],
+)
+def test_observation_result_observed(
+    browser: BrowserSession,
+    mock_site_url: str,
+    payload_fields: list[ExecutorField],
+    tmp_path: Any,
+    path: str,
+    expected_target: str,
+) -> None:
+    """Post-HUMAN observation: check result page parsing."""
+    url = f"{mock_site_url}{path}"
+    detail = _make_detail(
+        url, payload_fields, status=TaskStatus.OBSERVING_USER_SUBMISSION
+    )
+    fake = _FakeApiClient(detail)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    engine = ExecutorEngine(client=fake, browser=browser, checkpoints=checkpoints)
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "result_observed"
+    assert outcome.reason_code == expected_target
+    # Should have called report_result
+    assert any(
+        c["target_status"] == expected_target for c in fake.result_calls
+    )
