@@ -12,7 +12,10 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.api import dependencies
 from backend.app.api.executor_schemas import (
+    ExecutorProgressRequest,
+    ExecutorResultRequest,
     ExecutorTaskPayload,
+    ExecutorTaskState,
     ExecutorTaskSummary,
 )
 from backend.app.config import Settings
@@ -196,3 +199,34 @@ def test_executor_list_is_device_isolated_and_detail_requires_matching_lease(
     )
     assert detail.status_code == 200
     assert detail.json()["payload"]["protocol_version"] == "executor.v1"
+
+
+def test_progress_without_valid_lease_returns_401(
+    client, paired_device, seeded_task, payload_provider
+) -> None:
+    client.app.state.executor_payload_provider = payload_provider
+    headers = {"X-Device-Token": paired_device["device_token"]}
+    body = {
+        "protocol_version": "executor.v1",
+        "expected_version": 0,
+        "target_status": "running",
+        "page_fingerprint": "sha256:abc123",
+        "page_index": 1,
+        "field_counts": {"confirmed": 1, "defaulted": 0, "missing": 0, "low": 0},
+    }
+    # No lease headers at all
+    response = client.post(
+        f"/api/executor/tasks/{seeded_task.id}/progress",
+        headers=headers,
+        json=body,
+    )
+    assert response.status_code == 401
+
+
+def test_openapi_has_no_submit_operation_or_scope(client) -> None:
+    schema_text = client.get("/openapi.json").text.lower()
+    assert "task:progress" not in schema_text
+    assert "task:result" not in schema_text
+    assert "task:submit" not in schema_text
+    assert "/api/executor/tasks/{task_id}/progress" in schema_text
+    assert "/api/executor/tasks/{task_id}/result" in schema_text

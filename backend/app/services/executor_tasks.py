@@ -5,8 +5,14 @@ from typing import Protocol
 from sqlalchemy.orm import Session
 
 from backend.app.api.executor_schemas import ExecutorTaskPayload
-from backend.app.db.models import ApplicationTask, Device
+from backend.app.db.models import (
+    ApplicationTask,
+    ApplicationTaskStatus,
+    Device,
+    TaskActor,
+)
 from backend.app.repositories import executor_tasks
+from backend.app.services.applications import ApplicationService, InvalidTransitionError, StaleTaskVersionError, TaskNotFoundError  # noqa: F401
 
 
 class ExecutorTaskNotFoundError(LookupError):
@@ -104,3 +110,64 @@ class ExecutorTaskService:
         if payload.task_id != task.id or payload.state_version != task.state_version:
             raise ExecutorPayloadUnavailableError(task.id)
         return task, payload
+
+    def report_progress(
+        self,
+        db: Session,
+        *,
+        device: Device,
+        task_id: str,
+        expected_version: int,
+        target: ApplicationTaskStatus,
+        page_fingerprint: str,
+        page_index: int | None,
+        reason_code: str | None,
+        field_counts: dict[str, int],
+    ) -> ApplicationTask:
+        self.get_assigned(db, device=device, task_id=task_id)
+        task = ApplicationService().transition(
+            db,
+            task_id=task_id,
+            expected_version=expected_version,
+            target=target,
+            actor=TaskActor.EXECUTOR,
+            event_type="executor.progress",
+            redacted_payload={
+                "page_fingerprint": page_fingerprint,
+                "page_index": page_index,
+                "reason_code": reason_code or "",
+                "confirmed_count": field_counts["confirmed"],
+                "defaulted_count": field_counts["defaulted"],
+                "missing_count": field_counts["missing"],
+                "low_confidence_count": field_counts["low"],
+            },
+        )
+        db.commit()
+        return task
+
+    def report_result(
+        self,
+        db: Session,
+        *,
+        device: Device,
+        task_id: str,
+        expected_version: int,
+        target: ApplicationTaskStatus,
+        page_fingerprint: str,
+        reason_code: str,
+    ) -> ApplicationTask:
+        self.get_assigned(db, device=device, task_id=task_id)
+        task = ApplicationService().transition(
+            db,
+            task_id=task_id,
+            expected_version=expected_version,
+            target=target,
+            actor=TaskActor.EXECUTOR,
+            event_type="executor.result_observed",
+            redacted_payload={
+                "page_fingerprint": page_fingerprint,
+                "reason_code": reason_code,
+            },
+        )
+        db.commit()
+        return task

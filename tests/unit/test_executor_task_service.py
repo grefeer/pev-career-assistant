@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from backend.app.db.base import Base
 from backend.app.db.models import (
+    ApplicationEvent,
     ApplicationTask,
     ApplicationTaskStatus,
     Device,
     DevicePlatform,
     DeviceStatus,
+    TaskActor,
     User,
 )
+from backend.app.services.applications import InvalidTransitionError
 from backend.app.services.executor_tasks import (
     ExecutorTaskNotFoundError,
     ExecutorTaskService,
@@ -103,4 +106,65 @@ def test_detail_hides_task_owned_by_another_device(
     with pytest.raises(ExecutorTaskNotFoundError):
         ExecutorTaskService().get_assigned(
             db, device=alice_device, task_id=task.id
+        )
+
+
+def test_progress_uses_executor_actor_and_appends_only_redacted_counts(
+    db, alice_device, alice_user
+) -> None:
+    task = ApplicationTask(
+        user_id=alice_user.id,
+        target_job_id="simulation-job",
+        device_id=alice_device.id,
+        status=ApplicationTaskStatus.DISPATCHED,
+    )
+    db.add(task)
+    db.commit()
+
+    updated = ExecutorTaskService().report_progress(
+        db,
+        device=alice_device,
+        task_id=task.id,
+        expected_version=0,
+        target=ApplicationTaskStatus.RUNNING,
+        page_fingerprint="sha256:abc123",
+        page_index=1,
+        reason_code=None,
+        field_counts={"confirmed": 1, "defaulted": 0, "missing": 1, "low": 0},
+    )
+    event = db.scalar(select(ApplicationEvent).where(ApplicationEvent.task_id == task.id))
+    assert updated.status is ApplicationTaskStatus.RUNNING
+    assert event.actor is TaskActor.EXECUTOR
+    assert event.redacted_payload == {
+        "page_fingerprint": "sha256:abc123",
+        "page_index": 1,
+        "reason_code": "",
+        "confirmed_count": 1,
+        "defaulted_count": 0,
+        "missing_count": 1,
+        "low_confidence_count": 0,
+    }
+
+
+def test_executor_result_is_rejected_until_human_started_observation(
+    db, alice_device, alice_user
+) -> None:
+    task = ApplicationTask(
+        user_id=alice_user.id,
+        target_job_id="simulation-job",
+        device_id=alice_device.id,
+        status=ApplicationTaskStatus.READY_FOR_REVIEW,
+    )
+    db.add(task)
+    db.commit()
+
+    with pytest.raises(InvalidTransitionError):
+        ExecutorTaskService().report_result(
+            db,
+            device=alice_device,
+            task_id=task.id,
+            expected_version=0,
+            target=ApplicationTaskStatus.SUBMITTED_SUCCESS,
+            page_fingerprint="sha256:result",
+            reason_code="success_marker",
         )

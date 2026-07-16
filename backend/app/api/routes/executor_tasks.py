@@ -8,11 +8,18 @@ from sqlalchemy.orm import Session
 
 from backend.app.api import dependencies
 from backend.app.api.executor_schemas import (
+    ExecutorProgressRequest,
+    ExecutorResultRequest,
     ExecutorTaskDetail,
     ExecutorTaskListResponse,
+    ExecutorTaskState,
     ExecutorTaskSummary,
 )
-from backend.app.db.models import ApplicationTask, Device
+from backend.app.db.models import ApplicationTask, ApplicationTaskStatus, Device
+from backend.app.services.applications import (
+    InvalidTransitionError,
+    StaleTaskVersionError,
+)
 from backend.app.services.executor_tasks import (
     ExecutorPayloadUnavailableError,
     ExecutorTaskNotFoundError,
@@ -63,6 +70,16 @@ def _task_error(error: Exception) -> HTTPException:
             status_code=409,
             detail={"error_code": "executor_payload_unavailable"},
         )
+    if isinstance(error, StaleTaskVersionError):
+        return HTTPException(
+            status_code=409,
+            detail={"error_code": "stale_task_version"},
+        )
+    if isinstance(error, InvalidTransitionError):
+        return HTTPException(
+            status_code=409,
+            detail={"error_code": "invalid_executor_transition"},
+        )
     raise error
 
 
@@ -85,6 +102,30 @@ def _require_executor_progress_lease(
             device=device,
             task_id=exec_task_id,
             required_scope="task:progress",
+        )
+    except InvalidTaskLeaseError:
+        raise HTTPException(status_code=401, detail={"error_code": "invalid_task_lease"}) from None
+    return device
+
+
+def _require_executor_result_lease(
+    db: Annotated[Session, Depends(_get_db)],
+    device: Annotated[Device, Depends(dependencies.get_current_device)],
+    service=Depends(dependencies.get_device_service),
+    exec_task_id: Annotated[str | None, Header(alias="X-Task-ID")] = None,
+    exec_task_lease: Annotated[str | None, Header(alias="X-Task-Lease")] = None,
+) -> Device:
+    from backend.app.services.devices import InvalidTaskLeaseError
+
+    if not exec_task_id or not exec_task_lease:
+        raise HTTPException(status_code=401, detail={"error_code": "invalid_task_lease"})
+    try:
+        service.verify_task_lease(
+            db,
+            exec_task_lease,
+            device=device,
+            task_id=exec_task_id,
+            required_scope="task:result",
         )
     except InvalidTaskLeaseError:
         raise HTTPException(status_code=401, detail={"error_code": "invalid_task_lease"}) from None
@@ -127,4 +168,60 @@ def get_executor_task(
         ) from None
     return ExecutorTaskDetail(
         **_summary(task).model_dump(), payload=payload
+    )
+
+
+@router.post("/{task_id}/progress", response_model=ExecutorTaskState)
+def report_executor_progress(
+    task_id: str,
+    body: ExecutorProgressRequest,
+    header_task_id: Annotated[str, Header(alias="X-Task-ID")],
+    device: Annotated[Device, Depends(_require_executor_progress_lease)],
+    db: Annotated[Session, Depends(_get_db)],
+    service: Annotated[ExecutorTaskService, Depends(get_executor_task_service)],
+) -> ExecutorTaskState:
+    _require_path_binding(task_id, header_task_id)
+    try:
+        task = service.report_progress(
+            db,
+            device=device,
+            task_id=task_id,
+            expected_version=body.expected_version,
+            target=ApplicationTaskStatus(body.target_status),
+            page_fingerprint=body.page_fingerprint,
+            page_index=body.page_index,
+            reason_code=body.reason_code,
+            field_counts=body.field_counts.model_dump(),
+        )
+    except (ExecutorTaskNotFoundError, StaleTaskVersionError, InvalidTransitionError) as error:
+        raise _task_error(error) from None
+    return ExecutorTaskState(
+        task_id=task.id, status=task.status, state_version=task.state_version
+    )
+
+
+@router.post("/{task_id}/result", response_model=ExecutorTaskState)
+def report_executor_result(
+    task_id: str,
+    body: ExecutorResultRequest,
+    header_task_id: Annotated[str, Header(alias="X-Task-ID")],
+    device: Annotated[Device, Depends(_require_executor_result_lease)],
+    db: Annotated[Session, Depends(_get_db)],
+    service: Annotated[ExecutorTaskService, Depends(get_executor_task_service)],
+) -> ExecutorTaskState:
+    _require_path_binding(task_id, header_task_id)
+    try:
+        task = service.report_result(
+            db,
+            device=device,
+            task_id=task_id,
+            expected_version=body.expected_version,
+            target=ApplicationTaskStatus(body.target_status),
+            page_fingerprint=body.page_fingerprint,
+            reason_code=body.reason_code,
+        )
+    except (ExecutorTaskNotFoundError, StaleTaskVersionError, InvalidTransitionError) as error:
+        raise _task_error(error) from None
+    return ExecutorTaskState(
+        task_id=task.id, status=task.status, state_version=task.state_version
     )
