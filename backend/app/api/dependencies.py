@@ -14,6 +14,7 @@ from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
 from backend.app.services.job_sync import JobSyncService
+from backend.app.services.storage import EncryptedObjectStore
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
 
 
@@ -32,6 +33,10 @@ def _unauthorized() -> HTTPException:
         detail="无法验证身份。",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+def get_object_store(request: Request) -> EncryptedObjectStore:
+    return cast(EncryptedObjectStore, request.app.state.object_store)
 
 
 def get_redis(request: Request):
