@@ -94,4 +94,53 @@ describe("App workspace navigation", () => {
     expect(wrapper.get('[data-test="analysis-workspace"]').isVisible()).toBe(true);
     expect(wrapper.text()).toContain("运行分析");
   });
+
+  it("shows job review only to administrators and guards leaving a dirty draft", async () => {
+    apiMocks.fetchMe.mockResolvedValue({ ...profile, role: "admin" });
+    const wrapper = mount(App, {
+      global: {
+        stubs: {
+          AdminJobReview: {
+            template: '<section data-test="admin-stub"><button @click="$emit(\'dirty-change\', true)">dirty</button></section>',
+          },
+        },
+      },
+    });
+    await flushPromises();
+    expect(wrapper.get('[data-test="job-review-view"]').exists()).toBe(true);
+    await wrapper.get('[data-test="job-review-view"]').trigger("click");
+    await wrapper.get('[data-test="admin-stub"] button').trigger("click");
+
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    await wrapper.get('[data-test="jobs-view"]').trigger("click");
+    expect(wrapper.get('[data-test="admin-stub"]').exists()).toBe(true);
+    expect(confirm).toHaveBeenCalledOnce();
+  });
+
+  it("does not leave a student on a blank administrator view after logout and role change", async () => {
+    const admin = { ...profile, role: "admin" as const };
+    apiMocks.fetchMe.mockResolvedValue(admin);
+    apiMocks.login.mockResolvedValue({
+      ok: true,
+      message: "登录成功",
+      token: "student-token-2",
+      profile,
+    });
+    const wrapper = mount(App, {
+      global: { stubs: { AdminJobReview: { template: "<section>管理员审核台</section>" } } },
+    });
+    await flushPromises();
+    await wrapper.get('[data-test="job-review-view"]').trigger("click");
+    expect(wrapper.text()).toContain("管理员审核台");
+    await wrapper.get(".danger-button").trigger("click");
+
+    await wrapper.get('input[placeholder="例如 lichunfeng"]').setValue("student");
+    await wrapper.get('input[type="password"]').setValue("password");
+    await wrapper.get(".primary-button").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="job-review-view"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="analysis-workspace"]').isVisible()).toBe(true);
+    expect(wrapper.text()).toContain("运行分析");
+  });
 });

@@ -1,5 +1,14 @@
 import { request } from "../../api";
-import type { JobDetail, JobListQuery, JobListResponse } from "./jobTypes";
+import type {
+  AdminJobDetail,
+  AdminJobListQuery,
+  AdminJobListResponse,
+  JobCompletionPayload,
+  JobDecisionPayload,
+  JobDetail,
+  JobListQuery,
+  JobListResponse,
+} from "./jobTypes";
 
 export function fetchVerifiedJobs(
   token: string,
@@ -18,4 +27,53 @@ export function fetchVerifiedJobs(
 
 export function fetchVerifiedJob(token: string, jobId: string): Promise<JobDetail> {
   return request<JobDetail>(`/jobs/${encodeURIComponent(jobId)}`, {}, token);
+}
+
+export function fetchJobReviewQueue(
+  token: string,
+  query: AdminJobListQuery,
+): Promise<AdminJobListResponse> {
+  const params = new URLSearchParams({
+    limit: String(query.limit),
+    offset: String(query.offset),
+  });
+  if (query.reviewStatus) params.set("review_status", query.reviewStatus);
+  return request<AdminJobListResponse>(
+    `/admin/jobs/review-queue?${params.toString()}`,
+    {},
+    token,
+  );
+}
+
+export function fetchAdminVerifiedJobs(
+  token: string,
+  query: Pick<AdminJobListQuery, "limit" | "offset">,
+): Promise<AdminJobListResponse> {
+  const params = new URLSearchParams({
+    limit: String(query.limit),
+    offset: String(query.offset),
+  });
+  return request<AdminJobListResponse>(`/admin/jobs/verified?${params.toString()}`, {}, token);
+}
+
+export function saveJobCompletion(
+  token: string,
+  jobId: string,
+  payload: JobCompletionPayload,
+): Promise<AdminJobDetail> {
+  return request<AdminJobDetail>(`/admin/jobs/${encodeURIComponent(jobId)}/completion`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  }, token);
+}
+
+export function decideJob(
+  token: string,
+  jobId: string,
+  payload: JobDecisionPayload,
+): Promise<AdminJobDetail> {
+  return request<AdminJobDetail>(`/admin/jobs/${encodeURIComponent(jobId)}/decision`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  }, token);
 }

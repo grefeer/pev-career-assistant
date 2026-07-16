@@ -12,6 +12,7 @@ import {
   runAnalysis,
 } from "./api";
 import JobCenter from "./features/jobs/JobCenter.vue";
+import AdminJobReview from "./features/jobs/AdminJobReview.vue";
 import type {
   AnalysisResponse,
   HistoryItem,
@@ -35,7 +36,9 @@ const loading = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
 const authMode = ref<"login" | "register">("login");
-const workspaceView = ref<"analysis" | "jobs">("analysis");
+type WorkspaceView = "analysis" | "jobs" | "job_review";
+const workspaceView = ref<WorkspaceView>("analysis");
+const adminReviewDirty = ref(false);
 
 const authForm = reactive({
   account: "",
@@ -221,8 +224,29 @@ function onFileChange(event: Event) {
   analysisForm.resumeFile = input.files?.[0] || null;
 }
 
+function selectWorkspace(next: WorkspaceView) {
+  if (next === "job_review" && profile.value?.role !== "admin") return;
+  if (
+    workspaceView.value === "job_review"
+    && next !== "job_review"
+    && adminReviewDirty.value
+    && !window.confirm("职位审核草稿尚未保存，确定离开吗？")
+  ) {
+    return;
+  }
+  workspaceView.value = next;
+}
+
 function logout() {
+  if (
+    workspaceView.value === "job_review"
+    && adminReviewDirty.value
+    && !window.confirm("职位审核草稿尚未保存，确定退出吗？")
+  ) {
+    return;
+  }
   workspaceView.value = "analysis";
+  adminReviewDirty.value = false;
   token.value = "";
   profile.value = null;
   sessions.value = [];
@@ -236,10 +260,12 @@ function logout() {
 
 watch(
   () => profile.value?.role,
-  () => {
-    if (!profile.value) {
+  (role) => {
+    if (role !== "admin" && workspaceView.value === "job_review") {
       workspaceView.value = "analysis";
+      adminReviewDirty.value = false;
     }
+    if (!profile.value) workspaceView.value = "analysis";
   },
 );
 
@@ -359,7 +385,7 @@ onMounted(() => {
             data-test="analysis-view"
             :class="{ active: workspaceView === 'analysis' }"
             :aria-current="workspaceView === 'analysis' ? 'page' : undefined"
-            @click="workspaceView = 'analysis'"
+            @click="selectWorkspace('analysis')"
           >
             分析工作台
           </button>
@@ -368,13 +394,28 @@ onMounted(() => {
             data-test="jobs-view"
             :class="{ active: workspaceView === 'jobs' }"
             :aria-current="workspaceView === 'jobs' ? 'page' : undefined"
-            @click="workspaceView = 'jobs'"
+            @click="selectWorkspace('jobs')"
           >
             职位中心
+          </button>
+          <button
+            v-if="profile.role === 'admin'"
+            type="button"
+            data-test="job-review-view"
+            :class="{ active: workspaceView === 'job_review' }"
+            :aria-current="workspaceView === 'job_review' ? 'page' : undefined"
+            @click="selectWorkspace('job_review')"
+          >
+            职位审核
           </button>
         </nav>
 
         <JobCenter v-if="workspaceView === 'jobs'" :token="token" />
+        <AdminJobReview
+          v-if="workspaceView === 'job_review' && profile.role === 'admin'"
+          :token="token"
+          @dirty-change="adminReviewDirty = $event"
+        />
 
         <div
           v-show="workspaceView === 'analysis'"
