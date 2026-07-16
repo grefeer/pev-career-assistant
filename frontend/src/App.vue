@@ -13,6 +13,7 @@ import {
 } from "./api";
 import JobCenter from "./features/jobs/JobCenter.vue";
 import AdminJobReview from "./features/jobs/AdminJobReview.vue";
+import ProfileWorkspace from "./features/profile/ProfileWorkspace.vue";
 import type {
   AnalysisResponse,
   HistoryItem,
@@ -36,9 +37,10 @@ const loading = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
 const authMode = ref<"login" | "register">("login");
-type WorkspaceView = "analysis" | "jobs" | "job_review";
+type WorkspaceView = "analysis" | "jobs" | "profile" | "job_review";
 const workspaceView = ref<WorkspaceView>("analysis");
 const adminReviewDirty = ref(false);
+const profileWorkspaceDirty = ref(false);
 
 const authForm = reactive({
   account: "",
@@ -234,6 +236,14 @@ function selectWorkspace(next: WorkspaceView) {
   ) {
     return;
   }
+  if (
+    workspaceView.value === "profile"
+    && next !== "profile"
+    && profileWorkspaceDirty.value
+    && !window.confirm("档案校对尚未保存，确定离开吗？")
+  ) {
+    return;
+  }
   workspaceView.value = next;
 }
 
@@ -247,6 +257,7 @@ function logout() {
   }
   workspaceView.value = "analysis";
   adminReviewDirty.value = false;
+  profileWorkspaceDirty.value = false;
   token.value = "";
   profile.value = null;
   sessions.value = [];
@@ -399,6 +410,15 @@ onMounted(() => {
             职位中心
           </button>
           <button
+            type="button"
+            data-test="profile-view"
+            :class="{ active: workspaceView === 'profile' }"
+            :aria-current="workspaceView === 'profile' ? 'page' : undefined"
+            @click="selectWorkspace('profile')"
+          >
+            我的档案
+          </button>
+          <button
             v-if="profile.role === 'admin'"
             type="button"
             data-test="job-review-view"
@@ -410,6 +430,11 @@ onMounted(() => {
           </button>
         </nav>
 
+        <ProfileWorkspace
+          v-if="workspaceView === 'profile'"
+          :token="token"
+          @dirty-change="profileWorkspaceDirty = $event"
+        />
         <JobCenter v-if="workspaceView === 'jobs'" :token="token" />
         <AdminJobReview
           v-if="workspaceView === 'job_review' && profile.role === 'admin'"
