@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import uuid
 
+import sqlalchemy as sa
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Engine, create_engine, inspect, text
 
@@ -32,12 +33,15 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260717_0006"
+HEAD_REVISION = "20260717_0007"
 BUSINESS_TABLES |= PROFILE_TABLES
 MANUAL_SUBMISSION_TABLES = {
     "user_job_submissions",
     "job_duplicate_candidates",
     "job_source_links",
+}
+FEEDBACK_TABLES = {
+    "job_feedback",
 }
 
 
@@ -333,6 +337,13 @@ def test_mysql_migration_upgrade_and_downgrade(
                 assert manual == ("user_submission", 0)
             _run_alembic("downgrade", "20260717_0005", env=env)
             assert "user_job_submissions" not in sa.inspect(engine).get_table_names()
+            _run_alembic("upgrade", "head", env=env)
+            assert FEEDBACK_TABLES <= set(sa.inspect(engine).get_table_names())
+            feedback_columns = {col["name"] for col in sa.inspect(engine).get_columns("job_feedback")}
+            assert {"job_id", "user_id", "category", "note", "idempotency_key", "created_at"} <= feedback_columns
+            _run_alembic("downgrade", "20260717_0006", env=env)
+            assert _current_revision(engine) == "20260717_0006"
+            assert "job_feedback" not in sa.inspect(engine).get_table_names()
             _run_alembic("upgrade", "head", env=env)
         finally:
             _run_alembic("downgrade", "base", env=env)

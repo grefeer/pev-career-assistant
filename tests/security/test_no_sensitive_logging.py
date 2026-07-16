@@ -30,6 +30,8 @@ from backend.app.db.base import Base
 from backend.app.db.models import (
     ApplicationTask,
     ApplicationTaskStatus,
+    JobFeedback,
+    JobFeedbackCategory,
     JobPosting,
     JobPostingStatus,
     JobSource,
@@ -615,3 +617,72 @@ def test_manual_job_failures_do_not_log_original_jd_or_sensitive_url(client: Tes
     assert secret_marker not in combined
     assert "token-9988" not in combined
     assert "unsafe_job_url" in second.text
+
+
+def _setup_job_for_feedback(client: TestClient) -> str:
+    """Create a minimal job posting and return its id."""
+    import uuid
+    job_id = str(uuid.uuid4())
+    source_id = str(uuid.uuid4())
+    raw_id = str(uuid.uuid4())
+    with client.session_factory() as db:
+        source = JobSource(
+            id=source_id, source_key=f"fb-sec-{source_id[:8]}",
+            provider=JobSourceProvider.TENCENT_SMARTSHEET, name="FB Sec Source",
+            file_id=f"fb-sec-file-{source_id[:8]}", sheet_id=f"fb-sec-sheet-{source_id[:8]}",
+            mapper_version="fb-sec-v1", enabled=True,
+        )
+        raw = RawJobRecord(
+            id=raw_id, source_id=source_id, external_record_id="fb-sec-record",
+            payload_hash="s" * 64, raw_fields=[{"field": "test", "value": "test"}],
+        )
+        posting = JobPosting(
+            id=job_id, source_id=source_id, external_record_id="fb-sec-record",
+            raw_record_id=raw_id, status=JobPostingStatus.VERIFIED,
+            company_name="FB Sec Corp", title="FB Sec Role", locations=[],
+            recruitment_types=[], industries=[],
+            apply_url="https://example.com/fb-sec", mapper_version="fb-sec-v1",
+            source_candidate={},
+        )
+        db.add_all([source, raw, posting])
+        db.commit()
+    return job_id
+
+
+def test_feedback_logs_must_not_contain_note_identity_or_idempotency_key(
+    client: TestClient,
+) -> None:
+    """Logs must NOT contain feedback note, user identity, or idempotency key."""
+    job_id = _setup_job_for_feedback(client)
+    secret_note = "FEEDBACK-SECRET-NOTE-7722-Issue-with-job-application-channel"
+    secret_account = "fb-sec-account-6644"
+    secret_idem = "idem-sec-test-key-" + "x" * 37
+    with client.session_factory() as db:
+        user = User(
+            account=secret_account, nickname="FB Secret User",
+            password_hash="hash", role=UserRole.STUDENT,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        auth = AuthService(client.app.state.settings)
+        token = auth.issue_user_token(user)
+    headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": secret_idem}
+
+    with _capture_application_logs() as capture:
+        response = client.post(
+            "/api/feedbacks",
+            json={"job_id": job_id, "category": "closed", "note": secret_note},
+            headers=headers,
+        )
+
+    assert response.status_code == 201
+    combined = " ".join(capture.formatted)
+    assert secret_note not in combined
+    assert secret_account not in combined
+    assert secret_idem not in combined
+    for record in capture.records:
+        record_str = str(record.args) + str(record.__dict__)
+        assert secret_note not in record_str
+        assert secret_account not in record_str
+        assert secret_idem not in record_str
