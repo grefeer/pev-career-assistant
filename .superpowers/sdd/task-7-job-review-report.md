@@ -126,3 +126,34 @@ served-image HTTP check cover the two relevant boundaries.
   takeover verification deliberately reran the Task 7 focused, safety, real
   MySQL, frontend, and runtime-stack gates requested for integration.
 - No blocking concern remains.
+
+## Important review fix: page-transaction lock order
+
+The original real-MySQL test accumulated every `FOR UPDATE` issued by the sync
+Session into one flat list. It therefore combined the source lock from the
+initial run-acquisition transaction, the page transaction's posting-then-source
+locks, and the final source lock. Its assertion proved only that a source lock
+existed somewhere before and after a posting lock, not that the page transaction
+itself followed source-to-posting order.
+
+The corrected test records an `after_commit` boundary for the exact sync Session
+and asserts only the transaction segment containing the posting lock. Before the
+production fix, the real isolated MySQL test failed with the expected page
+segment `['posting', 'source']` (`1 < 0` was false). The reviewer-held-posting
+scenario still completed within its finite timeout, proving the RED was the
+ordering defect rather than a deadlock or test setup failure.
+
+`JobSyncService` now calls the existing fail-closed `refresh_sync_lease` helper
+after validating each fetched page and before inserting any raw record or
+upserting any posting. That helper locks `JobSource FOR UPDATE`, verifies that
+the run still owns the active lease, and refreshes its expiry. The existing
+end-of-page refresh remains in place. Consequently every page transaction locks
+source before posting, while a lost lease aborts before page writes.
+
+Fresh verification for this review fix:
+
+- transaction-segment real MySQL regression: 1 passed;
+- unit job-sync service suite: 24 passed;
+- isolated `career_assistant_test` real MySQL gate: 9 passed;
+- focused unit/contract/security gate: 192 passed;
+- `ruff check backend src tests scripts`: passed.

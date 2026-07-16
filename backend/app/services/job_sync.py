@@ -140,6 +140,7 @@ class JobSyncService:
                     raise TencentProtocolError(
                         "Tencent records exceeded declared total"
                     )
+                jobs.refresh_sync_lease(db, source_id, run_id, now=self.now())
                 page_raw_snapshots_created = 0
                 page_postings_created = 0
                 page_postings_updated = 0

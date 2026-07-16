@@ -400,7 +400,7 @@ def test_mysql_job_sync_service_lock_order_preserves_review_and_stales_admin(
     reviewer_holds_lock = Event()
     sync_posting_lock_started = Event()
     sync_thread_id: list[int] = []
-    lock_order: list[str] = []
+    lock_transactions: list[list[str]] = [[]]
 
     def capture_sync_lock_order(
         _connection: object,
@@ -416,10 +416,13 @@ def test_mysql_job_sync_service_lock_order_preserves_review_and_stales_admin(
         if "FOR UPDATE" not in normalized:
             return
         if "JOB_POSTINGS" in normalized:
-            lock_order.append("posting")
+            lock_transactions[-1].append("posting")
             sync_posting_lock_started.set()
         elif "JOB_SOURCES" in normalized:
-            lock_order.append("source")
+            lock_transactions[-1].append("source")
+
+    def capture_sync_commit(_session: Session) -> None:
+        lock_transactions.append([])
 
     def review_lock_attempt() -> None:
         with Session(mysql_engine) as db:
@@ -438,11 +441,15 @@ def test_mysql_job_sync_service_lock_order_preserves_review_and_stales_admin(
         sync_thread_id.append(get_ident())
         with Session(mysql_engine) as db:
             db.execute(text("SET SESSION innodb_lock_wait_timeout = 10"))
-            return JobSyncService(MutableGateway(_changed_record(record_id))).sync(
-                db,
-                source_key=INTERN_SOURCE_KEY,
-                actor_user_id=actor_id,
-            )
+            event.listen(db, "after_commit", capture_sync_commit)
+            try:
+                return JobSyncService(MutableGateway(_changed_record(record_id))).sync(
+                    db,
+                    source_key=INTERN_SOURCE_KEY,
+                    actor_user_id=actor_id,
+                )
+            finally:
+                event.remove(db, "after_commit", capture_sync_commit)
 
     event.listen(mysql_engine, "before_cursor_execute", capture_sync_lock_order)
     try:
@@ -453,9 +460,13 @@ def test_mysql_job_sync_service_lock_order_preserves_review_and_stales_admin(
             outcome = syncer.result(timeout=25)
 
         assert outcome.status is JobSyncRunStatus.SUCCEEDED
-        posting_lock_index = lock_order.index("posting")
-        assert "source" in lock_order[:posting_lock_index]
-        assert "source" in lock_order[posting_lock_index + 1 :]
+        page_transactions = [
+            transaction for transaction in lock_transactions if "posting" in transaction
+        ]
+        assert len(page_transactions) == 1
+        page_lock_order = page_transactions[0]
+        assert "source" in page_lock_order
+        assert page_lock_order.index("source") < page_lock_order.index("posting")
 
         with Session(mysql_engine) as verification:
             persisted = verification.get(JobPosting, posting_id)
