@@ -52,6 +52,8 @@ DEVICE_TOKEN = "device-token-must-never-be-logged-in-full"
 PAIRING_CODE = "pair-code-must-never-be-logged"
 OBJECT_PLAINTEXT = b"private resume plaintext must stay out of logs"
 CONFIG_SECRET = "object-config-secret-must-never-be-logged"
+RESUME_OBJECT_KEY = "users/u1/resume-assets/object-key-sentinel-must-not-leak"
+RESUME_LSR = "lsr:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 SENSITIVE_VALUES = (
     PASSWORD,
     DEVICE_TOKEN,
@@ -229,6 +231,35 @@ def test_object_store_failure_logs_operation_without_plaintext_or_config_secret(
             )
 
     _assert_safe_log(capture, "encrypted object write failed")
+
+
+def test_profile_upload_failure_logs_operation_without_object_key_or_lsr() -> (
+    None
+):
+    """Object store failure during profile upload must not leak object key or LSR."""
+
+    class FailingBlobStore:
+        def put_bytes(self, **_kwargs: object) -> None:
+            raise RuntimeError(
+                f"store failure: {RESUME_OBJECT_KEY} LSR={RESUME_LSR}"
+            )
+
+    encryption_key = base64.b64encode(bytes(range(32))).decode("ascii")
+    store = EncryptedObjectStore(FailingBlobStore(), encryption_key)  # type: ignore[arg-type]
+
+    with _capture_application_logs() as capture:
+        with pytest.raises(RuntimeError, match="store failure"):
+            store.put(
+                key=RESUME_OBJECT_KEY,
+                plaintext=OBJECT_PLAINTEXT,
+                content_type="application/pdf",
+            )
+
+    _assert_safe_log(
+        capture,
+        "encrypted object write failed",
+        sensitive_values=(RESUME_OBJECT_KEY, RESUME_LSR, OBJECT_PLAINTEXT.decode()),
+    )
 
 
 def test_state_transition_failure_logs_outcome_without_payload_or_config_secret() -> (
