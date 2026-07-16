@@ -1,38 +1,110 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import subprocess
 import sys
-from threading import Barrier, Event
+from threading import Barrier, Event, get_ident
 import uuid
 
 import pytest
-from sqlalchemy import create_engine, delete, event, text
+from sqlalchemy import create_engine, delete, event, func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
+    AuditEvent,
     JobPosting,
     JobPostingStatus,
     JobSource,
     JobSourceProvider,
     JobSyncRun,
     JobSyncRunStatus,
+    JobVerification,
     RawJobRecord,
+    User,
+    UserRole,
 )
 from backend.app.repositories import jobs
-from backend.app.services.job_mappers import NormalizedJobCandidate
-from tests.integration.job_sync_gate_safety import (
-    require_dedicated_mysql_test_database,
+from backend.app.services.job_mappers import BUILTIN_SOURCES
+from backend.app.services.job_review import (
+    JobCompletionInput,
+    JobReviewService,
+    StaleJobReviewError,
+)
+from backend.app.services.job_sync import JobSyncService, SyncOutcome
+from backend.app.services.tencent_smartsheet import (
+    TencentField,
+    TencentRecord,
+    TencentRecordPage,
 )
 
 
-requires_mysql = pytest.mark.skipif(
-    not os.environ.get("TEST_MYSQL_URL"), reason="requires TEST_MYSQL_URL"
-)
+INTERN_SOURCE_KEY = "tencent-intern-referrals"
+
+
+class MutableGateway:
+    def __init__(self, record: TencentRecord) -> None:
+        self.record = record
+
+    def list_fields(self, _file_id: str, _sheet_id: str) -> list[TencentField]:
+        return [
+            TencentField("company", "公司名称", "text"),
+            TencentField("title", "招聘岗位", "text"),
+            TencentField("url", "投递链接", "url"),
+        ]
+
+    def list_records(
+        self,
+        _file_id: str,
+        _sheet_id: str,
+        *,
+        offset: int,
+        limit: int,
+    ) -> TencentRecordPage:
+        assert offset == 0
+        assert limit == 100
+        return TencentRecordPage([self.record], 1, False, 0)
+
+
+def _text_field(title: str, value: str) -> dict[str, object]:
+    return {
+        "field": title,
+        "text_value": {"items": [{"text": value, "type": "text"}]},
+    }
+
+
+def _option_field(title: str, values: list[str]) -> dict[str, object]:
+    return {
+        "field": title,
+        "option_value": {
+            "items": [{"text": value, "type": "option"} for value in values]
+        },
+    }
+
+
+def _changed_record(record_id: str) -> TencentRecord:
+    return TencentRecord(
+        record_id,
+        [
+            _text_field("公司名称", "来源更新公司"),
+            _text_field("招聘岗位", "来源更新岗位"),
+            {
+                "field": "投递链接",
+                "url_value": {
+                    "items": [{"link": "https://source.example.com/changed"}]
+                },
+            },
+            _text_field("工作地点", "北京、深圳"),
+            _option_field("招聘类型", ["实习", "校招"]),
+            _option_field("多选", ["软件"]),
+            _text_field("内推码", "SOURCE-REFERRAL"),
+            _text_field("截止日期", "2027-01-01"),
+            {"field": "更新时间", "string_value": "1810000000000"},
+        ],
+    )
 
 
 def _migrate_to_head(database_url: str) -> None:
@@ -53,63 +125,10 @@ def _migrate_to_head(database_url: str) -> None:
     )
 
 
-def test_database_guard_rejects_non_mysql_backend() -> None:
-    invalid_url = "sqlite+pysqlite:///" + "career_assistant_test"
-    with pytest.raises(ValueError, match="MySQL.*_test"):
-        require_dedicated_mysql_test_database(invalid_url)
-
-
-def test_database_guard_rejects_postgresql_backend() -> None:
-    invalid_url = "postgresql+psycopg://root@localhost/" + "career_assistant_test"
-    with pytest.raises(ValueError, match="MySQL.*_test"):
-        require_dedicated_mysql_test_database(invalid_url)
-
-
-def test_database_guard_rejects_mysql_non_test_database() -> None:
-    invalid_url = "mysql+pymysql://root@localhost/" + "career_assistant"
-    with pytest.raises(ValueError, match="MySQL.*_test"):
-        require_dedicated_mysql_test_database(invalid_url)
-
-
-def test_database_guard_accepts_dedicated_mysql_test_database() -> None:
-    valid_url = "mysql+pymysql://root@localhost/" + "career_assistant_test"
-    require_dedicated_mysql_test_database(valid_url)
-
-
-def test_database_guard_is_active_under_python_optimization() -> None:
-    env = {
-        **os.environ,
-        "TASK7_GUARD_URL": "mysql+pymysql://root@localhost/" + "career_assistant",
-    }
-    script = """
-import os
-from tests.integration.job_sync_gate_safety import require_dedicated_mysql_test_database
-
-try:
-    require_dedicated_mysql_test_database(os.environ["TASK7_GUARD_URL"])
-except ValueError:
-    raise SystemExit(0)
-raise SystemExit(1)
-"""
-    completed = subprocess.run(
-        [sys.executable, "-O", "-c", script],
-        cwd=Path(__file__).resolve().parents[2],
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0
-    assert completed.stdout == ""
-    assert completed.stderr == ""
-
-
 @pytest.fixture(scope="module")
-def mysql_engine() -> Engine:
-    database_url = os.environ["TEST_MYSQL_URL"]
-    require_dedicated_mysql_test_database(database_url)
-    _migrate_to_head(database_url)
-    engine = create_engine(database_url, pool_pre_ping=True)
+def mysql_engine(destructive_mysql_url: str) -> Engine:
+    _migrate_to_head(destructive_mysql_url)
+    engine = create_engine(destructive_mysql_url, pool_pre_ping=True)
     try:
         yield engine
     finally:
@@ -174,7 +193,6 @@ def _cleanup_source(db: Session, source_id: str) -> None:
     db.commit()
 
 
-@requires_mysql
 def test_mysql_exact_recruitment_type_filter(mysql_engine: Engine) -> None:
     prefix = f"task7-filter-{uuid.uuid4().hex}"
     with Session(mysql_engine, expire_on_commit=False) as db:
@@ -210,7 +228,6 @@ def test_mysql_exact_recruitment_type_filter(mysql_engine: Engine) -> None:
             _cleanup_source(db, source_id)
 
 
-@requires_mysql
 def test_mysql_active_source_lease_conflicts(mysql_engine: Engine) -> None:
     prefix = f"task7-conflict-{uuid.uuid4().hex}"
     with Session(mysql_engine, expire_on_commit=False) as db:
@@ -228,7 +245,6 @@ def test_mysql_active_source_lease_conflicts(mysql_engine: Engine) -> None:
             _cleanup_source(db, source_id)
 
 
-@requires_mysql
 def test_mysql_concurrent_lease_allows_exactly_one_owner(
     mysql_engine: Engine,
 ) -> None:
@@ -305,117 +321,324 @@ def test_mysql_concurrent_lease_allows_exactly_one_owner(
             _cleanup_source(cleanup, source_id)
 
 
-@requires_mysql
-def test_mysql_sync_waits_for_review_lock_and_preserves_reviewed_fields(
+def test_mysql_job_sync_service_lock_order_preserves_review_and_stales_admin(
     mysql_engine: Engine,
 ) -> None:
-    prefix = f"task2-review-lock-{uuid.uuid4().hex}"
+    record_id = f"task7-service-{uuid.uuid4().hex}"
+    actor_id = str(uuid.uuid4())
+    reviewed_at = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
     with Session(mysql_engine, expire_on_commit=False) as setup:
-        source = _seed_source(setup, prefix)
-        posting = _seed_posting(
-            setup,
-            source,
-            record_id=f"{prefix}-record",
-            recruitment_types=["暑期实习"],
+        jobs.ensure_builtin_sources(setup, BUILTIN_SOURCES)
+        source = jobs.get_source(setup, INTERN_SOURCE_KEY)
+        assert source is not None
+        admin = User(
+            id=actor_id,
+            account=f"task7-sync-admin-{uuid.uuid4().hex}",
+            nickname="Task 7 Sync Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
         )
-        changed_raw = RawJobRecord(
+        setup.add(admin)
+        old_raw_fields = [{"field": "old", "value": "immutable-old-value"}]
+        old_raw = RawJobRecord(
             source_id=source.id,
-            external_record_id=posting.external_record_id,
-            payload_hash="b" * 64,
-            raw_fields=[{"field": "招聘岗位", "value": "来源新岗位"}],
-            observed_at=datetime.now(timezone.utc),
+            external_record_id=record_id,
+            payload_hash="0" * 64,
+            raw_fields=old_raw_fields,
+            observed_at=reviewed_at,
         )
-        setup.add(changed_raw)
+        setup.add(old_raw)
+        setup.flush()
+        posting = JobPosting(
+            source_id=source.id,
+            external_record_id=record_id,
+            raw_record_id=old_raw.id,
+            status=JobPostingStatus.VERIFIED,
+            company_name="人工确认公司",
+            title="人工确认岗位",
+            description_text="人工确认的完整 JD",
+            locations=["上海"],
+            recruitment_types=["实习"],
+            industries=["人工行业"],
+            apply_url="https://reviewed.example.com/apply",
+            referral_code="HUMAN-REFERRAL",
+            deadline_text="2026-12-31",
+            mapper_version=source.mapper_version,
+            source_candidate={
+                "company_name": "旧来源公司",
+                "title": "旧来源岗位",
+                "locations": ["旧地点"],
+                "recruitment_types": ["旧类型"],
+                "industries": ["旧行业"],
+                "apply_url": "https://source.example.com/old",
+                "referral_code": "OLD",
+                "deadline_text": "2026-01-01",
+            },
+            review_version=7,
+            verified_at=reviewed_at,
+            gui_eligible=True,
+        )
+        setup.add(posting)
+        setup.flush()
+        setup.add(
+            JobVerification(
+                job_id=posting.id,
+                actor_user_id=actor_id,
+                action="verified",
+                from_status=JobPostingStatus.PENDING_REVIEW.value,
+                to_status=JobPostingStatus.VERIFIED.value,
+                review_version=7,
+                field_snapshot={"title": "人工确认岗位"},
+                created_at=reviewed_at,
+            )
+        )
         setup.commit()
         source_id = source.id
         posting_id = posting.id
-        raw_id = changed_raw.id
+        old_raw_id = old_raw.id
 
     reviewer_holds_lock = Event()
-    sync_lock_started = Event()
+    sync_posting_lock_started = Event()
+    sync_thread_id: list[int] = []
+    lock_order: list[str] = []
 
-    def review_attempt() -> None:
+    def capture_sync_lock_order(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        if not sync_thread_id or get_ident() != sync_thread_id[0]:
+            return
+        normalized = statement.upper()
+        if "FOR UPDATE" not in normalized:
+            return
+        if "JOB_POSTINGS" in normalized:
+            lock_order.append("posting")
+            sync_posting_lock_started.set()
+        elif "JOB_SOURCES" in normalized:
+            lock_order.append("source")
+
+    def review_lock_attempt() -> None:
         with Session(mysql_engine) as db:
+            db.execute(text("SET SESSION innodb_lock_wait_timeout = 10"))
             row = jobs.get_posting_for_review(db, posting_id, lock=True)
             assert row is not None
-            posting, _source = row
-            posting.status = JobPostingStatus.PENDING_REVIEW
-            posting.review_version = 1
-            posting.title = "人工确认岗位"
-            posting.description_text = "人工补全的完整 JD"
-            db.flush()
             reviewer_holds_lock.set()
-            if not sync_lock_started.wait(timeout=10):
+            if not sync_posting_lock_started.wait(timeout=10):
                 db.rollback()
-                raise TimeoutError("sync did not issue its posting lock query")
+                raise TimeoutError("sync service did not issue the posting lock query")
             db.commit()
 
-    def sync_attempt() -> tuple[str, str, str | None, bool]:
+    def sync_attempt() -> SyncOutcome:
+        if not reviewer_holds_lock.wait(timeout=10):
+            raise TimeoutError("reviewer did not acquire the posting lock")
+        sync_thread_id.append(get_ident())
         with Session(mysql_engine) as db:
-            if not reviewer_holds_lock.wait(timeout=10):
-                raise TimeoutError("reviewer did not acquire the posting lock")
-            connection = db.connection()
+            db.execute(text("SET SESSION innodb_lock_wait_timeout = 10"))
+            return JobSyncService(MutableGateway(_changed_record(record_id))).sync(
+                db,
+                source_key=INTERN_SOURCE_KEY,
+                actor_user_id=actor_id,
+            )
 
-            def signal_for_update(
-                _connection: object,
-                _cursor: object,
-                statement: str,
-                _parameters: object,
-                _context: object,
-                _executemany: bool,
-            ) -> None:
-                normalized = statement.upper()
-                if "JOB_POSTINGS" in normalized and "FOR UPDATE" in normalized:
-                    sync_lock_started.set()
+    event.listen(mysql_engine, "before_cursor_execute", capture_sync_lock_order)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reviewer = pool.submit(review_lock_attempt)
+            syncer = pool.submit(sync_attempt)
+            reviewer.result(timeout=25)
+            outcome = syncer.result(timeout=25)
 
-            event.listen(connection, "before_cursor_execute", signal_for_update)
-            try:
-                source = db.get(JobSource, source_id)
-                raw = db.get(RawJobRecord, raw_id)
-                assert source is not None
-                assert raw is not None
-                updated, action = jobs.upsert_posting(
-                    db,
-                    source=source,
-                    raw_record=raw,
-                    candidate=NormalizedJobCandidate(
-                        company_name="来源公司",
-                        title="来源新岗位",
+        assert outcome.status is JobSyncRunStatus.SUCCEEDED
+        posting_lock_index = lock_order.index("posting")
+        assert "source" in lock_order[:posting_lock_index]
+        assert "source" in lock_order[posting_lock_index + 1 :]
+
+        with Session(mysql_engine) as verification:
+            persisted = verification.get(JobPosting, posting_id)
+            old_raw = verification.get(RawJobRecord, old_raw_id)
+            assert persisted is not None
+            assert old_raw is not None
+            assert persisted.status is JobPostingStatus.VERIFIED
+            assert persisted.company_name == "人工确认公司"
+            assert persisted.title == "人工确认岗位"
+            assert persisted.description_text == "人工确认的完整 JD"
+            assert persisted.locations == ["上海"]
+            assert persisted.recruitment_types == ["实习"]
+            assert persisted.industries == ["人工行业"]
+            assert persisted.apply_url == "https://reviewed.example.com/apply"
+            assert persisted.referral_code == "HUMAN-REFERRAL"
+            assert persisted.deadline_text == "2026-12-31"
+            assert persisted.gui_eligible is True
+            assert persisted.verified_at == reviewed_at.replace(tzinfo=None)
+            assert persisted.source_candidate == {
+                "company_name": "来源更新公司",
+                "title": "来源更新岗位",
+                "locations": ["北京", "深圳"],
+                "recruitment_types": ["实习", "校招"],
+                "industries": ["软件"],
+                "apply_url": "https://source.example.com/changed",
+                "referral_code": "SOURCE-REFERRAL",
+                "deadline_text": "2027-01-01",
+            }
+            assert persisted.source_changed_since_review is True
+            assert persisted.review_version == 8
+            assert old_raw.raw_fields == old_raw_fields
+            assert old_raw.payload_hash == "0" * 64
+            assert verification.scalar(
+                select(func.count())
+                .select_from(RawJobRecord)
+                .where(
+                    RawJobRecord.source_id == source_id,
+                    RawJobRecord.external_record_id == record_id,
+                )
+            ) == 2
+
+            with pytest.raises(StaleJobReviewError):
+                JobReviewService().save_completion(
+                    verification,
+                    job_id=posting_id,
+                    actor_user_id=actor_id,
+                    expected_version=7,
+                    values=JobCompletionInput(
+                        company_name="旧管理员公司",
+                        title="旧管理员岗位",
+                        description_text="旧管理员 JD",
                         locations=["北京"],
-                        recruitment_types=["暑期实习"],
-                        industries=["互联网"],
-                        apply_url="https://example.com/changed",
+                        recruitment_types=["校招"],
+                        industries=["旧行业"],
+                        apply_url="https://stale.example.com/apply",
                         referral_code=None,
                         deadline_text=None,
-                        source_updated_at=None,
                     ),
                 )
-                db.commit()
-                return (
-                    action,
-                    updated.title,
-                    updated.description_text,
-                    updated.source_changed_since_review,
+            verification.rollback()
+            assert verification.scalar(
+                select(func.count())
+                .select_from(JobVerification)
+                .where(JobVerification.job_id == posting_id)
+            ) == 1
+    finally:
+        event.remove(mysql_engine, "before_cursor_execute", capture_sync_lock_order)
+        with Session(mysql_engine) as cleanup:
+            run_ids = list(
+                cleanup.scalars(
+                    select(AuditEvent.entity_id).where(
+                        AuditEvent.actor_user_id == actor_id,
+                        AuditEvent.entity_type == "job_sync_run",
+                    )
                 )
-            finally:
-                event.remove(connection, "before_cursor_execute", signal_for_update)
+            )
+            source = cleanup.get(JobSource, source_id)
+            if source is not None:
+                source.active_sync_run_id = None
+                source.sync_lease_expires_at = None
+            cleanup.execute(delete(AuditEvent).where(AuditEvent.actor_user_id == actor_id))
+            cleanup.execute(delete(JobVerification).where(JobVerification.job_id == posting_id))
+            cleanup.execute(delete(JobPosting).where(JobPosting.id == posting_id))
+            cleanup.execute(
+                delete(RawJobRecord).where(
+                    RawJobRecord.source_id == source_id,
+                    RawJobRecord.external_record_id == record_id,
+                )
+            )
+            if run_ids:
+                cleanup.execute(delete(JobSyncRun).where(JobSyncRun.id.in_(run_ids)))
+            cleanup.execute(delete(User).where(User.id == actor_id))
+            cleanup.commit()
+
+
+def test_mysql_concurrent_admin_review_commits_one_state_and_event(
+    mysql_engine: Engine,
+) -> None:
+    prefix = f"task7-admin-review-{uuid.uuid4().hex}"
+    actor_id = str(uuid.uuid4())
+    with Session(mysql_engine, expire_on_commit=False) as setup:
+        source = _seed_source(setup, prefix)
+        raw = RawJobRecord(
+            source_id=source.id,
+            external_record_id=f"{prefix}-record",
+            payload_hash="c" * 64,
+            raw_fields=[{"field": "seed", "value": "pending-review"}],
+            observed_at=datetime.now(timezone.utc),
+        )
+        admin = User(
+            id=actor_id,
+            account=f"{prefix}-admin",
+            nickname="Task 7 Review Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
+        )
+        setup.add_all([raw, admin])
+        setup.flush()
+        posting = JobPosting(
+            source_id=source.id,
+            external_record_id=raw.external_record_id,
+            raw_record_id=raw.id,
+            status=JobPostingStatus.PENDING_REVIEW,
+            company_name="并发公司",
+            title="并发岗位",
+            description_text="并发审核的完整 JD",
+            locations=["上海"],
+            recruitment_types=["实习"],
+            industries=["软件"],
+            apply_url="https://concurrent.example.com/apply",
+            mapper_version=source.mapper_version,
+            source_candidate={},
+            review_version=11,
+        )
+        setup.add(posting)
+        setup.commit()
+        source_id = source.id
+        posting_id = posting.id
+
+    attempts_ready = Barrier(2)
+
+    def verify_attempt() -> str:
+        with Session(mysql_engine) as db:
+            db.execute(text("SET SESSION innodb_lock_wait_timeout = 10"))
+            attempts_ready.wait(timeout=10)
+            try:
+                JobReviewService().verify(
+                    db,
+                    job_id=posting_id,
+                    actor_user_id=actor_id,
+                    expected_version=11,
+                    gui_eligible=True,
+                )
+                db.commit()
+                return "success"
+            except StaleJobReviewError:
+                db.rollback()
+                return "stale"
 
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
-            reviewer = pool.submit(review_attempt)
-            syncer = pool.submit(sync_attempt)
-            reviewer.result(timeout=20)
-            result = syncer.result(timeout=20)
-        assert result == (
-            "updated",
-            "人工确认岗位",
-            "人工补全的完整 JD",
-            True,
-        )
+            results = [
+                future.result(timeout=25)
+                for future in [pool.submit(verify_attempt), pool.submit(verify_attempt)]
+            ]
+        assert sorted(results) == ["stale", "success"]
         with Session(mysql_engine) as verification:
-            posting = verification.get(JobPosting, posting_id)
-            assert posting is not None
-            assert posting.source_candidate["title"] == "来源新岗位"
+            persisted = verification.get(JobPosting, posting_id)
+            events = list(
+                verification.scalars(
+                    select(JobVerification).where(JobVerification.job_id == posting_id)
+                )
+            )
+            assert persisted is not None
+            assert persisted.status is JobPostingStatus.VERIFIED
+            assert persisted.review_version == 12
+            assert persisted.gui_eligible is True
+            assert len(events) == 1
+            assert events[0].action == "verified"
+            assert events[0].review_version == 12
+            assert events[0].field_snapshot["title"] == "并发岗位"
     finally:
         with Session(mysql_engine) as cleanup:
             _cleanup_source(cleanup, source_id)
+            cleanup.execute(delete(User).where(User.id == actor_id))
+            cleanup.commit()

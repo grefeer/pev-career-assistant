@@ -29,6 +29,11 @@ from backend.app.db.base import Base
 from backend.app.db.models import (
     ApplicationTask,
     ApplicationTaskStatus,
+    JobPosting,
+    JobPostingStatus,
+    JobSource,
+    JobSourceProvider,
+    RawJobRecord,
     TaskActor,
     User,
     UserRole,
@@ -354,6 +359,175 @@ def test_unexpected_job_sync_failure_redacts_details_from_logs_and_response(
     for record in capture.records:
         assert not _contains_sensitive_value(record.args, (sensitive_detail,))
         assert not _contains_sensitive_value(record.__dict__, (sensitive_detail,))
+
+
+def test_admin_completion_never_leaks_raw_source_or_credentials(
+    client: TestClient,
+) -> None:
+    business_sentinels = (
+        "business-company-sentinel",
+        "business-title-sentinel",
+        "business-jd-sentinel",
+        "business-location-sentinel",
+        "business-recruitment-sentinel",
+        "business-industry-sentinel",
+        "business-referral-sentinel",
+        "business-deadline-sentinel",
+    )
+    source_sentinels = (
+        "source-company-sentinel",
+        "source-title-sentinel",
+        "source-location-sentinel",
+        "source-recruitment-sentinel",
+        "source-industry-sentinel",
+        "source-referral-sentinel",
+        "source-deadline-sentinel",
+    )
+    raw_value = "raw-record-value-sentinel"
+    payload_hash = "a" * 64
+    external_record_id = "external-record-sentinel"
+    mcp_trace = "mcp-trace-sentinel"
+    upstream_response = "complete-upstream-response-sentinel"
+    tencent_token = "tencent-token-sentinel"
+    authorization_value = "authorization-secret-sentinel"
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        admin = User(
+            account="completion-log-admin",
+            nickname="Completion Log Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
+        )
+        source = JobSource(
+            source_key="completion-log-source",
+            provider=JobSourceProvider.TENCENT_SMARTSHEET,
+            name="Completion Log Source",
+            file_id="completion-log-file",
+            sheet_id="completion-log-sheet",
+            mapper_version="completion-log-v1",
+            enabled=True,
+        )
+        db.add_all([admin, source])
+        db.flush()
+        raw = RawJobRecord(
+            source_id=source.id,
+            external_record_id=external_record_id,
+            payload_hash=payload_hash,
+            raw_fields=[
+                {
+                    "raw_value": raw_value,
+                    "mcp_trace": mcp_trace,
+                    "upstream_response": upstream_response,
+                    "token": tencent_token,
+                }
+            ],
+        )
+        db.add(raw)
+        db.flush()
+        posting = JobPosting(
+            source_id=source.id,
+            external_record_id=external_record_id,
+            raw_record_id=raw.id,
+            status=JobPostingStatus.PENDING_COMPLETION,
+            company_name="Unreviewed Company",
+            title="Unreviewed Role",
+            locations=[],
+            recruitment_types=[],
+            industries=[],
+            apply_url="https://example.com/unreviewed",
+            mapper_version=source.mapper_version,
+            source_candidate={
+                "company_name": source_sentinels[0],
+                "title": source_sentinels[1],
+                "locations": [source_sentinels[2]],
+                "recruitment_types": [source_sentinels[3]],
+                "industries": [source_sentinels[4]],
+                "apply_url": "https://source.example.com/apply",
+                "referral_code": source_sentinels[5],
+                "deadline_text": source_sentinels[6],
+                "raw_fields": raw_value,
+                "payload_hash": payload_hash,
+                "external_record_id": external_record_id,
+                "mcp_trace": mcp_trace,
+                "authorization": authorization_value,
+            },
+        )
+        db.add(posting)
+        db.commit()
+        db.refresh(admin)
+        db.refresh(posting)
+        bearer_token = AuthService(client.app.state.settings).issue_user_token(admin)
+        job_id = posting.id
+
+    request_body = {
+        "expected_version": 0,
+        "company_name": business_sentinels[0],
+        "title": business_sentinels[1],
+        "description_text": business_sentinels[2],
+        "locations": [business_sentinels[3]],
+        "recruitment_types": [business_sentinels[4]],
+        "industries": [business_sentinels[5]],
+        "apply_url": "https://business.example.com/apply",
+        "referral_code": business_sentinels[6],
+        "deadline_text": business_sentinels[7],
+        "raw_fields": raw_value,
+        "payload_hash": payload_hash,
+        "external_record_id": external_record_id,
+        "mcp_trace": mcp_trace,
+        "authorization": authorization_value,
+        "tencent_token": tencent_token,
+        "upstream_response": upstream_response,
+    }
+    log_forbidden = (
+        *business_sentinels,
+        *source_sentinels,
+        raw_value,
+        payload_hash,
+        external_record_id,
+        mcp_trace,
+        upstream_response,
+        tencent_token,
+        authorization_value,
+        bearer_token,
+        "raw_fields",
+        "payload_hash",
+        "external_record_id",
+        "mcp_trace",
+        "authorization",
+    )
+    response_forbidden = (
+        raw_value,
+        payload_hash,
+        external_record_id,
+        mcp_trace,
+        upstream_response,
+        tencent_token,
+        authorization_value,
+        bearer_token,
+        "raw_fields",
+        "payload_hash",
+        "external_record_id",
+        "mcp_trace",
+        "authorization",
+        "tencent_token",
+        "upstream_response",
+    )
+
+    with _capture_application_logs() as capture:
+        response = client.patch(
+            f"/api/admin/jobs/{job_id}/completion",
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            json=request_body,
+        )
+
+    assert response.status_code == 200
+    assert response.json()["company_name"] == business_sentinels[0]
+    assert response.json()["source_candidate"]["title"] == source_sentinels[1]
+    assert not _contains_sensitive_value(response.text, response_forbidden)
+    for formatted, record in zip(capture.formatted, capture.records, strict=True):
+        assert not _contains_sensitive_value(formatted, log_forbidden)
+        assert not _contains_sensitive_value(record.args, log_forbidden)
+        assert not _contains_sensitive_value(record.__dict__, log_forbidden)
 
 
 @pytest.mark.parametrize("mutation", ["exception", "args", "nested_extra"])

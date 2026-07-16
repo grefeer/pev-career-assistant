@@ -23,18 +23,10 @@ from backend.app.db.models import (
 from backend.app.repositories import jobs
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
-from tests.integration.job_sync_gate_safety import (
-    require_dedicated_mysql_test_database,
-)
-
-
 SOURCE_KEYS = ("tencent-27-referrals", "tencent-intern-referrals")
 pytestmark = pytest.mark.skipif(
-    not (
-        os.environ.get("TEST_MYSQL_URL")
-        and os.environ.get("TEST_TENCENT_DOCS_TOKEN")
-    ),
-    reason="requires TEST_MYSQL_URL and TEST_TENCENT_DOCS_TOKEN",
+    not os.environ.get("TEST_TENCENT_DOCS_TOKEN"),
+    reason="requires TEST_TENCENT_DOCS_TOKEN",
 )
 
 
@@ -85,11 +77,11 @@ def _count_for_source(db: Session, model: type[object], source_id: str) -> int:
     )
 
 
-def test_live_tencent_sources_sync_read_only_and_idempotently() -> None:
-    database_url = os.environ["TEST_MYSQL_URL"]
-    require_dedicated_mysql_test_database(database_url)
-    _migrate_to_head(database_url)
-    engine = create_engine(database_url, pool_pre_ping=True)
+def test_live_tencent_sources_sync_read_only_and_idempotently(
+    destructive_mysql_url: str,
+) -> None:
+    _migrate_to_head(destructive_mysql_url)
+    engine = create_engine(destructive_mysql_url, pool_pre_ping=True)
     admin_id = str(uuid.uuid4())
 
     try:

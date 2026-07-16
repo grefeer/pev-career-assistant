@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.db.models import JobPostingStatus
 
@@ -96,3 +96,14 @@ class JobDecisionRequest(BaseModel):
     decision: Literal["verify", "reject", "expire"]
     gui_eligible: bool = False
     reason_code: str | None = Field(default=None, max_length=80)
+
+    @model_validator(mode="after")
+    def validate_reason_for_decision(self) -> Self:
+        if self.decision == "verify":
+            if self.reason_code is not None:
+                raise ValueError("verify requires reason_code to be null")
+            return self
+        if self.reason_code is None or not self.reason_code.strip():
+            raise ValueError(f"{self.decision} requires a stable reason_code")
+        self.reason_code = self.reason_code.strip()
+        return self

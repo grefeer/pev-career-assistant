@@ -123,8 +123,11 @@
 - `POST /api/auth/login`
 - `GET /api/auth/me`
 - `POST /api/admin/job-sources/{source_key}/sync`（管理员只读同步腾讯智能表来源）
-- `GET /api/jobs`（认证用户分页查询待补全职位）
-- `GET /api/jobs/{job_id}`（认证用户查询待补全职位详情）
+- `GET /api/jobs`（认证用户分页查询已核验 `verified` 职位）
+- `GET /api/jobs/{job_id}`（认证用户查询已核验 `verified` 职位详情）
+- `GET /api/admin/jobs/review-queue`（管理员查询待补全、待审核和已拒绝职位）
+- `PATCH /api/admin/jobs/{job_id}/completion`（管理员保存补全草稿）
+- `POST /api/admin/jobs/{job_id}/decision`（管理员核验、拒绝或失效职位）
 - `GET /api/sessions`
 - `POST /api/sessions`
 - `POST /api/sessions/{thread_id}/activate`

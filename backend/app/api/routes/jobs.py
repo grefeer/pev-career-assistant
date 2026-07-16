@@ -276,20 +276,22 @@ def decide_job(
                 gui_eligible=body.gui_eligible,
             )
         elif body.decision == "reject":
+            assert body.reason_code is not None
             posting = service.reject(
                 db,
                 job_id=job_id,
                 actor_user_id=admin.id,
                 expected_version=body.expected_version,
-                reason_code=body.reason_code or "unspecified_rejection",
+                reason_code=body.reason_code,
             )
         else:
+            assert body.reason_code is not None
             posting = service.expire(
                 db,
                 job_id=job_id,
                 actor_user_id=admin.id,
                 expected_version=body.expected_version,
-                reason_code=body.reason_code or "expired",
+                reason_code=body.reason_code,
             )
         row = jobs.get_posting_for_review(db, posting.id)
         assert row is not None

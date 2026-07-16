@@ -1,5 +1,8 @@
+import pytest
+from pydantic import ValidationError
 from sqlalchemy import UniqueConstraint
 
+from backend.app.api.job_schemas import JobDecisionRequest
 from backend.app.db.base import Base
 from backend.app.db.models import JobPosting, JobPostingStatus, JobVerification
 
@@ -68,3 +71,36 @@ def test_job_verification_is_an_immutable_review_record() -> None:
         "reason_code",
         "created_at",
     } <= set(columns.keys())
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"expected_version": 0, "decision": "reject"},
+        {"expected_version": 0, "decision": "reject", "reason_code": ""},
+        {"expected_version": 0, "decision": "expire", "reason_code": "   "},
+        {"expected_version": 0, "decision": "verify", "reason_code": "unused"},
+        {"expected_version": 0, "decision": "verify", "reason_code": ""},
+    ],
+)
+def test_job_decision_requires_explicit_reason_contract(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        JobDecisionRequest.model_validate(payload)
+
+
+def test_job_decision_accepts_only_matching_reason_shape() -> None:
+    rejected = JobDecisionRequest.model_validate(
+        {"expected_version": 0, "decision": "reject", "reason_code": "invalid_source"}
+    )
+    expired = JobDecisionRequest.model_validate(
+        {"expected_version": 1, "decision": "expire", "reason_code": "closed"}
+    )
+    verified = JobDecisionRequest.model_validate(
+        {"expected_version": 2, "decision": "verify", "reason_code": None}
+    )
+
+    assert rejected.reason_code == "invalid_source"
+    assert expired.reason_code == "closed"
+    assert verified.reason_code is None

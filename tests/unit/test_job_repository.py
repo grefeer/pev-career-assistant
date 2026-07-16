@@ -15,6 +15,7 @@ from backend.app.db.models import (
     JobPostingStatus,
     JobSyncRun,
     JobSyncRunStatus,
+    JobVerification,
     RawJobRecord,
 )
 from backend.app.repositories import jobs
@@ -293,7 +294,7 @@ def test_posting_upsert_points_to_new_snapshot_without_deleting_history(
     assert (first_action, second_action) == ("created", "updated")
     assert updated.id == posting.id
     assert updated.raw_record_id == second_raw.id
-    assert updated.review_version == 0
+    assert updated.review_version == 1
     assert db.get(RawJobRecord, first_raw.id) is first_raw
     assert db.scalar(select(func.count()).select_from(RawJobRecord)) == 2
 
@@ -402,7 +403,7 @@ def test_sync_refreshes_cached_posting_before_protecting_reviewed_fields(
     assert updated.source_changed_since_review is True
 
 
-def test_sync_does_not_overwrite_versioned_posting_with_reset_status(
+def test_sync_does_not_overwrite_reviewed_posting_with_reset_status(
     db: Session,
 ) -> None:
     source = seeded_source(db)
@@ -414,6 +415,18 @@ def test_sync_does_not_overwrite_versioned_posting_with_reset_status(
     )
     posting.title = "人工确认岗位"
     posting.review_version = 1
+    db.add(
+        JobVerification(
+            job_id=posting.id,
+            actor_user_id=None,
+            action="completion_saved",
+            from_status=JobPostingStatus.PENDING_COMPLETION.value,
+            to_status=JobPostingStatus.PENDING_REVIEW.value,
+            review_version=1,
+            field_snapshot={"title": "人工确认岗位"},
+            created_at=utc_now(),
+        )
+    )
     db.flush()
 
     changed_raw = snapshot(
@@ -747,6 +760,40 @@ def test_locked_review_read_refreshes_loaded_posting(db: Session) -> None:
     assert locked is not None
     assert locked[0] is posting
     assert locked[0].title == "数据库最新岗位"
+
+
+def test_locked_review_read_does_not_join_and_lock_job_source(db: Session) -> None:
+    source = seeded_source(db)
+    raw = snapshot(
+        db,
+        source_id=source.id,
+        external_record_id="posting-only-lock",
+        payload_hash="e" * 64,
+    )
+    posting, _ = jobs.upsert_posting(
+        db, source=source, raw_record=raw, candidate=candidate()
+    )
+    db.flush()
+    statements: list[str] = []
+
+    def capture_statement(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement.upper())
+
+    engine = db.get_bind()
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    try:
+        locked = jobs.get_posting_for_review(db, posting.id, lock=True)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    assert locked == (posting, source)
+    posting_select = next(
+        statement for statement in statements if "FROM JOB_POSTINGS" in statement
+    )
+    assert "JOIN JOB_SOURCES" not in posting_select
 
 
 def test_empty_review_queue_statuses_include_all_reviewable_but_not_expired(

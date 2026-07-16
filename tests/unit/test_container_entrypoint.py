@@ -161,6 +161,57 @@ def test_compose_requires_minio_credentials_without_public_defaults() -> None:
     assert "minioadmin" not in completed.stderr
 
 
+def test_compose_declares_revision_and_respects_configured_host_ports() -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker compose is not available")
+    environment = {
+        **os.environ,
+        "DB_PASSWORD": "compose-db-not-public",
+        "REDIS_PASSWORD": "compose-redis-not-public",
+        "MINIO_ROOT_USER": "compose-minio-user-not-public",
+        "MINIO_ROOT_PASSWORD": "compose-minio-password-not-public",
+        "APP_AUTH_SECRET": "a" * 32,
+        "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
+        "MYSQL_HOST_PORT": "13306",
+        "REDIS_HOST_PORT": "16379",
+        "MINIO_HOST_PORT": "19000",
+        "MINIO_CONSOLE_HOST_PORT": "19001",
+        "BACKEND_HOST_PORT": "18000",
+        "FRONTEND_HOST_PORT": "15173",
+    }
+
+    completed = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config: dict[str, Any] = json.loads(completed.stdout)
+
+    assert config["services"]["migrate"]["labels"] == {
+        "com.career-assistant.schema-revision": "20260716_0004"
+    }
+    expected_ports = {
+        "mysql": ("13306", 3306),
+        "redis": ("16379", 6379),
+        "minio": ("19000", 9000),
+        "backend": ("18000", 8000),
+        "frontend": ("15173", 80),
+    }
+    for service_name, (published, target) in expected_ports.items():
+        ports = config["services"][service_name]["ports"]
+        assert any(
+            str(port["published"]) == published and port["target"] == target
+            for port in ports
+        )
+    assert any(
+        str(port["published"]) == "19001" and port["target"] == 9001
+        for port in config["services"]["minio"]["ports"]
+    )
+
+
 def test_backend_image_contract_includes_admin_script() -> None:
     dockerfile = (ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
 

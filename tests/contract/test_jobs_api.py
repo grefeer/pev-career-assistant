@@ -961,7 +961,11 @@ def test_missing_admin_review_job_returns_stable_404(
     decision = client.post(
         "/api/admin/jobs/not-a-job/decision",
         headers=seeded["admin_headers"],
-        json={"expected_version": 0, "decision": "reject"},
+        json={
+            "expected_version": 0,
+            "decision": "reject",
+            "reason_code": "invalid_source",
+        },
     )
 
     expected = {"detail": {"error_code": "job_not_found", "message": "职位不存在。"}}
@@ -969,6 +973,38 @@ def test_missing_admin_review_job_returns_stable_404(
     assert completion.json() == expected
     assert decision.status_code == 404
     assert decision.json() == expected
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"expected_version": 0, "decision": "reject"},
+        {"expected_version": 0, "decision": "reject", "reason_code": ""},
+        {"expected_version": 0, "decision": "expire", "reason_code": "   "},
+        {"expected_version": 0, "decision": "verify", "reason_code": "unexpected"},
+        {"expected_version": 0, "decision": "verify", "reason_code": ""},
+    ],
+)
+def test_admin_decision_rejects_missing_or_mismatched_reason(
+    client: TestClient,
+    seeded: dict[str, Any],
+    body: dict[str, object],
+) -> None:
+    posting = seeded["postings"][0]
+
+    response = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json=body,
+    )
+
+    assert response.status_code == 422
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_COMPLETION
+        assert persisted.review_version == 0
+        assert _events_for(db, posting.id) == []
 
 
 def test_stale_admin_review_returns_409_without_mutation_or_event(
@@ -1128,6 +1164,69 @@ def test_source_sync_makes_read_version_stale_without_overwriting_canonical_fiel
         assert [event.action for event in _events_for(db, posting.id)] == [
             "completion_saved"
         ]
+
+
+def test_pending_source_change_makes_loaded_version_zero_stale(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    queue = client.get(
+        "/api/admin/jobs/review-queue?review_status=pending_completion",
+        headers=seeded["admin_headers"],
+    )
+    loaded = next(item for item in queue.json()["jobs"] if item["id"] == posting.id)
+    assert loaded["review_version"] == 0
+
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        source = db.get(JobSource, persisted.source_id)
+        assert source is not None
+        raw, created = job_repository.insert_raw_snapshot(
+            db,
+            source_id=source.id,
+            external_record_id=persisted.external_record_id,
+            raw_fields=[{"source": "changed-before-first-review"}],
+            payload_hash="d" * 64,
+            source_updated_at=NOW + timedelta(days=3),
+            observed_at=NOW + timedelta(days=3),
+        )
+        assert created is True
+        job_repository.upsert_posting(
+            db,
+            source=source,
+            raw_record=raw,
+            candidate=NormalizedJobCandidate(
+                company_name="Fresh Source Company",
+                title="Fresh Source Role",
+                locations=["北京"],
+                recruitment_types=["校招"],
+                industries=["硬件"],
+                apply_url="https://fresh-source.example.com/apply",
+                referral_code="FRESH",
+                deadline_text="2027-03-01",
+                source_updated_at=NOW + timedelta(days=3),
+            ),
+        )
+        db.commit()
+
+    stale = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "expected_version": loaded["review_version"]},
+    )
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["error_code"] == "stale_job_review"
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        persisted = db.get(JobPosting, posting.id)
+        assert persisted is not None
+        assert persisted.status is JobPostingStatus.PENDING_COMPLETION
+        assert persisted.company_name == "Fresh Source Company"
+        assert persisted.title == "Fresh Source Role"
+        assert persisted.review_version == 1
+        assert persisted.source_changed_since_review is False
+        assert _events_for(db, posting.id) == []
 
 
 @pytest.mark.parametrize(

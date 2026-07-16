@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import Session
@@ -17,11 +15,10 @@ from backend.app.db.models import (
 from backend.app.services.applications import ApplicationService, InvalidTransitionError
 
 
-@pytest.mark.skipif(
-    "TEST_MYSQL_URL" not in os.environ, reason="requires TEST_MYSQL_URL"
-)
-def test_repeatable_read_uses_current_task_state_not_cached_snapshot() -> None:
-    engine = create_engine(os.environ["TEST_MYSQL_URL"])
+def test_repeatable_read_uses_current_task_state_not_cached_snapshot(
+    destructive_mysql_url: str,
+) -> None:
+    engine = create_engine(destructive_mysql_url)
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     service = ApplicationService()
@@ -90,4 +87,6 @@ def test_repeatable_read_uses_current_task_state_not_cached_snapshot() -> None:
             assert event_count == 1
     finally:
         Base.metadata.drop_all(engine)
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
         engine.dispose()

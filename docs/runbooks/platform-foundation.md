@@ -82,6 +82,35 @@ docker compose down
 docker compose run --rm migrate alembic upgrade head
 ```
 
+`20260716_0004` 会修改 `job_postings` 的状态约束、回填 `source_candidate` 并创建
+`job_verifications`。升级必须安排维护窗口：先停止 Backend 和所有写入作业，完成并
+校验 MySQL 备份，再观察 `performance_schema.metadata_locks` 与长事务，确认没有阻塞
+`job_postings` 的 metadata lock 后执行迁移。迁移期间不得恢复同步或管理员写入。
+
+```powershell
+docker compose stop backend
+docker compose exec -T mysql sh -c `
+  'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -e "SHOW PROCESSLIST; SELECT OBJECT_SCHEMA,OBJECT_NAME,LOCK_TYPE,LOCK_STATUS FROM performance_schema.metadata_locks WHERE OBJECT_SCHEMA = DATABASE();" career_assistant'
+docker compose run --rm migrate alembic upgrade 20260716_0004
+$revision = docker compose run --rm migrate alembic current
+if ($revision -notmatch '20260716_0004') {
+  throw 'Unexpected Alembic revision after migration'
+}
+```
+
+备份必须写入仓库外受控目录，并使用组织批准的加密 `mysqldump` 或物理备份流程；不得
+把数据库密码放进 argv、命令历史或输出。确认 revision 与抽样数据后才恢复写入。
+
+从 `20260716_0004` 降到 `20260715_0003` 会永久删除全部 `job_verifications` 和审核
+新增列，并把所有职位状态重置为 `pending_completion`；人工审核历史、版本、来源变化
+标记、GUI 资格和终态时间均不可由 0003 恢复。只有在已验证备份且明确接受这些损失的
+开发或灾难恢复场景才可执行：
+
+```powershell
+docker compose stop backend
+docker compose run --rm migrate alembic downgrade 20260715_0003
+```
+
 回退前必须进入维护窗口、停止后端写入并完成 MySQL 备份。回退到空基线会删除平台表：
 
 ```powershell
@@ -153,7 +182,40 @@ $secureAdminJwt.Dispose()
 - HTTP `503`：令牌缺失、鉴权失败、限流重试耗尽、腾讯服务不可用或数据库写入失败；按稳定 `error_code` 检查配置与依赖状态。
 - HTTP `504`：腾讯请求在重试后仍超时；检查网络和上游状态后重新运行。
 
-对于已创建同步运行后由 `JobSyncFailedError` 返回的 5xx 失败响应，`detail` 只应包含稳定 `error_code` 和 `run_id`；404、409 和认证授权错误遵循各自的标准响应。任何响应都不得包含腾讯原始响应、令牌或原始记录载荷，也不得把这些内容复制到日志或工单。`GET /api/jobs` 和 `GET /api/jobs/{job_id}` 需要已认证用户，仅返回 `PENDING_COMPLETION` 职位；这些职位尚未核验，也不具备投递授权。
+对于已创建同步运行后由 `JobSyncFailedError` 返回的 5xx 失败响应，`detail` 只应包含稳定 `error_code` 和 `run_id`；404、409 和认证授权错误遵循各自的标准响应。任何响应都不得包含腾讯原始响应、令牌或原始记录载荷，也不得把这些内容复制到日志或工单。`GET /api/jobs` 和 `GET /api/jobs/{job_id}` 需要已认证用户，仅返回 `verified` 职位；待补全、待审核、已拒绝和已失效职位只允许管理员读取。
+
+## 职位补全与核验
+
+职位状态依次使用 `pending_completion`、`pending_review`、`verified`、`expired` 和
+`rejected`。学生职位中心只读取 `verified`；待补全、待审核、已拒绝和已失效记录只
+通过管理员接口访问。
+
+管理员在前端“职位审核”页完成以下操作：
+
+1. 对照最新来源候选值补全公司、具体岗位、完整 JD、地点、投递入口和截止日期。
+2. 保存草稿，使记录进入 `pending_review`。
+3. 明确选择“允许 GUI 辅助填写”或“仅人工投递”。
+4. 核验并发布，或填写稳定原因后拒绝；失效操作同样必须填写稳定原因。
+
+每次写操作携带 `review_version`。收到 HTTP 409 和 `stale_job_review` 时必须丢弃本地
+旧版本、重新加载记录并让管理员重新确认，不得自动重放或重复提交旧内容。来源候选值
+只要发生实质变化就递增 `review_version`，因此管理员读取 `pending_completion@v0` 后
+发生的来源变化也会使旧 v0 写入变 stale。
+
+在记录尚无任何 `JobVerification` 时，`pending_completion` 的规范字段可随来源候选
+刷新；一旦存在人工审核事件，即使状态后来被重置，重同步也只更新
+`source_candidate`、`source_changed_since_review=true` 和版本，不会覆盖人工确认字段。
+每次成功管理员写入在同一事务中追加且只追加一条不可变 `JobVerification`；失败或 stale
+事务不得产生事件。不得编辑或删除核验事件来“修复”当前状态。
+
+邮箱、二维码、扫码、微信和其他人工渠道可以被核验，但必须保持
+`gui_eligible=false`。`verify` 请求的 `reason_code` 必须为 `null`；`reject` 和
+`expire` 必须显式提交非空白稳定 `reason_code`，服务端不会静默生成默认原因。官网职位
+关闭后由管理员执行失效操作；已失效记录不再出现在学生职位中心。
+
+迁移 `20260716_0004` 增加审核状态、版本和 `job_verifications`。降级会删除核验记录并
+把全部职位重置为 `pending_completion`，因此只能在确认不需要保留审核历史的开发或恢复
+场景执行。
 
 ## 撤销设备
 
@@ -204,15 +266,30 @@ $secureToken.Dispose()
 存活检查不依赖 MySQL、Redis 或对象存储：
 
 ```powershell
-Invoke-RestMethod 'http://127.0.0.1:8000/api/health/live'
+$backendPort = if ($env:BACKEND_HOST_PORT) { $env:BACKEND_HOST_PORT } else { '8000' }
+Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/live"
 ```
 
 就绪检查逐项报告 MySQL、Redis 和对象存储，但不会返回连接 URL 或凭据：
 
 ```powershell
-Invoke-RestMethod 'http://127.0.0.1:8000/api/health/ready' | ConvertTo-Json -Depth 4
+$backendPort = if ($env:BACKEND_HOST_PORT) { $env:BACKEND_HOST_PORT } else { '8000' }
+$frontendPort = if ($env:FRONTEND_HOST_PORT) { $env:FRONTEND_HOST_PORT } else { '5173' }
+$revision = docker compose run --rm migrate alembic current
+if ($revision -notmatch '20260716_0004') {
+  throw 'Compose database is not at 20260716_0004'
+}
+Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/ready" |
+  ConvertTo-Json -Depth 4
+Invoke-WebRequest "http://127.0.0.1:$frontendPort/" -UseBasicParsing
 docker compose ps
 ```
+
+Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用与启动栈相同的
+`BACKEND_HOST_PORT` 和 `FRONTEND_HOST_PORT`；MySQL、Redis 与 MinIO 的宿主端口也分别
+由 `MYSQL_HOST_PORT`、`REDIS_HOST_PORT`、`MINIO_HOST_PORT` 和
+`MINIO_CONSOLE_HOST_PORT` 控制。`migrate` 容器退出 0 不是 revision 证明，必须额外执行
+`alembic current` 并看到 `20260716_0004`。
 
 ## 测试和发布前门禁
 
@@ -226,9 +303,14 @@ $env:TEST_S3_ACCESS_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_USER
 $env:TEST_S3_SECRET_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_PASSWORD', 'User')
 $env:TEST_S3_BUCKET = 'career-assistant-storage-test'
 $env:TEST_TENCENT_DOCS_TOKEN = [Environment]::GetEnvironmentVariable('TEST_TENCENT_DOCS_TOKEN', 'User')
+$env:ALLOW_DESTRUCTIVE_MYSQL_TESTS = '1'
 ```
 
-`TEST_TENCENT_DOCS_TOKEN` 仅用于测试环境中的真实腾讯只读门禁。只有在 `TEST_MYSQL_URL` 指向数据库名以 `_test` 结尾的专用测试库时才运行该门禁；不得对非测试数据库执行真实来源集成测试。
+`ALLOW_DESTRUCTIVE_MYSQL_TESTS=1` 是破坏性 MySQL 门禁的显式开关。共享 guard 会先检查
+该开关，再读取 `TEST_MYSQL_URL`，并拒绝空 URL、非 MySQL 后端和数据库名不以 `_test`
+结尾的连接。缺少开关或 URL 时测试按精确变量名 skip；配置了不安全值时直接失败。只可
+使用 `career_assistant_test` 这类隔离 schema，严禁把业务库 URL 复用为测试 URL。
+`TEST_TENCENT_DOCS_TOKEN` 仅用于测试环境中的真实腾讯只读门禁。
 
 运行全部门禁：
 
@@ -236,6 +318,7 @@ $env:TEST_TENCENT_DOCS_TOKEN = [Environment]::GetEnvironmentVariable('TEST_TENCE
 .\.venv\Scripts\python.exe -m ruff check backend src tests scripts
 .\.venv\Scripts\python.exe -m pytest -v
 npm --prefix frontend run build
+npm --prefix frontend run typecheck
 rg "app_users.json|USER_STORE_PATH|replace-with-your-own-secret|password_hash.*sha256|postgres" backend src frontend docker-compose.yml README.md
 ```
 

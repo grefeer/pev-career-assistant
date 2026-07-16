@@ -14,6 +14,7 @@ from backend.app.db.models import (
     JobPostingStatus,
     JobSyncRun,
     JobSyncRunStatus,
+    JobVerification,
     RawJobRecord,
     User,
     UserRole,
@@ -260,6 +261,108 @@ def test_source_change_invalidates_loaded_admin_completion(db: Session) -> None:
     assert posting.title == "人工确认岗位"
     assert posting.description_text == "人工补全的完整 JD"
     assert posting.source_changed_since_review is True
+
+
+def test_pending_source_change_invalidates_loaded_version_and_refreshes_canonical(
+    db: Session,
+) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("pending-r1")], 1, False, 0)},
+    )
+    sync = service(gateway)
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    posting = db.scalar(
+        select(JobPosting).where(JobPosting.external_record_id == "pending-r1")
+    )
+    assert posting is not None
+    loaded_version = posting.review_version
+    assert loaded_version == 0
+
+    gateway.pages = {
+        0: TencentRecordPage(
+            [complete_record("pending-r1", title="来源更新岗位")], 1, False, 0
+        )
+    }
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+
+    assert posting.title == "来源更新岗位"
+    assert posting.source_candidate["title"] == "来源更新岗位"
+    assert posting.review_version == loaded_version + 1
+    assert posting.source_changed_since_review is False
+    with pytest.raises(StaleJobReviewError):
+        JobReviewService(now=lambda: NOW).save_completion(
+            db,
+            job_id=posting.id,
+            actor_user_id="admin",
+            expected_version=loaded_version,
+            values=JobCompletionInput(
+                company_name="旧表单公司",
+                title="旧表单岗位",
+                description_text="旧表单 JD",
+                locations=["上海"],
+                recruitment_types=["实习"],
+                industries=["软件"],
+                apply_url="https://example.com/stale-pending",
+                referral_code=None,
+                deadline_text=None,
+            ),
+        )
+
+
+def test_review_event_protects_canonical_fields_after_status_and_version_reset(
+    db: Session,
+) -> None:
+    gateway = FakeGateway(
+        fields=intern_fields(),
+        pages={0: TencentRecordPage([complete_record("reset-r1")], 1, False, 0)},
+    )
+    sync = service(gateway)
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    posting = db.scalar(
+        select(JobPosting).where(JobPosting.external_record_id == "reset-r1")
+    )
+    assert posting is not None
+    review = JobReviewService(now=lambda: NOW).save_completion(
+        db,
+        job_id=posting.id,
+        actor_user_id="admin",
+        expected_version=0,
+        values=JobCompletionInput(
+            company_name="人工确认公司",
+            title="人工确认岗位",
+            description_text="人工确认 JD",
+            locations=["上海"],
+            recruitment_types=["实习"],
+            industries=["软件"],
+            apply_url="https://example.com/reviewed-reset",
+            referral_code="HUMAN",
+            deadline_text="2026-12-31",
+        ),
+    )
+    assert db.scalar(
+        select(func.count())
+        .select_from(JobVerification)
+        .where(JobVerification.job_id == posting.id)
+    ) == 1
+    review.status = JobPostingStatus.PENDING_COMPLETION
+    review.review_version = 0
+    db.commit()
+
+    gateway.pages = {
+        0: TencentRecordPage(
+            [complete_record("reset-r1", title="来源不得覆盖岗位")], 1, False, 0
+        )
+    }
+    sync.sync(db, source_key=INTERN_SOURCE, actor_user_id="admin")
+    db.refresh(posting)
+
+    assert posting.title == "人工确认岗位"
+    assert posting.description_text == "人工确认 JD"
+    assert posting.source_candidate["title"] == "来源不得覆盖岗位"
+    assert posting.source_changed_since_review is True
+    assert posting.review_version == 1
 
 
 def test_second_page_failure_preserves_first_page(db: Session) -> None:

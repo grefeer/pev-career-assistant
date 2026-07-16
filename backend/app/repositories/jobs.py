@@ -18,6 +18,7 @@ from backend.app.db.models import (
     JobSourceProvider,
     JobSyncRun,
     JobSyncRunStatus,
+    JobVerification,
     RawJobRecord,
 )
 from backend.app.services.job_mappers import BuiltinJobSource, NormalizedJobCandidate
@@ -290,14 +291,22 @@ def upsert_posting(
     source_candidate_changed = posting.source_candidate != payload
     for name, value in source_values.items():
         setattr(posting, name, value)
+    has_review_event = bool(
+        db.scalar(
+            select(
+                exists().where(JobVerification.job_id == posting.id)
+            )
+        )
+    )
     if (
         posting.status is JobPostingStatus.PENDING_COMPLETION
-        and posting.review_version == 0
+        and not has_review_event
     ):
         for name, value in canonical_values.items():
             setattr(posting, name, value)
     elif source_candidate_changed:
         posting.source_changed_since_review = True
+    if source_candidate_changed:
         posting.review_version += 1
     db.flush()
     return posting, "updated"
@@ -466,13 +475,24 @@ def list_review_queue(
 def get_posting_for_review(
     db: Session, job_id: str, *, lock: bool = False
 ) -> tuple[JobPosting, JobSource] | None:
+    if lock:
+        posting = db.scalar(
+            select(JobPosting)
+            .where(JobPosting.id == job_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if posting is None:
+            return None
+        source = db.get(JobSource, posting.source_id)
+        if source is None:
+            return None
+        return posting, source
     statement = (
         select(JobPosting, JobSource)
         .join(JobSource)
         .where(JobPosting.id == job_id)
         .execution_options(populate_existing=True)
     )
-    if lock:
-        statement = statement.with_for_update()
     row = db.execute(statement).one_or_none()
     return (row[0], row[1]) if row is not None else None
