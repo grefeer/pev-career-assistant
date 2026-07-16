@@ -53,8 +53,11 @@ export async function request<T>(
         const structuredDetail = detail as Record<string, unknown>;
         if (typeof structuredDetail.message === "string" && structuredDetail.message.trim()) {
           message = structuredDetail.message;
-        } else if (structuredDetail.error_code != null) {
-          message = String(structuredDetail.error_code);
+        } else if (
+          typeof structuredDetail.error_code === "string" &&
+          structuredDetail.error_code.trim()
+        ) {
+          message = structuredDetail.error_code;
         }
       }
     } catch {

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 
 import { fetchVerifiedJob, fetchVerifiedJobs } from "./jobsApi";
 import type { JobDetail, JobSummary } from "./jobTypes";
@@ -16,6 +16,9 @@ const selectedJob = ref<JobDetail | null>(null);
 const selectedJobId = ref("");
 const detailLoading = ref(false);
 const detailError = ref("");
+let isMounted = true;
+let listRequestVersion = 0;
+let detailRequestVersion = 0;
 
 const filters = reactive({
   company: "",
@@ -38,21 +41,28 @@ function currentQuery() {
 }
 
 async function loadJobs() {
+  const requestVersion = ++listRequestVersion;
+  detailRequestVersion += 1;
   loading.value = true;
   error.value = "";
   selectedJob.value = null;
   selectedJobId.value = "";
+  detailLoading.value = false;
   detailError.value = "";
   try {
     const response = await fetchVerifiedJobs(props.token, currentQuery());
+    if (!isMounted || requestVersion !== listRequestVersion) return;
     jobs.value = response.jobs;
     total.value = response.total;
   } catch (caught) {
+    if (!isMounted || requestVersion !== listRequestVersion) return;
     jobs.value = [];
     total.value = 0;
     error.value = caught instanceof Error ? caught.message : "职位加载失败。";
   } finally {
-    loading.value = false;
+    if (isMounted && requestVersion === listRequestVersion) {
+      loading.value = false;
+    }
   }
 }
 
@@ -75,17 +85,31 @@ async function changePage(nextPage: number) {
 }
 
 async function showDetail(jobId: string) {
+  const requestVersion = ++detailRequestVersion;
   selectedJobId.value = jobId;
   selectedJob.value = null;
   detailError.value = "";
   detailLoading.value = true;
   try {
-    selectedJob.value = await fetchVerifiedJob(props.token, jobId);
+    const response = await fetchVerifiedJob(props.token, jobId);
+    if (!isMounted || requestVersion !== detailRequestVersion) return;
+    selectedJob.value = response;
   } catch (caught) {
+    if (!isMounted || requestVersion !== detailRequestVersion) return;
     detailError.value = caught instanceof Error ? caught.message : "职位详情加载失败。";
   } finally {
-    detailLoading.value = false;
+    if (isMounted && requestVersion === detailRequestVersion) {
+      detailLoading.value = false;
+    }
   }
+}
+
+function closeDetail() {
+  detailRequestVersion += 1;
+  selectedJobId.value = "";
+  selectedJob.value = null;
+  detailLoading.value = false;
+  detailError.value = "";
 }
 
 function formatDate(value: string | null) {
@@ -93,6 +117,11 @@ function formatDate(value: string | null) {
 }
 
 onMounted(loadJobs);
+onUnmounted(() => {
+  isMounted = false;
+  listRequestVersion += 1;
+  detailRequestVersion += 1;
+});
 </script>
 
 <template>
@@ -227,7 +256,7 @@ onMounted(loadJobs);
             <p class="job-company">{{ selectedJob.company_name }}</p>
             <h3>{{ selectedJob.title }}</h3>
           </div>
-          <button class="close-button" type="button" aria-label="关闭职位详情" @click="selectedJobId = ''">
+          <button class="close-button" type="button" aria-label="关闭职位详情" @click="closeDetail">
             ×
           </button>
         </div>

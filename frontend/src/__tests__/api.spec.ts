@@ -56,4 +56,27 @@ describe("request", () => {
       message: "请求失败：502",
     });
   });
+
+  it.each([
+    { detail: { error_code: "" } },
+    { detail: { error_code: "", message: "" } },
+    { detail: [] },
+    { detail: { error_code: null, message: 42 } },
+    { detail: "   " },
+  ])("keeps the HTTP fallback for empty or malformed detail %#", async (body) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const error = await request("/jobs").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.message).toBe("请求失败：500");
+  });
 });

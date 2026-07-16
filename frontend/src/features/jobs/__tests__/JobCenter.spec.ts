@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import JobCenter from "../JobCenter.vue";
 import { fetchVerifiedJob, fetchVerifiedJobs } from "../jobsApi";
-import type { JobDetail, JobSummary } from "../jobTypes";
+import type { JobDetail, JobListResponse, JobSummary } from "../jobTypes";
 
 vi.mock("../jobsApi", () => ({
   fetchVerifiedJob: vi.fn(),
@@ -35,6 +35,23 @@ const detail: JobDetail = {
 
 const listMock = vi.mocked(fetchVerifiedJobs);
 const detailMock = vi.mocked(fetchVerifiedJob);
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function jobWith(id: string, companyName: string): JobSummary {
+  return {
+    ...job,
+    id,
+    company_name: companyName,
+    apply_url: `https://example.com/jobs/${id}`,
+  };
+}
 
 describe("JobCenter", () => {
   beforeEach(() => {
@@ -130,5 +147,142 @@ describe("JobCenter", () => {
     expect(wrapper.text()).toContain("2026-07-16");
     expect(wrapper.text()).not.toContain("source_candidate");
     expect(wrapper.text()).not.toContain("review_version");
+  });
+
+  it("keeps the latest filter result when list requests resolve out of order", async () => {
+    const staleResponse = deferred<JobListResponse>();
+    const latestResponse = deferred<JobListResponse>();
+    listMock
+      .mockReset()
+      .mockResolvedValueOnce({ total: 1, jobs: [job] })
+      .mockReturnValueOnce(staleResponse.promise)
+      .mockReturnValueOnce(latestResponse.promise);
+
+    const wrapper = mount(JobCenter, { props: { token: "student-token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="company-filter"]').setValue("旧筛选");
+    await wrapper.get("form").trigger("submit");
+    await wrapper.get('[data-test="company-filter"]').setValue("新筛选");
+    await wrapper.get("form").trigger("submit");
+
+    latestResponse.resolve({ total: 1, jobs: [jobWith("latest", "最新公司")] });
+    await flushPromises();
+    expect(wrapper.text()).toContain("最新公司");
+
+    staleResponse.resolve({ total: 1, jobs: [jobWith("stale", "过期公司")] });
+    await flushPromises();
+    expect(wrapper.text()).toContain("最新公司");
+    expect(wrapper.text()).not.toContain("过期公司");
+  });
+
+  it("keeps the latest page when pagination requests resolve out of order", async () => {
+    const pageTwoResponse = deferred<JobListResponse>();
+    const pageThreeResponse = deferred<JobListResponse>();
+    listMock
+      .mockReset()
+      .mockResolvedValueOnce({ total: 13, jobs: [job] })
+      .mockReturnValueOnce(pageTwoResponse.promise)
+      .mockReturnValueOnce(pageThreeResponse.promise);
+
+    const wrapper = mount(JobCenter, { props: { token: "student-token" } });
+    await flushPromises();
+
+    const nextButton = wrapper.get('[data-test="next-page"]');
+    const pageTwoClick = nextButton.trigger("click");
+    const pageThreeClick = nextButton.trigger("click");
+    await Promise.all([pageTwoClick, pageThreeClick]);
+
+    pageThreeResponse.resolve({ total: 13, jobs: [jobWith("page-3", "第三页公司")] });
+    await flushPromises();
+    expect(wrapper.text()).toContain("第 3 / 3 页");
+    expect(wrapper.text()).toContain("第三页公司");
+
+    pageTwoResponse.resolve({ total: 13, jobs: [jobWith("page-2", "第二页公司")] });
+    await flushPromises();
+    expect(wrapper.text()).toContain("第 3 / 3 页");
+    expect(wrapper.text()).toContain("第三页公司");
+    expect(wrapper.text()).not.toContain("第二页公司");
+  });
+
+  it("keeps the latest selected detail when detail requests resolve out of order", async () => {
+    const firstDetail = deferred<JobDetail>();
+    const secondDetail = deferred<JobDetail>();
+    const secondJob = jobWith("job-2", "第二家公司");
+    listMock.mockResolvedValue({ total: 2, jobs: [job, secondJob] });
+    detailMock
+      .mockReset()
+      .mockReturnValueOnce(firstDetail.promise)
+      .mockReturnValueOnce(secondDetail.promise);
+
+    const wrapper = mount(JobCenter, { props: { token: "student-token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="show-detail-job-1"]').trigger("click");
+    await wrapper.get('[data-test="show-detail-job-2"]').trigger("click");
+
+    secondDetail.resolve({
+      ...detail,
+      ...secondJob,
+      description_text: "最新选择的职位详情。",
+    });
+    await flushPromises();
+    expect(wrapper.text()).toContain("最新选择的职位详情");
+
+    firstDetail.resolve({ ...detail, description_text: "已经过期的职位详情。" });
+    await flushPromises();
+    expect(wrapper.text()).toContain("最新选择的职位详情");
+    expect(wrapper.text()).not.toContain("已经过期的职位详情");
+  });
+
+  it("does not read a list response that resolves after unmount", async () => {
+    const pendingResponse = deferred<JobListResponse>();
+    let jobsReadCount = 0;
+    const response = {
+      total: 1,
+      get jobs() {
+        jobsReadCount += 1;
+        return [job];
+      },
+    };
+    listMock.mockReset().mockReturnValue(pendingResponse.promise);
+
+    const wrapper = mount(JobCenter, { props: { token: "student-token" } });
+    wrapper.unmount();
+    pendingResponse.resolve(response);
+    await flushPromises();
+
+    expect(jobsReadCount).toBe(0);
+  });
+
+  it("does not render sensitive fields even when a runtime payload contains them", async () => {
+    const sentinels = [
+      "SOURCE_CANDIDATE_SENTINEL",
+      "REVIEW_VERSION_SENTINEL",
+      "RAW_FIELDS_SENTINEL",
+      "TOKEN_SENTINEL",
+      "TRACE_SENTINEL",
+    ];
+    const unsafeFields = {
+      source_candidate: sentinels[0],
+      review_version: sentinels[1],
+      raw_fields: sentinels[2],
+      token: sentinels[3],
+      trace: sentinels[4],
+    };
+    listMock.mockResolvedValue({
+      total: 1,
+      jobs: [{ ...job, ...unsafeFields } as unknown as JobSummary],
+    });
+    detailMock.mockResolvedValue({ ...detail, ...unsafeFields } as unknown as JobDetail);
+
+    const wrapper = mount(JobCenter, { props: { token: "student-token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="show-detail-job-1"]').trigger("click");
+    await flushPromises();
+
+    for (const sentinel of sentinels) {
+      expect(wrapper.text()).not.toContain(sentinel);
+    }
   });
 });
