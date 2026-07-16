@@ -113,9 +113,11 @@ const dirty = computed(
   () => mode.value === "review" && Boolean(selected.value) && completionSnapshot() !== baseline.value,
 );
 const interactionLocked = computed(() => actionBusy.value || listLoading.value);
+function isManualApplicationChannel(value: string): boolean {
+  return /^(?:mailto|qr|weixin|wechat):/i.test(value.trim());
+}
 const manualChannel = computed(() => {
-  const value = form.apply_url.trim().toLowerCase();
-  return /^(mailto:|weixin:|wechat:|qr:)/.test(value) || /二维码|qrcode|qr-code/.test(value);
+  return isManualApplicationChannel(form.apply_url);
 });
 const canSave = computed(() =>
   Boolean(selected.value && ["pending_completion", "pending_review", "rejected"].includes(selected.value.status)),
@@ -157,7 +159,7 @@ function populateForm(job: AdminJobDetail): void {
     deadline_text: job.deadline_text,
   });
   guiChoice.value = job.status === "pending_review" && job.gui_eligible ? "yes" : "";
-  if (/^(mailto:|weixin:|wechat:|qr:)/i.test(job.apply_url)) guiChoice.value = "no";
+  if (isManualApplicationChannel(job.apply_url)) guiChoice.value = "no";
   rejectReason.value = "";
   baseline.value = completionSnapshot();
 }

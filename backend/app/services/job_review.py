@@ -46,6 +46,7 @@ class JobCompletionInput:
 
 _HOST_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
 _EMAIL_LOCAL = re.compile(r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+")
+_MANUAL_OPAQUE_SCHEMES = frozenset({"qr", "weixin", "wechat"})
 _SNAPSHOT_FIELDS = (
     "company_name",
     "title",
@@ -137,20 +138,32 @@ def _valid_email_address(value: str) -> bool:
     return _valid_hostname(domain)
 
 
+def _valid_manual_opaque_channel(parsed: SplitResult) -> bool:
+    return (
+        parsed.scheme in _MANUAL_OPAQUE_SCHEMES
+        and not parsed.netloc
+        and bool(parsed.path)
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 def _valid_application_channel(value: str, *, gui_eligible: bool) -> bool:
     parsed = _split_application_channel(value)
     if parsed is None:
         return False
     if parsed.scheme in {"http", "https"}:
         return bool(parsed.netloc) and _valid_hostname(parsed.hostname)
-    if gui_eligible or parsed.scheme != "mailto":
+    if gui_eligible:
         return False
-    return (
-        not parsed.netloc
-        and not parsed.query
-        and not parsed.fragment
-        and _valid_email_address(parsed.path)
-    )
+    if parsed.scheme == "mailto":
+        return (
+            not parsed.netloc
+            and not parsed.query
+            and not parsed.fragment
+            and _valid_email_address(parsed.path)
+        )
+    return _valid_manual_opaque_channel(parsed)
 
 
 Validator = Callable[[JobPosting], None]

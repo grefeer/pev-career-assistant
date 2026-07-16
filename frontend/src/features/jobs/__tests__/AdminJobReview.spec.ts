@@ -194,6 +194,40 @@ describe("AdminJobReview", () => {
     expect(wrapper.find('[data-test="reject-job"]').exists()).toBe(false);
   });
 
+  it.each([
+    "mailto:jobs@example.com",
+    "qr:campus-scan-2026",
+    "weixin:official-account-123",
+    "wechat:miniprogram-456",
+  ])("recognizes %s as an exact manual application scheme", async (applyUrl) => {
+    vi.mocked(fetchJobReviewQueue).mockResolvedValue({
+      total: 1,
+      jobs: [job({ status: "pending_review", apply_url: applyUrl })],
+    });
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+
+    expect(wrapper.get('input[value="yes"]').attributes("disabled")).toBeDefined();
+    expect(wrapper.get('input[value="no"]').element).toHaveProperty("checked", true);
+  });
+
+  it.each([
+    "二维码",
+    "qrcode",
+    "qr-code",
+    "https://jobs.example.com/二维码",
+  ])("does not recognize unsupported free-form channel %s as a manual scheme", async (applyUrl) => {
+    vi.mocked(fetchJobReviewQueue).mockResolvedValue({
+      total: 1,
+      jobs: [job({ status: "pending_review", apply_url: applyUrl })],
+    });
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+
+    expect(wrapper.get('input[value="yes"]').attributes("disabled")).toBeUndefined();
+    expect(wrapper.get('input[value="no"]').element).toHaveProperty("checked", false);
+  });
+
   it("loads the verified lifecycle separately, reloads after verify, and expires with its current version", async () => {
     const verified = job({ status: "verified", review_version: 9, id: "verified-1" });
     vi.mocked(fetchAdminVerifiedJobs)

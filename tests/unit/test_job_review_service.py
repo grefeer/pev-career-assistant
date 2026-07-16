@@ -233,6 +233,73 @@ def test_email_application_is_not_gui_eligible(
 
 
 @pytest.mark.parametrize(
+    "manual_channel",
+    [
+        "qr:campus-scan-2026",
+        "weixin:official-account-123",
+        "wechat:miniprogram-456",
+    ],
+)
+def test_manual_application_channels_can_be_saved_and_verified_without_gui(
+    manual_channel: str,
+    db: Session,
+    pending_job: JobPosting,
+    admin: User,
+) -> None:
+    review = JobReviewService().save_completion(
+        db,
+        job_id=pending_job.id,
+        actor_user_id=admin.id,
+        expected_version=0,
+        values=completion_input(apply_url=manual_channel),
+    )
+
+    verified = JobReviewService().verify(
+        db,
+        job_id=review.id,
+        actor_user_id=admin.id,
+        expected_version=review.review_version,
+        gui_eligible=False,
+    )
+
+    assert verified.status is JobPostingStatus.VERIFIED
+    assert verified.apply_url == manual_channel
+    assert verified.gui_eligible is False
+
+
+@pytest.mark.parametrize(
+    "manual_channel",
+    [
+        "qr:campus-scan-2026",
+        "weixin:official-account-123",
+        "wechat:miniprogram-456",
+    ],
+)
+def test_manual_application_channels_are_never_gui_eligible(
+    manual_channel: str,
+    db: Session,
+    pending_job: JobPosting,
+    admin: User,
+) -> None:
+    review = JobReviewService().save_completion(
+        db,
+        job_id=pending_job.id,
+        actor_user_id=admin.id,
+        expected_version=0,
+        values=completion_input(apply_url=manual_channel),
+    )
+
+    with pytest.raises(IncompleteJobError, match="apply_url"):
+        JobReviewService().verify(
+            db,
+            job_id=review.id,
+            actor_user_id=admin.id,
+            expected_version=review.review_version,
+            gui_eligible=True,
+        )
+
+
+@pytest.mark.parametrize(
     "invalid_channel",
     [
         "https://exa mple.com/jobs",
@@ -244,6 +311,15 @@ def test_email_application_is_not_gui_eligible(
         "mailto:not-an-address",
         "mailto:two@@example.com",
         "mailto:jobs@example.com subject",
+        "qr:",
+        "qr:   ",
+        "qr:scan code",
+        "qr://scanner",
+        "weixin:\tofficial-account",
+        "wechat:\nminiprogram",
+        "二维码",
+        "qrcode",
+        "sms:application-123",
     ],
 )
 def test_verify_rejects_malformed_application_channels_without_leaking_url_errors(

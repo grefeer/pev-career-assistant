@@ -888,6 +888,37 @@ def test_admin_can_save_and_verify_job_with_authenticated_actor(
         ]
 
 
+def test_admin_can_save_and_verify_qr_application_without_gui(
+    client: TestClient, seeded: dict[str, Any]
+) -> None:
+    posting = seeded["postings"][0]
+    saved = client.patch(
+        f"/api/admin/jobs/{posting.id}/completion",
+        headers=seeded["admin_headers"],
+        json={**COMPLETION_BODY, "apply_url": "qr:campus-scan-2026"},
+    )
+
+    assert saved.status_code == 200
+    assert saved.json()["status"] == "pending_review"
+    assert saved.json()["apply_url"] == "qr:campus-scan-2026"
+    assert saved.json()["gui_eligible"] is False
+
+    verified = client.post(
+        f"/api/admin/jobs/{posting.id}/decision",
+        headers=seeded["admin_headers"],
+        json={
+            "expected_version": saved.json()["review_version"],
+            "decision": "verify",
+            "gui_eligible": False,
+        },
+    )
+
+    assert verified.status_code == 200
+    assert verified.json()["status"] == "verified"
+    assert verified.json()["apply_url"] == "qr:campus-scan-2026"
+    assert verified.json()["gui_eligible"] is False
+
+
 def test_admin_can_reject_and_expire_jobs(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:
