@@ -36,7 +36,6 @@ os.environ.setdefault(
 )
 
 from backend.app.main import create_app
-from backend.app.api.routes import executor_tasks
 
 PUBLIC_KEY = "-----BEGIN PUBLIC KEY-----\nwindows-test\n-----END PUBLIC KEY-----"
 
@@ -81,8 +80,6 @@ def client(settings: Settings) -> Iterator[TestClient]:
     app = create_app(settings)
     app.dependency_overrides[dependencies._get_db] = override_db
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
-    # Mount executor routes only in test fixture (Task 1 rule)
-    app.include_router(executor_tasks.router, prefix="/api")
     with TestClient(app) as value:
         value.session_factory = session_factory  # type: ignore[attr-defined]
         yield value
