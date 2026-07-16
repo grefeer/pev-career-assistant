@@ -1,86 +1,63 @@
-Status: DONE
+# Task 6 Report: Windows device pairing, authentication, heartbeat, and revoke
 
-# Task 6 Report: Administrator job review workspace
+## Status
 
-## Commit
-
-- `feat: add administrator job review workspace`
-- Scope is frontend-only: administrator job DTO/API clients, review component,
-  role-aware App navigation, and their Vitest coverage. No backend files changed.
+Implemented the Task 6 device workflow only.
 
 ## Delivered
 
-- Added administrator review-queue and verified-lifecycle clients with explicit
-  bounded pagination, non-terminal status filtering, encoded job ids, completion
-  PATCH, and decision POST payloads carrying the authoritative `review_version`.
-- Added a responsive, component-scoped administrator review workspace. It shows
-  only the strict eight-field normalized source candidate whitelist and edits
-  every completion field: company, title, full JD, locations, recruitment
-  types, industries, apply URL, referral code, and deadline.
-- Enforced the action matrix: pending completion can save/reject, pending review
-  can save/verify/reject, rejected can save only, and verified expiry exists only
-  in the separate `GET /admin/jobs/verified` lifecycle list.
-- Added stable enumerated reject and expire reason codes with human-readable UI
-  labels. Arbitrary text is never sent as `reason_code`.
-- Mail, QR, WeChat-style, and explicit QR-code channels force
-  `gui_eligible=false`; verification remains disabled while completion edits are
-  dirty or until the GUI/manual choice is explicit.
-- Added loading, empty, total/page feedback, busy and duplicate-submit guards,
-  before-unload protection, guarded job/tab/refresh/logout transitions, and
-  monotonically versioned list requests.
-- Every async write captures the target job id and version. Late save/decision
-  responses update only their target and preserve a newer user selection.
-- Only exact HTTP 409 plus `detail.error_code === "stale_job_review"` triggers
-  automatic reload. Reload failure, invalid transition, 401, 403, 422, and
-  general failures have distinct safe messages.
-- Added administrator-only navigation. Logout and profile role loss reset the
-  workspace to analysis, preventing an admin-to-student blank view.
+- One-time pairing tickets stored at `pairing-ticket:{sha256(code)}` as JSON containing only `user_id` and `created_at`, with a 600-second TTL and atomic Redis `GETDEL` redemption.
+- Windows device issuance with `secrets.token_urlsafe(32)`; only the SHA-256 digest is stored in MySQL and authentication uses `hmac.compare_digest`.
+- MySQL-authoritative active/revoked device state, owner-scoped listing and revocation, and immediate rejection of revoked tokens.
+- Heartbeat persistence of `last_seen_at` and `version`, plus `device-online:{device_id}=1` with a 90-second Redis TTL.
+- Device online display derived only from Redis; losing online keys reports offline without changing MySQL device status.
+- Audit events for pairing-ticket creation, successful pairing, and revocation. Audit payload keys are restricted to `platform`, `version`, and `result` and do not include pairing codes, tokens, or public keys.
+- All six `/api/devices` endpoints with fixed 400/401/404 behavior and response models that do not expose `token_hash` or `public_key_pem`.
+- Application lifespan Redis client creation/closure. `REDIS_PASSWORD` is read only from the environment and is never logged or returned.
 
-## TDD RED
+## TDD evidence
 
-Initial focused command:
+1. Initial unit RED: `python -m pytest tests/unit/test_device_service.py -v` failed during collection with `ModuleNotFoundError: No module named 'backend.app.services.devices'`.
+2. Exact service-interface RED: `create_pairing_ticket(user_id=...)` failed with the expected missing-`db` `TypeError`, then passed after adding the compatible optional audit-session argument.
+3. Device unit/contract GREEN: 11 tests passed, exercising fakeredis `GETDEL`, bytes JSON, pairing TTL (599-600 after Redis second rounding), online TTL (1-90), replay, revoke, heartbeat, redaction, credential response boundaries, and ownership isolation.
 
-```powershell
-npm.cmd --prefix frontend run test -- AdminJobReview.spec.ts jobsApi.spec.ts App.spec.ts
-```
+## Final verification
 
-The intended RED failed because `AdminJobReview.vue`, all four administrator API
-functions, and the administrator App navigation did not exist. The component
-suite failed import resolution, two administrator API tests failed with missing
-functions, and two App tests failed because the role-only tab was absent. The
-four pre-existing tests in those files still passed.
-
-During self-review, two additional regression tests were first observed RED:
-
-- a late verification reload switched from the administrator's newer selection
-  back to the first queue row;
-- explicit refresh discarded a dirty draft without confirmation.
-
-Both failed deterministically before the selection-preserving reload and refresh
-guard were added.
-
-## GREEN and verification
-
-Fresh final evidence:
-
-- Focused administrator/API/App tests: **3 files, 25 tests passed**.
-- Full frontend tests: **5 files, 43 tests passed**.
-- `npm.cmd --prefix frontend run build`: passed, **21 modules transformed**.
-- `npm.cmd --prefix frontend ci --ignore-scripts`: passed; package/lock are
-  consistent and unchanged.
-- `npm.cmd --prefix frontend ls --depth=0`: passed with the declared dependency
-  tree intact.
 - `git diff --check`: passed.
+- `.venv\\Scripts\\python.exe -m compileall -q backend\\app`: passed.
+- `.venv\\Scripts\\python.exe -m pytest -v`: **244 passed, 2 skipped** in 33.05 seconds.
+- The two skips are pre-existing opt-in MySQL integration tests; no development Redis connection was used by the new tests.
 
-The tests cover role/navigation/logout, loading/empty/errors, paging and queue
-status, full completion payload/version, dirty/busy/double-click/late responses,
-exact error branching, the complete state/action matrix, manual-channel GUI
-rules, stable reasons, source-change warnings, forbidden upstream fields,
-verify reload, expire success, and stale expire reload failure.
+## Notes / concerns
 
-## Concerns
+- Unit and contract tests use `fakeredis`; no real `redis-custom` integration was necessary for this task.
+- Ticket creation requires a DB session so no unaudited service-level bypass exists.
 
-- No blocking concerns.
-- The project has no `typecheck` script or `vue-tsc` dependency, so no standalone
-  TypeScript typecheck claim is made. Vite production bundling and Vitest
-  compilation both passed.
+## Review fix (2026-07-14)
+
+The review findings were addressed in a separate fix:
+
+- Removed the optional-DB ticket creation path. Every ticket creation now requires a database session and a successful `AuditEvent` commit.
+- If ticket audit flush/commit fails, the SQLAlchemy transaction is rolled back and the newly written Redis ticket key is deleted; no usable unaudited ticket is returned.
+- Redemption now validates `created_at` from the consumed JSON and pre-generates the device id and token digest before persistence.
+- If device/audit persistence fails after `GETDEL`, the service rolls back and queries authoritative MySQL by both device id and token digest:
+  - If both identify the same committed device (for example, commit succeeded but its acknowledgement was lost), the original issued device/token is returned and the ticket is not restored.
+  - If neither exists, the original raw ticket JSON is restored only with Redis `SET NX` and only for the integer seconds remaining in its original 600-second window.
+  - If rollback/query cannot determine the result, or id/digest results conflict, `PairingPersistenceUncertainError` is raised and the ticket is not restored, preferring no duplicate credential issuance.
+- Malformed ticket JSON is consumed and is never restored.
+- Added explicit Pydantic response models and route `response_model` declarations for pairing tickets, device summary, pair response, list response, and heartbeat response. OpenAPI confirms only the pair response exposes `device_token`; list and `/me` expose no token hash, public key, or device token.
+
+### Review TDD evidence
+
+- RED: ticket audit insert failure left a `pairing-ticket:*` key behind.
+- RED: paired audit flush failure and explicit pre-commit failure permanently consumed the code (`TTL == -2`).
+- RED: OpenAPI contained no named `PairingTicketResponse`/device response schemas.
+- GREEN: audit failure cleanup, flush compensation, explicit commit compensation, original-TTL preservation, NX race protection, malformed-ticket non-restoration, commit-ACK-loss recovery, and OpenAPI schema tests all pass.
+
+### Review final verification
+
+- Device unit/contract suite: **17 passed**.
+- Full suite: **250 passed, 2 skipped** in 47.95 seconds.
+- `ruff check` on all Task 6 production/test files: passed.
+- `mypy --explicit-package-bases --follow-imports=skip` on the Task 6 production files: passed with no issues. The flags are required by this repository's namespace-package layout and avoid unrelated pre-existing transitive modules.
+- `compileall`, `git diff --check`: passed.
