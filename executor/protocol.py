@@ -32,3 +32,43 @@ class ExecutorTaskPayload(BaseModel):
     state_version: int = Field(ge=0)
     target_url: HttpUrl
     fields: list[ExecutorField] = Field(max_length=100)
+
+
+class TaskStatus(StrEnum):
+    DISPATCHED = "dispatched"
+    RUNNING = "running"
+    WAITING_FOR_HUMAN = "waiting_for_human"
+    READY_FOR_REVIEW = "ready_for_review"
+    OBSERVING_USER_SUBMISSION = "observing_user_submission"
+    SUBMITTED_SUCCESS = "submitted_success"
+    SUBMITTED_FAILED = "submitted_failed"
+    RESULT_UNKNOWN = "result_unknown"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class ExecutorTaskSummary(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    protocol_version: Literal["executor.v1"]
+    task_id: str
+    target_job_id: str
+    snapshot_id: str | None
+    status: TaskStatus
+    state_version: int
+
+
+class ExecutorTaskListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    tasks: list[ExecutorTaskSummary]
+
+
+class ExecutorTaskDetail(ExecutorTaskSummary):
+    payload: ExecutorTaskPayload
+
+
+class ExecutorTaskState(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    protocol_version: Literal["executor.v1"]
+    task_id: str
+    status: TaskStatus
+    state_version: int
