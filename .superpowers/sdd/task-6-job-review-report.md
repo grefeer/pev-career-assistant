@@ -84,3 +84,42 @@ verify reload, expire success, and stale expire reload failure.
 - The project has no `typecheck` script or `vue-tsc` dependency, so no standalone
   TypeScript typecheck claim is made. Vite production bundling and Vitest
   compilation both passed.
+
+## Review fix: serialized administrator interactions
+
+The follow-up review identified concurrency gaps between list refreshes, draft
+edits, selection changes, and administrator writes. The workspace now:
+
+- uses one `interactionLocked` gate for both list and action requests;
+- disables form fields, queue selection, mode changes, paging, filtering,
+  refresh, and decision controls while either request class is active;
+- retains handler-level guards so synthetic or queued events cannot bypass the
+  disabled controls;
+- snapshots mode, selected id/version, completion values, and the applied
+  status filter when a list request starts, then ignores a response if that
+  interaction state changed before it returned;
+- replaces a saved queue row only when both its id and `review_version` still
+  match the write target, preventing a late save from downgrading a newer row;
+- separates the displayed and applied status filter, restoring the applied
+  value without a request when dirty-draft confirmation is cancelled;
+- suppresses queue empty-state copy while a list error is displayed.
+
+### Review TDD evidence
+
+The focused RED run produced **6 expected failures and 16 passes**. Failures
+reproduced the error-plus-empty collision, missing action/list interaction locks,
+refresh/action overlap, list responses overwriting post-request edits and
+selection, a late save replacing v5 with v4, and cancelled filter UI drift.
+
+After the minimal fix, fresh verification passed:
+
+- Focused administrator/API/App tests: **3 files, 30 tests passed**.
+- Full frontend tests: **5 files, 48 tests passed**.
+- Vite production build: passed, **21 modules transformed**.
+- `npm.cmd --prefix frontend ci --ignore-scripts`: passed.
+- `npm.cmd --prefix frontend ls --depth=0`: passed.
+- `git diff --check`: passed.
+
+The first combined verification attempt incorrectly ran `npm ci` concurrently
+with Vitest and Vite, so dependency cleanup raced config loading. The lock check
+was rerun serially, followed by fresh read-only verification commands; all passed.

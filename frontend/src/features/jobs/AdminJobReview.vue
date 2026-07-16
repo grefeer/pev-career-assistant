@@ -60,6 +60,7 @@ const verifiedTotal = ref(0);
 const queueOffset = ref(0);
 const verifiedOffset = ref(0);
 const reviewStatus = ref<"" | ReviewQueueStatus>("");
+const appliedReviewStatus = ref<"" | ReviewQueueStatus>("");
 const listLoading = ref(false);
 const actionBusy = ref(false);
 const listError = ref("");
@@ -98,9 +99,20 @@ function completionSnapshot(): string {
   });
 }
 
+function interactionStamp(): string {
+  return JSON.stringify({
+    mode: mode.value,
+    selectedId: selected.value?.id || null,
+    selectedVersion: selected.value?.review_version ?? null,
+    completion: mode.value === "review" ? completionSnapshot() : null,
+    reviewStatus: appliedReviewStatus.value,
+  });
+}
+
 const dirty = computed(
   () => mode.value === "review" && Boolean(selected.value) && completionSnapshot() !== baseline.value,
 );
+const interactionLocked = computed(() => actionBusy.value || listLoading.value);
 const manualChannel = computed(() => {
   const value = form.apply_url.trim().toLowerCase();
   return /^(mailto:|weixin:|wechat:|qr:)/.test(value) || /二维码|qrcode|qr-code/.test(value);
@@ -115,7 +127,7 @@ const canVerify = computed(() =>
   selected.value?.status === "pending_review"
   && !dirty.value
   && guiChoice.value !== ""
-  && !actionBusy.value,
+  && !interactionLocked.value,
 );
 const currentJobs = computed(() => mode.value === "review" ? queueJobs.value : verifiedJobs.value);
 const currentTotal = computed(() => mode.value === "review" ? queueTotal.value : verifiedTotal.value);
@@ -155,6 +167,7 @@ function confirmDraftLoss(): boolean {
 }
 
 function selectJob(job: AdminJobDetail, force = false): boolean {
+  if (!force && interactionLocked.value) return false;
   if (!force && selected.value?.id !== job.id && !confirmDraftLoss()) return false;
   selected.value = job;
   if (mode.value === "review") populateForm(job);
@@ -176,20 +189,21 @@ function listMessage(caught: unknown): string {
 
 async function loadQueue(preferredId?: string, propagate = false): Promise<void> {
   const requestVersion = ++listRequestVersion;
+  const requestInteraction = interactionStamp();
   listLoading.value = true;
   listError.value = "";
   try {
     const response = await fetchJobReviewQueue(props.token, {
       limit: PAGE_SIZE,
       offset: queueOffset.value,
-      ...(reviewStatus.value ? { reviewStatus: reviewStatus.value } : {}),
+      ...(appliedReviewStatus.value ? { reviewStatus: appliedReviewStatus.value } : {}),
     });
-    if (requestVersion !== listRequestVersion) return;
+    if (requestVersion !== listRequestVersion || requestInteraction !== interactionStamp()) return;
     queueJobs.value = response.jobs;
     queueTotal.value = response.total;
     if (mode.value === "review") selectAfterLoad(response.jobs, preferredId);
   } catch (caught) {
-    if (requestVersion !== listRequestVersion) return;
+    if (requestVersion !== listRequestVersion || requestInteraction !== interactionStamp()) return;
     listError.value = listMessage(caught);
     if (propagate) throw caught;
   } finally {
@@ -199,6 +213,7 @@ async function loadQueue(preferredId?: string, propagate = false): Promise<void>
 
 async function loadVerified(preferredId?: string, propagate = false): Promise<void> {
   const requestVersion = ++listRequestVersion;
+  const requestInteraction = interactionStamp();
   listLoading.value = true;
   listError.value = "";
   try {
@@ -206,12 +221,12 @@ async function loadVerified(preferredId?: string, propagate = false): Promise<vo
       limit: PAGE_SIZE,
       offset: verifiedOffset.value,
     });
-    if (requestVersion !== listRequestVersion) return;
+    if (requestVersion !== listRequestVersion || requestInteraction !== interactionStamp()) return;
     verifiedJobs.value = response.jobs;
     verifiedTotal.value = response.total;
     if (mode.value === "verified") selectAfterLoad(response.jobs, preferredId);
   } catch (caught) {
-    if (requestVersion !== listRequestVersion) return;
+    if (requestVersion !== listRequestVersion || requestInteraction !== interactionStamp()) return;
     listError.value = listMessage(caught);
     if (propagate) throw caught;
   } finally {
@@ -220,6 +235,7 @@ async function loadVerified(preferredId?: string, propagate = false): Promise<vo
 }
 
 async function refreshCurrent(): Promise<void> {
+  if (interactionLocked.value) return;
   if (!confirmDraftLoss()) return;
   resetFeedback();
   if (mode.value === "review") await loadQueue(selected.value?.id);
@@ -227,6 +243,7 @@ async function refreshCurrent(): Promise<void> {
 }
 
 async function switchMode(next: "review" | "verified"): Promise<void> {
+  if (interactionLocked.value) return;
   if (next === mode.value) {
     await refreshCurrent();
     return;
@@ -240,6 +257,7 @@ async function switchMode(next: "review" | "verified"): Promise<void> {
 }
 
 async function changePage(direction: -1 | 1): Promise<void> {
+  if (interactionLocked.value) return;
   if (!confirmDraftLoss()) return;
   if (mode.value === "review") {
     queueOffset.value = Math.max(0, queueOffset.value + direction * PAGE_SIZE);
@@ -250,8 +268,16 @@ async function changePage(direction: -1 | 1): Promise<void> {
   }
 }
 
-async function changeStatus(): Promise<void> {
-  if (!confirmDraftLoss()) return;
+async function changeStatus(event: Event): Promise<void> {
+  const input = event.target as HTMLSelectElement;
+  const nextStatus = input.value as "" | ReviewQueueStatus;
+  if (interactionLocked.value || !confirmDraftLoss()) {
+    reviewStatus.value = appliedReviewStatus.value;
+    input.value = appliedReviewStatus.value;
+    return;
+  }
+  reviewStatus.value = nextStatus;
+  appliedReviewStatus.value = nextStatus;
   queueOffset.value = 0;
   await loadQueue();
 }
@@ -314,7 +340,7 @@ async function handleActionError(
 }
 
 async function save(): Promise<void> {
-  if (!selected.value || !canSave.value || actionBusy.value) return;
+  if (!selected.value || !canSave.value || interactionLocked.value) return;
   const targetId = selected.value.id;
   const targetVersion = selected.value.review_version;
   const payload: JobCompletionPayload = {
@@ -330,7 +356,9 @@ async function save(): Promise<void> {
   actionBusy.value = true;
   try {
     const updated = await saveJobCompletion(props.token, targetId, payload);
-    queueJobs.value = queueJobs.value.map((item) => item.id === targetId ? updated : item);
+    queueJobs.value = queueJobs.value.map((item) =>
+      item.id === targetId && item.review_version === targetVersion ? updated : item,
+    );
     if (selected.value?.id === targetId && selected.value.review_version === targetVersion) {
       selected.value = updated;
       populateForm(updated);
@@ -344,7 +372,7 @@ async function save(): Promise<void> {
 }
 
 async function verify(): Promise<void> {
-  if (!selected.value || !canVerify.value || actionBusy.value) return;
+  if (!selected.value || !canVerify.value || interactionLocked.value) return;
   const targetId = selected.value.id;
   const targetVersion = selected.value.review_version;
   actionBusy.value = true;
@@ -366,7 +394,7 @@ async function verify(): Promise<void> {
 }
 
 async function reject(): Promise<void> {
-  if (!selected.value || !canReject.value || !rejectReason.value || actionBusy.value) return;
+  if (!selected.value || !canReject.value || !rejectReason.value || interactionLocked.value) return;
   const targetId = selected.value.id;
   const targetVersion = selected.value.review_version;
   actionBusy.value = true;
@@ -388,7 +416,7 @@ async function reject(): Promise<void> {
 }
 
 async function expire(): Promise<void> {
-  if (!selected.value || selected.value.status !== "verified" || !expireReason.value || actionBusy.value) return;
+  if (!selected.value || selected.value.status !== "verified" || !expireReason.value || interactionLocked.value) return;
   const targetId = selected.value.id;
   const targetVersion = selected.value.review_version;
   actionBusy.value = true;
@@ -439,12 +467,14 @@ onBeforeUnmount(() => {
           type="button"
           data-test="review-queue-tab"
           :class="{ active: mode === 'review' }"
+          :disabled="interactionLocked"
           @click="switchMode('review')"
         >待处理</button>
         <button
           type="button"
           data-test="verified-tab"
           :class="{ active: mode === 'verified' }"
+          :disabled="interactionLocked"
           @click="switchMode('verified')"
         >已核验生命周期</button>
       </div>
@@ -453,7 +483,7 @@ onBeforeUnmount(() => {
     <div class="review-toolbar">
       <label v-if="mode === 'review'">
         状态
-        <select v-model="reviewStatus" data-test="status-filter" @change="changeStatus">
+        <select :value="reviewStatus" data-test="status-filter" :disabled="interactionLocked" @change="changeStatus">
           <option value="">全部非终态</option>
           <option value="pending_completion">待补全</option>
           <option value="pending_review">待核验</option>
@@ -461,7 +491,7 @@ onBeforeUnmount(() => {
         </select>
       </label>
       <span>共 {{ currentTotal }} 条 · 第 {{ Math.floor(currentOffset / PAGE_SIZE) + 1 }} 页</span>
-      <button type="button" data-test="refresh-queue" :disabled="listLoading" @click="refreshCurrent">
+      <button type="button" data-test="refresh-queue" :disabled="interactionLocked" @click="refreshCurrent">
         {{ listLoading ? "载入中…" : "刷新" }}
       </button>
     </div>
@@ -473,7 +503,7 @@ onBeforeUnmount(() => {
     <div class="review-layout">
       <aside class="queue-panel" aria-label="职位列表">
         <div v-if="listLoading && currentJobs.length === 0" class="empty-state">正在读取职位…</div>
-        <div v-else-if="currentJobs.length === 0" class="empty-state">
+        <div v-else-if="!listError && currentJobs.length === 0" class="empty-state">
           {{ mode === "review" ? "当前筛选没有待处理职位。" : "当前没有已核验职位。" }}
         </div>
         <button
@@ -483,6 +513,7 @@ onBeforeUnmount(() => {
           class="queue-item"
           :class="{ selected: selected?.id === item.id }"
           :data-test="`queue-job-${item.id}`"
+          :disabled="interactionLocked"
           @click="selectJob(item)"
         >
           <span class="status-mark">{{ item.status }}</span>
@@ -494,13 +525,13 @@ onBeforeUnmount(() => {
           <button
             type="button"
             data-test="previous-page"
-            :disabled="currentOffset === 0 || listLoading"
+            :disabled="currentOffset === 0 || interactionLocked"
             @click="changePage(-1)"
           >上一页</button>
           <button
             type="button"
             data-test="next-page"
-            :disabled="currentOffset + PAGE_SIZE >= currentTotal || listLoading"
+            :disabled="currentOffset + PAGE_SIZE >= currentTotal || interactionLocked"
             @click="changePage(1)"
           >下一页</button>
         </div>
@@ -534,20 +565,20 @@ onBeforeUnmount(() => {
         </section>
 
         <form class="completion-form" @submit.prevent="save">
-          <label>公司<input v-model="form.company_name" data-test="company" /></label>
-          <label>岗位<input v-model="form.title" data-test="title" /></label>
-          <label class="wide">完整 JD<textarea v-model="form.description_text" data-test="description" rows="8" /></label>
-          <label>地点<input :value="form.locations.join('，')" data-test="locations" @input="setListField('locations', $event)" /></label>
-          <label>招聘类型<input :value="form.recruitment_types.join('，')" data-test="recruitment-types" @input="setListField('recruitment_types', $event)" /></label>
-          <label>行业<input :value="form.industries.join('，')" data-test="industries" @input="setListField('industries', $event)" /></label>
-          <label>投递入口<input v-model="form.apply_url" data-test="apply-url" /></label>
-          <label>内推码<input v-model="form.referral_code" data-test="referral-code" /></label>
-          <label>截止日期<input v-model="form.deadline_text" data-test="deadline" /></label>
+          <label>公司<input v-model="form.company_name" data-test="company" :disabled="interactionLocked" /></label>
+          <label>岗位<input v-model="form.title" data-test="title" :disabled="interactionLocked" /></label>
+          <label class="wide">完整 JD<textarea v-model="form.description_text" data-test="description" rows="8" :disabled="interactionLocked" /></label>
+          <label>地点<input :value="form.locations.join('，')" data-test="locations" :disabled="interactionLocked" @input="setListField('locations', $event)" /></label>
+          <label>招聘类型<input :value="form.recruitment_types.join('，')" data-test="recruitment-types" :disabled="interactionLocked" @input="setListField('recruitment_types', $event)" /></label>
+          <label>行业<input :value="form.industries.join('，')" data-test="industries" :disabled="interactionLocked" @input="setListField('industries', $event)" /></label>
+          <label>投递入口<input v-model="form.apply_url" data-test="apply-url" :disabled="interactionLocked" /></label>
+          <label>内推码<input v-model="form.referral_code" data-test="referral-code" :disabled="interactionLocked" /></label>
+          <label>截止日期<input v-model="form.deadline_text" data-test="deadline" :disabled="interactionLocked" /></label>
 
           <fieldset v-if="selected.status === 'pending_review'" class="wide gui-choice">
             <legend>是否允许 GUI 辅助填写</legend>
-            <label><input v-model="guiChoice" type="radio" value="yes" :disabled="manualChannel" />允许</label>
-            <label><input v-model="guiChoice" type="radio" value="no" />仅人工投递</label>
+            <label><input v-model="guiChoice" type="radio" value="yes" :disabled="manualChannel || interactionLocked" />允许</label>
+            <label><input v-model="guiChoice" type="radio" value="no" :disabled="interactionLocked" />仅人工投递</label>
             <small v-if="manualChannel">邮箱、二维码等人工渠道已强制关闭 GUI 辅助。</small>
           </fieldset>
 
@@ -556,7 +587,7 @@ onBeforeUnmount(() => {
               v-if="canSave"
               data-test="save-completion"
               type="button"
-              :disabled="actionBusy"
+              :disabled="interactionLocked"
               @click="save"
             >{{ actionBusy ? "处理中…" : "保存补全草稿" }}</button>
             <button
@@ -573,7 +604,7 @@ onBeforeUnmount(() => {
         <section v-if="canReject" class="decision-box">
           <label>
             拒绝原因
-            <select v-model="rejectReason" data-test="reject-reason">
+            <select v-model="rejectReason" data-test="reject-reason" :disabled="interactionLocked">
               <option value="">请选择稳定原因码</option>
               <option v-for="reason in rejectReasons" :key="reason.code" :value="reason.code">
                 {{ reason.label }} · {{ reason.code }}
@@ -583,7 +614,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             data-test="reject-job"
-            :disabled="!rejectReason || actionBusy"
+            :disabled="!rejectReason || interactionLocked"
             @click="reject"
           >拒绝记录</button>
         </section>
@@ -596,7 +627,7 @@ onBeforeUnmount(() => {
         <section class="decision-box">
           <label>
             失效原因
-            <select v-model="expireReason" data-test="expire-reason">
+            <select v-model="expireReason" data-test="expire-reason" :disabled="interactionLocked">
               <option value="">请选择稳定原因码</option>
               <option v-for="reason in expireReasons" :key="reason.code" :value="reason.code">
                 {{ reason.label }} · {{ reason.code }}
@@ -606,7 +637,7 @@ onBeforeUnmount(() => {
           <button
             type="button"
             data-test="expire-job"
-            :disabled="!expireReason || actionBusy"
+            :disabled="!expireReason || interactionLocked"
             @click="expire"
           >标记职位失效</button>
         </section>

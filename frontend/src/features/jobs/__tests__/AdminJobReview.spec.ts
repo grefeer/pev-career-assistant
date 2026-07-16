@@ -260,6 +260,115 @@ describe("AdminJobReview", () => {
     response.reject(new ApiError(403, null, "forbidden"));
     await flushPromises();
     expect(wrapper.text()).toContain("当前账号没有职位审核权限");
+    expect(wrapper.text()).not.toContain("当前筛选没有待处理职位");
+  });
+
+  it("locks every review interaction while an action is in flight and guards refresh overlap", async () => {
+    const first = job({ status: "pending_review" });
+    const second = job({ id: "job-2", title: "第二岗位", status: "pending_review", review_version: 8 });
+    vi.mocked(fetchJobReviewQueue).mockResolvedValue({ total: 21, jobs: [first, second] });
+    const decision = deferred<AdminJobDetail>();
+    vi.mocked(decideJob).mockReturnValue(decision.promise);
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+    await wrapper.get('input[value="no"]').setValue();
+    await wrapper.get('[data-test="verify-job"]').trigger("click");
+
+    for (const selector of [
+      '[data-test="title"]',
+      '[data-test="queue-job-job-2"]',
+      '[data-test="review-queue-tab"]',
+      '[data-test="verified-tab"]',
+      '[data-test="status-filter"]',
+      '[data-test="refresh-queue"]',
+      '[data-test="next-page"]',
+    ]) {
+      expect(wrapper.get(selector).attributes("disabled"), selector).toBeDefined();
+    }
+    await wrapper.get('[data-test="refresh-queue"]').trigger("click");
+    expect(fetchJobReviewQueue).toHaveBeenCalledTimes(1);
+
+    decision.resolve(job({ status: "verified", review_version: 4 }));
+    await flushPromises();
+  });
+
+  it("locks form, queue, mode, paging, filtering and refresh while a list request is in flight", async () => {
+    const second = job({ id: "job-2", title: "第二岗位", review_version: 8 });
+    vi.mocked(fetchJobReviewQueue).mockResolvedValueOnce({ total: 21, jobs: [pending, second] });
+    const refresh = deferred<{ total: number; jobs: AdminJobDetail[] }>();
+    vi.mocked(fetchJobReviewQueue).mockReturnValueOnce(refresh.promise);
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="refresh-queue"]').trigger("click");
+    await wrapper.vm.$nextTick();
+
+    for (const selector of [
+      '[data-test="title"]',
+      '[data-test="save-completion"]',
+      '[data-test="queue-job-job-2"]',
+      '[data-test="review-queue-tab"]',
+      '[data-test="verified-tab"]',
+      '[data-test="status-filter"]',
+      '[data-test="refresh-queue"]',
+      '[data-test="next-page"]',
+    ]) {
+      expect(wrapper.get(selector).attributes("disabled"), selector).toBeDefined();
+    }
+
+    refresh.resolve({ total: 21, jobs: [pending, second] });
+    await flushPromises();
+  });
+
+  it("does not let a list response overwrite a selection or edit made after the request began", async () => {
+    const second = job({ id: "job-2", title: "第二岗位", review_version: 8 });
+    vi.mocked(fetchJobReviewQueue).mockResolvedValueOnce({ total: 2, jobs: [pending, second] });
+    const refresh = deferred<{ total: number; jobs: AdminJobDetail[] }>();
+    vi.mocked(fetchJobReviewQueue).mockReturnValueOnce(refresh.promise);
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="refresh-queue"]').trigger("click");
+    const state = (wrapper.vm as any).$?.setupState;
+    state.selectJob(second, true);
+    state.form.title = "请求后的编辑";
+
+    refresh.resolve({
+      total: 1,
+      jobs: [job({ title: "刷新返回值", review_version: 5 })],
+    });
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="title"]').element).toHaveProperty("value", "请求后的编辑");
+    expect(wrapper.get('[data-test="queue-job-job-2"]').classes()).toContain("selected");
+  });
+
+  it("does not let a late save downgrade a newer version of the same row", async () => {
+    const saveResult = deferred<AdminJobDetail>();
+    vi.mocked(saveJobCompletion).mockReturnValue(saveResult.promise);
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="save-completion"]').trigger("click");
+
+    const newer = job({ title: "刷新后的高版本", review_version: 5 });
+    const state = (wrapper.vm as any).$?.setupState;
+    state.queueJobs = [newer];
+    state.selectJob(newer, true);
+    saveResult.resolve(job({ title: "迟到的低版本", status: "pending_review", review_version: 4 }));
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="queue-job-job-1"]').text()).toContain("v5");
+    expect(wrapper.get('[data-test="title"]').element).toHaveProperty("value", "刷新后的高版本");
+  });
+
+  it("restores the applied status filter when dirty confirmation is cancelled", async () => {
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="title"]').setValue("未保存标题");
+    vi.mocked(confirm).mockReturnValueOnce(false);
+    await wrapper.get('[data-test="status-filter"]').setValue("rejected");
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="status-filter"]').element).toHaveProperty("value", "");
+    expect(fetchJobReviewQueue).toHaveBeenCalledTimes(1);
   });
 
   it("guards dirty selection, prevents duplicate submits, and ignores a late save for another selection", async () => {
@@ -281,7 +390,8 @@ describe("AdminJobReview", () => {
     await wrapper.get('[data-test="save-completion"]').trigger("click");
     await wrapper.get('[data-test="save-completion"]').trigger("click");
     expect(saveJobCompletion).toHaveBeenCalledTimes(1);
-    await wrapper.get('[data-test="queue-job-job-1"]').trigger("click");
+    const state = (wrapper.vm as any).$?.setupState;
+    state.selectJob(pending, true);
     saveResult.resolve(job({ id: "job-2", title: "迟到响应", review_version: 9 }));
     await flushPromises();
     expect(wrapper.get('[data-test="title"]').element).toHaveProperty("value", "来源岗位");
@@ -297,7 +407,8 @@ describe("AdminJobReview", () => {
     await flushPromises();
     await wrapper.get('input[value="no"]').setValue();
     await wrapper.get('[data-test="verify-job"]').trigger("click");
-    await wrapper.get('[data-test="queue-job-job-2"]').trigger("click");
+    const state = (wrapper.vm as any).$?.setupState;
+    state.selectJob(second, true);
     decision.resolve(job({ id: "job-1", status: "verified", review_version: 4 }));
     await flushPromises();
     expect(wrapper.get('[data-test="title"]').element).toHaveProperty("value", "第二岗位");
