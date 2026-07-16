@@ -153,3 +153,14 @@ def test_s3_blob_store_public_bucket_check_uses_head_bucket() -> None:
     blob_store.check_bucket()
 
     assert calls == [{"Bucket": "readiness-bucket"}]
+
+
+def test_inspect_accepts_only_expected_encryption_metadata(
+    memory_blob_store: MemoryBlobStore, encryption_key: str
+) -> None:
+    store = EncryptedObjectStore(memory_blob_store, encryption_key)
+    store.put(key="users/u1/a", plaintext=b"secret", content_type="text/plain")
+    assert store.inspect(key="users/u1/a").encryption == "v1-aes-256-gcm"
+    memory_blob_store.objects["users/u1/a"].metadata = {"encryption": "plaintext"}
+    with pytest.raises(ValueError, match="encrypted object metadata"):
+        store.inspect(key="users/u1/a")
