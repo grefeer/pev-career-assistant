@@ -16,7 +16,11 @@ from backend.app.db.models import (
     DeviceStatus,
     User,
 )
-from backend.app.services.devices import DeviceService, InvalidPairingTicketError
+from backend.app.services.devices import (
+    DeviceService,
+    InvalidPairingTicketError,
+    InvalidTaskLeaseError,
+)
 
 
 VALID_TEST_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
@@ -336,3 +340,26 @@ def test_device_audit_payloads_never_contain_credentials_or_public_key(
         set(event.redacted_payload) <= {"platform", "version", "result"}
         for event in events
     )
+
+
+def test_device_service_refuses_to_issue_unknown_or_submit_scope(
+    device_service, db, issued_device
+) -> None:
+    from backend.app.db.models import ApplicationTask
+
+    task = ApplicationTask(
+        user_id=issued_device.device.user_id,
+        target_job_id="simulation-job",
+        device_id=issued_device.device.id,
+    )
+    db.add(task)
+    db.commit()
+    service = DeviceService(device_service.redis, lease_secret="x" * 32)
+
+    with pytest.raises(InvalidTaskLeaseError, match="scope"):
+        service.issue_task_lease(
+            db,
+            device=issued_device.device,
+            task_id=task.id,
+            scopes={"task:progress", "task:submit"},
+        )

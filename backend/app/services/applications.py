@@ -127,10 +127,20 @@ class ApplicationService:
         actor: TaskActor,
         event_type: str,
         redacted_payload: dict[str, object],
+        required_device_id: str | None = None,
+        required_user_id: str | None = None,
     ) -> ApplicationTask:
         _validate_redacted_value(redacted_payload)
         task = applications.get_authoritative(db, task_id, lock=True)
         if task is None:
+            raise TaskNotFoundError(task_id)
+        if (
+            required_device_id is not None
+            and task.device_id != required_device_id
+        ) or (
+            required_user_id is not None
+            and task.user_id != required_user_id
+        ):
             raise TaskNotFoundError(task_id)
         if task.state_version != expected_version:
             raise StaleTaskVersionError(task_id)

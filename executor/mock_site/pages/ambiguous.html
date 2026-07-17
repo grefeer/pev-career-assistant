@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Ambiguous</title></head>
+<body>
+<main data-topology="unknown">
+  <label>姓名 <input data-field-key="full_name" name="full_name"></label>
+  <button type="button" data-action-kind="combined" id="combined-btn">保存并提交</button>
+  <button type="button" data-action-kind="unknown" id="icon-btn">⚡</button>
+</main>
+<script>
+document.querySelectorAll("[data-field-key]").forEach(function(el) {
+  el.addEventListener("input", function() {
+    fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"field", key:el.getAttribute("data-field-key")})});
+  });
+});
+document.getElementById("combined-btn").addEventListener("click", function() {
+  fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"ambiguous"})});
+});
+document.getElementById("icon-btn").addEventListener("click", function() {
+  fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"ambiguous"})});
+});
+</script>
+</body>
+</html>

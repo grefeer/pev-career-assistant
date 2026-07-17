@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Multi Step 1</title></head>
+<body>
+<main data-topology="multi" data-step-index="1" data-step-count="2" data-step-nav="true">
+  <label>姓名 <input data-field-key="full_name" name="full_name"></label>
+  <button type="button" data-action-kind="next" id="next-btn">保存并下一步</button>
+</main>
+<script>
+document.querySelectorAll("[data-field-key]").forEach(function(el) {
+  el.addEventListener("input", function() {
+    fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"field", key:el.getAttribute("data-field-key")})});
+  });
+});
+document.getElementById("next-btn").addEventListener("click", function() {
+  fetch("/event", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({kind:"intermediate"})});
+  window.location.href = "/multi-step/2";
+});
+</script>
+</body>
+</html>
