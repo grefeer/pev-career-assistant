@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
     ApprovedResumeAttachment,
-    ApprovedResumeVersion,
 )
 from backend.app.services.storage import EncryptedObjectStore
 
@@ -429,7 +428,7 @@ def generate_resume_docx(
     Office Open XML).
     """
     from docx import Document
-    from docx.shared import Pt, Inches
+    from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
 
     lines = render_resume_lines(approved_facts, diffs)

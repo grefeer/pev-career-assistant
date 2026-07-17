@@ -1,13 +1,10 @@
 # tests/unit/test_field_classification.py
-import pytest
 from backend.app.services.field_classification import (
     classify_field,
     is_non_sensitive,
-    is_local_sensitive,
     filter_non_sensitive,
     build_local_sensitive_requirements,
     FieldClassification,
-    UNKNOWN_FIELD,
 )
 
 

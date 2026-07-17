@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import logging
+import sys
 from dataclasses import dataclass
-from enum import StrEnum
 from typing import Literal
 from urllib.parse import urlsplit
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Minimal StrEnum polyfill for Python < 3.11."""
+        pass
 
 from executor.browser import BrowserSession
 from executor.checkpoints import (
@@ -21,8 +30,11 @@ from executor.client import (
 )
 from executor import EXECUTOR_VERSION
 from executor.protocol import (
+    ExecutorField,
     ExecutorTaskDetail,
+    ExecutorTaskDetailV2,
     ExecutorTaskPayload,
+    ExecutorTaskPayloadV2,
     PROTOCOL_VERSION,
 )
 
@@ -66,8 +78,65 @@ class EngineState:
     lease: str = ""
 
 
+# ── Field conversion helper ────────────────────────────────────────────────────
+
+
+def _v2_fields(
+    payload: ExecutorTaskPayloadV2,
+) -> list[ExecutorField]:
+    """Convert v2 non_sensitive_fields dict to ExecutorField list.
+
+    Each key-value pair becomes a confirmed required field.  Local-sensitive
+    requirements are included as missing required fields so the engine treats
+    them as gaps to be filled from the local vault.
+    """
+    fields: list[ExecutorField] = []
+    for key, value in payload.non_sensitive_fields.items():
+        str_value = str(value) if value is not None else None
+        fields.append(
+            ExecutorField(
+                field_key=key,
+                label=key.replace("_", " ").title(),
+                value=str_value,
+                confidence="confirmed",
+                required=True,
+                sensitive=False,
+            )
+        )
+    for req in payload.local_sensitive_requirements:
+        fk = req.get("field_key", "")
+        if fk:
+            fields.append(
+                ExecutorField(
+                    field_key=fk,
+                    label=req.get("category", fk),
+                    value=None,
+                    confidence="missing",
+                    required=True,
+                    sensitive=False,
+                )
+            )
+    return fields
+
+
+def _payload_fields(
+    payload: ExecutorTaskPayload | ExecutorTaskPayloadV2,
+) -> list[ExecutorField]:
+    """Extract fields from either v1 or v2 payload."""
+    if isinstance(payload, ExecutorTaskPayloadV2):
+        return _v2_fields(payload)
+    return payload.fields
+
+
+# ── Engine ─────────────────────────────────────────────────────────────────────
+
+
 class ExecutorEngine:
-    """Orchestrates executor simulation: heartbeat, lease, fill, report."""
+    """Orchestrates executor simulation: heartbeat, lease, fill, report.
+
+    Supports both v1 (simulation) and v2 (application) payloads.  The core
+    field-fill and safety-gate logic is identical for both versions.
+    """
 
     def __init__(
         self,
@@ -138,10 +207,14 @@ class ExecutorEngine:
     def run(
         self,
         task_id: str | None = None,
-        payload: ExecutorTaskPayload | None = None,
+        payload: ExecutorTaskPayload | ExecutorTaskPayloadV2 | None = None,
     ) -> RunOutcome:
-        """Run one complete simulation cycle."""
-        detail: ExecutorTaskDetail | None = None
+        """Run one complete simulation cycle (v1) or application cycle (v2).
+
+        For v2 (application) tasks the same safety gates apply:
+        final/ambiguous actions are never executed automatically.
+        """
+        detail: ExecutorTaskDetail | ExecutorTaskDetailV2 | None = None
 
         # Heartbeat
         try:
@@ -234,6 +307,9 @@ class ExecutorEngine:
         self.browser.open(str(payload.target_url))
         observation = self.browser.observe()
 
+        # Extract fields from payload (v1 fields or v2 converted)
+        fields = _payload_fields(payload)
+
         # Load checkpoint for recovery
         cp: ExecutorCheckpoint | None = None
         if state:
@@ -272,7 +348,7 @@ class ExecutorEngine:
                 pending = next(
                     (
                         field
-                        for field in payload.fields
+                        for field in fields
                         if field.field_key == cp.pending_field_key
                     ),
                     None,
@@ -304,7 +380,7 @@ class ExecutorEngine:
 
         fields_to_fill = [
             field
-            for field in payload.fields
+            for field in fields
             if field.field_key not in completed
         ]
 
@@ -536,7 +612,10 @@ class ExecutorEngine:
 
         return RunOutcome("ready_for_review", "navigated")
 
-    def _run_observation(self, payload: ExecutorTaskPayload) -> RunOutcome:
+    def _run_observation(
+        self,
+        payload: ExecutorTaskPayload | ExecutorTaskPayloadV2,
+    ) -> RunOutcome:
         """Observe the result page after human submission."""
         self.browser.open(str(payload.target_url))
         result = self.browser.observe_submission_result()

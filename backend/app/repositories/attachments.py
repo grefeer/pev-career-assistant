@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
 
 from sqlalchemy import select, update as sql_update
 from sqlalchemy.orm import Session

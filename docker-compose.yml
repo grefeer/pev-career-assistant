@@ -54,7 +54,7 @@ services:
   migrate:
     image: platform-foundation-backend:latest
     labels:
-      com.career-assistant.schema-revision: "20260717_0007"
+      com.career-assistant.schema-revision: "20260718_0008"
     build:
       context: .
       dockerfile: backend/Dockerfile

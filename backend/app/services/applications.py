@@ -1,21 +1,26 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import timezone
 import logging
 import re
 
 from sqlalchemy.orm import Session
 
+from backend.app.db.base import utc_now
 from backend.app.db.models import (
     ApplicationTask,
     ApplicationTaskStatus,
     TaskActor,
 )
 from backend.app.repositories import applications
+from backend.app.repositories import devices as devices_repo
 from backend.app.repositories.applications import (
     StaleTaskVersionError,
     TaskNotFoundError,
 )
+from backend.app.repositories.snapshots import get_by_id as get_snapshot_by_id
+from backend.app.services.task_eligibility_service import check_task_eligibility
 
 
 class InvalidTransitionError(ValueError):
@@ -168,6 +173,113 @@ class ApplicationService:
         )
 
 
+# ---------------------------------------------------------------------------
+# assign_and_dispatch_task — convenience for the dispatch endpoint
+# ---------------------------------------------------------------------------
+
+
+def assign_and_dispatch_task(
+    db: Session,
+    user_id: str,
+    task_id: str,
+    device_id: str,
+    expected_version: int,
+) -> ApplicationTask:
+    """Assign an existing ``CREATED`` task to *device_id* and dispatch it.
+
+    Performs two explicit state-machine transitions:
+        1. ``CREATED`` -> ``WAITING_FOR_DEVICE``  (actor: SYSTEM,
+           event: device_requested)
+        2. ``WAITING_FOR_DEVICE`` -> ``DISPATCHED`` (actor: SYSTEM,
+           event: device_dispatched)
+
+    Each transition validates ``state_version``; the second uses the version
+    returned by the first.  Device ownership and eligibility are re-checked
+    before the first transition.  The device is bound to the task between
+    the two transitions.  Both transitions share a single database
+    transaction -- if the second fails, the full operation rolls back.
+
+    There is deliberately no ``CREATED`` -> ``DISPATCHED`` shortcut; the task
+    always passes through ``WAITING_FOR_DEVICE``.
+
+    Returns:
+        The task in ``DISPATCHED`` status.
+
+    Raises:
+        TaskNotFoundError: Task does not exist or does not belong to
+            *user_id*.
+        StaleTaskVersionError: ``expected_version`` does not match.
+        InvalidTransitionError: Task is not in ``CREATED`` status.
+        ValueError: Snapshot not found, eligibility check failed, or
+            device is not available (not found, not active, expired, or
+            not owned by *user_id*).
+    """
+    # ── 1. Load task with row-level lock, verify ownership + snapshot ────
+    task = applications.get_authoritative(db, task_id, lock=True)
+    if task is None or task.user_id != user_id:
+        raise TaskNotFoundError(task_id)
+
+    snapshot = (
+        get_snapshot_by_id(db, task.snapshot_id, user_id)
+        if task.snapshot_id is not None
+        else None
+    )
+    if snapshot is None:
+        raise ValueError("snapshot_not_found")
+
+    # ── 2. Re-check eligibility via TaskEligibilityService ─────────────
+    can_create, reason = check_task_eligibility(db, user_id, task.snapshot_id)
+    if not can_create:
+        raise ValueError(f"task_not_eligible: {reason}")
+
+    # ── 3. Validate device: active, not expired, owned by user ─────────
+    device = devices_repo.get_active_owned(
+        db, user_id=user_id, device_id=device_id
+    )
+    if device is None:
+        raise ValueError("device_not_available")
+
+    expires_at = device.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at <= utc_now():
+        raise ValueError("device_not_available")
+
+    svc = ApplicationService()
+
+    # ── 4. Transition CREATED -> WAITING_FOR_DEVICE ────────────────────
+    task = svc.transition(
+        db,
+        task_id=task_id,
+        expected_version=expected_version,
+        target=ApplicationTaskStatus.WAITING_FOR_DEVICE,
+        actor=TaskActor.SYSTEM,
+        event_type="device_requested",
+        redacted_payload={"device_id": device_id},
+        required_user_id=user_id,
+    )
+
+    # ── 5. Bind device to task ─────────────────────────────────────────
+    task.device_id = device_id
+    db.flush()
+
+    # ── 6. Transition WAITING_FOR_DEVICE -> DISPATCHED ─────────────────
+    task = svc.transition(
+        db,
+        task_id=task_id,
+        expected_version=task.state_version,
+        target=ApplicationTaskStatus.DISPATCHED,
+        actor=TaskActor.SYSTEM,
+        event_type="device_dispatched",
+        redacted_payload={"device_id": device_id},
+        required_user_id=user_id,
+        required_device_id=device_id,
+    )
+
+    db.commit()
+    return task
+
+
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "ALLOWED_TRANSITION_ACTORS",
@@ -176,4 +288,5 @@ __all__ = [
     "StaleTaskVersionError",
     "TaskNotFoundError",
     "UnsafeAuditPayloadError",
+    "assign_and_dispatch_task",
 ]

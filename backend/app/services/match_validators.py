@@ -41,7 +41,7 @@ def validate_match_output(
     for risk in output.get("risks", []):
         risk_req_ids = risk.get("requirement_ids", [])
         if not risk_req_ids:
-            raise MatchValidationError("match_validation_risk_missing_ref", f"Risk missing requirement ref: requirement_ids is empty")
+            raise MatchValidationError("match_validation_risk_missing_ref", "Risk missing requirement ref: requirement_ids is empty")
         for rid in risk_req_ids:
             if rid not in all_requirement_ids:
                 raise MatchValidationError("match_validation_risk_invalid_ref", f"Risk references unknown requirement_id: {rid}")

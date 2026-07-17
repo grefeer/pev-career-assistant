@@ -41,7 +41,6 @@ from sqlalchemy.orm import Session
 from backend.app.db.models import (
     AnalysisSession,
     ApplicationSnapshot,
-    ApplicationTask,
     ApplicationTaskStatus,
     ApprovedResumeAttachment,
     ApprovedResumeVersion,
@@ -63,9 +62,7 @@ from backend.app.services.application_snapshot_service import (
     create_snapshot,
 )
 from backend.app.services.snapshot_validators import (
-    ApplicationSnapshotContent,
     SnapshotValidationError,
-    validate_snapshot_content,
 )
 
 # ---------------------------------------------------------------------------

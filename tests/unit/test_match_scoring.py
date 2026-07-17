@@ -1,8 +1,7 @@
-from backend.app.services.match_scoring import compute_score, SCORING_RULE_VERSION
+from backend.app.services.match_scoring import compute_score
 
 
 def test_perfect_match_scores_100():
-    from backend.app.services.match_scoring import ScoreComponent
     output = type("obj", (), {
         "strengths": [type("a", (), {"requirement_id": "r1"})()] * 5,
         "gaps": [],

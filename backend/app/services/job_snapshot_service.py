@@ -3,7 +3,6 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from backend.app.db.models import JobPosting, JobSourceLink
 
-from backend.app.services.field_classification import CLASSIFICATION_VERSION
 
 
 class VerifiedJobSnapshot:

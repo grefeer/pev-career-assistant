@@ -5,8 +5,8 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
-from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from backend.app.api import dependencies
@@ -251,4 +251,116 @@ def report_executor_result(
         raise _task_error(error) from None
     return ExecutorTaskState(
         task_id=task.id, status=task.status, state_version=task.state_version
+    )
+
+
+# ---------------------------------------------------------------------------
+# Attachment download
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{task_id}/attachments/{attachment_id}")
+def download_executor_attachment(
+    task_id: str,
+    attachment_id: str,
+    header_task_id: Annotated[str, Header(alias="X-Task-ID")],
+    device: Annotated[Device, Depends(_require_executor_progress_lease)],
+    db: Annotated[Session, Depends(_get_db)],
+    request: Request,
+) -> Response:
+    """Download a resume attachment for an executor task.
+
+    Validates:
+      1. Device token (X-Device-Token) authenticates the device.
+      2. X-Task-ID + X-Task-Lease binds the device to this task.
+      3. X-Task-ID matches the path ``task_id``.
+      4. The task belongs to the device's user and references a snapshot
+         that contains the requested attachment.
+    """
+    _require_path_binding(task_id, header_task_id)
+
+    # Load the task and verify user/device ownership
+    task = (
+        db.query(ApplicationTask)
+        .filter(
+            ApplicationTask.id == task_id,
+            ApplicationTask.user_id == device.user_id,
+            ApplicationTask.device_id == device.id,
+        )
+        .first()
+    )
+    if task is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "executor_task_not_found"},
+        )
+
+    # Load the snapshot
+    snapshot_id = task.snapshot_id
+    if not snapshot_id:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "executor_payload_unavailable"},
+        )
+
+    from backend.app.db.models import ApplicationSnapshot
+
+    snapshot = (
+        db.query(ApplicationSnapshot)
+        .filter(
+            ApplicationSnapshot.id == snapshot_id,
+            ApplicationSnapshot.user_id == device.user_id,
+        )
+        .first()
+    )
+    if snapshot is None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error_code": "executor_payload_unavailable"},
+        )
+
+    # Verify the attachment belongs to this snapshot
+    attachment_ids: list[str] = list(snapshot.attachment_ids or [])
+    if attachment_id not in attachment_ids:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "attachment_not_found"},
+        )
+
+    # Load the attachment record
+    from backend.app.db.models import ApprovedResumeAttachment
+
+    attachment = (
+        db.query(ApprovedResumeAttachment)
+        .filter(
+            ApprovedResumeAttachment.id == attachment_id,
+            ApprovedResumeAttachment.user_id == device.user_id,
+        )
+        .first()
+    )
+    if attachment is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error_code": "attachment_not_found"},
+        )
+
+    # Decrypt and return
+    from backend.app.services.storage import EncryptedObjectStore
+
+    object_store: EncryptedObjectStore = request.app.state.object_store  # type: ignore[assignment]
+    try:
+        body = object_store.get(key=attachment.object_key)
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail={"error_code": "attachment_storage_unavailable"},
+        )
+
+    return Response(
+        content=body,
+        media_type=attachment.content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="resume.{attachment.format}"',
+            "X-Encryption-Version": attachment.encryption_version,
+        },
     )

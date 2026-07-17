@@ -43,6 +43,20 @@ def list_by_user(db: Session, user_id: str) -> list[MatchReport]:
     )
 
 
+def list_by_session(db: Session, session_id: str, user_id: str) -> list[MatchReport]:
+    """List matches for a given analysis session, scoped by user."""
+    return list(
+        db.scalars(
+            select(MatchReport)
+            .where(
+                MatchReport.analysis_session_id == session_id,
+                MatchReport.user_id == user_id,
+            )
+            .order_by(MatchReport.created_at.desc())
+        ).all()
+    )
+
+
 def list_by_thread(
     db: Session, thread_id: str, user_id: str
 ) -> list[MatchReport]:

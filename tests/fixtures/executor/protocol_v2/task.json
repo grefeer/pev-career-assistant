@@ -1,0 +1,30 @@
+{
+  "protocol_version": "executor.v2",
+  "task_id": "22222222-2222-4222-8222-222222222222",
+  "state_version": 0,
+  "snapshot_id": "33333333-3333-4333-8333-333333333333",
+  "target_url": "http://127.0.0.1:8765/single-page",
+  "non_sensitive_fields": {
+    "name": "Alice Example",
+    "email": "alice@example.com",
+    "phone": "13800138000",
+    "education": [{"school": "Tsinghua University", "degree": "Bachelor"}],
+    "skills": ["Python", "FastAPI", "SQL"]
+  },
+  "local_sensitive_requirements": [
+    {
+      "field_key": "id_number",
+      "category": "id_number",
+      "local_reference": "vault://id_card/ref-001"
+    },
+    {
+      "field_key": "home_address",
+      "category": "home_address",
+      "local_reference": "vault://address/ref-002"
+    }
+  ],
+  "attachment_ids": [
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  ]
+}

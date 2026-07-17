@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / "data"
+DATA_DIR = ROOT_DIR / "src" / "cli" / "data"
 CHECKPOINT_DIR = ROOT_DIR / "checkpoints"
 
 

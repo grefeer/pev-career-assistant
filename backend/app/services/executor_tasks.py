@@ -4,7 +4,10 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
-from backend.app.api.executor_schemas import ExecutorTaskPayload
+from backend.app.api.executor_schemas import (
+    ExecutorTaskPayload,
+    ExecutorTaskPayloadAny,
+)
 from backend.app.db.models import (
     ApplicationTask,
     ApplicationTaskStatus,
@@ -15,6 +18,9 @@ from backend.app.repositories import executor_tasks
 from backend.app.services.applications import (
     ApplicationService,
     TaskNotFoundError,
+)
+from backend.app.services.executor_v2_provider import (
+    SnapshotExecutorPayloadProvider,
 )
 
 
@@ -107,9 +113,16 @@ class ExecutorTaskService:
 
     def get_payload(
         self, db: Session, *, device: Device, task_id: str
-    ) -> tuple[ApplicationTask, ExecutorTaskPayload]:
+    ) -> tuple[ApplicationTask, ExecutorTaskPayloadAny]:
         task = self.get_assigned(db, device=device, task_id=task_id)
-        payload = self.payload_provider.payload_for(task)
+
+        # Dispatch by task_kind
+        if task.task_kind == "application":
+            v2_provider = SnapshotExecutorPayloadProvider(db)
+            payload = v2_provider.payload_for(task)
+        else:
+            payload = self.payload_provider.payload_for(task)
+
         if payload.task_id != task.id or payload.state_version != task.state_version:
             raise ExecutorPayloadUnavailableError(task.id)
         return task, payload

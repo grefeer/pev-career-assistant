@@ -38,6 +38,8 @@ STALE_TIMEOUT_MINUTES = 10
 class MatchService:
     """Orchestrates the full evidence-matching workflow."""
 
+    repo = match_repo  # Module reference for route-level access (e.g. match_service.repo.get_by_id)
+
     def __init__(self, match_graph, model_version: str = MATCH_MODEL_VERSION):
         self.graph = match_graph
         self.model_version = model_version

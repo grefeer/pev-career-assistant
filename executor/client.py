@@ -8,6 +8,7 @@ import httpx
 from executor.protocol import (
     PROTOCOL_VERSION,
     ExecutorTaskDetail,
+    ExecutorTaskDetailV2,
     ExecutorTaskListResponse,
     ExecutorTaskState,
 )
@@ -41,6 +42,16 @@ class ApiDependencyUnavailable(RuntimeError):
 
 class UncertainWriteResult(RuntimeError):
     pass
+
+
+def _parse_task_detail(raw: dict[str, Any]) -> ExecutorTaskDetail | ExecutorTaskDetailV2:
+    """Parse an executor task detail response, dispatching on payload version."""
+    payload_version = (
+        raw.get("payload", {}).get("protocol_version", PROTOCOL_VERSION)
+    )
+    if payload_version == "executor.v2":
+        return ExecutorTaskDetailV2.model_validate(raw)
+    return ExecutorTaskDetail.model_validate(raw)
 
 
 class ExecutorApiClient:
@@ -145,13 +156,13 @@ class ExecutorApiClient:
         )
         return str(response.json()["lease"])
 
-    def get_task(self, task_id: str, lease: str) -> ExecutorTaskDetail:
+    def get_task(self, task_id: str, lease: str) -> ExecutorTaskDetail | ExecutorTaskDetailV2:
         response = self._read(
             "GET",
             f"/api/executor/tasks/{task_id}",
             headers=self._task_headers(task_id, lease),
         )
-        return ExecutorTaskDetail.model_validate(response.json())
+        return _parse_task_detail(response.json())
 
     def report_progress(
         self,
@@ -206,3 +217,26 @@ class ExecutorApiClient:
             json=body,
         )
         return ExecutorTaskState.model_validate(response.json())
+
+    def download_attachment(
+        self, task_id: str, attachment_id: str, lease: str
+    ) -> tuple[bytes, str, str]:
+        """Download an encrypted resume attachment for a v2 application task.
+
+        Returns ``(body, content_type, filename)``.
+
+        Raises:
+            ApiUnauthorized: If device-token or lease is invalid.
+            ApiTaskNotFound: If the task or attachment does not exist.
+        """
+        response = self._read(
+            "GET",
+            f"/api/executor/tasks/{task_id}/attachments/{attachment_id}",
+            headers=self._task_headers(task_id, lease),
+        )
+        content_type = response.headers.get("content-type", "application/octet-stream")
+        disposition = response.headers.get("content-disposition", "")
+        filename = "resume.bin"
+        if "filename=" in disposition:
+            filename = disposition.split("filename=")[-1].split(";")[0].strip('"')
+        return response.content, content_type, filename

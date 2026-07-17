@@ -26,7 +26,6 @@ from backend.app.repositories import snapshots as snapshots_repo
 from backend.app.services.idempotency import check_idempotency, compute_request_hash
 from backend.app.services.snapshot_validators import (
     ApplicationSnapshotContent,
-    SnapshotValidationError,
     validate_snapshot_content,
 )
 from backend.app.services.task_eligibility_service import check_task_eligibility

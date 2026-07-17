@@ -28,6 +28,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_redis: redis.Redis | None = None
     owned_object_store_client: Any | None = None
     owned_session_factory: Any | None = None
+    owned_match_service: object | None = None
+    owned_draft_service: object | None = None
     try:
         async with AsyncExitStack() as stack:
             timeout = app.state.settings.readiness_timeout_seconds
@@ -89,6 +91,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.object_store = EncryptedObjectStore(
                     app.state.blob_store, app.state.settings.object_encryption_key
                 )
+            if not hasattr(app.state, "match_service"):
+                from src.agents import build_llm
+                from src.evidence_matching.graph import EvidenceMatchingGraph
+                from backend.app.services.match_service import MatchService
+
+                model = build_llm("analyst")
+                match_graph = EvidenceMatchingGraph(model)
+                owned_match_service = MatchService(match_graph)
+                app.state.match_service = owned_match_service
+            if not hasattr(app.state, "draft_service"):
+                from backend.app.services.resume_draft_service import ResumeDraftService
+
+                owned_draft_service = ResumeDraftService()
+                app.state.draft_service = owned_draft_service
             yield
     finally:
         if owned_graph is not None and getattr(app.state, "graph", None) is owned_graph:
@@ -109,6 +125,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             del app.state.session_factory
         if hasattr(app.state, "object_store"):
             del app.state.object_store
+        if owned_match_service is not None and getattr(app.state, "match_service", None) is owned_match_service:
+            del app.state.match_service
+        if owned_draft_service is not None and getattr(app.state, "draft_service", None) is owned_draft_service:
+            del app.state.draft_service
 
 
 def create_app(

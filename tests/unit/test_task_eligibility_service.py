@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.app.db.base import Base, utc_now
+from backend.app.db.base import Base
 from backend.app.db.models import (
     ApplicationSnapshot,
     ApprovedResumeAttachment,

@@ -332,8 +332,8 @@ Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/live"
 $backendPort = if ($env:BACKEND_HOST_PORT) { $env:BACKEND_HOST_PORT } else { '8000' }
 $frontendPort = if ($env:FRONTEND_HOST_PORT) { $env:FRONTEND_HOST_PORT } else { '5173' }
 $revision = docker compose run --rm migrate alembic current
-if ($revision -notmatch '20260717_0005') {
-  throw 'Compose database is not at 20260717_0005'
+if ($revision -notmatch '20260718_0008') {
+  throw 'Compose database is not at 20260718_0008'
 }
 Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/ready" |
   ConvertTo-Json -Depth 4
@@ -354,7 +354,7 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 - 学生更新和撤回必须提交 `expected_version`。管理员通过 `GET /api/admin/job-feedback` 查看脱敏聚合，通过 `POST /api/admin/job-feedback/{feedback_id}/decision` 执行 `accept/resolve/reject`。
 - 反馈处置绝不改变职位状态。确认职位失效必须另行调用 `/api/admin/jobs/{job_id}/decision`，由 `JobReviewService` 写入 `JobVerification`。
 - 学生和管理员写限额分别为 20/分钟与 60/分钟；Redis 不可用时写操作返回 503。日志和管理员 DTO 不得包含提交者身份、说明原文或幂等 key。
-- schema head 固定为 `20260717_0007`，包含 `job_feedback` 和只追加的 `job_feedback_events`。
+- schema head 固定为 `20260718_0008`，包含 `job_feedback` 和只追加的 `job_feedback_events`。
 
 反馈专项验收：
 
@@ -362,6 +362,60 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 .\.venv\Scripts\python.exe -m pytest tests/unit/test_job_feedback_service.py tests/contract/test_feedbacks_api.py tests/security/test_no_sensitive_logging.py -q
 .\.venv\Scripts\python.exe -m pytest tests/integration/test_job_feedback_mysql.py tests/integration/test_mysql_migration.py -q -rs
 npm.cmd --prefix frontend run test -- src/features/jobs/__tests__/jobFeedbackApi.spec.ts src/features/jobs/__tests__/JobFeedbackPanel.spec.ts src/features/jobs/__tests__/AdminJobFeedback.spec.ts
+```
+
+## 证据匹配与投递任务流水线
+
+迁移 `20260718_0008` 增加了以下表和列，实现从证据匹配、简历草稿到投递任务的完整闭环：
+
+### 新增表
+
+- `match_reports`：证据匹配报告，记录匹配评分、优势和差距。
+- `resume_drafts`：简历草稿，从已完成匹配报告生成。
+- `approved_resume_versions`：已核准的简历版本，包含事实快照。
+- `approved_resume_attachments`：已核准简历的加密附件（PDF/DOCX）。
+- `application_snapshots`：投递快照，冻结职位和简历状态以供审计。
+- `application_tasks` 扩展：增加 `task_kind`、`simulation_scenario`、`request_idempotency_key` 列。
+
+### 状态与生命周期
+
+1. **匹配报告** (`POST /api/matches`)：`pending` → `running` → `completed` / `failed`。需要 `Idempotency-Key` 请求头。
+2. **简历草稿** (`POST /api/resume-drafts`)：从已完成匹配创建。`generating` → `draft` / `failed` → `approved` / `rejected`。
+3. **核准版本** (`POST /api/resume-drafts/{id}/approve`)：生成并加密 PDF/DOCX，使用乐观锁 `expected_version`。提供回滚补偿（生成失败时删除已存储对象）。
+4. **投递快照** (`POST /api/application-snapshots`)：冻结当前职位状态和简历事实。写入 `gui_eligible`、`job_status_at_snapshot`、`job_review_version_at_snapshot`。
+5. **投递任务** (`POST /api/application-snapshots/{id}/create-task`)：创建 `CREATED` 状态的任务。受资格检查控制：快照 `gui_eligible`、职位状态、审核版本匹配、附件就绪。
+6. **任务调度** (`POST /api/application-tasks/{task_id}/dispatch`)：`CREATED` → `WAITING_FOR_DEVICE` → `DISPATCHED`。需要有效设备。
+
+### 其他 API 端点
+
+- `GET /api/matches`：列出当前用户的匹配报告。
+- `GET /api/matches/{match_id}`：获取单个匹配报告。
+- `GET /api/resume-drafts`：列出当前用户的简历草稿。
+- `GET /api/resume-drafts/{draft_id}`：获取单个草稿。
+- `POST /api/resume-drafts/{draft_id}/reject`：拒绝草稿（乐观锁）。
+- `GET /api/application-snapshots`：列出快照。
+- `GET /api/application-snapshots/{id}`：获取单个快照。
+- `GET /api/application-snapshots/{id}/task-eligibility`：检查是否可以创建任务。
+- `GET /api/approved-resume-attachments/{id}/download`：下载解密后的附件。
+
+### 幂等性
+
+所有创建端点（matches、drafts、snapshots、tasks）都需要 `Idempotency-Key`（16–128 字符）。同 key、同请求重放原响应且不修改状态；同 key、不同请求返回 `409 idempotency_key_reused`。
+
+### 迁移维护 / 降级
+
+从 `20260718_0008` 降到 `20260717_0007` 会永久删除全部 `match_reports`、`resume_drafts`、`approved_resume_versions`、`approved_resume_attachments`、`application_snapshots`，并将 `application_tasks` 恢复至迁移前结构。只有确认不需要保留匹配和投递历史的开发或灾难恢复场景才可执行：
+
+```powershell
+docker compose stop backend
+docker compose run --rm migrate alembic downgrade 20260717_0007
+```
+
+验证回退后重新升级：
+
+```powershell
+docker compose run --rm migrate alembic upgrade head
+docker compose up -d backend frontend
 ```
 
 ## 测试和发布前门禁
@@ -403,10 +457,19 @@ $env:ALLOW_DESTRUCTIVE_MYSQL_TESTS = '1'
 & npm.cmd --prefix (Join-Path $repoRoot 'frontend') run test
 & npm.cmd --prefix (Join-Path $repoRoot 'frontend') run typecheck
 & npm.cmd --prefix (Join-Path $repoRoot 'frontend') run build
-rg "app_users.json|USER_STORE_PATH|replace-with-your-own-secret|password_hash.*sha256|postgres" backend src frontend docker-compose.yml README.md
+rg “app_users.json|USER_STORE_PATH|replace-with-your-own-secret|password_hash.*sha256|postgres” backend src frontend docker-compose.yml README.md
 ```
 
-最后一条搜索应无匹配；运行手册中唯一允许出现旧文件名的位置是上方“不迁移”说明，可单独核对：
+Wave 2 专项验收：
+
+```powershell
+& $python scripts/e2e_wave2_closure.py
+& $python -m pytest tests/unit/test_match_validators.py tests/unit/test_draft_validators.py tests/unit/test_snapshot_validators.py tests/unit/test_match_scoring.py tests/unit/test_task_eligibility_service.py tests/unit/test_wave2_repositories.py tests/api/test_matches_api.py tests/api/test_resume_drafts_api.py tests/api/test_application_snapshots_api.py tests/security/test_wave2_privacy.py tests/security/test_wave2_authorization.py -q
+& $python -m pytest tests/integration/test_match_service.py tests/integration/test_resume_draft_service.py tests/integration/test_application_snapshot_service.py tests/integration/test_assign_and_dispatch.py tests/integration/test_attachment_service.py tests/integration/test_executor_v2_integration.py tests/integration/test_wave2_migration_models.py -q -rs
+rg “load_jobs|load_sample_resume|runAnalysis” backend frontend
+```
+
+最后一条搜索应无匹配；运行手册中唯一允许出现旧文件名的位置是上方”不迁移”说明，可单独核对：
 
 ```powershell
 rg -n "app_users.json" docs/runbooks/platform-foundation.md
