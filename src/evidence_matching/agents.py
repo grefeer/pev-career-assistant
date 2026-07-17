@@ -1,6 +1,6 @@
 import json
 from langchain_core.messages import HumanMessage
-from .schemas import RequirementAssessment, ReferencedRecommendation, MatchComputationOutput
+from .schemas import RequirementAssessment, ReferencedRecommendation, ReferencedRisk, MatchComputationOutput
 from .prompts import EXTRACT_REQUIREMENTS_PROMPT, MATCH_ASSESSMENT_PROMPT
 
 
@@ -41,7 +41,7 @@ async def assess_match(state: dict, model) -> dict:
     strengths = [RequirementAssessment(**a) for a in raw.get("strengths", [])]
     gaps = [RequirementAssessment(**a) for a in raw.get("gaps", [])]
     unknowns = [RequirementAssessment(**a) for a in raw.get("unknowns", [])]
-    risks = [RequirementAssessment(**a) for a in raw.get("risks", [])]
+    risks = [ReferencedRisk(**a) for a in raw.get("risks", [])]
     recommendation = ReferencedRecommendation(**raw.get("recommendation", {"text": "", "requirement_ids": []}))
 
     result = MatchComputationOutput(

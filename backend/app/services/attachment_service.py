@@ -70,11 +70,6 @@ def render_resume_lines(
 
     # --- Summary -------------------------------------------------------------
     summary = approved_facts.get("summary")
-    if summary:
-        lines.append("PROFESSIONAL SUMMARY")
-        lines.append("")
-        lines.append(str(summary))
-        lines.append("")
 
     # --- Section helper ------------------------------------------------------
     def add_section(
@@ -100,7 +95,7 @@ def render_resume_lines(
                         lines.append(f"{label}: {val}")
             lines.append("")
 
-    add_section("summary", [{"text": summary}] if summary else None)
+    add_section("summary", [{"text": summary}] if summary else None, "text")
     add_section(
         "education",
         approved_facts.get("education"),
@@ -329,6 +324,9 @@ def _format_entry(entry: dict[str, Any], fmt: str) -> str:
         name = entry.get("name", "")
         issuer = entry.get("issuer", "")
         return f"{name} ({issuer})" if issuer else name
+
+    elif fmt == "text":
+        return str(entry.get("text", ""))
 
     return str(entry)
 

@@ -108,7 +108,7 @@ class MatchService:
                 user_id=user_id,
                 analysis_session_id=session.id,
                 job_id=job_id,
-                job_verification_id="placeholder",
+                job_verification_id=job_snapshot.job_verification_id,
                 job_snapshot={
                     "job_id": job_snapshot.job_id,
                     "company_name": job_snapshot.company_name,

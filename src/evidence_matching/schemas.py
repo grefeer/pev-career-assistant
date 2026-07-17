@@ -17,11 +17,19 @@ class ReferencedRecommendation(BaseModel):
     requirement_ids: list[str] = Field(default_factory=list)
 
 
+class ReferencedRisk(BaseModel):
+    requirement_ids: list[str] = Field(
+        default_factory=list, description="Risk references to requirement IDs"
+    )
+    requirement: str = Field(description="Risk description text")
+    detail: str = Field(default="", description="Risk detail explanation")
+
+
 class MatchComputationOutput(BaseModel):
     strengths: list[RequirementAssessment] = Field(default_factory=list)
     gaps: list[RequirementAssessment] = Field(default_factory=list)
     unknowns: list[RequirementAssessment] = Field(default_factory=list)
-    risks: list[RequirementAssessment] = Field(default_factory=list)
+    risks: list[ReferencedRisk] = Field(default_factory=list)
     recommendation: ReferencedRecommendation
 
 

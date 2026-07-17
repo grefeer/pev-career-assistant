@@ -253,6 +253,12 @@ class ApprovedResumeVersion(UUIDPrimaryKeyMixin, Base):
     )
     approved_facts: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     approved_diffs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    attachment_refs: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    approval_idempotency_key: Mapped[str] = mapped_column(
+        String(96), nullable=False
+    )
     approved_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
@@ -260,6 +266,11 @@ class ApprovedResumeVersion(UUIDPrimaryKeyMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("draft_id"),
+        UniqueConstraint(
+            "approved_by",
+            "approval_idempotency_key",
+            name="uq_approved_resume_versions_idempotency",
+        ),
     )
 
 
