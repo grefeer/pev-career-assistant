@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,7 +12,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import httpx
 
-from executor import EXECUTOR_VERSION
 from executor.browser import BrowserSession
 from executor.checkpoints import CheckpointStore
 from executor.client import ExecutorApiClient
@@ -110,7 +108,6 @@ def cmd_run_simulation(args: argparse.Namespace) -> None:
     client = ExecutorApiClient(args.base_url, secret_store=store)
     browser = BrowserSession(
         user_data_dir=str(data_dir / "chrome-profile"),
-        headless=True,
     )
     checkpoints = CheckpointStore(checkpoint_dir)
     engine = ExecutorEngine(client=client, browser=browser, checkpoints=checkpoints)
@@ -145,7 +142,6 @@ def cmd_resume_simulation(args: argparse.Namespace) -> None:
     client = ExecutorApiClient(args.base_url, secret_store=credential_store)
     browser = BrowserSession(
         user_data_dir=str(data_dir / "chrome-profile"),
-        headless=True,
     )
     checkpoints = CheckpointStore(checkpoint_dir)
     engine = ExecutorEngine(client=client, browser=browser, checkpoints=checkpoints)

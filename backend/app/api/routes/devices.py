@@ -188,7 +188,10 @@ def create_task_lease(
             scopes={"task:progress", "task:result"},
         )
     except InvalidTaskLeaseError:
-        raise HTTPException(status_code=403, detail="任务未分配给当前设备。") from None
+        raise HTTPException(
+            status_code=401,
+            detail={"error_code": "invalid_task_lease"},
+        ) from None
     return TaskLeaseResponse(task_id=body.task_id, lease=lease)
 
 

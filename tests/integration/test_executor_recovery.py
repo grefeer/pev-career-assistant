@@ -10,7 +10,7 @@ import uvicorn
 
 from executor.browser import BrowserSession
 from executor.checkpoints import CheckpointStore, ExecutorCheckpoint
-from executor.client import ApiUnauthorized, ApiConflict
+from executor.client import ApiUnauthorized, ApiConflict, UncertainWriteResult
 from executor.engine import ExecutorEngine, FaultPoint, InjectedCrash
 from executor.mock_site.app import app as mock_app, telemetry
 from executor.protocol import (
@@ -95,6 +95,7 @@ def browser(tmp_path: Any) -> Iterator[BrowserSession]:
     session = BrowserSession(
         user_data_dir=tmp_path / "chrome-profile",
         headless=True,
+        channel=None,
     )
     try:
         yield session
@@ -132,9 +133,13 @@ class _RecoveryFakeApiClient:
         self.progress_attempts: int = 0
         self.progress_calls: list[str] = []
         self.result_calls: list[str] = []
+        self.result_error: Exception | None = None
         self.lease_denied: bool = False
         self.detail_denied: bool = False
+        self.detail_attempts: int = 0
+        self.detail_error_on_attempt: dict[int, Exception] = {}
         self.progress_conflict: bool = False
+        self.progress_error_on_attempt: dict[int, Exception] = {}
 
     def heartbeat(self, version: str) -> None:
         pass
@@ -145,9 +150,17 @@ class _RecoveryFakeApiClient:
         return f"lease-{task_id}"
 
     def get_task(self, task_id: str, lease: str) -> ExecutorTaskDetail:
+        self.detail_attempts += 1
+        if error := self.detail_error_on_attempt.get(self.detail_attempts):
+            raise error
         if self.detail_denied:
             raise ApiUnauthorized("detail denied")
-        return self._detail
+        payload = self._detail.payload.model_copy(
+            update={"state_version": self.state_version}
+        )
+        return self._detail.model_copy(
+            update={"state_version": self.state_version, "payload": payload}
+        )
 
     def report_progress(
         self,
@@ -159,6 +172,8 @@ class _RecoveryFakeApiClient:
         **kwargs: object,
     ) -> ExecutorTaskState:
         self.progress_attempts += 1
+        if error := self.progress_error_on_attempt.get(self.progress_attempts):
+            raise error
         if self.progress_conflict:
             raise ApiConflict("stale_task_version")
         self.state_version += 1
@@ -177,6 +192,8 @@ class _RecoveryFakeApiClient:
         target_status: str,
         **kwargs: object,
     ) -> ExecutorTaskState:
+        if self.result_error is not None:
+            raise self.result_error
         self.state_version += 1
         self.result_calls.append(target_status)
         return ExecutorTaskState(
@@ -255,6 +272,39 @@ def test_process_restart_after_field_write_does_not_duplicate_fill(
     assert outcome.reason_code == "single_page_bottom_action"
     # The field was filled exactly once (first run).  Second run's checkpoint
     # filtering prevented re-fill even on a fresh page load.
+    assert _telemetry()["field_events"].get("full_name", 0) == 1
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_crash_between_field_write_and_verified_checkpoint_never_refills(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/single-page", PAYLOAD_FIELDS)
+    cp_dir = tmp_path / "checkpoints"
+    engine = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=browser,
+        checkpoints=CheckpointStore(cp_dir),
+        fault_point=FaultPoint.AFTER_FIELD_WRITE_BEFORE_VERIFIED,
+    )
+
+    with pytest.raises(InjectedCrash):
+        engine.run(task_id=detail.task_id)
+
+    pending = CheckpointStore(cp_dir).load(detail.task_id)
+    assert pending is not None
+    assert pending.pending_field_key == "full_name"
+
+    outcome = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=browser,
+        checkpoints=CheckpointStore(cp_dir),
+    ).run(task_id=detail.task_id)
+
+    assert outcome.kind == "ready_for_review"
+    assert outcome.reason_code == "field_write_uncertain"
     assert _telemetry()["field_events"].get("full_name", 0) == 1
     assert _telemetry()["final_clicks"] == 0
 
@@ -380,7 +430,7 @@ def test_changed_fingerprint_enters_review_without_click(
     mismatched = ExecutorCheckpoint(
         protocol_version=PROTOCOL_VERSION,
         task_id=detail.task_id,
-        task_state_version=0,
+        task_state_version=1,
         step="fill_page",
         page_index=None,
         page_fingerprint="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -401,4 +451,189 @@ def test_changed_fingerprint_enters_review_without_click(
 
     assert outcome.kind == "ready_for_review"
     assert outcome.reason_code == "page_topology_changed"
+    assert _telemetry()["final_clicks"] == 0
+
+
+class _FailingCheckpointStore(CheckpointStore):
+    def save(self, checkpoint: ExecutorCheckpoint) -> None:
+        raise OSError("checkpoint disk unavailable")
+
+
+def test_checkpoint_write_failure_prevents_intermediate_click(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/multi-step/1", PAYLOAD_FIELDS)
+    engine = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=browser,
+        checkpoints=_FailingCheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "failed_safe"
+    assert outcome.reason_code == "checkpoint_unavailable"
+    assert _telemetry()["intermediate_clicks"] == 0
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_uncertain_initial_progress_stops_before_browser_actions(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/single-page", PAYLOAD_FIELDS)
+    fake = _RecoveryFakeApiClient(detail)
+    fake.progress_error_on_attempt[1] = UncertainWriteResult("uncertain")
+    engine = ExecutorEngine(
+        client=fake,
+        browser=browser,
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "failed_safe"
+    assert outcome.reason_code == "progress_result_uncertain"
+    assert _telemetry()["field_events"] == {}
+    assert _telemetry()["intermediate_clicks"] == 0
+
+
+def test_lease_failure_before_intermediate_click_stops_without_side_effect(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/multi-step/1", PAYLOAD_FIELDS)
+    fake = _RecoveryFakeApiClient(detail)
+    fake.detail_error_on_attempt[2] = ApiUnauthorized("expired")
+    engine = ExecutorEngine(
+        client=fake,
+        browser=browser,
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "stopped_unauthorized"
+    assert outcome.reason_code == "progress_denied"
+    assert _telemetry()["intermediate_clicks"] == 0
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_stale_checkpoint_version_stops_before_field_or_page_side_effects(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/single-page", PAYLOAD_FIELDS)
+    checkpoints = CheckpointStore(tmp_path / "checkpoints")
+    checkpoints.save(
+        ExecutorCheckpoint(
+            protocol_version=PROTOCOL_VERSION,
+            task_id=detail.task_id,
+            task_state_version=999,
+            step="fill_page",
+            page_index=None,
+            page_fingerprint="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            completed_field_keys=["full_name"],
+            completed_effect_keys=[],
+            issue_counts={"missing": 0, "low": 0, "readback": 0, "defaulted": 0},
+        )
+    )
+    engine = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=browser,
+        checkpoints=checkpoints,
+    )
+
+    outcome = engine.run(task_id=detail.task_id)
+
+    assert outcome.kind == "ready_for_review"
+    assert outcome.reason_code == "checkpoint_version_mismatch"
+    assert _telemetry()["field_events"] == {}
+    assert _telemetry()["intermediate_clicks"] == 0
+
+
+class _BrowserThatMustNotOpen:
+    def open(self, url: str) -> None:
+        raise AssertionError(f"non-loopback browser navigation attempted: {url}")
+
+
+def test_wave_one_payload_rejects_non_loopback_target_before_navigation(
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/single-page", PAYLOAD_FIELDS)
+    payload = detail.payload.model_copy(
+        update={"target_url": "https://careers.example.com/apply"}
+    )
+    engine = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=_BrowserThatMustNotOpen(),  # type: ignore[arg-type]
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    )
+
+    outcome = engine.run(payload=payload)
+
+    assert outcome.kind == "failed_safe"
+    assert outcome.reason_code == "target_not_loopback"
+
+
+def test_review_status_timeout_does_not_claim_review_or_refill_on_resume(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(f"{mock_site_url}/single-page", PAYLOAD_FIELDS)
+    cp_dir = tmp_path / "checkpoints"
+    first_client = _RecoveryFakeApiClient(detail)
+    first_client.progress_error_on_attempt[2] = UncertainWriteResult("uncertain")
+
+    first = ExecutorEngine(
+        client=first_client,
+        browser=browser,
+        checkpoints=CheckpointStore(cp_dir),
+    ).run(task_id=detail.task_id)
+
+    assert first.kind == "failed_safe"
+    assert first.reason_code == "progress_result_uncertain"
+    assert _telemetry()["field_events"].get("full_name", 0) == 1
+    assert _telemetry()["final_clicks"] == 0
+
+    resumed = ExecutorEngine(
+        client=_RecoveryFakeApiClient(detail),
+        browser=browser,
+        checkpoints=CheckpointStore(cp_dir),
+    ).run(task_id=detail.task_id)
+
+    assert resumed.kind == "ready_for_review"
+    assert _telemetry()["field_events"].get("full_name", 0) == 1
+    assert _telemetry()["final_clicks"] == 0
+
+
+def test_result_write_timeout_does_not_claim_result_observed(
+    browser: BrowserSession,
+    mock_site_url: str,
+    tmp_path: Any,
+) -> None:
+    detail = _make_detail(
+        f"{mock_site_url}/submission-success",
+        PAYLOAD_FIELDS,
+        status=TaskStatus.OBSERVING_USER_SUBMISSION,
+    )
+    fake = _RecoveryFakeApiClient(detail)
+    fake.result_error = UncertainWriteResult("uncertain")
+
+    outcome = ExecutorEngine(
+        client=fake,
+        browser=browser,
+        checkpoints=CheckpointStore(tmp_path / "checkpoints"),
+    ).run(task_id=detail.task_id)
+
+    assert outcome.kind == "failed_safe"
+    assert outcome.reason_code == "result_write_uncertain"
+    assert fake.result_calls == []
     assert _telemetry()["final_clicks"] == 0

@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-import json
-
 import httpx
 import pytest
 
 from executor.client import (
+    ApiConflict,
     ExecutorApiClient,
     UncertainWriteResult,
 )
-from executor.secrets import SecretStore
 
 
 class InMemorySecretStore:
@@ -127,3 +125,32 @@ def test_list_tasks_returns_summaries(client) -> None:
     response = client.list_tasks()
     assert len(response.tasks) == 1
     assert response.tasks[0].task_id == "11111111-1111-4111-8111-111111111111"
+
+
+def test_conflict_error_code_is_read_from_fastapi_detail_envelope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            409,
+            json={"detail": {"error_code": "stale_task_version"}},
+            request=request,
+        )
+
+    conflict_client = ExecutorApiClient(
+        base_url="http://127.0.0.1:8765",
+        secret_store=InMemorySecretStore(),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ApiConflict) as exc_info:
+        conflict_client.report_progress(
+            task_id="11111111-1111-4111-8111-111111111111",
+            lease="lease-in-memory",
+            expected_version=0,
+            target_status="running",
+            page_fingerprint="sha256:abc123",
+            page_index=1,
+            field_counts={"confirmed": 0, "defaulted": 0, "missing": 0, "low": 0},
+            reason_code=None,
+        )
+
+    assert exc_info.value.error_code == "stale_task_version"

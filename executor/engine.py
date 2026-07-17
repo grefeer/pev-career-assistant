@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
+from urllib.parse import urlsplit
 
-from executor.browser import BrowserSession, FillReport, PageObservation
+from executor.browser import BrowserSession
 from executor.checkpoints import (
     CheckpointStore,
     ExecutorCheckpoint,
@@ -28,12 +29,17 @@ from executor.protocol import (
 
 logger = logging.getLogger(__name__)
 
+UNKNOWN_PAGE_FINGERPRINT = "sha256:" + ("0" * 64)
+
 
 class InjectedCrash(RuntimeError):
     """Raised at a configured fault point for recovery testing."""
 
 
 class FaultPoint(StrEnum):
+    AFTER_FIELD_WRITE_BEFORE_VERIFIED = (
+        "after_field_write_before_verified"
+    )
     AFTER_FIELD_CHECKPOINT_SAVED = "after_field_checkpoint_saved"
     AFTER_PENDING_EFFECT_CHECKPOINT_SAVED = (
         "after_pending_effect_checkpoint_saved"
@@ -92,7 +98,7 @@ class ExecutorEngine:
         self,
         *,
         step: str = "fill_page",
-        page_fingerprint: str = "sha256:pending",
+        page_fingerprint: str = UNKNOWN_PAGE_FINGERPRINT,
         page_index: int | None = None,
         completed_field_keys: list[str] | None = None,
         completed_effect_keys: list[str] | None = None,
@@ -178,6 +184,13 @@ class ExecutorEngine:
         if payload is None:
             return RunOutcome("failed_safe", "no_payload")
 
+        if urlsplit(str(payload.target_url)).hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            return RunOutcome("failed_safe", "target_not_loopback")
+
         # Check if we're in observation mode
         if detail and hasattr(detail, "status"):
             from executor.protocol import TaskStatus
@@ -187,14 +200,17 @@ class ExecutorEngine:
 
         # Dispatch -> Running transition
         state = self._state
-        if state and task_id:
+        if state and task_id and detail and detail.status.value in {
+            "dispatched",
+            "waiting_for_human",
+        }:
             try:
                 result = self.client.report_progress(
                     task_id=task_id,
                     lease=state.lease,
                     expected_version=state.state_version,
                     target_status="running",
-                    page_fingerprint="sha256:pending",
+                    page_fingerprint=UNKNOWN_PAGE_FINGERPRINT,
                     page_index=None,
                     field_counts={
                         "confirmed": 0,
@@ -210,7 +226,9 @@ class ExecutorEngine:
             except ApiConflict as error:
                 return self._reconcile_conflict(task_id, error)
             except UncertainWriteResult:
-                pass
+                return RunOutcome("failed_safe", "progress_result_uncertain")
+            except Exception:
+                return RunOutcome("failed_safe", "progress_unavailable")
 
         # Open page and observe
         self.browser.open(str(payload.target_url))
@@ -225,31 +243,70 @@ class ExecutorEngine:
                 cp = None
 
         if cp is not None:
+            if (
+                cp.protocol_version != PROTOCOL_VERSION
+                or cp.task_state_version != state.state_version
+            ):
+                return RunOutcome(
+                    "ready_for_review", "checkpoint_version_mismatch"
+                )
+
             # Check for pending intermediate effect — don't retry the click
             if cp.pending_effect_key is not None:
-                self.checkpoints.delete(state.task_id)
                 return RunOutcome(
                     "ready_for_review", "intermediate_result_uncertain"
                 )
 
             # Check if page fingerprint changed since checkpoint
             if (
-                cp.page_fingerprint != "sha256:pending"
-                and cp.page_fingerprint != observation.fingerprint
+                cp.page_fingerprint != observation.fingerprint
             ):
-                self.checkpoints.delete(state.task_id)
                 return RunOutcome(
                     "ready_for_review", "page_topology_changed"
                 )
 
-            # Filter out fields already completed in a previous run
             completed = set(cp.completed_field_keys)
-            fields_to_fill = [f for f in payload.fields if f.field_key not in completed]
+            completed_effects = set(cp.completed_effect_keys)
 
-            # Delete checkpoint so the current run writes fresh ones
-            self.checkpoints.delete(state.task_id)
+            if cp.pending_field_key is not None:
+                pending = next(
+                    (
+                        field
+                        for field in payload.fields
+                        if field.field_key == cp.pending_field_key
+                    ),
+                    None,
+                )
+                if (
+                    pending is None
+                    or pending.value is None
+                    or self.browser.field_value(cp.pending_field_key)
+                    != pending.value
+                ):
+                    return RunOutcome(
+                        "ready_for_review", "field_write_uncertain"
+                    )
+                completed.add(cp.pending_field_key)
+                if self._save_checkpoint(
+                    page_fingerprint=observation.fingerprint,
+                    page_index=observation.page_index,
+                    completed_field_keys=sorted(completed),
+                    completed_effect_keys=sorted(completed_effects),
+                    pending_field_key=None,
+                    issue_counts=cp.issue_counts,
+                ) is None:
+                    return RunOutcome(
+                        "failed_safe", "checkpoint_unavailable"
+                    )
         else:
-            fields_to_fill = payload.fields
+            completed = set()
+            completed_effects = set()
+
+        fields_to_fill = [
+            field
+            for field in payload.fields
+            if field.field_key not in completed
+        ]
 
         # Check if human gate
         if observation.human_required:
@@ -272,19 +329,56 @@ class ExecutorEngine:
                         reason_code=reason,
                     )
                     state.state_version = result.state_version
-                except Exception:
-                    pass
+                except Exception as error:
+                    return self._progress_failure(task_id, error)
             return RunOutcome("waiting_for_human", reason)
 
+        def before_write(field_key: str) -> None:
+            if self._save_checkpoint(
+                page_fingerprint=observation.fingerprint,
+                page_index=observation.page_index,
+                completed_field_keys=sorted(completed),
+                completed_effect_keys=sorted(completed_effects),
+                pending_field_key=field_key,
+            ) is None:
+                raise RuntimeError("checkpoint unavailable before field write")
+
+        def after_verified(field_key: str) -> None:
+            self._check_fault(
+                FaultPoint.AFTER_FIELD_WRITE_BEFORE_VERIFIED
+            )
+            completed.add(field_key)
+            if self._save_checkpoint(
+                page_fingerprint=observation.fingerprint,
+                page_index=observation.page_index,
+                completed_field_keys=sorted(completed),
+                completed_effect_keys=sorted(completed_effects),
+                pending_field_key=None,
+            ) is None:
+                raise RuntimeError(
+                    "checkpoint unavailable after field verification"
+                )
+
+        self.browser.set_checkpoint_callbacks(
+            before_write=before_write,
+            after_verified=after_verified,
+        )
+
         # Fill confirmed fields
-        report = self.browser.fill_confirmed(fields_to_fill)
+        try:
+            report = self.browser.fill_confirmed(fields_to_fill)
+        except InjectedCrash:
+            raise
+        except RuntimeError:
+            return RunOutcome("failed_safe", "checkpoint_unavailable")
 
         # Save checkpoint after fill (completed field keys recorded)
         if state:
-            self._save_checkpoint(
+            checkpoint = self._save_checkpoint(
                 page_fingerprint=observation.fingerprint,
                 page_index=observation.page_index,
-                completed_field_keys=report.confirmed_keys,
+                completed_field_keys=sorted(completed),
+                completed_effect_keys=sorted(completed_effects),
                 issue_counts={
                     "missing": len(report.missing_keys),
                     "low": len(report.low_confidence_keys),
@@ -292,6 +386,8 @@ class ExecutorEngine:
                     "defaulted": len(report.defaulted_keys),
                 },
             )
+            if checkpoint is None:
+                return RunOutcome("failed_safe", "checkpoint_unavailable")
 
         # Fault injection after fill checkpoint is persisted
         self._check_fault(FaultPoint.AFTER_FIELD_CHECKPOINT_SAVED)
@@ -316,8 +412,8 @@ class ExecutorEngine:
                         reason_code="readback_mismatch",
                     )
                     state.state_version = result.state_version
-                except Exception:
-                    pass
+                except Exception as error:
+                    return self._progress_failure(task_id, error)
             return RunOutcome("ready_for_review", "readback_mismatch")
 
         # Evaluate safety decision
@@ -341,17 +437,18 @@ class ExecutorEngine:
                         reason_code=decision.reason_code,
                     )
                     state.state_version = result.state_version
-                except Exception:
-                    pass
+                except Exception as error:
+                    return self._progress_failure(task_id, error)
             return RunOutcome("ready_for_review", decision.reason_code)
 
         # Safe intermediate action: save pending-effect checkpoint
         if state:
-            self._save_checkpoint(
+            checkpoint = self._save_checkpoint(
                 step="safe_intermediate",
                 page_fingerprint=observation.fingerprint,
                 page_index=observation.page_index,
-                completed_field_keys=report.confirmed_keys,
+                completed_field_keys=sorted(completed),
+                completed_effect_keys=sorted(completed_effects),
                 pending_effect_key=f"page-{observation.page_index or 0}:safe-next",
                 issue_counts={
                     "missing": len(report.missing_keys),
@@ -360,33 +457,28 @@ class ExecutorEngine:
                     "defaulted": len(report.defaulted_keys),
                 },
             )
+            if checkpoint is None:
+                return RunOutcome("failed_safe", "checkpoint_unavailable")
 
         # Fault injection after pending-effect checkpoint is persisted
         self._check_fault(FaultPoint.AFTER_PENDING_EFFECT_CHECKPOINT_SAVED)
 
-        # Report progress update
+        # Revalidate lease and authoritative version immediately before the
+        # browser side effect.  This is a read, so it is safe to retry in the
+        # HTTP client and avoids an invalid RUNNING -> RUNNING transition.
         if task_id and state:
             try:
-                result = self.client.report_progress(
-                    task_id=task_id,
-                    lease=state.lease,
-                    expected_version=state.state_version,
-                    target_status="running",
-                    page_fingerprint=observation.fingerprint,
-                    page_index=observation.page_index,
-                    field_counts={
-                        "confirmed": len(report.confirmed_keys),
-                        "defaulted": len(report.defaulted_keys),
-                        "missing": len(report.missing_keys),
-                        "low": len(report.low_confidence_keys),
-                    },
-                    reason_code=None,
-                )
-                state.state_version = result.state_version
+                current = self.client.get_task(task_id, state.lease)
+                if current.state_version != state.state_version:
+                    return RunOutcome("stopped_conflict", "stale_task_version")
+            except ApiUnauthorized:
+                return RunOutcome("stopped_unauthorized", "progress_denied")
+            except ApiTaskNotFound:
+                return RunOutcome("failed_safe", "task_not_found")
             except ApiConflict as error:
                 return self._reconcile_conflict(task_id, error)
             except Exception:
-                pass
+                return RunOutcome("failed_safe", "lease_revalidation_failed")
 
         # Click safe intermediate
         try:
@@ -395,16 +487,19 @@ class ExecutorEngine:
             return RunOutcome("failed_safe", "intermediate_click_failed")
 
         # After click, re-observe and report review
-        self.browser.observe()
+        post_navigation = self.browser.observe()
 
         # Navigation confirmed — clear pending effect
         if state:
-            self._save_checkpoint(
+            completed_effects.add(
+                f"page-{observation.page_index or 0}:safe-next"
+            )
+            checkpoint = self._save_checkpoint(
                 step="safe_intermediate",
-                page_fingerprint="sha256:after_nav",
-                page_index=observation.page_index,
-                completed_field_keys=report.confirmed_keys,
-                completed_effect_keys=[f"page-{observation.page_index or 0}:safe-next"],
+                page_fingerprint=post_navigation.fingerprint,
+                page_index=post_navigation.page_index,
+                completed_field_keys=sorted(completed),
+                completed_effect_keys=sorted(completed_effects),
                 pending_effect_key=None,
                 issue_counts={
                     "missing": len(report.missing_keys),
@@ -413,6 +508,10 @@ class ExecutorEngine:
                     "defaulted": len(report.defaulted_keys),
                 },
             )
+            if checkpoint is None:
+                return RunOutcome(
+                    "failed_safe", "intermediate_result_uncertain"
+                )
 
         if task_id and state:
             try:
@@ -421,8 +520,8 @@ class ExecutorEngine:
                     lease=state.lease,
                     expected_version=state.state_version,
                     target_status="ready_for_review",
-                    page_fingerprint="sha256:after_nav",
-                    page_index=None,
+                    page_fingerprint=post_navigation.fingerprint,
+                    page_index=post_navigation.page_index,
                     field_counts={
                         "confirmed": len(report.confirmed_keys),
                         "defaulted": len(report.defaulted_keys),
@@ -432,8 +531,8 @@ class ExecutorEngine:
                     reason_code="navigated",
                 )
                 state.state_version = result.state_version
-            except Exception:
-                pass
+            except Exception as error:
+                return self._progress_failure(task_id, error)
 
         return RunOutcome("ready_for_review", "navigated")
 
@@ -458,10 +557,40 @@ class ExecutorEngine:
                     page_fingerprint="sha256:result",
                     reason_code=result,
                 )
+            except ApiUnauthorized:
+                return RunOutcome("stopped_unauthorized", "result_denied")
+            except (UncertainWriteResult, ApiConflict):
+                return self._reconcile_result_write(target)
             except Exception:
-                pass
+                return RunOutcome("failed_safe", "result_report_unavailable")
 
         return RunOutcome("result_observed", target)
+
+    def _progress_failure(
+        self, task_id: str, error: Exception
+    ) -> RunOutcome:
+        if isinstance(error, ApiUnauthorized):
+            return RunOutcome("stopped_unauthorized", "progress_denied")
+        if isinstance(error, ApiConflict):
+            return self._reconcile_conflict(task_id, error)
+        if isinstance(error, UncertainWriteResult):
+            return RunOutcome("failed_safe", "progress_result_uncertain")
+        return RunOutcome("failed_safe", "progress_unavailable")
+
+    def _reconcile_result_write(self, target: str) -> RunOutcome:
+        state = self._state
+        if state is None:
+            return RunOutcome("failed_safe", "result_write_uncertain")
+        try:
+            current = self.client.get_task(state.task_id, state.lease)
+        except ApiUnauthorized:
+            return RunOutcome("stopped_unauthorized", "result_denied")
+        except Exception:
+            return RunOutcome("failed_safe", "result_write_uncertain")
+        if current.status.value == target:
+            state.state_version = current.state_version
+            return RunOutcome("result_observed", target)
+        return RunOutcome("failed_safe", "result_write_uncertain")
 
     def _reconcile_conflict(
         self, task_id: str, error: ApiConflict

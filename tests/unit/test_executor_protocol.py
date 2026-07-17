@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from backend.app.services.devices import ALLOWED_TASK_LEASE_SCOPES
 from executor.protocol import ExecutorTaskPayload, PROTOCOL_VERSION
 

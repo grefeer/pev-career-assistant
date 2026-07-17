@@ -4,7 +4,6 @@ import pytest
 
 from executor.safety import (
     PageTopology,
-    SafetyDecision,
     classify_topology,
     decide_action,
 )

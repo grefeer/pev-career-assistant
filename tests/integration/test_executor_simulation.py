@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-import os
+import re
 import socket
 import threading
 from typing import Any
 
 import pytest
 import uvicorn
-from fastapi.testclient import TestClient
 
 from executor.browser import BrowserSession
 from executor.checkpoints import CheckpointStore
@@ -107,6 +106,7 @@ def browser(tmp_path: Any) -> Iterator[BrowserSession]:
     session = BrowserSession(
         user_data_dir=tmp_path / "chrome-profile",
         headless=True,
+        channel=None,
     )
     try:
         yield session
@@ -143,6 +143,26 @@ def test_ambiguous_and_final_buttons_are_never_clicked(
     assert current["final_clicks"] == 0
 
 
+def test_multiple_candidate_actions_are_classified_ambiguous(
+    browser: BrowserSession, mock_site_url: str
+) -> None:
+    browser.open(f"{mock_site_url}/single-page")
+    browser.page.set_content(
+        """
+        <main data-topology="multi" data-step-index="1"
+              data-step-count="2" data-step-nav="true">
+          <button data-action-kind="next">保存并下一步</button>
+          <button data-action-kind="final">提交申请</button>
+        </main>
+        """
+    )
+
+    decision = browser.action_decision(browser.observe())
+
+    assert decision.allowed is False
+    assert decision.reason_code == "ambiguous_action_forbidden"
+
+
 # ---------------------------------------------------------------------------
 # Engine-level integration tests
 # ---------------------------------------------------------------------------
@@ -174,7 +194,12 @@ class _FakeApiClient:
 
     def get_task(self, task_id: str, lease: str) -> ExecutorTaskDetail:
         self.get_task_calls.append((task_id, lease))
-        return self._detail
+        payload = self._detail.payload.model_copy(
+            update={"state_version": self.state_version}
+        )
+        return self._detail.model_copy(
+            update={"state_version": self.state_version, "payload": payload}
+        )
 
     def report_progress(
         self,
@@ -193,6 +218,7 @@ class _FakeApiClient:
             "target_status": target_status,
             "expected_version": expected_version,
             "reason_code": reason_code,
+            "page_fingerprint": page_fingerprint,
         })
         self.state_version += 1
         return ExecutorTaskState(
@@ -321,6 +347,10 @@ def test_multi_step_intermediate_safe_click(
     statuses = [c["target_status"] for c in fake.progress_calls]
     assert "running" in statuses
     assert "ready_for_review" in statuses
+    assert all(
+        re.fullmatch(r"sha256:[0-9a-f]{6,64}", str(call["page_fingerprint"]))
+        for call in fake.progress_calls
+    )
     # The intermediate button was clicked -- mock site records it
     assert _telemetry()["intermediate_clicks"] == 1
     # The final page button must NOT have been clicked

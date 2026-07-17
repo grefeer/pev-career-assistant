@@ -12,11 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.api import dependencies
 from backend.app.api.executor_schemas import (
-    ExecutorProgressRequest,
-    ExecutorResultRequest,
     ExecutorTaskPayload,
-    ExecutorTaskState,
-    ExecutorTaskSummary,
 )
 from backend.app.config import Settings
 from backend.app.db.base import Base
@@ -227,3 +223,53 @@ def test_openapi_has_no_submit_operation_or_scope(client) -> None:
     assert "task:submit" not in schema_text
     assert "/api/executor/tasks/{task_id}/progress" in schema_text
     assert "/api/executor/tasks/{task_id}/result" in schema_text
+
+
+def test_task_lease_for_unassigned_task_returns_stable_401_error(
+    client, paired_device
+) -> None:
+    response = client.post(
+        "/api/devices/task-lease",
+        headers={"X-Device-Token": paired_device["device_token"]},
+        json={"task_id": "00000000-0000-0000-0000-000000000099"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"]["error_code"] == "invalid_task_lease"
+
+
+def test_executor_validation_error_has_stable_route_local_error_code(
+    client, paired_device, seeded_task, payload_provider
+) -> None:
+    client.app.state.executor_payload_provider = payload_provider
+    lease = issue_lease(
+        client, paired_device["device_token"], seeded_task.id
+    )
+    response = client.post(
+        f"/api/executor/tasks/{seeded_task.id}/progress",
+        headers={
+            "X-Device-Token": paired_device["device_token"],
+            "X-Task-ID": seeded_task.id,
+            "X-Task-Lease": lease,
+        },
+        json={
+            "protocol_version": "executor.v1",
+            "expected_version": 0,
+            "target_status": "running",
+            "page_fingerprint": "sha256:abc123",
+            "page_index": 1,
+            "field_counts": {
+                "confirmed": 0,
+                "defaulted": 0,
+                "missing": 0,
+                "low": 0,
+            },
+            "form_values": {"full_name": "must-not-echo"},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "detail": {"error_code": "executor_validation_failed"}
+    }
+    assert "must-not-echo" not in response.text

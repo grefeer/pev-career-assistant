@@ -12,7 +12,10 @@ from backend.app.db.models import (
     TaskActor,
 )
 from backend.app.repositories import executor_tasks
-from backend.app.services.applications import ApplicationService, InvalidTransitionError, StaleTaskVersionError, TaskNotFoundError  # noqa: F401
+from backend.app.services.applications import (
+    ApplicationService,
+    TaskNotFoundError,
+)
 
 
 class ExecutorTaskNotFoundError(LookupError):
@@ -125,23 +128,28 @@ class ExecutorTaskService:
         field_counts: dict[str, int],
     ) -> ApplicationTask:
         self.get_assigned(db, device=device, task_id=task_id)
-        task = ApplicationService().transition(
-            db,
-            task_id=task_id,
-            expected_version=expected_version,
-            target=target,
-            actor=TaskActor.EXECUTOR,
-            event_type="executor.progress",
-            redacted_payload={
-                "page_fingerprint": page_fingerprint,
-                "page_index": page_index,
-                "reason_code": reason_code or "",
-                "confirmed_count": field_counts["confirmed"],
-                "defaulted_count": field_counts["defaulted"],
-                "missing_count": field_counts["missing"],
-                "low_confidence_count": field_counts["low"],
-            },
-        )
+        try:
+            task = ApplicationService().transition(
+                db,
+                task_id=task_id,
+                expected_version=expected_version,
+                target=target,
+                actor=TaskActor.EXECUTOR,
+                event_type="executor.progress",
+                redacted_payload={
+                    "page_fingerprint": page_fingerprint,
+                    "page_index": page_index,
+                    "reason_code": reason_code or "",
+                    "confirmed_count": field_counts["confirmed"],
+                    "defaulted_count": field_counts["defaulted"],
+                    "missing_count": field_counts["missing"],
+                    "low_confidence_count": field_counts["low"],
+                },
+                required_device_id=device.id,
+                required_user_id=device.user_id,
+            )
+        except TaskNotFoundError as error:
+            raise ExecutorTaskNotFoundError(task_id) from error
         db.commit()
         return task
 
@@ -157,17 +165,22 @@ class ExecutorTaskService:
         reason_code: str,
     ) -> ApplicationTask:
         self.get_assigned(db, device=device, task_id=task_id)
-        task = ApplicationService().transition(
-            db,
-            task_id=task_id,
-            expected_version=expected_version,
-            target=target,
-            actor=TaskActor.EXECUTOR,
-            event_type="executor.result_observed",
-            redacted_payload={
-                "page_fingerprint": page_fingerprint,
-                "reason_code": reason_code,
-            },
-        )
+        try:
+            task = ApplicationService().transition(
+                db,
+                task_id=task_id,
+                expected_version=expected_version,
+                target=target,
+                actor=TaskActor.EXECUTOR,
+                event_type="executor.result_observed",
+                redacted_payload={
+                    "page_fingerprint": page_fingerprint,
+                    "reason_code": reason_code,
+                },
+                required_device_id=device.id,
+                required_user_id=device.user_id,
+            )
+        except TaskNotFoundError as error:
+            raise ExecutorTaskNotFoundError(task_id) from error
         db.commit()
         return task

@@ -21,6 +21,7 @@ from backend.app.services.executor_tasks import (
     ExecutorTaskNotFoundError,
     ExecutorTaskService,
 )
+from backend.app.repositories import executor_tasks
 
 
 @pytest.fixture
@@ -168,3 +169,46 @@ def test_executor_result_is_rejected_until_human_started_observation(
             page_fingerprint="sha256:result",
             reason_code="success_marker",
         )
+
+
+def test_progress_rechecks_device_assignment_under_authoritative_lock(
+    db, alice_device, bob_device, alice_user, monkeypatch
+) -> None:
+    task = ApplicationTask(
+        user_id=alice_user.id,
+        target_job_id="simulation-job",
+        device_id=alice_device.id,
+        status=ApplicationTaskStatus.DISPATCHED,
+    )
+    db.add(task)
+    db.commit()
+    original_get_assigned = executor_tasks.get_assigned
+
+    def reassign_after_initial_check(*args, **kwargs):
+        checked = original_get_assigned(*args, **kwargs)
+        assert checked is not None
+        checked.device_id = bob_device.id
+        checked.user_id = bob_device.user_id
+        db.commit()
+        return checked
+
+    monkeypatch.setattr(executor_tasks, "get_assigned", reassign_after_initial_check)
+
+    with pytest.raises(ExecutorTaskNotFoundError):
+        ExecutorTaskService().report_progress(
+            db,
+            device=alice_device,
+            task_id=task.id,
+            expected_version=0,
+            target=ApplicationTaskStatus.RUNNING,
+            page_fingerprint="sha256:abc123",
+            page_index=1,
+            reason_code=None,
+            field_counts={"confirmed": 0, "defaulted": 0, "missing": 0, "low": 0},
+        )
+
+    db.refresh(task)
+    assert task.status is ApplicationTaskStatus.DISPATCHED
+    assert db.scalar(
+        select(ApplicationEvent).where(ApplicationEvent.task_id == task.id)
+    ) is None

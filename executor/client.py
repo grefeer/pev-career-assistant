@@ -84,7 +84,11 @@ class ExecutorApiClient:
             raise ApiTaskNotFound("task not found")
         if status == 409:
             try:
-                error_code = response.json().get("error_code", "conflict")
+                payload = response.json()
+                detail = payload.get("detail", {})
+                error_code = payload.get("error_code") or (
+                    detail.get("error_code") if isinstance(detail, dict) else None
+                ) or "conflict"
             except Exception:
                 error_code = "conflict"
             raise ApiConflict(error_code)

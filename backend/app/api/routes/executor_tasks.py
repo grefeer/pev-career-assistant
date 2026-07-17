@@ -3,7 +3,10 @@ from __future__ import annotations
 import hmac
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from backend.app.api import dependencies
@@ -28,7 +31,31 @@ from backend.app.services.executor_tasks import (
 )
 
 
-router = APIRouter(prefix="/executor/tasks", tags=["executor"])
+class ExecutorAPIRoute(APIRoute):
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def stable_validation_handler(request: Request):
+            try:
+                return await original_handler(request)
+            except RequestValidationError:
+                return JSONResponse(
+                    status_code=422,
+                    content={
+                        "detail": {
+                            "error_code": "executor_validation_failed"
+                        }
+                    },
+                )
+
+        return stable_validation_handler
+
+
+router = APIRouter(
+    prefix="/executor/tasks",
+    tags=["executor"],
+    route_class=ExecutorAPIRoute,
+)
 
 
 # Use dependencies._get_db directly so dependency_overrides work in tests

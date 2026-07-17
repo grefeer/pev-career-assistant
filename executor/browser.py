@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from dataclasses import replace as dataclass_replace
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -62,10 +61,12 @@ class BrowserSession:
         user_data_dir: str | Path | None = None,
         *,
         headless: bool = False,
+        channel: str | None = "chrome",
         before_write: Callable[[str], None] | None = None,
         after_verified: Callable[[str], None] | None = None,
     ) -> None:
         self._headless = headless
+        self._channel = channel
         self._before_write = before_write
         self._after_verified = after_verified
         self._playwright: Playwright | None = None
@@ -76,14 +77,12 @@ class BrowserSession:
     def open(self, url: str) -> None:
         if self._context is None:
             self._playwright = sync_playwright().start()
-            launch_options = {
-                "headless": self._headless,
-            }
-            if self._user_data_dir:
-                launch_options["user_data_dir"] = self._user_data_dir
+            launch_options: dict[str, object] = {"headless": self._headless}
+            if self._channel is not None:
+                launch_options["channel"] = self._channel
             self._context = self._playwright.chromium.launch_persistent_context(
                 user_data_dir=self._user_data_dir or "",
-                headless=self._headless,
+                **launch_options,
             )
         self._page = self._context.new_page()
         self._page.goto(url, wait_until="domcontentloaded")
@@ -136,9 +135,14 @@ class BrowserSession:
         )
 
         # Find action button
-        action_el = self.page.locator("button[data-action-kind]").first
-        action_kind = action_el.get_attribute("data-action-kind") if action_el.count() > 0 else "unknown"
-        action_label = action_el.text_content() or "" if action_el.count() > 0 else ""
+        action_candidates = self.page.locator("button[data-action-kind]")
+        if action_candidates.count() == 1:
+            action_el = action_candidates.first
+            action_kind = action_el.get_attribute("data-action-kind") or "unknown"
+            action_label = action_el.text_content() or ""
+        else:
+            action_kind = "ambiguous"
+            action_label = ""
 
         # Collect field keys
         field_keys: list[str] = []
@@ -171,6 +175,23 @@ class BrowserSession:
             has_verified_next_step=observation.has_verified_next_step,
         )
 
+    def set_checkpoint_callbacks(
+        self,
+        *,
+        before_write: Callable[[str], None] | None,
+        after_verified: Callable[[str], None] | None,
+    ) -> None:
+        self._before_write = before_write
+        self._after_verified = after_verified
+
+    def field_value(self, field_key: str) -> str | None:
+        locator = self.page.locator(
+            f"[data-field-key={json.dumps(field_key)}]"
+        )
+        if locator.count() != 1:
+            return None
+        return locator.input_value()
+
     def fill_confirmed(self, fields: list[ExecutorField]) -> FillReport:
         confirmed_keys: list[str] = []
         missing_keys: list[str] = []
@@ -191,7 +212,9 @@ class BrowserSession:
                 continue
 
             # Confirmed field with value
-            locator = self.page.locator(f'[data-field-key="{field.field_key}"]')
+            locator = self.page.locator(
+                f"[data-field-key={json.dumps(field.field_key)}]"
+            )
             if locator.count() == 0:
                 if field.required:
                     defaulted_keys.append(field.field_key)

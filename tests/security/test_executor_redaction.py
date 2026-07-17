@@ -36,11 +36,9 @@ from backend.app.db.models import (
     Device,
     DevicePlatform,
     DeviceStatus,
-    TaskActor,
     User,
 )
 from backend.app.main import create_app
-from backend.app.api.routes import executor_tasks
 from backend.app.services.applications import (
     _validate_redacted_value,
     UnsafeAuditPayloadError,
@@ -131,7 +129,7 @@ def _assert_no_sentinels_in_logs(
             )
         if _contains_sensitive_value(record.__dict__, sentinels):
             raise AssertionError(
-                f"sentinel detected in log record __dict__"
+                "sentinel detected in log record __dict__"
             )
 
 
