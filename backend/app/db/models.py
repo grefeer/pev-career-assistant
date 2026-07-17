@@ -154,13 +154,179 @@ class Device(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     version: Mapped[str | None] = mapped_column(String(40))
 
 
+class MatchReport(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "match_reports"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    analysis_session_id: Mapped[str] = mapped_column(
+        ForeignKey("analysis_sessions.id"), nullable=False
+    )
+    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id"), nullable=False)
+    job_verification_id: Mapped[str] = mapped_column(
+        ForeignKey("job_verifications.id"), nullable=False
+    )
+    job_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    profile_version_id: Mapped[str] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id"), nullable=False
+    )
+    request_idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    score: Mapped[int | None] = mapped_column(Integer)
+    score_components: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    scoring_rule_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    strengths: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    gaps: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    unknowns: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    risks: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    application_priority: Mapped[str | None] = mapped_column(String(20))
+    recommendation: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    output_schema_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "request_idempotency_key"),
+        Index("ix_match_reports_analysis_session_id", "analysis_session_id"),
+        Index("ix_match_reports_job_id", "job_id"),
+        Index("ix_match_reports_profile_version_id", "profile_version_id"),
+        Index("ix_match_reports_user_id_created_at", "user_id", "created_at"),
+    )
+
+
+class ResumeDraft(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "resume_drafts"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    match_report_id: Mapped[str] = mapped_column(
+        ForeignKey("match_reports.id"), nullable=False
+    )
+    profile_version_id: Mapped[str] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id"), nullable=False
+    )
+    target_job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id"), nullable=False
+    )
+    request_idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    diffs: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="generating")
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    state_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "request_idempotency_key"),
+    )
+
+
+class ApprovedResumeVersion(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "approved_resume_versions"
+
+    draft_id: Mapped[str] = mapped_column(
+        ForeignKey("resume_drafts.id"), nullable=False
+    )
+    profile_version_id: Mapped[str] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id"), nullable=False
+    )
+    target_job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id"), nullable=False
+    )
+    approved_facts: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    approved_diffs: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    approved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    approved_by: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("draft_id"),
+    )
+
+
+class ApprovedResumeAttachment(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "approved_resume_attachments"
+
+    draft_id: Mapped[str] = mapped_column(
+        ForeignKey("resume_drafts.id"), nullable=False
+    )
+    approved_resume_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("approved_resume_versions.id")
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    format: Mapped[str] = mapped_column(String(16), nullable=False)
+    object_key: Mapped[str] = mapped_column(String(512), nullable=False, unique=True)
+    content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    plaintext_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    encryption_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+    __table_args__ = (
+        UniqueConstraint("draft_id", "format"),
+    )
+
+
+class ApplicationSnapshot(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "application_snapshots"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    job_id: Mapped[str] = mapped_column(ForeignKey("job_postings.id"), nullable=False)
+    approved_resume_version_id: Mapped[str] = mapped_column(
+        ForeignKey("approved_resume_versions.id"), nullable=False
+    )
+    profile_version_id: Mapped[str] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id"), nullable=False
+    )
+    job_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    profile_facts: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    request_idempotency_key: Mapped[str] = mapped_column(String(96), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dynamic_answers: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    local_sensitive_requirements: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False
+    )
+    attachment_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    gui_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    job_status_at_snapshot: Mapped[str] = mapped_column(String(20), nullable=False)
+    job_review_version_at_snapshot: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    created_by: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    schema_version: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "request_idempotency_key"),
+    )
+
+
 class ApplicationTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "application_tasks"
     user_id: Mapped[str] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    target_job_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
-    snapshot_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    target_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_postings.id"), index=True
+    )
+    snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("application_snapshots.id"), index=True
+    )
     device_id: Mapped[str | None] = mapped_column(
         ForeignKey("devices.id", ondelete="SET NULL"), index=True
     )
@@ -174,6 +340,9 @@ class ApplicationTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     current_page: Mapped[int | None] = mapped_column(Integer)
     page_count: Mapped[int | None] = mapped_column(Integer)
     last_error_code: Mapped[str | None] = mapped_column(String(80))
+    task_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="simulation")
+    simulation_scenario: Mapped[str | None] = mapped_column(String(100))
+    request_idempotency_key: Mapped[str | None] = mapped_column(String(96))
 
 
 class ApplicationEvent(Base):
