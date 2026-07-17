@@ -17,11 +17,11 @@ class EvidenceMatchingGraph:
     def _build(self):
         builder = StateGraph(EvidenceMatchingState)
         builder.add_node("extract_requirements", self._extract)
-        builder.add_node("assess_match", self._assess)
+        builder.add_node("assess", self._assess)
         builder.add_node("fail", self._fail)
         builder.set_entry_point("extract_requirements")
         builder.add_conditional_edges("extract_requirements", self._route_after_extract)
-        builder.add_conditional_edges("assess_match", self._route_after_assess)
+        builder.add_conditional_edges("assess", self._route_after_assess)
         builder.add_edge("fail", END)
         return builder.compile()
 
