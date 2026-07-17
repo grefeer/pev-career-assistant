@@ -1,13 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+import sys
+from typing import Any
+from typing import Union
+
+if sys.version_info >= (3, 10):
+    from typing import TypeAlias
+else:
+    from typing_extensions import TypeAlias  # Python 3.9 compat
+
+if sys.version_info >= (3, 11):
+    from enum import StrEnum
+else:
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Minimal StrEnum polyfill for Python < 3.11."""
+
+        pass
+
 import re
-from typing import TypeAlias
 
 
-JsonScalar: TypeAlias = None | bool | int | float | str
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonScalar: TypeAlias = Union[None, bool, int, float, str]
+JsonValue: TypeAlias = Union[JsonScalar, list[Any], dict[str, Any]]
 
 
 class ResumeAssetStatus(StrEnum):
