@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import uuid
 
+import sqlalchemy as sa
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import Engine, create_engine, inspect, text
 
@@ -32,12 +33,16 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260717_0006"
+HEAD_REVISION = "20260717_0007"
 BUSINESS_TABLES |= PROFILE_TABLES
 MANUAL_SUBMISSION_TABLES = {
     "user_job_submissions",
     "job_duplicate_candidates",
     "job_source_links",
+}
+FEEDBACK_TABLES = {
+    "job_feedback",
+    "job_feedback_events",
 }
 
 
@@ -333,6 +338,31 @@ def test_mysql_migration_upgrade_and_downgrade(
                 assert manual == ("user_submission", 0)
             _run_alembic("downgrade", "20260717_0005", env=env)
             assert "user_job_submissions" not in inspect(engine).get_table_names()
+            _run_alembic("upgrade", "head", env=env)
+            assert FEEDBACK_TABLES <= set(sa.inspect(engine).get_table_names())
+            feedback_columns = {col["name"] for col in sa.inspect(engine).get_columns("job_feedback")}
+            assert {
+                "job_id", "user_id", "category", "status", "note", "version",
+                "created_at", "updated_at",
+            } <= feedback_columns
+            event_columns = {
+                col["name"]
+                for col in sa.inspect(engine).get_columns("job_feedback_events")
+            }
+            assert {
+                "feedback_id", "actor_user_id", "action", "feedback_version",
+                "redacted_snapshot", "idempotency_key", "created_at",
+            } <= event_columns
+            feedback_inspector = sa.inspect(engine)
+            assert ("user_id", "job_id", "category") in _column_sets(
+                feedback_inspector.get_unique_constraints("job_feedback")
+            )
+            assert ("actor_user_id", "idempotency_key") in _column_sets(
+                feedback_inspector.get_unique_constraints("job_feedback_events")
+            )
+            _run_alembic("downgrade", "20260717_0006", env=env)
+            assert _current_revision(engine) == "20260717_0006"
+            assert "job_feedback" not in sa.inspect(engine).get_table_names()
             _run_alembic("upgrade", "head", env=env)
         finally:
             _run_alembic("downgrade", "base", env=env)

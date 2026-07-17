@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 
 import { fetchVerifiedJob, fetchVerifiedJobs } from "./jobsApi";
+import JobFeedbackPanel from "./JobFeedbackPanel.vue";
 import type { JobDetail, JobSummary } from "./jobTypes";
 
 const PAGE_SIZE = 6;
@@ -271,6 +272,7 @@ onUnmounted(() => {
             <div><dt>更新日期</dt><dd>{{ formatDate(selectedJob.updated_at) }}</dd></div>
           </dl>
         </div>
+        <JobFeedbackPanel :token="token" :job-id="selectedJob.id" />
       </article>
     </aside>
   </section>

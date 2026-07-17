@@ -20,6 +20,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from backend.app.domain.job_feedback import (
+    JobFeedbackAction,
+    JobFeedbackCategory,
+    JobFeedbackStatus,
+)
+
 from backend.app.domain.profiles import (
     EvidenceDecisionAction,
     ResumeAssetStatus,
@@ -395,7 +401,7 @@ class UserJobSubmission(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_user_job_submissions_user_status_updated", "user_id", "status", "updated_at"),
     )
     user_id: Mapped[str] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     input_type: Mapped[SubmissionInputType] = mapped_column(
         Enum(SubmissionInputType, name="job_submission_input_type", **enum_kwargs),
@@ -621,6 +627,63 @@ class ConfirmedProfileVersion(UUIDPrimaryKeyMixin, Base):
     local_sensitive_references: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class JobFeedback(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "job_feedback"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "job_id", "category", name="uq_job_feedback_user_job_category"
+        ),
+        Index("ix_job_feedback_job_status_updated", "job_id", "status", "updated_at"),
+        Index("ix_job_feedback_status_updated", "status", "updated_at"),
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    category: Mapped[JobFeedbackCategory] = mapped_column(
+        Enum(JobFeedbackCategory, name="job_feedback_category", **enum_kwargs),
+        nullable=False,
+    )
+    status: Mapped[JobFeedbackStatus] = mapped_column(
+        Enum(JobFeedbackStatus, name="job_feedback_status", **enum_kwargs),
+        default=JobFeedbackStatus.OPEN,
+        nullable=False,
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class JobFeedbackEvent(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_feedback_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "actor_user_id", "idempotency_key",
+            name="uq_job_feedback_events_actor_key",
+        ),
+        Index("ix_job_feedback_events_feedback_created", "feedback_id", "created_at"),
+    )
+    feedback_id: Mapped[str] = mapped_column(
+        ForeignKey("job_feedback.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[JobFeedbackAction] = mapped_column(
+        Enum(JobFeedbackAction, name="job_feedback_action", **enum_kwargs),
+        nullable=False,
+    )
+    from_status: Mapped[str | None] = mapped_column(String(40))
+    to_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    feedback_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    redacted_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

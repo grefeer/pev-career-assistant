@@ -40,7 +40,16 @@ def get_object_store(request: Request) -> EncryptedObjectStore:
 
 
 def get_redis(request: Request):
-    return request.app.state.redis
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "code": "rate_limit_unavailable",
+                "message": "频率限制服务暂时不可用。",
+            },
+        )
+    return redis_client
 
 
 def get_job_sync_service(request: Request) -> JobSyncService:

@@ -347,6 +347,23 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 `MINIO_CONSOLE_HOST_PORT` 控制。`migrate` 容器退出 0 不是 revision 证明，必须额外执行
 `alembic current` 并看到 `20260717_0005`。
 
+## 职位反馈闭环
+
+- 学生只在已核验职位详情中读取和变更本人反馈：`GET/POST /api/jobs/{job_id}/feedback`。
+- 写请求必须携带 16–128 字符的 `Idempotency-Key`；网络重试必须复用原 key。同 key、同请求重放原响应且不追加事件；同 key、不同请求返回 `409 idempotency_key_reused`。
+- 学生更新和撤回必须提交 `expected_version`。管理员通过 `GET /api/admin/job-feedback` 查看脱敏聚合，通过 `POST /api/admin/job-feedback/{feedback_id}/decision` 执行 `accept/resolve/reject`。
+- 反馈处置绝不改变职位状态。确认职位失效必须另行调用 `/api/admin/jobs/{job_id}/decision`，由 `JobReviewService` 写入 `JobVerification`。
+- 学生和管理员写限额分别为 20/分钟与 60/分钟；Redis 不可用时写操作返回 503。日志和管理员 DTO 不得包含提交者身份、说明原文或幂等 key。
+- schema head 固定为 `20260717_0007`，包含 `job_feedback` 和只追加的 `job_feedback_events`。
+
+反馈专项验收：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/unit/test_job_feedback_service.py tests/contract/test_feedbacks_api.py tests/security/test_no_sensitive_logging.py -q
+.\.venv\Scripts\python.exe -m pytest tests/integration/test_job_feedback_mysql.py tests/integration/test_mysql_migration.py -q -rs
+npm.cmd --prefix frontend run test -- src/features/jobs/__tests__/jobFeedbackApi.spec.ts src/features/jobs/__tests__/JobFeedbackPanel.spec.ts src/features/jobs/__tests__/AdminJobFeedback.spec.ts
+```
+
 ## 测试和发布前门禁
 
 从仓库根目录运行以下门禁。先把根目录和根 `.venv` 解释器解析为绝对路径，再在当前
