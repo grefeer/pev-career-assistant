@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -9,6 +10,7 @@ from sqlalchemy.orm import Session
 from backend.app.api.dependencies import _get_db, get_current_user, get_object_store
 from backend.app.api.profile_schemas import (
     ApplyEvidenceDecisionsRequest,
+    CreateResumeImportRequest,
     CreateProfileVersionRequest,
     EvidenceResponse,
     LocalSensitiveReferenceRequest,
@@ -91,14 +93,24 @@ def _build_evidence_response(
         decision = decisions.get(ev.id)
         status = "pending"
         if decision:
-            status = decision.action.value if hasattr(decision.action, "value") else str(decision.action)
+            action = (
+                decision.action.value
+                if hasattr(decision.action, "value")
+                else str(decision.action)
+            )
+            status = {
+                "confirm": "confirmed",
+                "correct": "corrected",
+                "ignore": "ignored",
+            }[action]
+        diff_action = diff_map.get(ev.field_path)
         result.append(
             EvidenceResponse.from_orm_model(
                 ev,
                 status=status,
-                diff_action=diff_map.get(ev.field_path, {}).value
-                if isinstance(diff_map.get(ev.field_path), object)
-                else diff_map.get(ev.field_path),
+                diff_action=diff_action.value
+                if hasattr(diff_action, "value")
+                else diff_action,
             )
         )
     return result
@@ -188,12 +200,12 @@ def download_resume_asset(
         plaintext = object_store.get(key=asset.object_key)
     except Exception as exc:
         raise _profile_http_error(ObjectStoreUnavailableError("object store read failed")) from exc
-    filename_part = asset.original_filename
+    filename_part = quote(asset.original_filename, safe="")
     return StreamingResponse(
         iter([plaintext]),
         media_type=asset.content_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename_part}"',
+            "Content-Disposition": f"attachment; filename*=UTF-8''{filename_part}",
         },
     )
 
@@ -225,8 +237,6 @@ def create_resume_import(
     current_user: Annotated[User, Depends(get_current_user)],
     object_store: Annotated[EncryptedObjectStore, Depends(get_object_store)],
 ) -> dict[str, Any]:
-    from backend.app.api.profile_schemas import CreateResumeImportRequest
-
     try:
         parsed = CreateResumeImportRequest(**body)
     except Exception as exc:

@@ -22,14 +22,27 @@ const selectedImportId = ref<string | null>(null);
 
 // Track local decisions per evidence ID
 const localDecisions = ref<Map<string, "confirm" | "ignore" | "correct">>(new Map());
+const correctionValues = ref<Map<string, string>>(new Map());
 const fileInput = ref<HTMLInputElement | null>(null);
 
+const selectedEvidence = computed(() =>
+  profile.value?.evidence.filter(
+    (evidence) => evidence.resume_import_id === selectedImportId.value,
+  ) ?? [],
+);
+
 const allDecided = computed(() => {
-  if (!profile.value) return false;
-  return profile.value.evidence.every((ev) => localDecisions.value.has(ev.id));
+  if (selectedEvidence.value.length === 0 || localDecisions.value.size > 0) return false;
+  return selectedEvidence.value.every((evidence) => evidence.status !== "pending");
 });
 
 const hasLocalChanges = computed(() => localDecisions.value.size > 0);
+const canSaveDecisions = computed(() =>
+  Array.from(localDecisions.value.entries()).every(
+    ([evidenceId, action]) =>
+      action !== "correct" || Boolean(correctionValues.value.get(evidenceId)?.trim()),
+  ) && hasLocalChanges.value,
+);
 
 watch(hasLocalChanges, (val) => {
   emit("dirty-change", val);
@@ -110,6 +123,20 @@ function setDecision(evidenceId: string, action: "confirm" | "ignore" | "correct
   localDecisions.value = newMap;
 }
 
+function setCorrection(evidenceId: string, value: string) {
+  const newMap = new Map(correctionValues.value);
+  newMap.set(evidenceId, value);
+  correctionValues.value = newMap;
+}
+
+function parseCorrection(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 async function handleSaveDecisions() {
   if (!profile.value) return;
   try {
@@ -118,7 +145,10 @@ async function handleSaveDecisions() {
       ([evidenceId, action]) => ({
         evidence_id: evidenceId,
         action,
-        corrected_value: null,
+        corrected_value:
+          action === "correct"
+            ? parseCorrection(correctionValues.value.get(evidenceId) ?? "")
+            : null,
       }),
     );
     const result = await profileApi.applyEvidenceDecisions(
@@ -128,6 +158,7 @@ async function handleSaveDecisions() {
     );
     profile.value.version = result.version;
     localDecisions.value = new Map();
+    correctionValues.value = new Map();
     successMessage.value = "校对已保存";
     await loadProfile();
   } catch (error: any) {
@@ -251,7 +282,7 @@ onMounted(() => {
         <button
           class="primary-button"
           data-test="save-decisions"
-          :disabled="loading || !hasLocalChanges"
+          :disabled="loading || !canSaveDecisions"
           @click="handleSaveDecisions"
         >
           保存校对
@@ -265,12 +296,12 @@ onMounted(() => {
           创建确认版本
         </button>
       </div>
-      <div v-if="!profile || profile.evidence.length === 0" class="display-box">
+      <div v-if="!profile || selectedEvidence.length === 0" class="display-box">
         暂无证据。请先上传并解析简历。
       </div>
       <div v-else class="evidence-table">
         <div
-          v-for="ev in profile.evidence"
+          v-for="ev in selectedEvidence"
           :key="ev.id"
           class="evidence-row"
         >
@@ -302,6 +333,7 @@ onMounted(() => {
               忽略
             </button>
             <button
+              :data-test="`decision-correct-${ev.id}`"
               class="decision-btn"
               :class="{ active: localDecisions.get(ev.id) === 'correct' }"
               :disabled="loading"
@@ -310,6 +342,13 @@ onMounted(() => {
               更正
             </button>
           </div>
+          <textarea
+            v-if="localDecisions.get(ev.id) === 'correct'"
+            :data-test="`correction-${ev.id}`"
+            :value="correctionValues.get(ev.id) ?? ''"
+            placeholder="输入更正后的 JSON 或文本"
+            @input="setCorrection(ev.id, ($event.target as HTMLTextAreaElement).value)"
+          />
         </div>
       </div>
     </section>

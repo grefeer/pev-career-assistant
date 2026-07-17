@@ -153,6 +153,12 @@ def test_upload_import_evidence_and_version_lifecycle(
     assert patch.status_code == 200
     new_version = patch.json()["version"]
 
+    reviewed_profile = client.get("/api/profiles", headers=student_headers)
+    assert len(reviewed_profile.json()["evidence"]) == len(evidence)
+    assert {item["status"] for item in reviewed_profile.json()["evidence"]} == {
+        "confirmed"
+    }
+
     # Create confirmed version
     version_resp = client.post(
         "/api/profile-versions",
@@ -186,3 +192,48 @@ def test_upload_import_evidence_and_version_lifecycle(
         ).status_code
         == 404
     )
+
+
+def test_profile_diff_response_tolerates_missing_diff_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    student_headers: dict[str, str],
+) -> None:
+    upload = client.post(
+        "/api/resume-assets",
+        headers=student_headers,
+        files={"file": ("resume.txt", b"Skills\nPython", "text/plain")},
+    )
+    client.post(
+        "/api/resume-imports",
+        headers=student_headers,
+        json={"asset_id": upload.json()["id"]},
+    )
+    from backend.app.api.routes import profiles as profile_routes
+
+    monkeypatch.setattr(profile_routes.profile_repository, "compute_evidence_diff", lambda *_: {})
+    response = client.get("/api/profiles", headers=student_headers)
+
+    assert response.status_code == 200
+    assert all(item["diff_action"] is None for item in response.json()["evidence"])
+
+
+def test_download_uses_sanitized_rfc5987_filename(
+    client: TestClient, student_headers: dict[str, str]
+) -> None:
+    upload = client.post(
+        "/api/resume-assets",
+        headers=student_headers,
+        files={"file": ('résumé "final".txt', b"Skills\nPython", "text/plain")},
+    )
+
+    response = client.get(
+        f"/api/resume-assets/{upload.json()['id']}/download",
+        headers=student_headers,
+    )
+
+    disposition = response.headers["content-disposition"]
+    assert disposition.startswith("attachment; filename*=UTF-8''")
+    disposition.encode("ascii")
+    assert '"' not in disposition
+    assert "\r" not in disposition and "\n" not in disposition

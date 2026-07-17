@@ -21,8 +21,8 @@ def upgrade() -> None:
         "profiles",
         sa.Column("id", sa.String(36), primary_key=True),
         sa.Column("user_id", sa.String(36), sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True),
-        sa.Column("version", sa.Integer(), nullable=False, server_default=sa.text("0")),
-        sa.Column("local_sensitive_references", sa.JSON(), nullable=False, server_default=sa.text("'{}'")),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("local_sensitive_references", sa.JSON(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("user_id", name="uq_profiles_user_id"),
@@ -40,7 +40,7 @@ def upgrade() -> None:
         sa.Column("encryption_version", sa.String(40), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("pending_upload", "ready", "upload_failed", name="resume_asset_status", create_constraint=True),
+            sa.String(14),
             nullable=False,
         ),
         sa.Column("error_code", sa.String(80), nullable=True),
@@ -48,6 +48,10 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("object_key", name="uq_resume_assets_object_key"),
         sa.Index("ix_resume_assets_profile_created", "profile_id", "created_at"),
+        sa.CheckConstraint(
+            "status IN ('pending_upload','ready','upload_failed')",
+            name="resume_asset_status",
+        ),
     )
 
     op.create_table(
@@ -58,7 +62,7 @@ def upgrade() -> None:
         sa.Column("parser_version", sa.String(40), nullable=False),
         sa.Column(
             "status",
-            sa.Enum("pending", "parsing", "awaiting_confirmation", "needs_manual_entry", "failed", name="resume_import_status", create_constraint=True),
+            sa.String(21),
             nullable=False,
         ),
         sa.Column("error_code", sa.String(80), nullable=True),
@@ -67,6 +71,10 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Index("ix_resume_imports_profile_created", "profile_id", "created_at"),
+        sa.CheckConstraint(
+            "status IN ('pending','parsing','awaiting_confirmation','needs_manual_entry','failed')",
+            name="resume_import_status",
+        ),
     )
 
     op.create_table(
@@ -96,12 +104,16 @@ def upgrade() -> None:
         sa.Column("actor_user_id", sa.String(36), nullable=False),
         sa.Column(
             "action",
-            sa.Enum("confirm", "correct", "ignore", name="profile_evidence_decision_action", create_constraint=True),
+            sa.String(7),
             nullable=False,
         ),
         sa.Column("resolved_value", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Index("ix_decisions_evidence_created", "evidence_id", "created_at"),
+        sa.CheckConstraint(
+            "action IN ('confirm','correct','ignore')",
+            name="profile_evidence_decision_action",
+        ),
     )
 
     op.create_table(

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from sqlalchemy import create_engine, inspect, select, func
 from sqlalchemy.orm import Session, sessionmaker
@@ -12,6 +14,7 @@ from backend.app.db.models import (
 )
 from backend.app.domain.profiles import (
     EvidenceCandidate,
+    EvidenceDecisionAction,
     EvidenceDiffAction,
 )
 from backend.app.repositories import profiles
@@ -64,7 +67,20 @@ def test_profile_schema_has_version_and_append_only_tables() -> None:
     assert {"version", "local_sensitive_references"} <= {
         column["name"] for column in inspector.get_columns("profiles")
     }
+    assert "ck_profile_field_evidence_confidence" in {
+        constraint["name"]
+        for constraint in inspector.get_check_constraints("profile_field_evidence")
+    }
     engine.dispose()
+
+
+def test_profile_migration_uses_named_checks_and_application_json_defaults() -> None:
+    source = Path(
+        "alembic/versions/20260717_0005_profile_resume_lifecycle.py"
+    ).read_text(encoding="utf-8")
+
+    assert source.count("sa.CheckConstraint(") == 4
+    assert "server_default" not in source
 
 
 def test_owned_queries_hide_cross_user_rows(
@@ -142,3 +158,36 @@ def test_evidence_diff_reports_add_unchanged_replace_and_conflict(
 
     assert diff2.get("projects") == EvidenceDiffAction.ADD
     assert diff2.get("skills") == EvidenceDiffAction.UNCHANGED
+
+
+def test_profile_evidence_list_does_not_duplicate_append_only_decisions(
+    profile_db: Session, seeded_profiles: tuple[Profile, Profile, ResumeAsset]
+) -> None:
+    owner, _other, asset = seeded_profiles
+    import_row = profiles.create_import(
+        profile_db, asset=asset, parser_version="profile-v1"
+    )
+    evidence = profiles.append_evidence(
+        profile_db,
+        profile_id=owner.id,
+        import_id=import_row.id,
+        candidates=(EvidenceCandidate("skills", ["Python"], "Python", 90),),
+    )[0]
+    profiles.append_decision(
+        profile_db,
+        profile_id=owner.id,
+        evidence_id=evidence.id,
+        actor_user_id=owner.user_id,
+        action=EvidenceDecisionAction.CONFIRM,
+    )
+    profiles.append_decision(
+        profile_db,
+        profile_id=owner.id,
+        evidence_id=evidence.id,
+        actor_user_id=owner.user_id,
+        action=EvidenceDecisionAction.IGNORE,
+    )
+
+    rows = profiles.get_profile_evidence_with_decisions(profile_db, owner.id)
+
+    assert [row.id for row in rows] == [evidence.id]

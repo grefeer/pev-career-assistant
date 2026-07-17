@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from sqlalchemy import select, func
@@ -108,6 +109,15 @@ def update_import_status(
 ) -> None:
     import_row.status = status
     import_row.error_code = error_code
+    now = datetime.now(timezone.utc)
+    if status is ResumeImportStatus.PARSING and import_row.started_at is None:
+        import_row.started_at = now
+    if status in {
+        ResumeImportStatus.AWAITING_CONFIRMATION,
+        ResumeImportStatus.NEEDS_MANUAL_ENTRY,
+        ResumeImportStatus.FAILED,
+    }:
+        import_row.finished_at = now
     db.flush()
 
 
@@ -239,32 +249,24 @@ def list_versions(
 
 def get_profile_evidence_with_decisions(
     db: Session, profile_id: str
-) -> Sequence[dict[str, Any]]:
-    """Return evidence rows with their latest decision status."""
-    import_backref = select(
-        ProfileFieldEvidence.id,
-        ProfileFieldEvidence.resume_import_id,
-        ProfileFieldEvidence.field_path,
-        ProfileFieldEvidence.candidate_value,
-        ProfileFieldEvidence.evidence_excerpt,
-        ProfileFieldEvidence.confidence,
-        ProfileFieldDecision.action,
-        ProfileFieldDecision.resolved_value,
-    ).outerjoin(
-        ProfileFieldDecision,
-        ProfileFieldEvidence.id == ProfileFieldDecision.evidence_id
-    ).where(
-        ProfileFieldEvidence.profile_id == profile_id
-    ).order_by(
-        ProfileFieldEvidence.created_at.desc()
-    )
-    return db.execute(import_backref).all()
+) -> Sequence[ProfileFieldEvidence]:
+    """Return each evidence row once; callers resolve latest decisions separately."""
+    return db.scalars(
+        select(ProfileFieldEvidence)
+        .where(ProfileFieldEvidence.profile_id == profile_id)
+        .order_by(ProfileFieldEvidence.created_at.desc())
+    ).all()
 
 
-def get_evidence_by_id(
-    db: Session, evidence_id: str
+def get_profile_evidence_by_id(
+    db: Session, profile_id: str, evidence_id: str
 ) -> ProfileFieldEvidence | None:
-    return db.get(ProfileFieldEvidence, evidence_id)
+    return db.scalar(
+        select(ProfileFieldEvidence).where(
+            ProfileFieldEvidence.profile_id == profile_id,
+            ProfileFieldEvidence.id == evidence_id,
+        )
+    )
 
 
 def compute_evidence_diff(

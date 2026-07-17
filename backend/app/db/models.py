@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -446,6 +447,10 @@ class ProfileFieldEvidence(UUIDPrimaryKeyMixin, Base):
         ),
         UniqueConstraint(
             "resume_import_id", "sequence", name="uq_evidence_import_sequence"
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 100",
+            name="ck_profile_field_evidence_confidence",
         ),
     )
     profile_id: Mapped[str] = mapped_column(

@@ -155,7 +155,10 @@ class ResumeAssetService:
             return asset
         try:
             metadata = self._object_store.inspect(key=asset.object_key)
-            if metadata.encryption == "v1-aes-256-gcm":
+            if (
+                metadata.encryption == "v1-aes-256-gcm"
+                and metadata.content_type == asset.content_type
+            ):
                 return self.mark_ready(db, asset=asset)
         except Exception:
             pass
@@ -256,8 +259,17 @@ class ProfileService:
             )
 
         for decision_input in decisions:
-            evidence = profile_repository.get_evidence_by_id(
-                db, decision_input.evidence_id
+            if (
+                decision_input.action == EvidenceDecisionAction.CORRECT
+                and decision_input.corrected_value is None
+            ) or (
+                decision_input.action != EvidenceDecisionAction.CORRECT
+                and decision_input.corrected_value is not None
+            ):
+                raise ProfileValidationError("invalid corrected value for decision action")
+
+            evidence = profile_repository.get_profile_evidence_by_id(
+                db, profile.id, decision_input.evidence_id
             )
             if evidence is None:
                 raise OwnedProfileResourceNotFound(
