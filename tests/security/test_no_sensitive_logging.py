@@ -30,8 +30,6 @@ from backend.app.db.base import Base
 from backend.app.db.models import (
     ApplicationTask,
     ApplicationTaskStatus,
-    JobFeedback,
-    JobFeedbackCategory,
     JobPosting,
     JobPostingStatus,
     JobSource,
@@ -671,12 +669,17 @@ def test_feedback_logs_must_not_contain_note_identity_or_idempotency_key(
 
     with _capture_application_logs() as capture:
         response = client.post(
-            "/api/feedbacks",
-            json={"job_id": job_id, "category": "closed", "note": secret_note},
+            f"/api/jobs/{job_id}/feedback",
+            json={
+                "action": "upsert",
+                "category": "closed",
+                "expected_version": None,
+                "note": secret_note,
+            },
             headers=headers,
         )
 
-    assert response.status_code == 201
+        assert response.status_code == 200
     combined = " ".join(capture.formatted)
     assert secret_note not in combined
     assert secret_account not in combined

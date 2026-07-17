@@ -10,7 +10,6 @@ from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base, utc_now
-from sqlalchemy import select
 
 from backend.app.db.models import (
     JobPosting,

@@ -1,4 +1,10 @@
 import pytest
+from pydantic import ValidationError
+
+from backend.app.api.job_submission_schemas import (
+    AdminJobSubmissionDecisionRequest,
+    JobSubmissionCreateRequest,
+)
 
 from backend.app.domain.job_submissions import (
     DuplicateDetector,
@@ -95,14 +101,6 @@ def test_jd_overlap_below_threshold_is_not_a_candidate() -> None:
     assert [item.job_id for item in matches] == ["job-match"]
     assert matches[0].reasons == ("jd_token_overlap",)
     assert matches[0].score_basis_points >= 7200
-
-
-from pydantic import ValidationError
-
-from backend.app.api.job_submission_schemas import (
-    AdminJobSubmissionDecisionRequest,
-    JobSubmissionCreateRequest,
-)
 
 
 def test_create_request_requires_exactly_one_matching_input() -> None:

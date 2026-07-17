@@ -42,6 +42,7 @@ MANUAL_SUBMISSION_TABLES = {
 }
 FEEDBACK_TABLES = {
     "job_feedback",
+    "job_feedback_events",
 }
 
 
@@ -340,7 +341,25 @@ def test_mysql_migration_upgrade_and_downgrade(
             _run_alembic("upgrade", "head", env=env)
             assert FEEDBACK_TABLES <= set(sa.inspect(engine).get_table_names())
             feedback_columns = {col["name"] for col in sa.inspect(engine).get_columns("job_feedback")}
-            assert {"job_id", "user_id", "category", "note", "idempotency_key", "created_at"} <= feedback_columns
+            assert {
+                "job_id", "user_id", "category", "status", "note", "version",
+                "created_at", "updated_at",
+            } <= feedback_columns
+            event_columns = {
+                col["name"]
+                for col in sa.inspect(engine).get_columns("job_feedback_events")
+            }
+            assert {
+                "feedback_id", "actor_user_id", "action", "feedback_version",
+                "redacted_snapshot", "idempotency_key", "created_at",
+            } <= event_columns
+            feedback_inspector = sa.inspect(engine)
+            assert ("user_id", "job_id", "category") in _column_sets(
+                feedback_inspector.get_unique_constraints("job_feedback")
+            )
+            assert ("actor_user_id", "idempotency_key") in _column_sets(
+                feedback_inspector.get_unique_constraints("job_feedback_events")
+            )
             _run_alembic("downgrade", "20260717_0006", env=env)
             assert _current_revision(engine) == "20260717_0006"
             assert "job_feedback" not in sa.inspect(engine).get_table_names()

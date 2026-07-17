@@ -16,8 +16,7 @@ import AdminJobReview from "./features/jobs/AdminJobReview.vue";
 import ProfileWorkspace from "./features/profile/ProfileWorkspace.vue";
 import JobSubmissions from "./features/job-submissions/JobSubmissions.vue";
 import AdminJobSubmissions from "./features/job-submissions/AdminJobSubmissions.vue";
-import JobFeedbackPanel from "./features/feedbacks/JobFeedbackPanel.vue";
-import AdminJobFeedback from "./features/feedbacks/AdminJobFeedback.vue";
+import AdminJobFeedback from "./features/jobs/AdminJobFeedback.vue";
 import type {
   AnalysisResponse,
   HistoryItem,
@@ -41,7 +40,7 @@ const loading = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
 const authMode = ref<"login" | "register">("login");
-type WorkspaceView = "analysis" | "jobs" | "profile" | "job_review" | "job_submissions" | "admin_job_submissions" | "feedbacks" | "admin_feedbacks";
+type WorkspaceView = "analysis" | "jobs" | "profile" | "job_review" | "job_submissions" | "admin_job_submissions" | "admin_feedbacks";
 const workspaceView = ref<WorkspaceView>("analysis");
 const adminReviewDirty = ref(false);
 const profileWorkspaceDirty = ref(false);
@@ -454,9 +453,9 @@ onMounted(() => {
           <button
             type="button"
             data-test="feedbacks-view"
-            :class="{ active: workspaceView === 'feedbacks' || workspaceView === 'admin_feedbacks' }"
-            :aria-current="workspaceView === 'feedbacks' || workspaceView === 'admin_feedbacks' ? 'page' : undefined"
-            @click="selectWorkspace(profile.role === 'admin' ? 'admin_feedbacks' : 'feedbacks')"
+            :class="{ active: workspaceView === 'jobs' || workspaceView === 'admin_feedbacks' }"
+            :aria-current="workspaceView === 'jobs' || workspaceView === 'admin_feedbacks' ? 'page' : undefined"
+            @click="selectWorkspace(profile.role === 'admin' ? 'admin_feedbacks' : 'jobs')"
           >
             职位反馈
           </button>
@@ -479,7 +478,6 @@ onMounted(() => {
           :token="token"
           @dirty-change="adminReviewDirty = $event"
         />
-        <JobFeedbackPanel v-if="workspaceView === 'feedbacks'" :token="token" />
         <AdminJobFeedback
           v-if="workspaceView === 'admin_feedbacks' && profile.role === 'admin'"
           :token="token"
