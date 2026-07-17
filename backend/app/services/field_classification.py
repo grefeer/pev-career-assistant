@@ -2,6 +2,8 @@
 from enum import Enum
 from typing import Any
 
+from backend.app.domain.profiles import validate_local_sensitive_reference
+
 
 class FieldClassification(str, Enum):
     NON_SENSITIVE = "non_sensitive"
@@ -15,7 +17,7 @@ UNKNOWN_FIELD: FieldClassification = FieldClassification.UNKNOWN
 CLASSIFICATION_VERSION = "1.0"
 
 # Top-level field paths → classification
-_FIELD_TABLE: dict[str, FieldClassification] = {
+ALLOWED_FIELDS: dict[str, FieldClassification] = {
     # --- Non-sensitive fields ---
     "name": FieldClassification.NON_SENSITIVE,
     "gender": FieldClassification.NON_SENSITIVE,
@@ -54,7 +56,7 @@ def _top_level_key(path: str) -> str:
 
 def classify_field(path: str) -> FieldClassification:
     """Classify a field path as non_sensitive, local_sensitive, or unknown."""
-    return _FIELD_TABLE.get(_top_level_key(path), FieldClassification.UNKNOWN)
+    return ALLOWED_FIELDS.get(_top_level_key(path), FieldClassification.UNKNOWN)
 
 
 def is_non_sensitive(path: str) -> bool:
@@ -73,14 +75,20 @@ def filter_non_sensitive(facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def extract_local_sensitive_requirements(facts: dict[str, Any]) -> list[dict[str, str]]:
-    """Return semantic references for local-sensitive fields — NO plaintext values."""
+def build_local_sensitive_requirements(references: dict[str, Any]) -> list[dict[str, str]]:
+    """Validate and return existing local-sensitive references from vault metadata.
+
+    Iterates over the vault metadata dict (ConfirmedProfileVersion.local_sensitive_references),
+    validates each reference via validate_local_sensitive_reference(), and passes through
+    valid entries. NEVER generates new references.
+    """
     requirements: list[dict[str, str]] = []
-    for key, classification in _FIELD_TABLE.items():
-        if classification == FieldClassification.LOCAL_SENSITIVE and key in facts:
-            requirements.append({
-                "field_key": key,
-                "category": _top_level_key(key),
-                "local_reference": f"local://{key}",  # irreversible reference
-            })
+    for category, metadata in references.items():
+        reference = metadata.get("reference", "") if isinstance(metadata, dict) else ""
+        validate_local_sensitive_reference(category, reference)
+        requirements.append({
+            "field_key": category,
+            "category": category,
+            "local_reference": reference,
+        })
     return requirements

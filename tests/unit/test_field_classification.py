@@ -5,7 +5,7 @@ from backend.app.services.field_classification import (
     is_non_sensitive,
     is_local_sensitive,
     filter_non_sensitive,
-    extract_local_sensitive_requirements,
+    build_local_sensitive_requirements,
     FieldClassification,
     UNKNOWN_FIELD,
 )
@@ -61,22 +61,29 @@ class TestFilterNonSensitive:
         assert "unknown_field" not in result
 
 
-class TestExtractLocalSensitiveRequirements:
-    def test_extracts_semantic_keys_only(self):
-        facts = {
-            "education": [{"school": "PKU"}],
-            "id_number": "110101199001011234",
-            "family_members": [{"name": "John", "relation": "father"}],
-            "emergency_contact": {"name": "Jane", "phone": "13800000000"},
+class TestBuildLocalSensitiveRequirements:
+    def test_validates_and_passes_through_references(self):
+        references = {
+            "government_id": {
+                "reference": "lsr:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+            },
+            "family_member": {
+                "reference": "lsr:v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "updated_at": "2026-01-02T00:00:00+00:00",
+            },
+            "emergency_contact": {
+                "reference": "lsr:v1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "updated_at": "2026-01-03T00:00:00+00:00",
+            },
         }
-        result = extract_local_sensitive_requirements(facts)
+        result = build_local_sensitive_requirements(references)
         keys = {r["field_key"] for r in result}
-        assert "id_number" in keys
-        assert "family_members" in keys
+        assert "government_id" in keys
+        assert "family_member" in keys
         assert "emergency_contact" in keys
-        assert "education" not in keys
-        # Must NOT contain plaintext values
+        # Must pass through the exact references without generating new ones
         for r in result:
-            assert "110101" not in str(r)
-            assert "John" not in str(r)
-            assert "13800000000" not in str(r)
+            cat = r["field_key"]
+            assert r["local_reference"] == references[cat]["reference"]
+            assert r["category"] == cat
