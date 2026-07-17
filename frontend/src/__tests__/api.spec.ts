@@ -57,6 +57,23 @@ describe("request", () => {
     });
   });
 
+  it("uses detail.code when the API omits a display message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: { code: "stale_job_submission" } }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    const error = await request("/job-submissions/1").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.message).toBe("stale_job_submission");
+  });
+
   it.each([
     { detail: { error_code: "" } },
     { detail: { error_code: "", message: "" } },

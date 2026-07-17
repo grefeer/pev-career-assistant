@@ -32,8 +32,13 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260717_0005"
+HEAD_REVISION = "20260717_0006"
 BUSINESS_TABLES |= PROFILE_TABLES
+MANUAL_SUBMISSION_TABLES = {
+    "user_job_submissions",
+    "job_duplicate_candidates",
+    "job_source_links",
+}
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:
@@ -312,6 +317,23 @@ def test_mysql_migration_upgrade_and_downgrade(
                 json.loads(raw_fields) if isinstance(raw_fields, str) else raw_fields
             )
             assert decoded_raw_fields == original_raw_fields
+
+            # 0006 phase: upgrade, verify, downgrade back to 0005
+            with engine.connect() as connection:
+                seeded_job_count = int(connection.scalar(text("SELECT COUNT(*) FROM job_postings")) or 0)
+            _run_alembic("upgrade", "20260717_0006", env=env)
+            inspector = inspect(engine)
+            assert MANUAL_SUBMISSION_TABLES <= set(inspector.get_table_names())
+            with engine.connect() as connection:
+                assert connection.scalar(text("SELECT COUNT(*) FROM job_source_links")) >= seeded_job_count
+                manual = connection.execute(
+                    text("SELECT provider, enabled FROM job_sources WHERE source_key=:key"),
+                    {"key": "manual-user-submissions"},
+                ).one()
+                assert manual == ("user_submission", 0)
+            _run_alembic("downgrade", "20260717_0005", env=env)
+            assert "user_job_submissions" not in inspect(engine).get_table_names()
+            _run_alembic("upgrade", "head", env=env)
         finally:
             _run_alembic("downgrade", "base", env=env)
             assert _tables(engine) <= ALEMBIC_TABLES

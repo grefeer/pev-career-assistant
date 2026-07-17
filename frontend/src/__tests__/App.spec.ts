@@ -117,6 +117,27 @@ describe("App workspace navigation", () => {
     expect(confirm).toHaveBeenCalledOnce();
   });
 
+  it("guards navigation away from unsaved manual submission input", async () => {
+    const wrapper = mount(App, {
+      global: {
+        stubs: {
+          JobSubmissions: {
+            template: '<section data-test="manual-stub"><button @click="$emit(\'dirty-change\', true)">dirty</button></section>',
+          },
+        },
+      },
+    });
+    await flushPromises();
+    await wrapper.get('[data-test="job-submissions-view"]').trigger("click");
+    await wrapper.get('[data-test="manual-stub"] button').trigger("click");
+
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    await wrapper.get('[data-test="jobs-view"]').trigger("click");
+
+    expect(wrapper.get('[data-test="manual-stub"]').exists()).toBe(true);
+    expect(confirm).toHaveBeenCalledOnce();
+  });
+
   it("does not leave a student on a blank administrator view after logout and role change", async () => {
     const admin = { ...profile, role: "admin" as const };
     apiMocks.fetchMe.mockResolvedValue(admin);

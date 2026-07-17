@@ -23,6 +23,8 @@ from backend.app.db.models import (
 )
 from backend.app.services.job_mappers import BuiltinJobSource, NormalizedJobCandidate
 
+from backend.app.repositories.job_submissions import ensure_tencent_source_link
+
 
 LEASE_DURATION = timedelta(minutes=10)
 
@@ -260,6 +262,7 @@ def upsert_posting(
         if not posting.source_candidate:
             posting.source_candidate = payload
             db.flush()
+        ensure_tencent_source_link(db, posting=posting, source=source)
         return posting, "unchanged"
     source_values: dict[str, Any] = {
         "raw_record_id": raw_record.id,
@@ -287,6 +290,7 @@ def upsert_posting(
         )
         db.add(posting)
         db.flush()
+        ensure_tencent_source_link(db, posting=posting, source=source)
         return posting, "created"
     source_candidate_changed = posting.source_candidate != payload
     for name, value in source_values.items():
@@ -309,6 +313,7 @@ def upsert_posting(
     if source_candidate_changed:
         posting.review_version += 1
     db.flush()
+    ensure_tencent_source_link(db, posting=posting, source=source)
     return posting, "updated"
 
 

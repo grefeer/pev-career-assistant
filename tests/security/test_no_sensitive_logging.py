@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import uuid
 from contextlib import contextmanager
 import logging
 import os
@@ -583,3 +584,34 @@ def test_sensitive_log_capture_detects_indirect_leaks_without_echoing_value(
     with pytest.raises(AssertionError, match="sensitive value detected") as error:
         _assert_safe_log(capture, "capture mutation")
     assert str(error.value) == "sensitive value detected"
+
+
+def _student_headers(client: TestClient) -> dict[str, str]:
+    with client.session_factory() as db:  # type: ignore[attr-defined]
+        user = User(
+            account=f"sec-manual-student-{uuid.uuid4().hex[:8]}",
+            nickname="Sec Manual Student", password_hash="hash",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        auth = AuthService(client.app.state.settings)
+        return {"Authorization": f"Bearer {auth.issue_user_token(user)}"}
+
+
+def test_manual_job_failures_do_not_log_original_jd_or_sensitive_url(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
+    secret_marker = "SECRET-PRIVATE-JD-7788"
+    secret_jd = ("公开职位描述" * 50) + secret_marker
+    unsafe_url = "https://user:token-9988@jobs.example.com/opening"
+    first = client.post(
+        "/api/job-submissions", headers=_student_headers(client),
+        json={"input_type": "jd_text", "jd_text": secret_jd},
+    )
+    second = client.post(
+        "/api/job-submissions", headers=_student_headers(client),
+        json={"input_type": "url", "url": unsafe_url},
+    )
+    combined = caplog.text + first.text + second.text
+    assert secret_marker not in combined
+    assert "token-9988" not in combined
+    assert "unsafe_job_url" in second.text

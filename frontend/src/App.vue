@@ -14,6 +14,8 @@ import {
 import JobCenter from "./features/jobs/JobCenter.vue";
 import AdminJobReview from "./features/jobs/AdminJobReview.vue";
 import ProfileWorkspace from "./features/profile/ProfileWorkspace.vue";
+import JobSubmissions from "./features/job-submissions/JobSubmissions.vue";
+import AdminJobSubmissions from "./features/job-submissions/AdminJobSubmissions.vue";
 import type {
   AnalysisResponse,
   HistoryItem,
@@ -37,10 +39,12 @@ const loading = ref(false);
 const errorMessage = ref("");
 const successMessage = ref("");
 const authMode = ref<"login" | "register">("login");
-type WorkspaceView = "analysis" | "jobs" | "profile" | "job_review";
+type WorkspaceView = "analysis" | "jobs" | "profile" | "job_review" | "job_submissions" | "admin_job_submissions";
 const workspaceView = ref<WorkspaceView>("analysis");
 const adminReviewDirty = ref(false);
 const profileWorkspaceDirty = ref(false);
+const manualSubmissionDirty = ref(false);
+const adminSubmissionDirty = ref(false);
 
 const authForm = reactive({
   account: "",
@@ -227,7 +231,20 @@ function onFileChange(event: Event) {
 }
 
 function selectWorkspace(next: WorkspaceView) {
-  if (next === "job_review" && profile.value?.role !== "admin") return;
+  if ((next === "job_review" || next === "admin_job_submissions") && profile.value?.role !== "admin") return;
+  const hasDirtyManualWorkspace =
+    (workspaceView.value === "job_submissions" && manualSubmissionDirty.value)
+    || (
+      workspaceView.value === "admin_job_submissions"
+      && adminSubmissionDirty.value
+    );
+  if (
+    next !== workspaceView.value
+    && hasDirtyManualWorkspace
+    && !window.confirm("当前手动职位草稿尚未保存，确定离开吗？")
+  ) {
+    return;
+  }
   if (
     workspaceView.value === "job_review"
     && next !== "job_review"
@@ -248,6 +265,18 @@ function selectWorkspace(next: WorkspaceView) {
 }
 
 function logout() {
+  const hasDirtyManualWorkspace =
+    (workspaceView.value === "job_submissions" && manualSubmissionDirty.value)
+    || (
+      workspaceView.value === "admin_job_submissions"
+      && adminSubmissionDirty.value
+    );
+  if (
+    hasDirtyManualWorkspace
+    && !window.confirm("当前手动职位草稿尚未保存，确定退出吗？")
+  ) {
+    return;
+  }
   if (
     workspaceView.value === "job_review"
     && adminReviewDirty.value
@@ -258,6 +287,8 @@ function logout() {
   workspaceView.value = "analysis";
   adminReviewDirty.value = false;
   profileWorkspaceDirty.value = false;
+  manualSubmissionDirty.value = false;
+  adminSubmissionDirty.value = false;
   token.value = "";
   profile.value = null;
   sessions.value = [];
@@ -272,9 +303,13 @@ function logout() {
 watch(
   () => profile.value?.role,
   (role) => {
-    if (role !== "admin" && workspaceView.value === "job_review") {
+    if (
+      role !== "admin"
+      && (workspaceView.value === "job_review" || workspaceView.value === "admin_job_submissions")
+    ) {
       workspaceView.value = "analysis";
       adminReviewDirty.value = false;
+      adminSubmissionDirty.value = false;
     }
     if (!profile.value) workspaceView.value = "analysis";
   },
@@ -419,6 +454,25 @@ onMounted(() => {
             我的档案
           </button>
           <button
+            type="button"
+            data-test="job-submissions-view"
+            :class="{ active: workspaceView === 'job_submissions' }"
+            :aria-current="workspaceView === 'job_submissions' ? 'page' : undefined"
+            @click="selectWorkspace('job_submissions')"
+          >
+            职位提交
+          </button>
+          <button
+            v-if="profile.role === 'admin'"
+            type="button"
+            data-test="admin-job-submissions-view"
+            :class="{ active: workspaceView === 'admin_job_submissions' }"
+            :aria-current="workspaceView === 'admin_job_submissions' ? 'page' : undefined"
+            @click="selectWorkspace('admin_job_submissions')"
+          >
+            提交审核
+          </button>
+          <button
             v-if="profile.role === 'admin'"
             type="button"
             data-test="job-review-view"
@@ -440,6 +494,16 @@ onMounted(() => {
           v-if="workspaceView === 'job_review' && profile.role === 'admin'"
           :token="token"
           @dirty-change="adminReviewDirty = $event"
+        />
+        <JobSubmissions
+          v-if="workspaceView === 'job_submissions'"
+          :token="token"
+          @dirty-change="manualSubmissionDirty = $event"
+        />
+        <AdminJobSubmissions
+          v-if="workspaceView === 'admin_job_submissions' && profile.role === 'admin'"
+          :token="token"
+          @dirty-change="adminSubmissionDirty = $event"
         />
 
         <div

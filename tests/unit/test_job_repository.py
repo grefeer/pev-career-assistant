@@ -13,6 +13,7 @@ from backend.app.db.base import Base, utc_now
 from backend.app.db.models import (
     JobPosting,
     JobPostingStatus,
+    JobSourceLink,
     JobSyncRun,
     JobSyncRunStatus,
     JobVerification,
@@ -848,6 +849,17 @@ def test_acquire_rejects_missing_or_disabled_source(db: Session) -> None:
     db.flush()
     with pytest.raises(jobs.SourceDisabledError):
         jobs.acquire_sync_run(db, source.id, now=utc_now())
+
+
+def test_tencent_upsert_creates_one_stable_source_link(db: Session) -> None:
+    source = seeded_source(db)
+    raw = snapshot(db, source_id=source.id, external_record_id="r-link", payload_hash="a" * 64)
+    posting, _ = jobs.upsert_posting(db, source=source, raw_record=raw, candidate=candidate())
+    posting_again, _ = jobs.upsert_posting(db, source=source, raw_record=raw, candidate=candidate())
+    links = db.scalars(select(JobSourceLink).where(JobSourceLink.job_id == posting.id)).all()
+    assert posting_again.id == posting.id
+    assert len(links) == 1
+    assert links[0].source_record_ref == f"{source.id}:r-link"
 
 
 def test_finishing_requires_matching_lease_owner(db: Session) -> None:
