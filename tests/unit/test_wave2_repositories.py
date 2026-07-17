@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import ANY
 
 import pytest
 from sqlalchemy import create_engine, update as sql_update
@@ -11,9 +10,7 @@ from sqlalchemy.orm import Session
 from backend.app.db.base import Base
 from backend.app.db.models import (
     AnalysisSession,
-    ApprovedResumeAttachment,
     ApprovedResumeVersion,
-    ApplicationSnapshot,
     ConfirmedProfileVersion,
     JobPosting,
     JobPostingStatus,
@@ -257,7 +254,7 @@ class TestMatchRepository:
         user = _user(db)
         _sess, job, jv, cv, r1 = _seed_match_scaffold(db, user)
         # Create a second report for same user
-        r2 = match_repo.create(
+        _r2 = match_repo.create(
             db,
             **_report_kwargs(
                 user.id, _sess.id, job.id, jv.id, cv.id,
@@ -373,7 +370,7 @@ class TestDraftRepository:
     def test_list_by_user(self, db: Session) -> None:
         user = _user(db)
         _job, _cv, report, d1 = _seed_draft_scaffold(db, user)
-        d2 = draft_repo.create(
+        _d2 = draft_repo.create(
             db,
             **_draft_kwargs(
                 user.id, report.id, _cv.id, _job.id,
@@ -607,14 +604,14 @@ class TestSnapshotRepository:
         db.add(arv)
         db.flush()
 
-        s1 = snapshot_repo.create(
+        _s1 = snapshot_repo.create(
             db,
             **_snapshot_kwargs(
                 user.id, _job.id, arv.id, cv.id,
                 **{"request_idempotency_key": "ik-s1", "request_hash": "h1"},
             ),
         )
-        s2 = snapshot_repo.create(
+        _s2 = snapshot_repo.create(
             db,
             **_snapshot_kwargs(
                 user.id, _job.id, arv.id, cv.id,

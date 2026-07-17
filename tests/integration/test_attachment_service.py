@@ -20,8 +20,6 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
     ApprovedResumeAttachment,
-    ApprovedResumeVersion,
-    ResumeDraft,
     User,
 )
 from backend.app.services.attachment_service import (
@@ -553,8 +551,6 @@ def test_real_s3_attachment_round_trip(
 
     draft_id = str(uuid.uuid4())
     arv_id = str(uuid.uuid4())
-
-    object_key = f"integration/{uuid.uuid4().hex}/attachments"
 
     attachments = generate_and_store_attachments(
         db=db_session,

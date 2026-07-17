@@ -45,7 +45,7 @@ from backend.app.db.models import (
 from backend.app.repositories import drafts as drafts_repo
 from backend.app.repositories.drafts import StaleDraftVersionError
 from backend.app.services.resume_draft_service import ResumeDraftService
-from backend.app.services.storage import ENCRYPTION_VERSION, EncryptedObjectStore
+from backend.app.services.storage import EncryptedObjectStore
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -677,8 +677,6 @@ class TestApproveDraft:
         service = self._service()
 
         # Patch put to fail on first call
-        original_put = object_store.put
-
         def failing_put(*, key, plaintext, content_type):
             raise RuntimeError("storage unavailability")
 

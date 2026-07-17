@@ -71,6 +71,7 @@ class ResumeDraftService:
 
     def __init__(self, draft_generator: DraftGenerator | None = None) -> None:
         self.draft_generator = draft_generator
+        self.repo = drafts_repo
 
     # ------------------------------------------------------------------
     # create_draft
@@ -120,7 +121,7 @@ class ResumeDraftService:
         # --- 3. Create ``generating`` draft (short tx, then commit) ----------
         draft_id = str(uuid.uuid4())
         try:
-            draft = drafts_repo.create(
+            _draft = drafts_repo.create(
                 db,
                 id=draft_id,
                 user_id=user_id,
