@@ -145,6 +145,13 @@ class EncryptedObjectStore:
             raise InvalidTag
         return self._cipher.decrypt(nonce, ciphertext, key.encode("utf-8"))
 
+    def delete(self, key: str) -> None:
+        """Delete an encrypted object. Idempotent -- no error if key doesn't exist."""
+        try:
+            self._blob_store.delete(key=key)
+        except FileNotFoundError:
+            pass  # already deleted
+
     def inspect(self, *, key: str) -> StoredObjectMetadata:
         head = self._blob_store.head(key=key)
         metadata = head.get("Metadata", {})
