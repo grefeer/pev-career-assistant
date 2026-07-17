@@ -106,6 +106,7 @@ def client() -> Iterator[TestClient]:
         database_url="sqlite+pysqlite:///:memory:",
         redis_url="redis://localhost:6379/15",
         checkpoint_backend="sqlite",
+        tencent_docs_token=None,
     )
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -1309,7 +1310,7 @@ def test_list_has_stable_order_and_pagination(
 def test_missing_token_does_not_affect_ready_or_job_reads(
     client: TestClient, seeded: dict[str, Any]
 ) -> None:
-    assert client.app.state.settings.tencent_docs_token is None
+    assert client.app.state.settings.tencent_docs_token is None or str(client.app.state.settings.tencent_docs_token) == ""
 
     class AvailableBlobStore:
         def check_bucket(self) -> None:

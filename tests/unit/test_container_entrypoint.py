@@ -191,7 +191,7 @@ def test_compose_declares_revision_and_respects_configured_host_ports() -> None:
     config: dict[str, Any] = json.loads(completed.stdout)
 
     assert config["services"]["migrate"]["labels"] == {
-        "com.career-assistant.schema-revision": "20260717_0007"
+        "com.career-assistant.schema-revision": "20260718_0008"
     }
     expected_ports = {
         "mysql": ("13306", 3306),

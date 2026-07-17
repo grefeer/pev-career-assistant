@@ -190,6 +190,7 @@ class ResumeDraftService:
         draft_id: str,
         expected_version: int,
         object_store: EncryptedObjectStore,
+        idempotency_key: str,
     ) -> ApprovedResumeVersion:
         """Approve a draft, generate PDF/DOCX attachments, persist version.
 
@@ -290,6 +291,7 @@ class ResumeDraftService:
                 target_job_id=draft.target_job_id,
                 approved_facts=facts,
                 approved_diffs=diffs,
+                approval_idempotency_key=idempotency_key,
                 approved_by=user_id,
             )
             db.add(arv)

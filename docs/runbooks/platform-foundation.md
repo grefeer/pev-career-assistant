@@ -440,6 +440,9 @@ $env:TEST_S3_ACCESS_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_USER
 $env:TEST_S3_SECRET_KEY = [Environment]::GetEnvironmentVariable('MINIO_ROOT_PASSWORD', 'User')
 $env:TEST_S3_BUCKET = 'career-assistant-storage-test'
 $env:TEST_TENCENT_DOCS_TOKEN = [Environment]::GetEnvironmentVariable('TEST_TENCENT_DOCS_TOKEN', 'User')
+if ([string]::IsNullOrWhiteSpace($env:TEST_TENCENT_DOCS_TOKEN)) {
+  $env:TEST_TENCENT_DOCS_TOKEN = [Environment]::GetEnvironmentVariable('TENCENT_DOCS_TOKEN', 'User')
+}
 $env:ALLOW_DESTRUCTIVE_MYSQL_TESTS = '1'
 ```
 
@@ -447,7 +450,8 @@ $env:ALLOW_DESTRUCTIVE_MYSQL_TESTS = '1'
 该开关，再读取 `TEST_MYSQL_URL`，并拒绝空 URL、非 MySQL 后端和数据库名不以 `_test`
 结尾的连接。缺少开关或 URL 时测试按精确变量名 skip；配置了不安全值时直接失败。只可
 使用 `career_assistant_test` 这类隔离 schema，严禁把业务库 URL 复用为测试 URL。
-`TEST_TENCENT_DOCS_TOKEN` 仅用于测试环境中的真实腾讯只读门禁。
+`TEST_TENCENT_DOCS_TOKEN` 仅用于测试环境中的真实腾讯只读门禁。未单独配置时，测试会回退使用
+`TENCENT_DOCS_TOKEN`；两者都只从环境变量读取，禁止写入仓库、命令参数或日志。
 
 运行全部门禁：
 

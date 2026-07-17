@@ -33,7 +33,7 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "20260717_0007"
+HEAD_REVISION = "7b757ef17d3f"
 BUSINESS_TABLES |= PROFILE_TABLES
 MANUAL_SUBMISSION_TABLES = {
     "user_job_submissions",
@@ -44,6 +44,16 @@ FEEDBACK_TABLES = {
     "job_feedback",
     "job_feedback_events",
 }
+MATCH_TABLES = {
+    "match_reports",
+    "resume_drafts",
+    "approved_resume_versions",
+    "approved_resume_attachments",
+    "application_snapshots",
+}
+BUSINESS_TABLES |= MANUAL_SUBMISSION_TABLES
+BUSINESS_TABLES |= FEEDBACK_TABLES
+BUSINESS_TABLES |= MATCH_TABLES
 
 
 def _alembic_env(database_url: str) -> dict[str, str]:

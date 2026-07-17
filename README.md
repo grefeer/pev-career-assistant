@@ -11,14 +11,15 @@
 
 - 用户可以注册 / 登录并拥有自己的分析空间
 - 用户可以创建多个分析会话并基于 `thread_id` 持续追踪状态
-- 用户可以输入求职目标、粘贴简历或上传简历文件
-- 系统会并行分析多个岗位、评估简历匹配度、在必要时触发简历优化回路
-- 最终输出结构化岗位分析结果与自然语言求职建议
+- 用户可以从已核验职位、已确认档案版本出发生成证据化匹配报告
+- 用户可以审查定制简历草稿、批准附件并创建不可变投递快照
+- 管理员可以同步、补全、审核和核验真实职位来源
 
 ## 核心亮点
 
 - 真实场景驱动：围绕“找第一段实习”设计业务流程，而不是泛化聊天
-- 多智能体协作：`Supervisor`、`Job Analyst`、`Resume Reviewer`、`Resume Optimizer`、`Career Coach`
+- 证据化匹配：Web 路径基于 MySQL 中已核验职位和已确认档案版本
+- 多智能体协作：CLI 演示仍保留 `Supervisor`、`Job Analyst`、`Resume Reviewer`、`Resume Optimizer`、`Career Coach`
 - `LangGraph` 核心能力完整落地：`Command`、`Send`、子图、状态聚合、低分回路、checkpoint
 - 多模型分工：支持按角色分配不同模型，兼顾效果与成本
 - `Redis 8 checkpoint`：支持自定义 `thread_id`、跨实例会话恢复和历史快照读取
@@ -98,10 +99,6 @@
 │       └── types.ts
 ├── docs
 │   └── graph-overview.svg
-├── data
-│   ├── jobs.json
-│   ├── sample_resume.md
-│   └── sample_resume.pdf
 └── src
     ├── __init__.py
     ├── agents.py
@@ -112,7 +109,12 @@
     ├── prompts.py
     ├── resume_parser.py
     ├── session_service.py
-    └── utils.py
+    ├── utils.py
+    └── cli
+        └── data
+            ├── jobs.json
+            ├── sample_resume.md
+            └── sample_resume.pdf
 ```
 
 ## 后端能力（FastAPI）
@@ -133,16 +135,19 @@
 - `POST /api/sessions/{thread_id}/activate`
 - `GET /api/sessions/{thread_id}`
 - `GET /api/sessions/{thread_id}/history`
-- `POST /api/analysis/run`
+- `POST /api/matches`
+- `POST /api/resume-drafts`
+- `POST /api/resume-drafts/{draft_id}/approve`
+- `POST /api/application-snapshots`
 - `GET /api/health`
 
 后端职责：
 
 - 用户认证与 MySQL 账户管理
 - 会话与 `thread_id` 管理
-- 调用 LangGraph 图执行求职分析
+- 基于已核验职位和已确认档案版本生成证据化匹配报告
 - 读取 Redis 8 checkpoint 当前状态与历史快照（开发环境可选 SQLite）
-- 处理 `txt / md / pdf` 简历上传
+- 处理简历资产、档案确认、定制草稿、批准附件和投递快照
 
 ## 前端能力（Vue）
 
@@ -151,10 +156,10 @@
 - 注册 / 登录
 - 查看并切换历史会话
 - 新建分析会话
-- 输入求职目标和用户消息
-- 粘贴简历文本或上传简历文件
-- 启动新分析 / 继续历史会话
-- 查看最终报告
+- 查看职位、档案、匹配、定制简历和投递快照
+- 上传简历资产并确认档案事实
+- 基于已核验职位启动证据化匹配
+- 审查定制简历草稿并创建投递快照
 - 查看当前会话摘要
 - 查看历史快照
 - 查看岗位分析结果和当前轮匹配结果

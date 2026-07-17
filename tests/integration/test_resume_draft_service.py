@@ -602,6 +602,7 @@ class TestApproveDraft:
             draft_id=draft_in_draft_status.id,
             expected_version=0,
             object_store=object_store,
+            idempotency_key=str(uuid.uuid4()),
         )
 
         # Verify ARV
@@ -651,6 +652,7 @@ class TestApproveDraft:
             draft_id=draft_in_draft_status.id,
             expected_version=0,
             object_store=object_store,
+            idempotency_key=str(uuid.uuid4()),
         )
 
         # Draft is now "approved". Call again.
@@ -660,6 +662,7 @@ class TestApproveDraft:
             draft_id=draft_in_draft_status.id,
             expected_version=1,
             object_store=object_store,
+            idempotency_key=str(uuid.uuid4()),
         )
 
         assert second.id == first.id
@@ -688,6 +691,7 @@ class TestApproveDraft:
                     draft_id=draft_in_draft_status.id,
                     expected_version=0,
                     object_store=object_store,
+                    idempotency_key=str(uuid.uuid4()),
                 )
 
         # Verify draft unchanged
@@ -732,6 +736,7 @@ class TestApproveDraft:
                     draft_id=draft_in_draft_status.id,
                     expected_version=0,
                     object_store=object_store,
+                    idempotency_key=str(uuid.uuid4()),
                 )
 
         # Verify draft unchanged
@@ -780,6 +785,7 @@ class TestApproveDraft:
             target_job_id=draft_in_draft_status.target_job_id,
             approved_facts=SAMPLE_FACTS,
             approved_diffs=[],
+            approval_idempotency_key=str(uuid.uuid4()),
             approved_by=user.id,
         )
         db_session.add(existing_arv)
@@ -793,6 +799,7 @@ class TestApproveDraft:
             draft_id=draft_in_draft_status.id,
             expected_version=0,
             object_store=object_store,
+            idempotency_key=str(uuid.uuid4()),
         )
 
         # Should return the existing ARV, not raise
@@ -825,6 +832,7 @@ class TestApproveDraft:
                 draft_id=draft_in_draft_status.id,
                 expected_version=99,  # wrong version
                 object_store=object_store,
+                idempotency_key=str(uuid.uuid4()),
             )
 
     # -- Scenario 12: Cross-user access ------------------------------------
@@ -854,6 +862,7 @@ class TestApproveDraft:
                 draft_id=draft_in_draft_status.id,
                 expected_version=0,
                 object_store=object_store,
+                idempotency_key=str(uuid.uuid4()),
             )
 
 
@@ -940,6 +949,7 @@ class TestRejectDraft:
             draft_id=draft_in_draft_status.id,
             expected_version=0,
             object_store=object_store,
+            idempotency_key=str(uuid.uuid4()),
         )
 
         # Now try to reject

@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     trusted_proxy_cidrs: str = ""
     tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
+    test_tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
 
     @property
     def is_production(self) -> bool:
@@ -53,6 +54,10 @@ class Settings(BaseSettings):
         return [
             value.strip() for value in self.cors_origins.split(",") if value.strip()
         ]
+
+    @property
+    def effective_test_tencent_docs_token(self) -> SecretStr | None:
+        return self.test_tencent_docs_token or self.tencent_docs_token
 
     @field_validator("app_auth_secret")
     @classmethod

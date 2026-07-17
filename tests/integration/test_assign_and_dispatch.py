@@ -338,6 +338,7 @@ def approved_resume_version(
         target_job_id=draft_in_draft_status.target_job_id,
         approved_facts=SAMPLE_FACTS,
         approved_diffs=SAMPLE_DIFFS,
+        approval_idempotency_key=str(uuid.uuid4()),
         approved_by=test_user.id,
     )
     db_session.add(arv)

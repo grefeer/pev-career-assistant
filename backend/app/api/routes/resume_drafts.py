@@ -138,6 +138,7 @@ def approve_draft(
             draft_id=draft_id,
             expected_version=req.expected_version,
             object_store=object_store,
+            idempotency_key=idempotency_key,
         )
     except ValueError as e:
         code = str(e)

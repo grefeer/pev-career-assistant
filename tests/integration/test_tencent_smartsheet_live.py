@@ -24,9 +24,17 @@ from backend.app.repositories import jobs
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
 SOURCE_KEYS = ("tencent-27-referrals", "tencent-intern-referrals")
+
+
+def _live_tencent_token() -> str | None:
+    return os.environ.get("TEST_TENCENT_DOCS_TOKEN") or os.environ.get(
+        "TENCENT_DOCS_TOKEN"
+    )
+
+
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("TEST_TENCENT_DOCS_TOKEN"),
-    reason="requires TEST_TENCENT_DOCS_TOKEN",
+    not _live_tencent_token(),
+    reason="requires TEST_TENCENT_DOCS_TOKEN or TENCENT_DOCS_TOKEN",
 )
 
 
@@ -97,9 +105,7 @@ def test_live_tencent_sources_sync_read_only_and_idempotently(
             db.add(admin)
             db.commit()
 
-            gateway = TencentSmartsheetGateway(
-                token=os.environ["TEST_TENCENT_DOCS_TOKEN"]
-            )
+            gateway = TencentSmartsheetGateway(token=_live_tencent_token() or "")
             service = JobSyncService(gateway)
             first_outcomes = {}
             for source_key in SOURCE_KEYS:

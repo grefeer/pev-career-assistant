@@ -556,6 +556,7 @@ class TestSnapshotRepository:
             target_job_id=_job.id,
             approved_facts={},
             approved_diffs={},
+            approval_idempotency_key="ik-arv-repo-1",
             approved_by=user.id,
         )
         db.add(arv)
@@ -579,6 +580,7 @@ class TestSnapshotRepository:
             target_job_id=_job.id,
             approved_facts={},
             approved_diffs={},
+            approval_idempotency_key="ik-arv-repo-2",
             approved_by=alice.id,
         )
         db.add(arv)
@@ -599,6 +601,7 @@ class TestSnapshotRepository:
             target_job_id=_job.id,
             approved_facts={},
             approved_diffs={},
+            approval_idempotency_key="ik-arv-repo-3",
             approved_by=user.id,
         )
         db.add(arv)
@@ -631,6 +634,7 @@ class TestSnapshotRepository:
             target_job_id=_job.id,
             approved_facts={},
             approved_diffs={},
+            approval_idempotency_key="ik-arv-repo-4",
             approved_by=alice.id,
         )
         db.add(arv)

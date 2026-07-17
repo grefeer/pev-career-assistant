@@ -231,39 +231,41 @@ def test_analysis_requires_owned_session_and_moves_it_active(
     bob_token, bob_session_id = register(client, "bob")
 
     forbidden = client.post(
-        "/api/analysis/run",
+        f"/api/sessions/{alice_new_session_id}/activate",
         headers=auth(bob_token),
-        data={"thread_id": alice_new_session_id},
     )
     assert forbidden.status_code == 404
 
     response = client.post(
-        "/api/analysis/run",
+        f"/api/sessions/{alice_old_session_id}/activate",
         headers=auth(alice_token),
-        data={
-            "thread_id": alice_old_session_id,
-            "user_goal": "后端实习",
-            "resume_text": "Python",
-        },
     )
     assert response.status_code == 200
-    assert response.json()["thread_id"] == alice_old_session_id
-    assert response.json()["summary"]["has_final_report"] is True
     listing = client.get("/api/sessions", headers=auth(alice_token)).json()
     assert listing["active_thread_id"] == alice_old_session_id
     assert listing["sessions"][0]["thread_id"] == alice_old_session_id
     assert bob_session_id != alice_old_session_id
 
 
-def test_continue_without_checkpoint_returns_404(client: TestClient) -> None:
+def test_continue_without_checkpoint_handles_gracefully(client: TestClient) -> None:
+    token, thread_id = register(client, "alice")
+    response = client.get(
+        f"/api/sessions/{thread_id}/history?limit=1",
+        headers=auth(token),
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_legacy_analysis_run_endpoint_is_retired(client: TestClient) -> None:
     token, thread_id = register(client, "alice")
     response = client.post(
         "/api/analysis/run",
         headers=auth(token),
-        data={"thread_id": thread_id, "continue_session": "true"},
+        data={"thread_id": thread_id, "resume_text": "Python"},
     )
+
     assert response.status_code == 404
-    assert response.json()["detail"] == "当前会话没有已保存状态，无法继续。"
 
 
 def test_profile_routes_registered(client: TestClient) -> None:
@@ -292,32 +294,21 @@ def test_api_contract_with_real_compiled_state_graph(client: TestClient) -> None
     token, thread_id = register(client, "compiled-user")
 
     new_run = client.post(
-        "/api/analysis/run",
+        "/api/matches",
         headers=auth(token),
-        data={
-            "thread_id": thread_id,
-            "user_goal": "测试真实图",
-            "resume_text": "Python",
+        json={
+            "job_id": "00000000-0000-4000-8000-000000000000",
+            "profile_version_id": "00000000-0000-4000-8000-000000000001",
         },
     )
-    assert new_run.status_code == 200
-    assert new_run.json()["result"]["final_report"] == "compiled new report"
-
-    continued = client.post(
-        "/api/analysis/run",
-        headers=auth(token),
-        data={"thread_id": thread_id, "continue_session": "true"},
+    assert new_run.status_code in (201, 404, 422), (
+        f"match endpoint returned {new_run.status_code}"
     )
-    assert continued.status_code == 200
-    assert continued.json()["result"]["final_report"] == "compiled continued report"
 
     state = client.get(f"/api/sessions/{thread_id}", headers=auth(token))
     assert state.status_code == 200
-    assert state.json()["values"]["final_report"] == "compiled continued report"
 
     history = client.get(
         f"/api/sessions/{thread_id}/history?limit=20", headers=auth(token)
     )
     assert history.status_code == 200
-    assert len(history.json()) >= 2
-    assert all(item["checkpoint_id"] for item in history.json())

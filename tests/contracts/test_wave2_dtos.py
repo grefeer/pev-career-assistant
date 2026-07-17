@@ -20,8 +20,9 @@ class TestVerifiedJobSnapshot:
             verified_at=datetime.now(timezone.utc),
             review_version=1,
             source_links=[],
+            job_verification_id="jv-001",
         )
-        data = json.loads(json.dumps(snapshot, default=str))
+        data = json.loads(json.dumps(snapshot.__dict__, default=str))
         assert data["job_id"] == "job-001"
         assert data["gui_eligible"] is True
 
@@ -41,6 +42,7 @@ class TestVerifiedJobSnapshot:
             verified_at=datetime.now(timezone.utc),
             review_version=2,
             source_links=[],
+            job_verification_id="jv-002",
         )
         assert snapshot.gui_eligible is False
         assert snapshot.apply_url is None

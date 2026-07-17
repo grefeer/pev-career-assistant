@@ -46,3 +46,8 @@ Task 6.2: complete (commits 89971ff..7573f2d, Pydantic discriminator fix + Ruff 
 Task 6.3: complete (all 9 security/privacy gates pass)
 Task 6.4: complete (E2E script created, chain verified)
 Task 6.5: complete (cleanup — data.json migrated, docs updated, web paths clean)
+Task 6.6: complete (commits 88a46d0..db31883, final review fixes applied)
+
+Phase 6 summary: 6/6 tasks complete — analysis removal, test gates (712 pass), security gates (9/9), E2E, cleanup, final review fixes
+
+WAVE 2 COMPLETE — 7 phases, ~28 tasks, ~712 backend + 78 frontend tests pass

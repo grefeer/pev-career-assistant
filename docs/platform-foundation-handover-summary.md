@@ -1,15 +1,17 @@
 # 平台基础与权威数据实施交接总结
 
-> 更新时间：2026-07-16
+> 更新时间：2026-07-17
 > 对应分支：`master`
-> 代码基线：`e29c6e0`（功能完成提交：`4bc4979`）
+> 代码基线：`db31883`（Alembic head：`7b757ef17d3f`）
 > 适用读者：后端、前端、GUI Agent、测试和运维开发人员
 
-> 文档状态：当前交接摘要。本文覆盖 `20260715_0003` 真实职位同步和
-> `20260716_0004` 职位补全、审核、核验纵向闭环；旧的 `pending_completion` 公开读取
-> 与“审核尚未交付”描述已失效。当前行为以本文、[README](../README.md)、
+> 文档状态：当前交接摘要。已完成迁移 `0001` 至 `0008`（含 hotfix
+> `7b757ef17d3f`），覆盖平台基础、职位同步与审核、个人资料与简历生命周期、
+> 手动 JD 导入与去重、职位反馈闭环、证据化匹配、定制简历与投递快照。
+> Wave 1 并行工作流（A/B/C/D）和 Wave 2 集成工作流（E）均已交付。
+> 当前行为以本文、[README](../README.md)、
 > [平台基础运行手册](./runbooks/platform-foundation.md)和
-> [职位补全与审核实施计划](./superpowers/plans/2026-07-16-job-completion-review-vertical-slice.md)
+> [MVP 并行交付设计](./superpowers/specs/2026-07-16-mvp-parallel-delivery-design.md)
 > 为准。
 
 ## 1. 一句话说明
@@ -76,10 +78,15 @@ flowchart LR
 
 迁移版本：
 
-- `20260714_0001_platform_foundation.py`：平台基础表结构。
-- `20260715_0002_device_credentials.py`：设备凭据过期与轮换字段。
-- `20260715_0003_real_job_sync.py`：职位来源、原始快照、同步运行和职位记录表。
-- `20260716_0004_job_completion_review.py`：职位审核生命周期、人工规范字段、乐观版本和不可变核验事件。
+- `20260714_0001`：平台基础表结构（用户、会话、设备、任务、审计）。
+- `20260715_0002`：设备凭据过期与轮换字段。
+- `20260715_0003`：职位来源、原始快照、同步运行和职位记录表。
+- `20260716_0004`：职位审核生命周期、人工规范字段、乐观版本和不可变核验事件。
+- `20260717_0005`：个人资料与简历生命周期（Profile、ResumeAsset、ResumeImport、ProfileFieldEvidence、ProfileFieldDecision、ConfirmedProfileVersion）。
+- `20260717_0006`：手动 JD 导入与去重（UserJobSubmission、JobDuplicateCandidate、JobSourceLink）。
+- `20260717_0007`：职位反馈闭环（JobFeedback、JobFeedbackEvent）。
+- `20260718_0008`：证据化匹配、定制简历与投递快照（MatchReport、ResumeDraft、ApprovedResumeVersion、ApprovedResumeAttachment、ApplicationSnapshot）。
+- `7b757ef17d3f`：修复 MatchReport 状态 CHECK 约束（允许 pending/running 状态）。
 
 ### 3.3 用户认证和授权
 
@@ -198,17 +205,25 @@ flowchart LR
 
 后续开发人员不要把下列能力视为已经交付：
 
-- 学生自行提交来源或补全职位的工作流；管理员职位补全与核验工作流已经交付。
-- 用户手动添加 JD 链接或文本，并与已同步职位执行统一去重。
-- 完整简历生命周期：Word 支持、复杂格式解析、在线纠错、版本管理和加密对象引用；现有文本/PDF 分析入口不等于该生命周期已经交付。
-- 分析工作台仍从 `data/jobs.json` 使用演示职位，尚未把 `verified` MySQL 职位接入 LangGraph 匹配、简历优化和建议报告流程。
-- Playwright/GUI Agent 真正打开招聘官网并填写表单。
-- 验证码、人机验证和 Human-in-the-loop 控制权交接界面。
-- 单页/多页招聘表单识别，以及“中间页保存、末页不提交”的执行策略。
-- 招聘网站表单的缺失字段汇总、可疑字段上报和最终人工接管界面；这与已经交付的管理员职位内容审核页不是同一功能。
 - 公众号图片招聘信息分类和 OCR；当前要求此类来源先进入人工审核。
+- 真实招聘网站 GUI Agent 适配（大疆 Moka、小鹏、科大讯飞）。
+- 验证码、人机验证和 CAPTCHA 处理。
+- 执行器本地敏感字段从 Windows Credential Manager 解析密码/身份证号等。
+- 生产环境部署（镜像 digest、Python lockfile、MinIO 非 root 凭据、production Compose overlay）。
+- `npm audit` 的 high severity 前端依赖已通过 lockfile 升级关闭。
 
-这些能力应建立在本阶段的用户、会话、ApplicationTask、设备和加密存储基础之上。
+### 4.1 已交付（自平台基础完成后新增）
+
+- 个人资料与简历生命周期：PDF/DOCX/文本上传、加密存储、解析、证据化字段确认、不可变版本。
+- 手动 JD 导入与统一去重：学生提交 URL/JD 文本、管理员提升、来源关系链。
+- Windows Executor 骨架与模拟安全门：Playwright 引擎、页面观察/填写/回读、本地检查点、安全决策、9 个模拟页面。
+- 职位反馈闭环：学生四项反馈类别、管理员处置、幂等事件。
+- 证据化匹配与定制简历：MatchReport、ResumeDraft、ApprovedResumeVersion、ApplicationSnapshot。
+- Web 工作台：Vue Router 分域路由（匹配、职位、个人资料、快照、设备、管理）。
+- 旧 `POST /api/analysis/run` 已移除，Web 匹配入口统一为 `POST /api/matches`。
+- `data/jobs.json` 演示职位文件已删除。
+
+这些能力建立在平台基础（用户、会话、ApplicationTask、设备配对、加密存储）之上。
 
 ## 5. 本地启动方式
 
@@ -421,40 +436,34 @@ docker compose -p platform-foundation run --rm backend `
 
 ### 9.1 当前功能代码的默认环境验证
 
-- 功能完成提交为 `4bc4979`，当前 `HEAD e29c6e0` 仅在其上增加实施台账。
-- 完整 Python 默认回归：`664 passed, 11 skipped`；使用根目录 `.venv` 的 Python 3.12.5。
-- 职位模型、审核服务和 API 聚焦回归：`127 passed`。
-- Ruff：`All checks passed!`。
-- 前端：5 个测试文件、`56 passed`；`vue-tsc` 类型检查通过；Vite production build 通过，转换 21 个模块。
-- `git diff --check` 通过，功能工作树在验收时干净。
-- 独立最终分支复审结论为 `APPROVE`：原有两项 Important（原因码 allowlist、运行手册可配置端口/前端门禁）均关闭，无新增 Critical 或 Important。
+- 当前 `HEAD db31883`，Alembic head `7b757ef17d3f`。
+- 完整 Python 默认回归：`907 passed, 6 skipped`；使用根目录 `.venv` 的 Python 3.12.5。
+- 核心单元/合约/安全测试：907 passed。
+- Ruff：`All checks passed!`（`ruff check backend src tests scripts`）。
+- 前端：13 个测试文件、`78 passed`；`vue-tsc` 类型检查通过；Vite production build 通过。
+- `git diff --check` 通过，有 CRLF 警告（.gitattributes 已配置 `*.sh text eol=lf`）。
 
-默认回归中的 11 个 skip 属于需要外部环境或显式 opt-in 的门禁，因此上述 `664 passed` 不能单独证明所有真实依赖已在 `4bc4979` 上执行。
+默认回归中的 6 个 skip 属于需要外部环境或显式 opt-in 的门禁。
 
 ### 9.2 真实 MySQL 与并发门禁
 
-- 在提交 `a8008cb` 上使用隔离库 `career_assistant_test` 执行了 24 个真实 MySQL/guard 用例：15 个 destructive guard 用例和 9 个真实数据库用例全部通过。
-- 真实数据库用例覆盖 migration `0003 → 0004 → 0003` 数据往返、同步锁序、人工规范字段保护、来源候选历史、陈旧版本失效，以及并发审核“一个成功、一个 stale、只产生一条事件”。
-- destructive guard 要求精确设置 `ALLOW_DESTRUCTIVE_MYSQL_TESTS=1`，并拒绝空 URL、非 MySQL 后端和库名不以 `_test` 结尾的连接。
-- `4bc4979` 之后变更的是审核原因码契约、前端类型和运行手册，没有修改 migration、同步锁序或数据库并发实现；但真实 MySQL 套件未在 `4bc4979/e29c6e0` 上再次执行，因此不得把 `a8008cb` 的 24 个结果标注为当前 HEAD 的新鲜数据库证明。
+- 历史记录：在提交 `a8008cb` 上使用隔离库执行了 24 个真实 MySQL/guard 用例全部通过。
+- 当前 HEAD 新增了迁移 `0005` 至 `0008` 和 hotfix `7b757ef17d3f`；真实 MySQL 套件未在 `db31883` 上重跑。
+- 必须在当前 HEAD 上重新执行 MySQL destructive guard、migration 往返（`head → base → head`）、并发同步和并发审核测试。
 
 ### 9.3 当前 Compose 运行态
 
-- 2026-07-16 已从仓库根目录 `D:\Python\langgraph-multi-agent-career-assistant-main` 的代码基线 `e29c6e0` 重新构建 backend 和 frontend 镜像；Compose `project.working_dir` 已核对为该根目录。
+- 当前 `docker-compose.yml` schema-revision 标签为 `20260718_0008`。
 - `platform-foundation` 当前使用 MySQL `3307`、Redis `6380`、MinIO `19000/19001`、Backend `18000`、Frontend `15173`。
-- MySQL、Redis、MinIO 和 Backend 容器为 healthy，Frontend 正常运行；migrate 容器退出 0。
-- 数据库 `alembic_version` 为 `20260716_0004`。
 - `GET /api/health/live`、`GET /api/health/ready` 和前端首页均返回 HTTP 200。
-- 当前开发库 `job_postings` 为 0 条，因此学生职位中心会显示空态；在真实同步并由管理员核验出至少一个 `verified` 职位前，不能开始真实职位匹配验收。
-- 当前运行态证明应用能连接 MySQL、Redis 和对象存储，但不替代 Redis、MinIO、Nginx 代理链的专门 opt-in 测试。
+- 当前开发库 `job_postings` 为 0 条；需要管理员触发腾讯同步并核验后方可验收真实职位匹配。
 
 ### 9.4 尚未关闭的外部验证缺口
 
-- 真实腾讯双来源只读门禁仍缺少有效 `TEST_TENCENT_DOCS_TOKEN`，尚未形成当前代码的外部 schema、分页和权限兼容性证据。
-- Redis、MinIO 和 Nginx→Uvicorn 专门 opt-in 套件没有在 `e29c6e0` 上重跑；发布前应按第 6 节统一执行。
-- 前端镜像构建期间 `npm audit` 报告 1 个 high severity 依赖项；构建与测试均通过，但依赖风险需要单独评估和升级验证。
-
-Windows 合并后曾发现 shell 脚本被 `core.autocrlf=true` 转成 CRLF。现已通过根目录 `.gitattributes` 强制 `*.sh text eol=lf`，相关 Docker Redis shell 测试已纳入并通过。
+- MySQL、Redis、MinIO 和 Nginx→Uvicorn 专门 opt-in 套件没有在当前 HEAD 上重跑。
+- 真实腾讯双来源只读门禁现在可读取 `TEST_TENCENT_DOCS_TOKEN`，未配置时回退使用 `TENCENT_DOCS_TOKEN`；当前 HEAD 仍需在真实测试库上重跑并记录结果。
+- 前端 `npm audit --audit-level=high --registry=https://registry.npmjs.org` 当前为 0 vulnerabilities。
+- 个人资料、匹配、快照和执行器集成测试（`tests/integration/`）未包含在默认回归中，需要 MySQL/MinIO 测试环境。
 
 readiness 成功时 HTTP 状态应为 200，核心响应含义如下：
 
@@ -479,21 +488,31 @@ readiness 成功时 HTTP 状态应为 200，核心响应含义如下：
 4. 使用镜像 digest 和带 hash 的 Python lockfile，提高构建可复现性。
 5. 生产环境使用 MinIO/S3 非 root 应用凭据、最小 bucket policy 和单独的 production Compose overlay。
 6. 新增任何 Executor API 时，补齐 principal/actor 权限测试并强制 task lease。
-7. 评估并升级前端依赖，关闭当前 `npm audit` 的 1 个 high severity 报告；升级后重跑 56 个前端测试、类型检查和 production build。
+7. 持续关注前端依赖升级；当前 `npm audit` high severity 报告已关闭，后续升级仍需重跑前端测试、类型检查和 production build。
 8. 在当前 HEAD 上重跑 MySQL、Redis、MinIO、Nginx 代理链和真实腾讯只读 opt-in 门禁，形成统一可追溯的发布证据。
 
 ## 11. 下一步建议
 
-下一阶段先完成 **Wave 0 共享契约门禁**：冻结跨模块 ID、状态、DTO、事件、隐私字段、migration 顺序和 Executor 通信协议，并通过 schema/API 契约评审。该门禁阻塞跨模块集成；在其冻结前只能做不依赖最终契约的 fixture、解析器或模拟页面准备。
+Wave 1（个人资料、手动 JD、执行器骨架、职位反馈）和 Wave 2（证据化匹配、定制简历、
+投递快照）已交付。下一阶段进入 Wave 3：大疆 Moka 纵向闭环。
 
-Wave 0 通过后优先采用并行工作包，只有明确依赖点串行集成：
+硬前置条件：
 
-1. **档案与简历生命周期（Wave 1 并行）**：增加 ResumeAsset、Profile、证据和确认版本，补齐 PDF/DOCX/文本解析、冲突确认、版本管理和加密对象引用。
-2. **手动 JD 导入与统一去重（Wave 1 并行）**：支持粘贴 JD 文本或链接，复用来源映射、规范化和 MySQL 权威存储，并与腾讯记录执行可解释的候选合并；不阻塞档案主线。
-3. **Windows Executor 骨架和模拟安全门（Wave 1 并行）**：基于已冻结的设备/task DTO、事件和 lease scope，使用模拟页面实现观察、填写、回读和本地检查点；暂不连接真实招聘站点，也不得点击最终提交。
-4. **职位反馈闭环（Wave 1 并行）**：学生侧继续只消费 `verified`，增加职位已关闭或内容变化的可追踪反馈入口。
-5. **证据化匹配、简历草稿和投递快照（集成阻塞项）**：必须同时具备至少一个来源链完整的 `verified` 职位和一个 `ConfirmedProfileVersion`，之后才能把 LangGraph 从 `data/jobs.json` 切换到权威快照，并生成 ResumeDraft、ApprovedResumeVersion 和不可变 ApplicationSnapshot。
-6. **真实站点 GUI 纵向闭环（后置硬门禁）**：只有 ApplicationSnapshot、执行器协议和模拟安全门通过后才能接入大疆 Moka；Agent 只能填写并暂停，最终提交必须由 HUMAN 本人完成，永远不签发 `task:submit`。大疆“自动最终提交为 0、歧义按钮点击为 0、恢复不重复”通过后，才能并行扩展其他站点。
+1. 在当前 HEAD 上重跑 MySQL/Redis/MinIO/Nginx opt-in 门禁。
+2. 在当前进程加载 `TENCENT_DOCS_TOKEN` 或 `TEST_TENCENT_DOCS_TOKEN` 后，使用真实测试库重跑腾讯双来源只读门禁。
+3. 完成执行器本地敏感字段从 Windows Credential Manager 解析。
+4. 至少一个 `verified` 职位和至少一个 `ConfirmedProfileVersion` 用于真实匹配验收。
+
+Wave 3 实施要点（参见
+[MVP 并行交付设计](./superpowers/specs/2026-07-16-mvp-parallel-delivery-design.md)
+第 9 节波次 3）：
+
+- 实现 Moka 页面拓扑、常用控件、重复经历组件和附件上传适配。
+- 实现单页停止、多页安全中间保存和末页停止。
+- 验证网络中断、Chrome 重启、页面变化和任务恢复不重复添加经历。
+- 硬门禁：最终提交和歧义组合按钮自动点击 = 0。
+
+大疆安全门通过后方可并行扩展小鹏和科大讯飞。
 
 ## 12. 开发时必须遵守的规则
 

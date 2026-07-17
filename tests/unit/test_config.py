@@ -2,7 +2,7 @@ from pydantic import ValidationError
 import pytest
 
 from backend.app.config import Settings
-from conftest import settings_override
+from tests.conftest import settings_override
 
 
 def test_production_rejects_default_secrets() -> None:
@@ -61,3 +61,17 @@ def test_settings_override_uses_test_defaults_and_applies_values() -> None:
     assert settings.database_url == "sqlite+pysqlite:///:memory:"
     assert settings.checkpoint_backend == "sqlite"
     assert settings.jwt_audience == "test-client"
+
+
+def test_test_tencent_token_falls_back_to_runtime_token() -> None:
+    settings = Settings(
+        app_env="test",
+        app_auth_secret="test-secret-with-at-least-32-characters",
+        object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        database_url="sqlite+pysqlite:///:memory:",
+        redis_url="redis://localhost:6379/15",
+        checkpoint_backend="sqlite",
+        tencent_docs_token="runtime-token",
+    )
+
+    assert settings.effective_test_tencent_docs_token.get_secret_value() == "runtime-token"

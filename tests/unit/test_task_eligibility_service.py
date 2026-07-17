@@ -144,6 +144,7 @@ def approved_resume_version(db: Session, resume_draft: ResumeDraft) -> ApprovedR
         target_job_id=resume_draft.target_job_id,
         approved_facts={},
         approved_diffs={},
+        approval_idempotency_key="ik-arv-elig",
         approved_by=resume_draft.user_id,
     )
     db.add(value)

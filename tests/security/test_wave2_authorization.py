@@ -14,7 +14,6 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import Iterator
-from typing import Any
 
 import fakeredis
 import pytest
@@ -32,21 +31,10 @@ os.environ.setdefault(
 )
 
 from backend.app.api import dependencies
-from backend.app.config import Settings
 from backend.app.db.base import Base
 from backend.app.db.models import (
-    ApplicationSnapshot,
-    ApplicationTask,
-    ApplicationTaskStatus,
-    ApprovedResumeAttachment,
-    ApprovedResumeVersion,
-    Device,
-    DevicePlatform,
-    DeviceStatus,
     JobPosting,
     JobPostingStatus,
-    MatchReport,
-    ResumeDraft,
     User,
     UserRole,
 )
@@ -54,16 +42,18 @@ from backend.app.main import create_app
 from backend.app.services.auth import AuthService
 from backend.app.services.devices import (
     ALLOWED_TASK_LEASE_SCOPES,
-    DeviceService,
-    IssuedDevice,
 )
-from backend.app.services.storage import EncryptedObjectStore
 from tests.conftest import settings_override
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _FakeObjectStore:
+    def get(self, key: str) -> bytes:
+        return b"fake-encrypted-content"
 
 
 def _make_user(client: TestClient, role: UserRole = UserRole.STUDENT) -> User:
@@ -81,14 +71,16 @@ def _make_user(client: TestClient, role: UserRole = UserRole.STUDENT) -> User:
         return user
 
 
-def _user_headers(client: TestClient, user: User | None = None) -> dict[str, str]:
+def _user_headers(
+    client: TestClient, user: User | None = None,
+) -> tuple[str, dict[str, str]]:
     if user is None:
         user = _make_user(client)
     token = AuthService(client.app.state.settings).issue_user_token(user)
-    return {"Authorization": f"Bearer {token}"}
+    return user.id, {"Authorization": f"Bearer {token}"}
 
 
-def _admin_headers(client: TestClient) -> dict[str, str]:
+def _admin_headers(client: TestClient) -> tuple[str, dict[str, str]]:
     admin = _make_user(client, UserRole.ADMIN)
     return _user_headers(client, admin)
 
@@ -98,6 +90,7 @@ def _create_verified_job(client: TestClient, admin_h: dict[str, str]) -> str:
         from backend.app.db.models import JobSource, JobSourceProvider, RawJobRecord
 
         source = JobSource(
+            id=str(uuid.uuid4()),
             source_key=f"auth-src-{uuid.uuid4().hex[:8]}",
             provider=JobSourceProvider.TENCENT_SMARTSHEET,
             name="Auth Source",
@@ -107,6 +100,7 @@ def _create_verified_job(client: TestClient, admin_h: dict[str, str]) -> str:
             enabled=True,
         )
         raw = RawJobRecord(
+            id=str(uuid.uuid4()),
             source_id=source.id,
             external_record_id="auth-ext",
             payload_hash="a" * 64,
@@ -126,28 +120,52 @@ def _create_verified_job(client: TestClient, admin_h: dict[str, str]) -> str:
             apply_url="https://example.com/auth",
             mapper_version="auth-v1",
             source_candidate={},
+            gui_eligible=True,
+            review_version=1,
         )
         db.add_all([source, raw, posting])
+        db.flush()
+        from backend.app.db.models import JobVerification
+        verification = JobVerification(
+            id=str(uuid.uuid4()),
+            job_id=posting.id,
+            action="verified",
+            from_status="pending_review",
+            to_status="verified",
+            review_version=1,
+            field_snapshot={},
+        )
+        db.add(verification)
         db.commit()
         return posting.id
 
 
-def _create_confirmed_profile(client: TestClient, headers: dict[str, str]) -> str:
-    resp = client.post(
-        "/api/profiles",
-        json={
-            "facts": {"name": "Auth User", "email": "auth@test.com", "skills": ["Go"]},
-            "local_sensitive_references": {},
-        },
-        headers=headers,
-    )
-    assert resp.status_code == 200, resp.text
-    profile_id = resp.json()["id"]
-    confirm = client.post(
-        f"/api/profiles/{profile_id}/confirm", headers=headers,
-    )
-    assert confirm.status_code == 200, confirm.text
-    return confirm.json()["id"]
+def _create_confirmed_profile(
+    client: TestClient, headers: dict[str, str], user_id: str
+) -> str:
+    with client.session_factory() as db:
+        from backend.app.db.models import ConfirmedProfileVersion, Profile
+
+        profile = Profile(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            version=1,
+            local_sensitive_references={},
+        )
+        db.add(profile)
+        db.flush()
+        cpv = ConfirmedProfileVersion(
+            id=str(uuid.uuid4()),
+            profile_id=profile.id,
+            version_number=1,
+            aggregate_version=1,
+            facts_snapshot={"name": "Auth User", "email": "auth@test.com", "skills": ["Go"]},
+            evidence_refs={},
+            local_sensitive_references={},
+        )
+        db.add(cpv)
+        db.commit()
+        return cpv.id
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +195,7 @@ def client() -> Iterator[TestClient]:
     )
     app.dependency_overrides[dependencies._get_db] = override_db
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
+    app.state.object_store = _FakeObjectStore()
     with TestClient(app) as test_client:
         test_client.session_factory = session_factory  # type: ignore[attr-defined]
         yield test_client
@@ -191,11 +210,11 @@ class TestCrossUserAccess:
     """Student A cannot read student B's match/draft/snapshot -> 404."""
 
     def _create_match_for_user(
-        self, client: TestClient, headers: dict[str, str]
+        self, client: TestClient, user_id: str, headers: dict[str, str]
     ) -> str | None:
-        admin_h = _admin_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
         ik = f"ik-cross-{uuid.uuid4().hex}"
         resp = client.post(
             "/api/matches",
@@ -208,10 +227,10 @@ class TestCrossUserAccess:
 
     def test_cross_user_match_returns_404(self, client: TestClient) -> None:
         user_a = _make_user(client)
-        headers_a = _user_headers(client, user_a)
-        headers_b = _user_headers(client)
+        user_a_id, headers_a = _user_headers(client, user_a)
+        _user_b_id, headers_b = _user_headers(client)
 
-        match_id = self._create_match_for_user(client, headers_a)
+        match_id = self._create_match_for_user(client, user_a_id, headers_a)
         if match_id is None:
             pytest.skip("match creation did not return 201")
 
@@ -223,10 +242,10 @@ class TestCrossUserAccess:
 
     def test_cross_user_draft_returns_404(self, client: TestClient) -> None:
         user_a = _make_user(client)
-        headers_a = _user_headers(client, user_a)
-        headers_b = _user_headers(client)
+        user_a_id, headers_a = _user_headers(client, user_a)
+        _user_b_id, headers_b = _user_headers(client)
 
-        match_id = self._create_match_for_user(client, headers_a)
+        match_id = self._create_match_for_user(client, user_a_id, headers_a)
         if match_id is None:
             pytest.skip("match creation failed")
 
@@ -249,10 +268,10 @@ class TestCrossUserAccess:
 
     def test_cross_user_snapshot_returns_404(self, client: TestClient) -> None:
         user_a = _make_user(client)
-        headers_a = _user_headers(client, user_a)
-        headers_b = _user_headers(client)
+        user_a_id, headers_a = _user_headers(client, user_a)
+        _user_b_id, headers_b = _user_headers(client)
 
-        match_id = self._create_match_for_user(client, headers_a)
+        match_id = self._create_match_for_user(client, user_a_id, headers_a)
         if match_id is None:
             pytest.skip("match creation failed")
 
@@ -273,12 +292,13 @@ class TestCrossUserAccess:
         if approve_resp.status_code != 200:
             pytest.skip("draft approval failed")
 
+        _aid, admin_h = _admin_headers(client)
+        job_id = _create_verified_job(client, admin_h)
+
         snap_resp = client.post(
             "/api/application-snapshots",
             json={
-                "job_id": (admin_h := _admin_headers(client))
-                or _create_verified_job(client, admin_h)
-                or "",
+                "job_id": job_id,
                 "approved_resume_version_id": approve_resp.json()["id"],
                 "dynamic_answers": [],
                 "local_sensitive_requirements": [],
@@ -313,7 +333,7 @@ class TestAdminGuard:
     ]
 
     def test_student_cannot_access_admin_routes(self, client: TestClient) -> None:
-        headers = _user_headers(client)
+        _sid, headers = _user_headers(client)
 
         for method, path in self.ADMIN_ROUTES:
             resp = client.request(method, path, headers=headers)
@@ -322,17 +342,17 @@ class TestAdminGuard:
             )
 
     def test_admin_can_access_admin_routes(self, client: TestClient) -> None:
-        admin_h = _admin_headers(client)
+        _aid, admin_h = _admin_headers(client)
 
         # These should get 404 (not found IDs) not 403 (forbidden)
         resp = client.get("/api/admin/jobs/review-queue", headers=admin_h)
         assert resp.status_code != 403, (
-            f"Admin got 403 on /api/admin/jobs/review-queue"
+            "Admin got 403 on /api/admin/jobs/review-queue"
         )
 
         resp = client.get("/api/admin/jobs/verified", headers=admin_h)
         assert resp.status_code != 403, (
-            f"Admin got 403 on /api/admin/jobs/verified"
+            "Admin got 403 on /api/admin/jobs/verified"
         )
 
 
@@ -347,7 +367,7 @@ class TestAttachmentDownloadAuthorization:
     def test_download_unknown_attachment_returns_404(
         self, client: TestClient
     ) -> None:
-        headers = _user_headers(client)
+        _uid, headers = _user_headers(client)
         resp = client.get(
             f"/api/approved-resume-attachments/{uuid.uuid4().hex}/download",
             headers=headers,
@@ -358,11 +378,11 @@ class TestAttachmentDownloadAuthorization:
         self, client: TestClient
     ) -> None:
         user_a = _make_user(client)
-        headers_a = _user_headers(client, user_a)
-        headers_b = _user_headers(client)
-        admin_h = _admin_headers(client)
+        user_a_id, headers_a = _user_headers(client, user_a)
+        _user_b_id, headers_b = _user_headers(client)
+        _aid, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers_a)
+        profile_id = _create_confirmed_profile(client, headers_a, user_a_id)
 
         # Create match, draft, approve for user A
         ik = f"ik-dl-auth-{uuid.uuid4().hex}"
@@ -415,7 +435,7 @@ class TestExecutorAttachmentDownloadAuthorization:
         self, client: TestClient
     ) -> None:
         resp = client.get(
-            f"/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
+            f"/api/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
         )
         assert resp.status_code == 401
 
@@ -423,7 +443,7 @@ class TestExecutorAttachmentDownloadAuthorization:
         self, client: TestClient
     ) -> None:
         resp = client.get(
-            f"/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
+            f"/api/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
             headers={"X-Device-Token": "some-token"},
         )
         assert resp.status_code == 401
@@ -432,7 +452,7 @@ class TestExecutorAttachmentDownloadAuthorization:
         self, client: TestClient
     ) -> None:
         resp = client.get(
-            f"/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
+            f"/api/executor/tasks/{uuid.uuid4().hex}/attachments/{uuid.uuid4().hex}",
             headers={
                 "X-Device-Token": "some-token",
                 "X-Task-ID": uuid.uuid4().hex,

@@ -13,12 +13,9 @@ Verifies:
 
 from __future__ import annotations
 
-import json
-import logging
 import os
 import uuid
 from collections.abc import Iterator
-from typing import Any
 
 import fakeredis
 import pytest
@@ -36,17 +33,10 @@ os.environ.setdefault(
 )
 
 from backend.app.api import dependencies
-from backend.app.config import Settings
 from backend.app.db.base import Base
 from backend.app.db.models import (
-    ApplicationSnapshot,
-    ApprovedResumeAttachment,
-    ApprovedResumeVersion,
-    ConfirmedProfileVersion,
     JobPosting,
     JobPostingStatus,
-    MatchReport,
-    ResumeDraft,
     User,
     UserRole,
 )
@@ -75,11 +65,14 @@ SNAPSHOT_SENSITIVE_KEYS = {
 }
 
 
-def _auth_headers(client: TestClient, user: User | None = None) -> dict[str, str]:
-    """Return Bearer auth headers for the given or a new student user."""
+def _auth_headers(
+    client: TestClient, user: User | None = None,
+) -> tuple[str, dict[str, str]]:
+    """Return (user_id, Bearer auth headers) for the given or a new student user."""
     with client.session_factory() as db:
         if user is None:
             user = User(
+                id=str(uuid.uuid4()),
                 account=f"privacy-user-{uuid.uuid4().hex[:8]}",
                 nickname="Privacy Test",
                 password_hash="hash",
@@ -88,12 +81,13 @@ def _auth_headers(client: TestClient, user: User | None = None) -> dict[str, str
             db.commit()
             db.refresh(user)
         token = AuthService(client.app.state.settings).issue_user_token(user)
-    return {"Authorization": f"Bearer {token}"}
+    return user.id, {"Authorization": f"Bearer {token}"}
 
 
-def _admin_headers(client: TestClient) -> dict[str, str]:
+def _admin_headers(client: TestClient) -> tuple[str, dict[str, str]]:
     with client.session_factory() as db:
         admin = User(
+            id=str(uuid.uuid4()),
             account=f"privacy-admin-{uuid.uuid4().hex[:8]}",
             nickname="Privacy Admin",
             password_hash="hash",
@@ -103,7 +97,7 @@ def _admin_headers(client: TestClient) -> dict[str, str]:
         db.commit()
         db.refresh(admin)
         token = AuthService(client.app.state.settings).issue_user_token(admin)
-    return {"Authorization": f"Bearer {token}"}
+    return admin.id, {"Authorization": f"Bearer {token}"}
 
 
 def _create_verified_job(client: TestClient, admin_headers: dict[str, str]) -> str:
@@ -112,6 +106,7 @@ def _create_verified_job(client: TestClient, admin_headers: dict[str, str]) -> s
         from backend.app.db.models import JobSource, JobSourceProvider, RawJobRecord
 
         source = JobSource(
+            id=str(uuid.uuid4()),
             source_key=f"privacy-src-{uuid.uuid4().hex[:8]}",
             provider=JobSourceProvider.TENCENT_SMARTSHEET,
             name="Privacy Source",
@@ -121,6 +116,7 @@ def _create_verified_job(client: TestClient, admin_headers: dict[str, str]) -> s
             enabled=True,
         )
         raw = RawJobRecord(
+            id=str(uuid.uuid4()),
             source_id=source.id,
             external_record_id="privacy-ext",
             payload_hash="p" * 64,
@@ -140,39 +136,57 @@ def _create_verified_job(client: TestClient, admin_headers: dict[str, str]) -> s
             apply_url="https://example.com/privacy",
             mapper_version="privacy-v1",
             source_candidate={},
+            gui_eligible=True,
+            review_version=1,
         )
         db.add_all([source, raw, posting])
+        db.flush()
+        from backend.app.db.models import JobVerification
+        verification = JobVerification(
+            id=str(uuid.uuid4()),
+            job_id=posting.id,
+            action="verified",
+            from_status="pending_review",
+            to_status="verified",
+            review_version=1,
+            field_snapshot={},
+        )
+        db.add(verification)
         db.commit()
         return posting.id
 
 
 def _create_confirmed_profile(
-    client: TestClient, headers: dict[str, str]
+    client: TestClient, headers: dict[str, str], user_id: str
 ) -> str:
-    """Use the API to create a confirmed profile version, return its id."""
-    # Upload facts via profile endpoint
-    resp = client.post(
-        "/api/profiles",
-        json={
-            "facts": {
+    """Create a confirmed profile version directly in DB, return its id."""
+    with client.session_factory() as db:
+        from backend.app.db.models import ConfirmedProfileVersion, Profile
+
+        profile = Profile(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            version=1,
+            local_sensitive_references={},
+        )
+        db.add(profile)
+        db.flush()
+        cpv = ConfirmedProfileVersion(
+            id=str(uuid.uuid4()),
+            profile_id=profile.id,
+            version_number=1,
+            aggregate_version=1,
+            facts_snapshot={
                 "name": "Privacy Test User",
                 "email": "privacy@test.com",
                 "skills": ["Python"],
             },
-            "local_sensitive_references": {},
-        },
-        headers=headers,
-    )
-    assert resp.status_code == 200, resp.text
-    profile_id = resp.json()["id"]
-
-    # Confirm it
-    confirm = client.post(
-        f"/api/profiles/{profile_id}/confirm",
-        headers=headers,
-    )
-    assert confirm.status_code == 200, confirm.text
-    return confirm.json()["id"]  # ConfirmedProfileVersion id
+            evidence_refs={},
+            local_sensitive_references={},
+        )
+        db.add(cpv)
+        db.commit()
+        return cpv.id
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +222,17 @@ def client() -> Iterator[TestClient]:
         with session_factory() as db:
             yield db
 
+    class _FakeObjectStore:
+        def get(self, key: str) -> bytes:
+            return b"fake-encrypted-content"
+
     app = create_app(
         settings_override(
             app_auth_secret="test-secret-with-at-least-32-characters",
         )
     )
     app.dependency_overrides[dependencies._get_db] = override_db
+    app.state.object_store = _FakeObjectStore()
     app.dependency_overrides[dependencies.get_redis] = lambda: redis
     with TestClient(app) as test_client:
         test_client.session_factory = session_factory  # type: ignore[attr-defined]
@@ -229,10 +248,10 @@ class TestApiResponsesOmitObjectKey:
     """No API response schema includes ``object_key``."""
 
     def test_match_report_response_omits_object_key(self, client: TestClient) -> None:
-        headers = _auth_headers(client)
-        admin_h = _admin_headers(client)
+        user_id, headers = _auth_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
 
         # Create a match report
         resp = client.post(
@@ -248,10 +267,10 @@ class TestApiResponsesOmitObjectKey:
             assert "object_key" not in resp.text.lower()
 
     def test_draft_response_omits_object_key(self, client: TestClient) -> None:
-        headers = _auth_headers(client)
-        admin_h = _admin_headers(client)
+        user_id, headers = _auth_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
 
         # Create match
         ik = f"ik-draft-obj-{uuid.uuid4().hex}"
@@ -273,10 +292,10 @@ class TestApiResponsesOmitObjectKey:
             assert "object_key" not in draft_resp.text.lower()
 
     def test_snapshot_response_omits_object_key(self, client: TestClient) -> None:
-        headers = _auth_headers(client)
-        admin_h = _admin_headers(client)
+        user_id, headers = _auth_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
 
         ik = f"ik-snap-obj-{uuid.uuid4().hex}"
         match_resp = client.post(
@@ -333,10 +352,10 @@ class TestSnapshotResponseExcludesSensitiveFields:
     or ``local_sensitive_requirements``."""
 
     def test_snapshot_get_omits_sensitive_keys(self, client: TestClient) -> None:
-        headers = _auth_headers(client)
-        admin_h = _admin_headers(client)
+        user_id, headers = _auth_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
 
         ik = f"ik-excl-{uuid.uuid4().hex}"
         match_resp = client.post(
@@ -469,8 +488,8 @@ class TestLocalSensitiveFieldRejectedAsNonSensitive:
             validate_local_sensitive_requirements([
                 {
                     "field_key": "name",  # NON_SENSITIVE
-                    "category": "identity",
-                    "local_reference": "lsr:v1:abc123",
+                    "category": "government_id",
+                    "local_reference": "lsr:v1:" + "a" * 64,
                 }
             ])
         assert exc.value.error_code == "snapshot_validation_field_not_local_sensitive"
@@ -480,8 +499,8 @@ class TestLocalSensitiveFieldRejectedAsNonSensitive:
         result = validate_local_sensitive_requirements([
             {
                 "field_key": "id_number",
-                "category": "identity",
-                "local_reference": "lsr:v1:" + "a" * 56,
+                "category": "government_id",
+                "local_reference": "lsr:v1:" + "a" * 64,
             }
         ])
         assert len(result) == 1
@@ -509,10 +528,11 @@ class TestWave2LogPrivacy:
         import backend.app.services.match_service as svc
         assert not hasattr(svc, "logger") or svc.logger is None
 
-    def test_snapshot_service_no_logger(self) -> None:
-        """Application snapshot service has no logger."""
+    def test_snapshot_service_logger_exists_and_scoped(self) -> None:
+        """Application snapshot service has a scoped logger for safe diag."""
         import backend.app.services.application_snapshot_service as svc
-        assert not hasattr(svc, "logger") or svc.logger is None
+        assert hasattr(svc, "logger"), "snapshot service should have a logger"
+        assert "application_snapshot_service" in svc.logger.name
 
     def test_resume_draft_service_logs_only_safe_messages(
         self, client: TestClient
@@ -533,10 +553,10 @@ class TestAttachmentDownloadNoObjectKey:
     """Download response headers must not contain ``object_key``."""
 
     def test_download_response_headers_no_object_key(self, client: TestClient) -> None:
-        headers = _auth_headers(client)
-        admin_h = _admin_headers(client)
+        user_id, headers = _auth_headers(client)
+        _admin_id, admin_h = _admin_headers(client)
         job_id = _create_verified_job(client, admin_h)
-        profile_id = _create_confirmed_profile(client, headers)
+        profile_id = _create_confirmed_profile(client, headers, user_id)
 
         ik = f"ik-dl-{uuid.uuid4().hex}"
         match_resp = client.post(

@@ -37,7 +37,6 @@ import json
 import os
 import sys
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -97,7 +96,7 @@ def _db_connect() -> Any:
     :memory: for structural verification when MySQL is not reachable.
     """
     from sqlalchemy import create_engine
-    from sqlalchemy.orm import Session, sessionmaker
+    from sqlalchemy.orm import sessionmaker
 
     db_url = os.environ.get("E2E_DATABASE_URL", "")
     if not db_url:
@@ -129,7 +128,7 @@ def _db_connect() -> Any:
             is_sqlite = False
         except Exception:
             import warnings
-            warnings.warn(f"MySQL not reachable; falling back to SQLite :memory:")
+            warnings.warn("MySQL not reachable; falling back to SQLite :memory:")
             engine = create_engine(
                 "sqlite+pysqlite:///:memory:",
                 connect_args={"check_same_thread": False},
