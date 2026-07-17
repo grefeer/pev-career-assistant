@@ -47,3 +47,9 @@ class EvidenceMatchingGraph:
         )
         result = await self._graph.ainvoke(initial)
         return result
+
+    def arun_sync(self, job_snapshot: dict, profile_snapshot: dict) -> dict:
+        """Synchronous wrapper around arun for use in non-async contexts."""
+        import asyncio
+
+        return asyncio.run(self.arun(job_snapshot, profile_snapshot))

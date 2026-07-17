@@ -27,6 +27,11 @@ def get_by_id(db: Session, match_id: str, user_id: str) -> MatchReport | None:
     )
 
 
+def get_by_id_raw(db: Session, match_id: str) -> MatchReport | None:
+    """Fetch a match by id without user scope (used by internal services)."""
+    return db.scalar(select(MatchReport).where(MatchReport.id == match_id))
+
+
 def list_by_user(db: Session, user_id: str) -> list[MatchReport]:
     """List all matches for a user, newest first."""
     return list(
