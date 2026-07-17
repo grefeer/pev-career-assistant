@@ -1,7 +1,6 @@
 """Builds ConfirmedProfileSnapshot, filtering out local-sensitive fields."""
-from datetime import datetime
 from sqlalchemy.orm import Session
-from backend.app.db.models import ConfirmedProfileVersion as CPV
+from backend.app.db.models import ConfirmedProfileVersion as CPV, Profile
 from backend.app.services.field_classification import filter_non_sensitive
 
 
@@ -21,10 +20,12 @@ class ConfirmedProfileSnapshot:
 def build_confirmed_profile_snapshot(
     db: Session, profile_version_id: str, user_id: str
 ) -> ConfirmedProfileSnapshot:
-    cpv = db.query(CPV).filter(
-        CPV.id == profile_version_id,
-        CPV.profile.has(user_id=user_id),
-    ).first()
+    cpv = (
+        db.query(CPV)
+        .join(Profile, Profile.id == CPV.profile_id)
+        .filter(CPV.id == profile_version_id, Profile.user_id == user_id)
+        .first()
+    )
     if cpv is None:
         raise ValueError("not_found")
 
