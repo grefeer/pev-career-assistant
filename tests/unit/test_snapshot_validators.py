@@ -6,6 +6,7 @@ from backend.app.services.snapshot_validators import (
     validate_dynamic_answers,
     validate_local_sensitive_requirements,
     SnapshotValidationError,
+    ApplicationSnapshotContent,
 )
 
 
@@ -105,7 +106,7 @@ class TestValidateLocalSensitiveRequirements:
             {
                 "field_key": "id_number",
                 "category": "government_id",
-                "local_reference": "lsr:v1:aaa",
+                "local_reference": "lsr:v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "value": "110101199001011234",
             },
         ]
@@ -152,10 +153,10 @@ class TestValidateLocalSensitiveRequirements:
 
 
 class TestValidateSnapshotContent:
-    """validate_snapshot_content(...) — validates all pieces together."""
+    """validate_snapshot_content(content) — validates all pieces together via ApplicationSnapshotContent."""
 
     def test_valid_snapshot_passes(self):
-        validate_snapshot_content(
+        content = ApplicationSnapshotContent(
             job_snapshot={"job_id": "job-001"},
             profile_facts={"education": [{"school": "PKU"}]},
             dynamic_answers=[
@@ -170,57 +171,64 @@ class TestValidateSnapshotContent:
             ],
             attachment_ids=["att-001", "att-002"],
         )
+        result = validate_snapshot_content(content)
+        assert result == content
 
     def test_empty_job_snapshot_fails(self):
+        content = ApplicationSnapshotContent(
+            job_snapshot={},
+            profile_facts={"education": [{"school": "PKU"}]},
+            dynamic_answers=[],
+            local_sensitive_requirements=[],
+            attachment_ids=["att-001"],
+        )
         with pytest.raises(SnapshotValidationError, match="job_snapshot"):
-            validate_snapshot_content(
-                job_snapshot={},
-                profile_facts={"education": [{"school": "PKU"}]},
-                dynamic_answers=[],
-                local_sensitive_requirements=[],
-                attachment_ids=["att-001"],
-            )
+            validate_snapshot_content(content)
 
     def test_empty_profile_facts_fails(self):
+        content = ApplicationSnapshotContent(
+            job_snapshot={"job_id": "job-001"},
+            profile_facts={},
+            dynamic_answers=[],
+            local_sensitive_requirements=[],
+            attachment_ids=["att-001"],
+        )
         with pytest.raises(SnapshotValidationError, match="profile_facts"):
-            validate_snapshot_content(
-                job_snapshot={"job_id": "job-001"},
-                profile_facts={},
-                dynamic_answers=[],
-                local_sensitive_requirements=[],
-                attachment_ids=["att-001"],
-            )
+            validate_snapshot_content(content)
 
     def test_missing_attachment_ids_fails(self):
+        content = ApplicationSnapshotContent(
+            job_snapshot={"job_id": "job-001"},
+            profile_facts={"education": [{"school": "PKU"}]},
+            dynamic_answers=[],
+            local_sensitive_requirements=[],
+            attachment_ids=[],
+        )
         with pytest.raises(SnapshotValidationError, match="attachment"):
-            validate_snapshot_content(
-                job_snapshot={"job_id": "job-001"},
-                profile_facts={"education": [{"school": "PKU"}]},
-                dynamic_answers=[],
-                local_sensitive_requirements=[],
-                attachment_ids=[],
-            )
+            validate_snapshot_content(content)
 
     def test_invalid_dynamic_answers_propagates(self):
+        content = ApplicationSnapshotContent(
+            job_snapshot={"job_id": "job-001"},
+            profile_facts={"education": [{"school": "PKU"}]},
+            dynamic_answers=[
+                {"field_key": "education", "value": "PKU", "classification": "sensitive"},
+            ],
+            local_sensitive_requirements=[],
+            attachment_ids=["att-001"],
+        )
         with pytest.raises(SnapshotValidationError, match="non_sensitive"):
-            validate_snapshot_content(
-                job_snapshot={"job_id": "job-001"},
-                profile_facts={"education": [{"school": "PKU"}]},
-                dynamic_answers=[
-                    {"field_key": "education", "value": "PKU", "classification": "sensitive"},
-                ],
-                local_sensitive_requirements=[],
-                attachment_ids=["att-001"],
-            )
+            validate_snapshot_content(content)
 
     def test_invalid_local_sensitive_reqs_propagates(self):
+        content = ApplicationSnapshotContent(
+            job_snapshot={"job_id": "job-001"},
+            profile_facts={"education": [{"school": "PKU"}]},
+            dynamic_answers=[],
+            local_sensitive_requirements=[
+                {"category": "government_id", "local_reference": "lsr:v1:aaa"},
+            ],
+            attachment_ids=["att-001"],
+        )
         with pytest.raises(SnapshotValidationError, match="field_key"):
-            validate_snapshot_content(
-                job_snapshot={"job_id": "job-001"},
-                profile_facts={"education": [{"school": "PKU"}]},
-                dynamic_answers=[],
-                local_sensitive_requirements=[
-                    {"category": "government_id", "local_reference": "lsr:v1:aaa"},
-                ],
-                attachment_ids=["att-001"],
-            )
+            validate_snapshot_content(content)

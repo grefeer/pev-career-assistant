@@ -1,60 +1,19 @@
 """Validates snapshot content, dynamic answers, and local-sensitive requirements before persisting."""
-from enum import Enum
+from dataclasses import dataclass
 from typing import Any
 
-# Inlined field classification to avoid Python 3.9 import-chain breakage
-# through field_classification.py → domain/profiles.py (StrEnum / X|Y syntax).
-# Mirrors backend.app.services.field_classification v1.0.
-# Keep in sync when the classification table is updated.
+from backend.app.services.field_classification import classify_field, FieldClassification
+from backend.app.domain.profiles import validate_local_sensitive_reference, LocalSensitiveReferenceError
 
 
-class _FieldClassification(str, Enum):
-    NON_SENSITIVE = "non_sensitive"
-    LOCAL_SENSITIVE = "local_sensitive"
-    UNKNOWN = "unknown"
-
-
-_LOCAL_SENSITIVE_KEYS: frozenset = frozenset({
-    "id_number",
-    "family_members",
-    "emergency_contact",
-    "home_address",
-    "passport_number",
-    "bank_account",
-    "political_status",
-    "marital_status",
-})
-
-_NON_SENSITIVE_KEYS: frozenset = frozenset({
-    "name",
-    "gender",
-    "birth_date",
-    "email",
-    "phone",
-    "education",
-    "skills",
-    "languages",
-    "work_experience",
-    "internship_experience",
-    "project_experience",
-    "awards",
-    "certifications",
-    "self_introduction",
-    "career_objective",
-    "expected_city",
-    "expected_salary",
-    "available_date",
-})
-
-
-def _classify_field(path: str) -> _FieldClassification:
-    """Classify a field path, matching field_classification.py logic."""
-    top_key = path.split(".")[0]
-    if top_key in _LOCAL_SENSITIVE_KEYS:
-        return _FieldClassification.LOCAL_SENSITIVE
-    if top_key in _NON_SENSITIVE_KEYS:
-        return _FieldClassification.NON_SENSITIVE
-    return _FieldClassification.UNKNOWN
+@dataclass
+class ApplicationSnapshotContent:
+    """Wrapper type for all data that makes up an application snapshot."""
+    job_snapshot: Any
+    profile_facts: dict[str, Any]
+    dynamic_answers: list[dict[str, Any]]
+    local_sensitive_requirements: list[dict[str, Any]]
+    attachment_ids: list[str]
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -69,34 +28,32 @@ class SnapshotValidationError(ValueError):
 
 
 def validate_snapshot_content(
-    job_snapshot: Any,
-    profile_facts: dict[str, Any],
-    dynamic_answers: list[dict[str, Any]],
-    local_sensitive_requirements: list[dict[str, Any]],
-    attachment_ids: list[str],
-) -> None:
+    content: ApplicationSnapshotContent,
+) -> ApplicationSnapshotContent:
     """Validate all pieces of an application snapshot before persisting.
 
     Raises ``SnapshotValidationError`` on any failure.
     """
-    if not job_snapshot:
+    if not content.job_snapshot:
         raise SnapshotValidationError(
             "snapshot_validation_empty_job_snapshot",
             "job_snapshot must be non-empty",
         )
-    if not profile_facts:
+    if not content.profile_facts:
         raise SnapshotValidationError(
             "snapshot_validation_empty_profile_facts",
             "profile_facts must be non-empty",
         )
-    if not attachment_ids:
+    if not content.attachment_ids:
         raise SnapshotValidationError(
             "snapshot_validation_no_attachments",
             "attachment_ids must contain at least one attachment",
         )
 
-    validate_dynamic_answers(dynamic_answers)
-    validate_local_sensitive_requirements(local_sensitive_requirements)
+    validate_dynamic_answers(content.dynamic_answers)
+    validate_local_sensitive_requirements(content.local_sensitive_requirements)
+
+    return content
 
 
 def validate_dynamic_answers(answers: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -122,8 +79,8 @@ def validate_dynamic_answers(answers: list[dict[str, Any]]) -> list[dict[str, An
             )
 
         field_key = answer.get("field_key", "")
-        field_cls = _classify_field(field_key)
-        if field_cls != _FieldClassification.NON_SENSITIVE:
+        field_cls = classify_field(field_key)
+        if field_cls != FieldClassification.NON_SENSITIVE:
             raise SnapshotValidationError(
                 "snapshot_validation_field_not_allowed",
                 f"Dynamic answer field '{field_key}' classifies as '{field_cls.value}', only 'non_sensitive' allowed",
@@ -153,8 +110,8 @@ def validate_local_sensitive_requirements(
                 f"Local-sensitive requirement missing 'field_key': {req}",
             )
 
-        field_cls = _classify_field(field_key)
-        if field_cls != _FieldClassification.LOCAL_SENSITIVE:
+        field_cls = classify_field(field_key)
+        if field_cls != FieldClassification.LOCAL_SENSITIVE:
             raise SnapshotValidationError(
                 "snapshot_validation_field_not_local_sensitive",
                 f"Requirement field_key '{field_key}' classifies as '{field_cls.value}', expected 'local_sensitive'",
@@ -172,6 +129,15 @@ def validate_local_sensitive_requirements(
             raise SnapshotValidationError(
                 "snapshot_validation_missing_local_reference",
                 f"Local-sensitive requirement missing 'local_reference': {req}",
+            )
+
+        # Validate the local reference format via domain rules
+        try:
+            validate_local_sensitive_reference(req.get("category", "unknown"), req.get("local_reference", ""))
+        except LocalSensitiveReferenceError as e:
+            raise SnapshotValidationError(
+                "snapshot_validation_invalid_local_reference",
+                f"Local-sensitive requirement has invalid local_reference: {e}",
             )
 
         # Reject plaintext values — only empty string or absent are acceptable
