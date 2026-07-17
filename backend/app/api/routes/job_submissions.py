@@ -189,20 +189,23 @@ def decide_submission(
     service = JobSubmissionService()
     try:
         if body.action == "link_existing":
-            assert body.job_id is not None
+            if body.job_id is None:
+                raise InvalidPromotionTarget("missing_job_id")
             item = service.link_existing(
                 db, submission_id=submission_id, actor_user_id=admin.id,
                 expected_version=body.expected_version, job_id=body.job_id,
             )
         elif body.action == "create_pending":
-            assert body.company_name is not None and body.title is not None
+            if body.company_name is None or body.title is None:
+                raise InvalidPromotionTarget("missing_pending_job_identity")
             item, _posting = service.create_pending(
                 db, submission_id=submission_id, actor_user_id=admin.id,
                 expected_version=body.expected_version, company_name=body.company_name,
                 title=body.title, apply_url=body.apply_url or "",
             )
         else:
-            assert body.reason_code is not None
+            if body.reason_code is None:
+                raise InvalidPromotionTarget("missing_rejection_reason")
             item = service.reject(
                 db, submission_id=submission_id, actor_user_id=admin.id,
                 expected_version=body.expected_version, reason_code=body.reason_code,

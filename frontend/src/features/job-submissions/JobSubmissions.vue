@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 
 import {
   createJobSubmission,
@@ -11,6 +11,7 @@ import {
 import type { DuplicateCandidate, JobSubmission } from "./jobSubmissionTypes";
 
 const props = defineProps<{ token: string }>();
+const emit = defineEmits<{ (event: "dirty-change", value: boolean): void }>();
 
 const submissions = ref<JobSubmission[]>([]);
 const total = ref(0);
@@ -35,10 +36,22 @@ const editInputType = ref<"url" | "jd_text">("url");
 const editUrl = ref("");
 const editJdText = ref("");
 const editVersion = ref(0);
+const editInitialType = ref<"url" | "jd_text">("url");
+const editInitialValue = ref("");
 const saving = ref(false);
 
 let isMounted = true;
 const PAGE_SIZE = 10;
+const dirty = computed(() => {
+  if (newUrl.value.trim() || newJdText.value.trim()) return true;
+  if (!editingId.value) return false;
+  const currentValue = editInputType.value === "url" ? editUrl.value : editJdText.value;
+  return (
+    editInputType.value !== editInitialType.value
+    || currentValue !== editInitialValue.value
+  );
+});
+watch(dirty, (value) => emit("dirty-change", value), { immediate: true });
 
 async function loadSubmissions() {
   loading.value = true;
@@ -87,8 +100,13 @@ function startEdit(item: JobSubmission) {
   editingId.value = item.id;
   editInputType.value = item.input_type;
   editUrl.value = item.normalized_url || "";
-  editJdText.value = item.input_preview;
+  editJdText.value = "";
   editVersion.value = item.version;
+  editInitialType.value = item.input_type;
+  editInitialValue.value = item.input_type === "url" ? editUrl.value : "";
+  if (item.input_type === "jd_text") {
+    success.value = "请输入完整的新内容替换草稿；服务端不会回传完整 JD。";
+  }
 }
 
 function cancelEdit() {
@@ -338,6 +356,8 @@ onUnmounted(() => { isMounted = false; });
                 <div class="candidate-info">
                   <strong>{{ c.job.company_name }}</strong> · {{ c.job.title }}
                   <span class="score">{{ (c.score_basis_points / 100).toFixed(0) }}%</span>
+                  <span class="candidate-reasons">{{ c.reasons.join("、") }}</span>
+                  <em>候选，不会自动合并</em>
                 </div>
                 <a :href="c.job.apply_url" target="_blank" rel="noopener noreferrer">
                   查看

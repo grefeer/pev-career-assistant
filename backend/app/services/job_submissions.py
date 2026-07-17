@@ -37,8 +37,20 @@ class JobSubmissionService:
     def __init__(self, detector: DuplicateDetector | None = None) -> None:
         self.detector = detector or DuplicateDetector()
 
-    def _owned(self, db: Session, *, user_id: str, submission_id: str) -> UserJobSubmission:
-        item = job_submissions.get_owned(db, user_id=user_id, submission_id=submission_id)
+    def _owned(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        submission_id: str,
+        lock: bool = False,
+    ) -> UserJobSubmission:
+        item = job_submissions.get_owned(
+            db,
+            user_id=user_id,
+            submission_id=submission_id,
+            lock=lock,
+        )
         if item is None:
             raise SubmissionNotFoundError(submission_id)
         return item
@@ -92,7 +104,9 @@ class JobSubmissionService:
         self, db: Session, *, user_id: str, submission_id: str,
         expected_version: int, input_type: str, raw_value: str,
     ) -> UserJobSubmission:
-        item = self._owned(db, user_id=user_id, submission_id=submission_id)
+        item = self._owned(
+            db, user_id=user_id, submission_id=submission_id, lock=True
+        )
         self._check_version(item, expected_version)
         if item.status is not SubmissionStatus.DRAFT:
             raise InvalidSubmissionTransition(item.status.value)
@@ -113,7 +127,9 @@ class JobSubmissionService:
     def submit(
         self, db: Session, *, user_id: str, submission_id: str, expected_version: int,
     ) -> UserJobSubmission:
-        item = self._owned(db, user_id=user_id, submission_id=submission_id)
+        item = self._owned(
+            db, user_id=user_id, submission_id=submission_id, lock=True
+        )
         self._check_version(item, expected_version)
         if item.status is not SubmissionStatus.DRAFT:
             raise InvalidSubmissionTransition(item.status.value)
@@ -167,11 +183,20 @@ class JobSubmissionService:
         self, db: Session, *, submission_id: str, actor_user_id: str,
         expected_version: int, company_name: str, title: str, apply_url: str,
     ) -> tuple[UserJobSubmission, JobPosting]:
-        item = self._lock_submitted(db, submission_id=submission_id, expected_version=expected_version)
+        normalized_company_name = company_name.strip()
+        normalized_title = title.strip()
+        if not normalized_company_name or not normalized_title:
+            raise InvalidPromotionTarget("blank_pending_job_identity")
+        item = self._lock_submitted(
+            db, submission_id=submission_id, expected_version=expected_version
+        )
         if apply_url:
             normalize_submission_input(SubmissionInputType.URL, apply_url)
         posting = job_submissions.create_manual_pending_posting(
-            db, submission=item, company_name=company_name.strip(), title=title.strip(),
+            db,
+            submission=item,
+            company_name=normalized_company_name,
+            title=normalized_title,
             apply_url=apply_url.strip(), now=datetime.now(timezone.utc),
         )
         item.status = SubmissionStatus.PROMOTED

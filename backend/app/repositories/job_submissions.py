@@ -26,10 +26,19 @@ class PersistedMatch:
     algorithm_version: str
 
 
-def get_owned(db: Session, *, user_id: str, submission_id: str) -> UserJobSubmission | None:
-    return db.scalar(select(UserJobSubmission).where(
+def get_owned(
+    db: Session,
+    *,
+    user_id: str,
+    submission_id: str,
+    lock: bool = False,
+) -> UserJobSubmission | None:
+    statement = select(UserJobSubmission).where(
         UserJobSubmission.id == submission_id, UserJobSubmission.user_id == user_id,
-    ))
+    )
+    if lock:
+        statement = statement.execution_options(populate_existing=True).with_for_update()
+    return db.scalar(statement)
 
 
 def list_owned(db: Session, *, user_id: str, limit: int, offset: int) -> tuple[int, list[UserJobSubmission]]:
@@ -86,15 +95,21 @@ def add_candidates(
 def list_candidates(
     db: Session, *, submission: UserJobSubmission, public_only: bool,
 ) -> list[tuple[JobDuplicateCandidate, JobPosting]]:
-    latest_generated_version = select(func.max(JobDuplicateCandidate.generated_for_version)).where(
-        JobDuplicateCandidate.submission_id == submission.id,
-        JobDuplicateCandidate.generated_for_version <= submission.version,
-    ).scalar_subquery()
+    # ``version`` is the aggregate concurrency token, not solely the input
+    # revision.  Submit and the terminal admin decision each increment it
+    # without changing the input that produced the duplicate candidates.
+    non_input_transitions = {
+        SubmissionStatus.DRAFT: 0,
+        SubmissionStatus.SUBMITTED: 1,
+        SubmissionStatus.PROMOTED: 2,
+        SubmissionStatus.REJECTED: 2,
+    }
+    generated_for_version = submission.version - non_input_transitions[submission.status]
     statement = select(JobDuplicateCandidate, JobPosting).join(
         JobPosting, JobPosting.id == JobDuplicateCandidate.candidate_job_id
     ).where(
         JobDuplicateCandidate.submission_id == submission.id,
-        JobDuplicateCandidate.generated_for_version == latest_generated_version,
+        JobDuplicateCandidate.generated_for_version == generated_for_version,
     )
     if public_only:
         statement = statement.where(JobPosting.status == JobPostingStatus.VERIFIED)

@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 
 import {
   decideJobSubmission,
+  fetchAdminDuplicateCandidates,
   fetchAdminJobSubmissions,
-  fetchDuplicateCandidates,
 } from "./jobSubmissionsApi";
-import type { AdminJobSubmission, DuplicateCandidate } from "./jobSubmissionTypes";
+import type {
+  AdminJobSubmission,
+  AdminJobSubmissionDecision,
+  DuplicateCandidate,
+} from "./jobSubmissionTypes";
 
 const props = defineProps<{ token: string }>();
 
-const emit = defineEmits<{ dirtyChange: [value: boolean] }>();
+const emit = defineEmits<{ (event: "dirty-change", value: boolean): void }>();
 
 const submissions = ref<AdminJobSubmission[]>([]);
 const total = ref(0);
@@ -35,6 +39,17 @@ const deciding = ref(false);
 const decisionError = ref("");
 
 const PAGE_SIZE = 20;
+const dirty = computed(() => Boolean(
+  selectedId.value
+  && (
+    decisionAction.value !== "link_existing"
+    || linkJobId.value.trim()
+    || newCompanyName.value.trim()
+    || newTitle.value.trim()
+    || newApplyUrl.value.trim()
+  )
+));
+watch(dirty, (value) => emit("dirty-change", value), { immediate: true });
 
 async function loadQueue() {
   loading.value = true;
@@ -61,7 +76,7 @@ async function loadCandidates(submissionId: string) {
   candidates.value = [];
   candidatesLoading.value = true;
   try {
-    const response = await fetchDuplicateCandidates(props.token, submissionId);
+    const response = await fetchAdminDuplicateCandidates(props.token, submissionId);
     candidates.value = response.candidates;
     const item = submissions.value.find((s) => s.id === submissionId);
     if (item) {
@@ -90,7 +105,7 @@ async function handleDecision() {
   deciding.value = true;
   decisionError.value = "";
   try {
-    let payload: any;
+    let payload: AdminJobSubmissionDecision;
     if (decisionAction.value === "link_existing") {
       if (!linkJobId.value.trim()) {
         decisionError.value = "请输入职位 ID。";
@@ -104,15 +119,19 @@ async function handleDecision() {
         deciding.value = false;
         return;
       }
-      const body: Record<string, string> = { expected_version: String(decisionVersion.value), action: "create_pending", company_name: newCompanyName.value.trim(), title: newTitle.value.trim() };
-      if (newApplyUrl.value.trim()) body.apply_url = newApplyUrl.value.trim();
+      const body: AdminJobSubmissionDecision = {
+        expected_version: decisionVersion.value,
+        action: "create_pending",
+        company_name: newCompanyName.value.trim(),
+        title: newTitle.value.trim(),
+        ...(newApplyUrl.value.trim() ? { apply_url: newApplyUrl.value.trim() } : {}),
+      };
       payload = body;
     } else {
       payload = { expected_version: decisionVersion.value, action: "reject", reason_code: rejectReason.value };
     }
-    await decideJobSubmission(props.token, selectedId.value, payload as any);
+    await decideJobSubmission(props.token, selectedId.value, payload);
     success.value = "处理完成。";
-    emit("dirtyChange", true);
     selectedId.value = "";
     await loadQueue();
   } catch (caught) {
@@ -207,6 +226,7 @@ onMounted(loadQueue);
                 <strong>{{ c.job.company_name }}</strong> · {{ c.job.title }}
                 <span class="status-tag" :class="c.job.status">{{ c.job.status }}</span>
                 <span class="score">{{ (c.score_basis_points / 100).toFixed(0) }}%</span>
+                <span class="candidate-reasons">{{ c.reasons.join("、") }}</span>
               </div>
               <code class="job-id">{{ c.job.id }}</code>
             </div>

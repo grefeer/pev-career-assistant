@@ -2,6 +2,7 @@ import os
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import Mock
 
 import fakeredis
 import pytest
@@ -14,6 +15,7 @@ os.environ.setdefault(
     "OBJECT_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 )
 from fastapi.testclient import TestClient
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -27,6 +29,8 @@ from backend.app.db.models import (
     SubmissionStatus, User, UserJobSubmission, UserRole,
 )
 from backend.app.main import create_app
+from backend.app.api.job_submission_schemas import AdminJobSubmissionDecisionRequest
+from backend.app.api.routes.job_submissions import decide_submission
 from backend.app.services.auth import AuthService
 
 
@@ -112,7 +116,9 @@ def submission_seed(client: TestClient) -> dict[str, Any]:
         db.flush()
         db.add_all([JobDuplicateCandidate(
             submission_id=item.id, candidate_job_id=posting.id,
-            generated_for_version=item.version, score_basis_points=9000 - index,
+            # Submission increments the aggregate version without changing the
+            # input revision for which these candidates were generated.
+            generated_for_version=item.version - 1, score_basis_points=9000 - index,
             reasons=["jd_token_overlap"], score_components={"jd_token_jaccard": 9000 - index},
             algorithm_version="manual-job-dedup-v1",
         ) for index, posting in enumerate(postings)])
@@ -201,6 +207,28 @@ def test_student_cannot_use_admin_submission_queue(client, submission_seed) -> N
         headers=submission_seed["owner_headers"],
     )
     assert response.status_code == 403
+
+
+def test_admin_decision_route_fails_explicitly_when_validated_field_is_missing() -> None:
+    body = AdminJobSubmissionDecisionRequest.model_construct(
+        expected_version=2,
+        action="link_existing",
+        job_id=None,
+        company_name=None,
+        title=None,
+        apply_url=None,
+        reason_code=None,
+    )
+    db = Mock(spec=Session)
+    admin = Mock(spec=User)
+    admin.id = "admin-id"
+
+    with pytest.raises(HTTPException) as exc_info:
+        decide_submission("submission-id", body, admin, db)
+
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == "invalid_promotion_target"
+    db.rollback.assert_called_once_with()
 
 
 def test_admin_candidates_can_include_non_public_jobs_without_submitter_identity(client, submission_seed) -> None:

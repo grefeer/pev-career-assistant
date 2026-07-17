@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createJobSubmission,
   decideJobSubmission,
+  fetchAdminDuplicateCandidates,
   fetchDuplicateCandidates,
   submitJobSubmission,
 } from "../jobSubmissionsApi";
@@ -38,12 +39,16 @@ describe("job submissions API", () => {
       }),
     ));
     vi.stubGlobal("fetch", fetchMock);
+    await fetchAdminDuplicateCandidates("admin", "submission/1");
     await decideJobSubmission("admin", "submission-1", {
       expected_version: 2,
       action: "link_existing",
       job_id: "00000000-0000-4000-8000-000000000001",
     });
     expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/admin/job-submissions/submission%2F1/duplicate-candidates",
+    );
+    expect(fetchMock.mock.calls[1][0]).toBe(
       "/api/admin/job-submissions/submission-1/decision",
     );
   });

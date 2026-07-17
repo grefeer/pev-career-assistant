@@ -63,7 +63,7 @@ def test_owned_reads_hide_another_users_submission(db: Session) -> None:
     assert job_submissions.get_owned(db, user_id=other.id, submission_id=item.id) is None
 
 
-def test_candidate_reads_use_only_current_submission_version(db: Session) -> None:
+def test_candidate_reads_use_only_current_input_version(db: Session) -> None:
     owner = User(account="candidate-owner", nickname="Owner", password_hash="hash")
     source = JobSource(
         source_key="candidate-source", provider=JobSourceProvider.TENCENT_SMARTSHEET,
@@ -94,4 +94,15 @@ def test_candidate_reads_use_only_current_submission_version(db: Session) -> Non
     student_rows = job_submissions.list_candidates(db, submission=submission, public_only=True)
     admin_rows = job_submissions.list_candidates(db, submission=submission, public_only=False)
     assert student_rows == []
+    assert admin_rows == []
+
+    submission.status = SubmissionStatus.SUBMITTED
+    student_rows = job_submissions.list_candidates(db, submission=submission, public_only=True)
+    admin_rows = job_submissions.list_candidates(db, submission=submission, public_only=False)
+    assert student_rows == []
+    assert [row[1].id for row in admin_rows] == [pending.id]
+
+    submission.status = SubmissionStatus.REJECTED
+    submission.version = 3
+    admin_rows = job_submissions.list_candidates(db, submission=submission, public_only=False)
     assert [row[1].id for row in admin_rows] == [pending.id]

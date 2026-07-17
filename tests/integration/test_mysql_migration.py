@@ -322,7 +322,7 @@ def test_mysql_migration_upgrade_and_downgrade(
             with engine.connect() as connection:
                 seeded_job_count = int(connection.scalar(text("SELECT COUNT(*) FROM job_postings")) or 0)
             _run_alembic("upgrade", "20260717_0006", env=env)
-            inspector = sa.inspect(engine)
+            inspector = inspect(engine)
             assert MANUAL_SUBMISSION_TABLES <= set(inspector.get_table_names())
             with engine.connect() as connection:
                 assert connection.scalar(text("SELECT COUNT(*) FROM job_source_links")) >= seeded_job_count
@@ -332,7 +332,7 @@ def test_mysql_migration_upgrade_and_downgrade(
                 ).one()
                 assert manual == ("user_submission", 0)
             _run_alembic("downgrade", "20260717_0005", env=env)
-            assert "user_job_submissions" not in sa.inspect(engine).get_table_names()
+            assert "user_job_submissions" not in inspect(engine).get_table_names()
             _run_alembic("upgrade", "head", env=env)
         finally:
             _run_alembic("downgrade", "base", env=env)

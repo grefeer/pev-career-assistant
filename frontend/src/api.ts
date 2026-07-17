@@ -54,6 +54,11 @@ export async function request<T>(
         if (typeof structuredDetail.message === "string" && structuredDetail.message.trim()) {
           message = structuredDetail.message;
         } else if (
+          typeof structuredDetail.code === "string"
+          && structuredDetail.code.trim()
+        ) {
+          message = structuredDetail.code;
+        } else if (
           typeof structuredDetail.error_code === "string" &&
           structuredDetail.error_code.trim()
         ) {

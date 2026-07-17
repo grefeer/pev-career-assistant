@@ -14,7 +14,9 @@ from backend.app.db.models import (
     SubmissionStatus, User, UserRole,
 )
 from backend.app.repositories.job_submissions import MANUAL_SOURCE_ID
+from backend.app.repositories import job_submissions
 from backend.app.services.job_submissions import (
+    InvalidPromotionTarget,
     InvalidSubmissionTransition,
     JobSubmissionService,
     StaleSubmissionError,
@@ -111,6 +113,28 @@ def test_stale_update_does_not_mutate_submission(service_db) -> None:
     assert item.version == 0
 
 
+def test_student_update_and_submit_lock_the_owned_submission(service_db) -> None:
+    service, db, user, _admin = service_db
+    item = service.create(
+        db, user_id=user.id, input_type="url", raw_value="https://jobs.example.com/1"
+    )
+
+    with patch.object(job_submissions, "get_owned", wraps=job_submissions.get_owned) as get_owned:
+        service.update(
+            db,
+            user_id=user.id,
+            submission_id=item.id,
+            expected_version=0,
+            input_type="url",
+            raw_value="https://jobs.example.com/2",
+        )
+    assert get_owned.call_args.kwargs["lock"] is True
+
+    with patch.object(job_submissions, "get_owned", wraps=job_submissions.get_owned) as get_owned:
+        service.submit(db, user_id=user.id, submission_id=item.id, expected_version=1)
+    assert get_owned.call_args.kwargs["lock"] is True
+
+
 def test_duplicate_detection_failure_keeps_private_submission_editable(service_db) -> None:
     service, db, user, _admin = service_db
     with patch(
@@ -156,6 +180,30 @@ def test_admin_create_pending_does_not_create_verification(service_db) -> None:
     assert posting.status is JobPostingStatus.PENDING_COMPLETION
     assert promoted.promoted_job_id == posting.id
     assert db.scalar(select(JobVerification).where(JobVerification.job_id == posting.id)) is None
+
+
+def test_admin_create_pending_rejects_blank_normalized_names(service_db) -> None:
+    service, db, user, admin = service_db
+    item = service.create(
+        db,
+        user_id=user.id,
+        input_type="jd_text",
+        raw_value="示例科技招聘后端实习生，负责 FastAPI 与 MySQL。",
+    )
+    service.submit(db, user_id=user.id, submission_id=item.id, expected_version=0)
+
+    with pytest.raises(InvalidPromotionTarget):
+        service.create_pending(
+            db,
+            submission_id=item.id,
+            actor_user_id=admin.id,
+            expected_version=1,
+            company_name="   ",
+            title="后端实习生",
+            apply_url="",
+        )
+
+    assert item.status is SubmissionStatus.SUBMITTED
 
 
 def test_second_admin_decision_is_stale_and_has_no_second_side_effect(service_db, verified_job) -> None:

@@ -1,4 +1,10 @@
 import pytest
+from pydantic import ValidationError
+
+from backend.app.api.job_submission_schemas import (
+    AdminJobSubmissionDecisionRequest,
+    JobSubmissionCreateRequest,
+)
 
 from backend.app.domain.job_submissions import (
     DuplicateDetector,
@@ -37,6 +43,15 @@ def test_url_input_canonicalizes_without_fetching() -> None:
     assert result.normalized_url == "https://jobs.example.com/opening/1?lang=zh"
     assert result.content_sha256 == result.fingerprint
     assert result.preview == "https://jobs.example.com/opening/1?lang=zh"
+
+
+def test_url_input_preserves_ipv6_brackets_when_canonicalizing() -> None:
+    result = normalize_submission_input(
+        SubmissionInputType.URL,
+        "HTTPS://[2606:4700:4700::1111]:443/opening/1",
+    )
+
+    assert result.normalized_url == "https://[2606:4700:4700::1111]/opening/1"
 
 
 def test_jd_text_has_explicit_size_boundary_and_redacted_preview() -> None:
@@ -97,14 +112,6 @@ def test_jd_overlap_below_threshold_is_not_a_candidate() -> None:
     assert matches[0].score_basis_points >= 7200
 
 
-from pydantic import ValidationError
-
-from backend.app.api.job_submission_schemas import (
-    AdminJobSubmissionDecisionRequest,
-    JobSubmissionCreateRequest,
-)
-
-
 def test_create_request_requires_exactly_one_matching_input() -> None:
     request = JobSubmissionCreateRequest(input_type="url", url="https://jobs.example.com/1")
     assert request.jd_text is None
@@ -123,3 +130,13 @@ def test_admin_decision_is_discriminated_and_complete() -> None:
     assert request.job_id is None
     with pytest.raises(ValidationError):
         AdminJobSubmissionDecisionRequest(expected_version=2, action="link_existing")
+
+
+def test_admin_create_pending_rejects_whitespace_only_names() -> None:
+    with pytest.raises(ValidationError):
+        AdminJobSubmissionDecisionRequest(
+            expected_version=2,
+            action="create_pending",
+            company_name="   ",
+            title="后端实习生",
+        )

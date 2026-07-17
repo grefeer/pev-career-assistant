@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from backend.app.domain.job_submissions import (
     DeduplicationStatus,
@@ -19,6 +19,8 @@ def _as_utc(value: datetime) -> datetime:
 
 
 class JobSubmissionCreateRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     input_type: SubmissionInputType
     url: str | None = Field(default=None, max_length=4096)
     jd_text: str | None = Field(default=None, max_length=100_000)
@@ -92,6 +94,8 @@ class DuplicateCandidateListResponse(BaseModel):
 
 
 class AdminJobSubmissionDecisionRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     expected_version: int = Field(ge=0)
     action: Literal["link_existing", "create_pending", "reject"]
     job_id: str | None = Field(default=None, min_length=36, max_length=36)

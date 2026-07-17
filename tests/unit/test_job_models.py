@@ -4,7 +4,15 @@ from sqlalchemy import UniqueConstraint
 
 from backend.app.api.job_schemas import JobDecisionRequest
 from backend.app.db.base import Base
-from backend.app.db.models import JobPosting, JobPostingStatus, JobVerification
+from backend.app.db.models import (
+    JobDuplicateCandidate,
+    JobPosting,
+    JobPostingStatus,
+    JobSourceLink,
+    JobSourceProvider,
+    JobVerification,
+    UserJobSubmission,
+)
 
 
 def test_job_sync_tables_and_status_exist() -> None:
@@ -99,14 +107,6 @@ def test_job_decision_requires_explicit_reason_contract(
 ) -> None:
     with pytest.raises(ValidationError):
         JobDecisionRequest.model_validate(payload)
-
-
-from backend.app.db.models import (
-    JobDuplicateCandidate,
-    JobSourceLink,
-    JobSourceProvider,
-    UserJobSubmission,
-)
 
 
 def test_manual_job_entities_use_uuid_and_versioned_private_ownership() -> None:

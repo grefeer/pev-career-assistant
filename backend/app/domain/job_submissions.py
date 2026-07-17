@@ -94,7 +94,12 @@ def _canonicalize_url(value: str) -> str:
         raise InvalidSubmissionInput("unsafe_job_url")
     scheme = parsed.scheme.lower()
     default_port = (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
-    netloc = host if port is None or default_port else f"{host}:{port}"
+    host_for_netloc = f"[{host}]" if address is not None and address.version == 6 else host
+    netloc = (
+        host_for_netloc
+        if port is None or default_port
+        else f"{host_for_netloc}:{port}"
+    )
     safe_query = sorted(
         (key, item)
         for key, item in parse_qsl(parsed.query, keep_blank_values=True)
@@ -163,6 +168,9 @@ class DuplicateDetector:
         jobs: list[JobFingerprint],
     ) -> list[DuplicateMatch]:
         matches: list[DuplicateMatch] = []
+        submission_tokens = (
+            _tokens(submission.normalized_text) if submission.normalized_text else None
+        )
         for job in jobs:
             if submission.normalized_url and job.apply_url:
                 try:
@@ -179,11 +187,14 @@ class DuplicateDetector:
                         )
                     )
                     continue
-            if submission.normalized_text and job.description_text:
-                left = _tokens(submission.normalized_text)
-                right = _tokens(_normalize_text(job.description_text))
-                union = left | right
-                score = round(10_000 * len(left & right) / len(union)) if union else 0
+            if submission_tokens is not None and job.description_text:
+                right = _tokens(job.description_text)
+                union = submission_tokens | right
+                score = (
+                    round(10_000 * len(submission_tokens & right) / len(union))
+                    if union
+                    else 0
+                )
                 if score >= MIN_TEXT_OVERLAP_BPS:
                     matches.append(
                         DuplicateMatch(

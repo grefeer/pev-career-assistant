@@ -36,6 +36,11 @@ export const fetchAdminJobSubmissions = (token: string, limit = 20, offset = 0) 
     `/admin/job-submissions?status=submitted&limit=${limit}&offset=${offset}`, {}, token,
   );
 
+export const fetchAdminDuplicateCandidates = (token: string, id: string) =>
+  request<{ candidates: DuplicateCandidate[] }>(
+    `/admin/job-submissions/${encodeURIComponent(id)}/duplicate-candidates`, {}, token,
+  );
+
 export const decideJobSubmission = (
   token: string, id: string, payload: AdminJobSubmissionDecision,
 ) => request<AdminJobSubmission>(`/admin/job-submissions/${encodeURIComponent(id)}/decision`, {
