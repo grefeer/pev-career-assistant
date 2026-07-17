@@ -266,6 +266,27 @@ def test_continue_without_checkpoint_returns_404(client: TestClient) -> None:
     assert response.json()["detail"] == "当前会话没有已保存状态，无法继续。"
 
 
+def test_profile_routes_registered(client: TestClient) -> None:
+    routes = {route.path for route in client.app.routes if hasattr(route, "path")}
+    assert "/api/resume-assets" in routes or any(
+        "resume-assets" in r for r in routes
+    )
+    assert "/api/resume-imports" in routes or any(
+        "resume-imports" in r for r in routes
+    )
+    assert "/api/profiles" in routes or any(
+        "profiles" in r and "/api" in r for r in routes
+    )
+    assert "/api/profile-versions" in routes or any(
+        "profile-versions" in r for r in routes
+    )
+
+    # Verify no sensitive fields in response schemas
+    serialized = str(client.app.openapi())
+    assert "object_key" not in serialized
+    assert "plaintext_sha256" not in serialized
+
+
 def test_api_contract_with_real_compiled_state_graph(client: TestClient) -> None:
     client.app.state.graph = build_test_compiled_graph()
     token, thread_id = register(client, "compiled-user")

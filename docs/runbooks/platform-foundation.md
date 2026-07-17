@@ -217,6 +217,62 @@ $secureAdminJwt.Dispose()
 把全部职位重置为 `pending_completion`，因此只能在确认不需要保留审核历史的开发或恢复
 场景执行。
 
+## 档案与简历生命周期
+
+学生上传个人简历（.txt、.md、.pdf、.docx，最大 10 MiB）后经加密存储至 MinIO，
+解析并提取结构化证据，经人工校对后创建不可变的确认版本。整个流程由用户身份
+（`user_id`）隔离，所有跨用户查询返回 404。
+
+### 上传与加密存储
+
+前端或 API 上传简历文件到 `POST /resume-assets`。后端立即在 MySQL 创建 `pending_upload`
+资产记录；加密明文至对象存储（AES-256-GCM，nonce 前置），确认写入后标记 `ready`。
+写入失败时标记 `upload_failed` 并返回 503。加密密钥由 `OBJECT_ENCRYPTION_KEY` 控制，
+对象存储不保存明文。对象 key 格式为 `users/{user_id}/resume-assets/{asset_id}`。
+
+### 解析与导入
+
+资产就绪后调用 `POST /resume-assets/{id}/reconcile` 通过 `inspect()` 确认密文完整性，
+再调用 `POST /resume-imports` 创建解析任务。后端解密对象后使用 `python-docx`（docx）
+或正则（txt/md/pdf）提取简历文本，根据中文章节标题（"技能"、"教育背景"、"工作经历"
+等）切分出字段路径、候选值和置信度，写入 `profile_field_evidence`。解析失败标记为
+`failed` 或 `needs_manual_entry`。
+
+### 证据校对
+
+`GET /profiles` 返回当前档案全部证据及其最新决定状态，附带与前一个确认版本比较的
+diff 操作（`add`/`replace`/`unchanged`/`conflict`）。学生通过前端对每条证据选择
+"确认"、"忽略"或"更正"；`PATCH /profiles/evidence` 追加不可变的决定记录，
+`expected_version` 确保乐观并发——收到 HTTP 409 时必须重新加载。`correct` 动作需要
+提供 `corrected_value`。
+
+### 版本确认
+
+前端"创建确认版本"按钮调用 `POST /profile-versions`。服务端使用
+`SELECT ... FOR UPDATE` 行级锁确保并发确认安全：两个线程使用相同
+`expected_version` 时只有一个成功，另一个收到 HTTP 409 `stale_profile_version`。
+成功写入追加 `confirmed_profile_version` 行，记录事实快照、证据引用和当时本地敏感
+引用，并递增档案版本。版本号按 `profile_id` 自增，`aggregate_version` 与档案版本一致。
+
+`PATCH /profiles/local-sensitive-references` 维护敏感引用（格式
+`lsr:v1:<64 lowercase hex characters>`），也使用乐观并发。
+
+### 生命周期错误码
+
+- 409 `stale_profile_version`：版本冲突，重新加载后重试。
+- 409 `resume_asset_state_conflict`：资产状态不允许当前操作（未就绪、已同步等）。
+- 422 `invalid_profile_operation`：操作不合法（类型不支持、超限等）。
+- 503 `profile_dependency_unavailable`：对象存储或解析依赖不可用。
+- 404 `profile_resource_not_found`：资源不存在或无权限。
+
+### 运维关注点
+
+- 对象存储备份必须与 `OBJECT_ENCRYPTION_KEY` 分开保存，否则密文不可解密。
+- 加密密钥轮换需逐对象解密再加密，无法原地替换。
+- 压缩前原始简历文本通过 `download` 端点以明文形式返回，传输中依赖 HTTPS 保护。
+- 测试门禁包含 MySQL 并发确认测试（`test_profile_lifecycle_mysql.py`），使用
+  `ALLOW_DESTRUCTIVE_MYSQL_TESTS=1` 和隔离的 `career_assistant_test` 数据库。
+
 ## 撤销设备
 
 先以用户 Bearer token 获取设备列表，再由设备所有者撤销。令牌使用隐藏输入并只保留在当前 PowerShell 进程中：
@@ -276,8 +332,8 @@ Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/live"
 $backendPort = if ($env:BACKEND_HOST_PORT) { $env:BACKEND_HOST_PORT } else { '8000' }
 $frontendPort = if ($env:FRONTEND_HOST_PORT) { $env:FRONTEND_HOST_PORT } else { '5173' }
 $revision = docker compose run --rm migrate alembic current
-if ($revision -notmatch '20260716_0004') {
-  throw 'Compose database is not at 20260716_0004'
+if ($revision -notmatch '20260717_0005') {
+  throw 'Compose database is not at 20260717_0005'
 }
 Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/ready" |
   ConvertTo-Json -Depth 4
@@ -289,7 +345,7 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 `BACKEND_HOST_PORT` 和 `FRONTEND_HOST_PORT`；MySQL、Redis 与 MinIO 的宿主端口也分别
 由 `MYSQL_HOST_PORT`、`REDIS_HOST_PORT`、`MINIO_HOST_PORT` 和
 `MINIO_CONSOLE_HOST_PORT` 控制。`migrate` 容器退出 0 不是 revision 证明，必须额外执行
-`alembic current` 并看到 `20260716_0004`。
+`alembic current` 并看到 `20260717_0005`。
 
 ## 测试和发布前门禁
 

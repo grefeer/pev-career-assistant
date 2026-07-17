@@ -144,3 +144,20 @@ class EncryptedObjectStore:
         if len(nonce) != NONCE_SIZE:
             raise InvalidTag
         return self._cipher.decrypt(nonce, ciphertext, key.encode("utf-8"))
+
+    def inspect(self, *, key: str) -> StoredObjectMetadata:
+        head = self._blob_store.head(key=key)
+        metadata = head.get("Metadata", {})
+        encryption = str(metadata.get("encryption", ""))
+        if encryption != ENCRYPTION_VERSION:
+            raise ValueError("invalid encrypted object metadata")
+        return StoredObjectMetadata(
+            content_type=str(head.get("ContentType", "application/octet-stream")),
+            encryption=encryption,
+        )
+
+
+@dataclass(frozen=True)
+class StoredObjectMetadata:
+    content_type: str
+    encryption: str

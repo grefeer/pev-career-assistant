@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -18,6 +19,12 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from backend.app.domain.profiles import (
+    EvidenceDecisionAction,
+    ResumeAssetStatus,
+    ResumeImportStatus,
+)
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -369,6 +376,147 @@ class JobVerification(UUIDPrimaryKeyMixin, Base):
     review_version: Mapped[int] = mapped_column(Integer, nullable=False)
     field_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     reason_code: Mapped[str | None] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class Profile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "profiles"
+    __table_args__ = (UniqueConstraint("user_id", name="uq_profiles_user_id"),)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    local_sensitive_references: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+
+
+class ResumeAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "resume_assets"
+    __table_args__ = (
+        UniqueConstraint("object_key", name="uq_resume_assets_object_key"),
+        Index("ix_resume_assets_profile_created", "profile_id", "created_at"),
+    )
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    object_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    plaintext_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    plaintext_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    encryption_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[ResumeAssetStatus] = mapped_column(
+        Enum(ResumeAssetStatus, name="resume_asset_status", **enum_kwargs),
+        nullable=False,
+    )
+    error_code: Mapped[str | None] = mapped_column(String(80))
+
+
+class ResumeImport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "resume_imports"
+    __table_args__ = (
+        Index("ix_resume_imports_profile_created", "profile_id", "created_at"),
+    )
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    asset_id: Mapped[str] = mapped_column(
+        ForeignKey("resume_assets.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    parser_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[ResumeImportStatus] = mapped_column(
+        Enum(ResumeImportStatus, name="resume_import_status", **enum_kwargs),
+        nullable=False,
+    )
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ProfileFieldEvidence(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "profile_field_evidence"
+    __table_args__ = (
+        Index(
+            "ix_evidence_profile_field_created",
+            "profile_id",
+            "field_path",
+            "created_at",
+        ),
+        UniqueConstraint(
+            "resume_import_id", "sequence", name="uq_evidence_import_sequence"
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 100",
+            name="ck_profile_field_evidence_confidence",
+        ),
+    )
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    resume_import_id: Mapped[str] = mapped_column(
+        ForeignKey("resume_imports.id", ondelete="CASCADE"), nullable=False
+    )
+    field_path: Mapped[str] = mapped_column(String(255), nullable=False)
+    candidate_value: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(  # noqa: E501
+        JSON, nullable=False
+    )
+    evidence_excerpt: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ProfileFieldDecision(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "profile_field_decisions"
+    __table_args__ = (
+        Index("ix_decisions_evidence_created", "evidence_id", "created_at"),
+    )
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        ForeignKey("profile_field_evidence.id", ondelete="CASCADE"), nullable=False
+    )
+    actor_user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    action: Mapped[EvidenceDecisionAction] = mapped_column(
+        Enum(EvidenceDecisionAction, name="profile_evidence_decision_action", **enum_kwargs),
+        nullable=False,
+    )
+    resolved_value: Mapped[dict[str, Any] | list[Any] | str | int | float | bool | None] = mapped_column(  # noqa: E501
+        JSON, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class ConfirmedProfileVersion(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "confirmed_profile_versions"
+    __table_args__ = (
+        UniqueConstraint(
+            "profile_id", "version_number", name="uq_confirmed_version_number"
+        ),
+        Index("ix_confirmed_versions_profile_created", "profile_id", "created_at"),
+    )
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    aggregate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    facts_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    evidence_refs: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    local_sensitive_references: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
