@@ -34,7 +34,6 @@ const apiMocks = vi.hoisted(() => ({
   login: vi.fn(),
   register: vi.fn(),
   request: vi.fn(),
-  runAnalysis: vi.fn(),
 }));
 
 vi.mock("../api", () => apiMocks);

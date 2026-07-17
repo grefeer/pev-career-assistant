@@ -1,5 +1,4 @@
 import type {
-  AnalysisResponse,
   AuthResponse,
   HistoryItem,
   SessionItem,
@@ -127,35 +126,4 @@ export function fetchSessionHistory(
   limit = 10,
 ): Promise<HistoryItem[]> {
   return request<HistoryItem[]>(`/sessions/${threadId}/history?limit=${limit}`, {}, token);
-}
-
-export function runAnalysis(
-  token: string,
-  payload: {
-    threadId: string;
-    continueSession: boolean;
-    userGoal: string;
-    message: string;
-    resumeText?: string;
-    maxOptimizationRounds: number;
-    resumeFile?: File | null;
-  },
-): Promise<AnalysisResponse> {
-  const formData = new FormData();
-  formData.append("thread_id", payload.threadId);
-  formData.append("continue_session", String(payload.continueSession));
-  formData.append("user_goal", payload.userGoal);
-  formData.append("message", payload.message);
-  formData.append("max_optimization_rounds", String(payload.maxOptimizationRounds));
-  if (payload.resumeText) {
-    formData.append("resume_text", payload.resumeText);
-  }
-  if (payload.resumeFile) {
-    formData.append("resume_file", payload.resumeFile);
-  }
-
-  return request<AnalysisResponse>("/analysis/run", {
-    method: "POST",
-    body: formData,
-  }, token);
 }
