@@ -20,6 +20,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -951,3 +952,159 @@ class ObservedSite(UUIDPrimaryKeyMixin, Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+
+
+# ── Job Discovery Agent ────────────────────────────────────────────────────────
+
+
+class JobDiscoveryTaskStatus(StrEnum):
+    queued = "queued"
+    running = "running"
+    partial_success = "partial_success"
+    succeeded = "succeeded"
+    needs_manual_review = "needs_manual_review"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
+class DiscoveredJobCandidateStatus(StrEnum):
+    pending_review = "pending_review"
+    approved = "approved"
+    rejected = "rejected"
+    merged = "merged"
+    needs_manual_review = "needs_manual_review"
+
+
+class DiscoveryBlockReason(StrEnum):
+    login_required = "login_required"
+    captcha = "captcha"
+    anti_bot = "anti_bot"
+    wechat_unavailable = "wechat_unavailable"
+    permission_denied = "permission_denied"
+    invalid_url = "invalid_url"
+    timeout = "timeout"
+    budget_exceeded = "budget_exceeded"
+    parse_failed = "parse_failed"
+    unknown = "unknown"
+
+
+class JobDiscoveryTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "job_discovery_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id", "external_record_id", "url_hash", "payload_hash", "agent_version",
+            name="uq_job_discovery_tasks_source_record",
+        ),
+        Index("ix_job_discovery_tasks_status_lease_created", "status", "lease_expires_at", "created_at"),
+        Index("ix_job_discovery_tasks_raw_record_id", "raw_record_id"),
+    )
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("job_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    raw_record_id: Mapped[str] = mapped_column(
+        ForeignKey("raw_job_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_record_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255), unique=True, nullable=False
+    )
+    agent_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[JobDiscoveryTaskStatus] = mapped_column(
+        Enum(JobDiscoveryTaskStatus, name="job_discovery_task_status", **enum_kwargs),
+        default=JobDiscoveryTaskStatus.queued,
+        index=True,
+        nullable=False,
+    )
+    block_reason: Mapped[DiscoveryBlockReason | None] = mapped_column(
+        Enum(DiscoveryBlockReason, name="discovery_block_reason", **enum_kwargs),
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    budget_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    result_summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class JobDiscoveryEvidence(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_discovery_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id", "evidence_type", "content_hash",
+            name="uq_job_discovery_evidence_task_type_hash",
+        ),
+        Index("ix_job_discovery_evidence_task_created", "task_id", "created_at"),
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("job_discovery_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    evidence_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    url: Mapped[str | None] = mapped_column(Text)
+    title: Mapped[str | None] = mapped_column(String(512))
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    text_excerpt: Mapped[str | None] = mapped_column(Text)
+    storage_uri: Mapped[str | None] = mapped_column(String(1024))
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class DiscoveredJobCandidate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "discovered_job_candidates"
+    __table_args__ = (
+        Index(
+            "ix_discovered_job_candidates_status_group_created",
+            "status", "similarity_group_key", "created_at",
+        ),
+        Index(
+            "ix_discovered_job_candidates_source_record",
+            "source_id", "external_record_id",
+        ),
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("job_discovery_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    source_id: Mapped[str] = mapped_column(
+        ForeignKey("job_sources.id", ondelete="RESTRICT"), nullable=False
+    )
+    raw_record_id: Mapped[str] = mapped_column(
+        ForeignKey("raw_job_records.id", ondelete="RESTRICT"), nullable=False
+    )
+    external_record_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(
+        String(255), unique=True, nullable=False
+    )
+    similarity_group_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[DiscoveredJobCandidateStatus] = mapped_column(
+        Enum(
+            DiscoveredJobCandidateStatus,
+            name="discovered_job_candidate_status",
+            **enum_kwargs,
+        ),
+        default=DiscoveredJobCandidateStatus.pending_review,
+        nullable=False,
+    )
+    title: Mapped[str | None] = mapped_column(String(512))
+    company_name: Mapped[str | None] = mapped_column(String(256))
+    department: Mapped[str | None] = mapped_column(String(256))
+    description_text: Mapped[str | None] = mapped_column(Text)
+    responsibilities: Mapped[str | None] = mapped_column(Text)
+    requirements: Mapped[str | None] = mapped_column(Text)
+    locations_json: Mapped[list[str] | None] = mapped_column(JSON)
+    recruitment_types_json: Mapped[list[str] | None] = mapped_column(JSON)
+    industries_json: Mapped[list[str] | None] = mapped_column(JSON)
+    apply_url: Mapped[str | None] = mapped_column(String(2048))
+    application_channel_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    deadline_text: Mapped[str | None] = mapped_column(String(256))
+    referral_code: Mapped[str | None] = mapped_column(String(256))
+    confidence: Mapped[float | None] = mapped_column(Float)
+    evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    normalization_warnings_json: Mapped[list[str] | None] = mapped_column(JSON)
