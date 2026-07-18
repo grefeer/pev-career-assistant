@@ -50,6 +50,52 @@ _REFERRAL_CODE_PATTERNS: list[re.Pattern] = [
     re.compile(r"(?:内推码|推荐码|内推|referral code|referral)\s*[:：]?\s*(.{0,30})(?:\n|$)", re.IGNORECASE),
 ]
 
+# --- Multi-job page separators (Chinese numbered position markers) ---
+
+_MULTI_JOB_SEPARATORS: list[re.Pattern] = [
+    re.compile(r"\n\s*(?:岗位|职位)\s*(?:二|三|四|五|[2-5])\s*[：:]"),
+    re.compile(r"\n\s*招聘岗位\s*(?:二|三|四|五|[2-5])"),
+]
+
+_TITLE_HEADER_RE: re.Pattern = re.compile(r"^(?:岗位名称|职位名称|招聘职位)", re.MULTILINE)
+
+
+def _split_multi_job_page(text: str) -> list[str]:
+    """Split page text containing multiple job postings into segments.
+
+    Detects Chinese multi-job separators like 岗位二： / 职位2：
+    or repeated title headings (岗位名称 appearing twice).
+    Returns up to 2 text segments, each fed separately to extraction.
+    """
+    if not text.strip():
+        return [text]
+
+    # Pattern 1: Numbered position markers
+    for pattern in _MULTI_JOB_SEPARATORS:
+        m = pattern.search(text)
+        if m:
+            split_pos = m.start()
+            before = text[:split_pos].strip()
+            after = text[split_pos:].strip()
+            result = []
+            if before:
+                result.append(before)
+            if after:
+                result.append(after)
+            return result[:2]
+
+    # Pattern 2: Repeated title headers (e.g. 岗位名称 appearing twice)
+    heading_matches = list(_TITLE_HEADER_RE.finditer(text))
+    if len(heading_matches) >= 2:
+        segments = []
+        for i, m in enumerate(heading_matches):
+            start = m.start()
+            end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(text)
+            segments.append(text[start:end].strip())
+        return segments[:2]
+
+    return [text]
+
 
 def _extract_title(text: str) -> tuple[str | None, float]:
     """Extract job title from text using keyword heuristics."""
@@ -234,58 +280,71 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
     if not page_text.strip():
         return []
 
-    title, title_conf = _extract_title(page_text)
-    company, company_conf = _extract_company(page_text)
-    department = _extract_department(page_text)
-    responsibilities = _extract_section(page_text, _RESPONSIBILITIES_HEADERS)
-    requirements = _extract_section(page_text, _REQUIREMENTS_HEADERS)
-    locations = _extract_locations(page_text)
-    recruitment_types = _detect_recruitment_types(page_text)
-    apply_method = _extract_apply_method(page_text)
-    deadline = _extract_deadline(page_text)
-    referral_code = _extract_referral_code(page_text)
+    # Split multi-job pages into individual segments (max 2)
+    segments = _split_multi_job_page(page_text)
 
-    has_section_content = bool(responsibilities or requirements)
-    confidence = _estimate_confidence(
-        title, company, responsibilities, requirements, has_section_content
-    )
+    results: list[NormalizedJobCandidate] = []
+    seen_dedup_keys: set[str] = set()
 
-    warnings: list[str] = []
-    if not title:
-        warnings.append("No job title found via heuristics")
-    if not responsibilities and not requirements:
-        warnings.append("No responsibilities or requirements sections found")
-    if not locations:
-        warnings.append("No location information found")
+    for segment in segments:
+        if len(results) >= 2:
+            break
 
-    # Build description_text from what we have
-    desc_parts = []
-    if responsibilities:
-        desc_parts.append(responsibilities)
-    if requirements:
-        desc_parts.append(requirements)
-    description_text = "\n\n".join(desc_parts) if desc_parts else page_text[:2000]
+        title, title_conf = _extract_title(segment)
+        company, company_conf = _extract_company(segment)
+        department = _extract_department(segment)
+        responsibilities = _extract_section(segment, _RESPONSIBILITIES_HEADERS)
+        requirements = _extract_section(segment, _REQUIREMENTS_HEADERS)
+        locations = _extract_locations(segment)
+        recruitment_types = _detect_recruitment_types(segment)
+        apply_method = _extract_apply_method(segment)
+        deadline = _extract_deadline(segment)
+        referral_code = _extract_referral_code(segment)
 
-    candidate = NormalizedJobCandidate(
-        title=title,
-        company_name=company,
-        department=department,
-        description_text=description_text,
-        responsibilities=responsibilities,
-        requirements=requirements,
-        locations=locations,
-        recruitment_types=recruitment_types,
-        apply_url=url,
-        application_channel_json=apply_method,
-        deadline_text=deadline,
-        referral_code=referral_code,
-        confidence=confidence,
-        normalization_warnings=warnings,
-    )
+        has_section_content = bool(responsibilities or requirements)
+        confidence = _estimate_confidence(
+            title, company, responsibilities, requirements, has_section_content
+        )
 
-    result = [candidate]
+        warnings: list[str] = []
+        if not title:
+            warnings.append("No job title found via heuristics")
+        if not responsibilities and not requirements:
+            warnings.append("No responsibilities or requirements sections found")
+        if not locations:
+            warnings.append("No location information found")
 
-    # Deduplication: if the same page seems to have 2 distinct roles,
-    # this would be handled by splitting logic — but for deterministic
-    # heuristics we only return 1 candidate per call.
-    return result
+        # Build description_text from what we have
+        desc_parts = []
+        if responsibilities:
+            desc_parts.append(responsibilities)
+        if requirements:
+            desc_parts.append(requirements)
+        description_text = "\n\n".join(desc_parts) if desc_parts else segment[:2000]
+
+        # Deduplicate by title + company to avoid identical candidates from overlapping segments
+        dedup_key = f"{title or ''}|{company or ''}"
+        if dedup_key in seen_dedup_keys:
+            continue
+        seen_dedup_keys.add(dedup_key)
+
+        candidate = NormalizedJobCandidate(
+            title=title,
+            company_name=company,
+            department=department,
+            description_text=description_text,
+            responsibilities=responsibilities,
+            requirements=requirements,
+            locations=locations,
+            recruitment_types=recruitment_types,
+            apply_url=url,
+            application_channel_json=apply_method,
+            deadline_text=deadline,
+            referral_code=referral_code,
+            confidence=confidence,
+            normalization_warnings=warnings,
+        )
+
+        results.append(candidate)
+
+    return results

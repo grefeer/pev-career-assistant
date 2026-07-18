@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from backend.app.services.job_discovery.schemas import NormalizedJobCandidate, PageEvidence
 
 # Minimum description length to avoid flagging as vague (characters).
@@ -36,12 +38,26 @@ def _is_vague(candidate: NormalizedJobCandidate) -> bool:
     return False
 
 
+# JD-related keywords used to distinguish job content from boilerplate/navigation.
+_JD_KEYWORDS: list[str] = [
+    "岗位", "职位", "招聘", "要求", "职责",
+    "job", "position", "requirement", "responsibility", "qualification",
+]
+
+
 def _is_non_jd_text(candidate: NormalizedJobCandidate) -> bool:
-    """Check if the extracted text looks like non-job content."""
+    """Check if the extracted text looks like non-job content.
+
+    Flags text longer than 100 characters that contains fewer than 2
+    JD-related keywords as likely non-job (e.g. navigation, boilerplate).
+    """
     text = candidate.description_text or ""
     if not text.strip():
         return True
-    # If it looks like nav / boilerplate with no job keywords
+    if len(text) > 100:
+        text_lower = text.lower()
+        keyword_count = sum(1 for kw in _JD_KEYWORDS if kw in text_lower)
+        return keyword_count < 2
     return False
 
 
@@ -82,17 +98,11 @@ def verify_evidence(
             continue
 
         # --- Rejection: no supporting evidence refs ---
-        if not candidate.evidence_refs and not evidence:
+        if not candidate.evidence_refs:
             warnings.append(
-                "Rejected: no supporting evidence refs and no evidence provided"
+                "Rejected: no supporting evidence refs"
             )
             continue
-
-        # If there's evidence but candidate has no evidence_refs, add a warning
-        if not candidate.evidence_refs and evidence:
-            warnings.append(
-                "Candidate has no evidence_refs but evidence was collected"
-            )
 
         # --- Staleness check ---
         if _check_stale(candidate.description_text):
@@ -105,6 +115,12 @@ def verify_evidence(
         if _is_vague(candidate):
             warnings.append(
                 f"Vague description: less than {_MIN_DESCRIPTION_LENGTH} characters"
+            )
+
+        # --- Non-JD text check ---
+        if _is_non_jd_text(candidate):
+            warnings.append(
+                "Description may not be job-related: fewer than 2 JD keywords found"
             )
 
         # --- Build final candidate (preserve original, add warnings) ---

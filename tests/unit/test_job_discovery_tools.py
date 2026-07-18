@@ -522,8 +522,8 @@ class TestEvidenceVerifier:
         result = verify_evidence(candidates, [])
         assert len(result) == 1
 
-    def test_accept_with_evidence_list(self):
-        """Candidate without refs but with evidence list should pass with a warning."""
+    def test_reject_no_evidence_refs_with_evidence_list(self):
+        """Candidate without refs is rejected even when broader evidence exists."""
         candidates = [
             NormalizedJobCandidate(
                 title="Engineer",
@@ -540,8 +540,7 @@ class TestEvidenceVerifier:
             )
         ]
         result = verify_evidence(candidates, evidence)
-        assert len(result) == 1
-        assert any("no evidence_refs" in w.lower() for w in result[0].normalization_warnings)
+        assert len(result) == 0
 
     def test_flag_vague_description(self):
         candidates = [
