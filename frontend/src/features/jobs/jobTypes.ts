@@ -88,6 +88,46 @@ export interface JobSyncResponse {
   finished_at: string;
 }
 
+// ── Job Discovery (Phase 7) ─────────────────────────────────────────────
+
+export interface JobDiscoveryTask {
+  id: string;
+  source_key: string;
+  source_name: string | null;
+  source_url: string;
+  status: string;
+  block_reason: string | null;
+  attempt_count: number;
+  result_summary_json: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobDiscoveryTaskListResponse {
+  tasks: JobDiscoveryTask[];
+}
+
+export interface DiscoveredJobCandidate {
+  id: string;
+  task_id: string;
+  similarity_group_key: string;
+  status: string;
+  title: string | null;
+  company_name: string | null;
+  description_text: string | null;
+  locations_json: string[] | null;
+  apply_url: string | null;
+  confidence: number | null;
+  evidence_refs_json: Array<{ url?: string; title?: string; excerpt?: string; type?: string }> | null;
+  normalization_warnings_json: string[] | null;
+  created_at: string;
+}
+
+export interface JobDiscoveryReviewGroup {
+  similarity_group_key: string;
+  candidates: DiscoveredJobCandidate[];
+}
+
 export interface JobCompletionPayload {
   expected_version: number;
   company_name: string;

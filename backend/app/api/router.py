@@ -6,6 +6,7 @@ from backend.app.api.routes import (
     devices,
     executor_tasks,
     health,
+    job_discovery,
     job_feedback,
     job_submissions,
     jobs,
@@ -32,4 +33,5 @@ api_router.include_router(job_feedback.router)
 api_router.include_router(matches.router)
 api_router.include_router(resume_drafts.router)
 api_router.include_router(application_snapshots.router)
+api_router.include_router(job_discovery.router)
 api_router.include_router(site_adapters.router)
