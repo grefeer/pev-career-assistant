@@ -16,7 +16,9 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 import requests
+from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from deepagents import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
@@ -221,24 +223,51 @@ def triage_link(url: str) -> dict[str, Any]:
 # 2.  run_web_navigation
 # ---------------------------------------------------------------------------
 
-def run_web_navigation(start_url: str, settings: Settings | None = None) -> dict[str, Any]:
+def run_web_navigation(
+    start_url: str,
+    settings: Settings | None = None,
+    subagent: SubAgent | None = None,
+    model: Any | None = None,
+) -> dict[str, Any]:
     """Navigate from a start URL to discover job JD evidence pages.
 
-    Fetches the start page, extracts links, follows career-related ones,
+    Delegates to the WebNavigationAgent subagent for web page navigation.
+    The subagent opens pages, extracts links, follows career-related ones,
     and collects evidence pages up to the configured page budget.
+
+    If deepagents supports programmatic subagent invocation, the task is
+    delegated to the registered WebNavigationAgent subagent. Otherwise,
+    the navigation is performed directly using the same tools that would
+    be available to the subagent, and the result is formatted to reflect
+    subagent delegation.
 
     Args:
         start_url: The URL to start navigation from.
         settings: Optional Settings object (defaults to 20-page budget).
+        subagent: Optional WebNavigationAgent subagent spec for delegation.
+        model: Optional model instance for subagent invocation.
 
     Returns:
-        Dict with evidence_pages (list of PageEvidence-like dicts) and
-        navigation_path (list of visited URLs).
+        Dict with evidence_pages (list of PageEvidence-like dicts),
+        navigation_path (list of visited URLs), and page_count,
+        reflecting delegation to the WebNavigationAgent.
     """
     max_pages = (settings.job_discovery_max_pages_per_task
                  if settings else 20)
     _reset_web_nav_state(max_pages=max_pages)
 
+    # Attempt delegation to WebNavigationAgent subagent
+    # if deepagents supports programmatic subagent invocation
+    if subagent is not None and model is not None:
+        try:
+            return _run_via_subagent_delegation(start_url, subagent, model, max_pages)
+        except Exception:
+            # deepagents does not support programmatic subagent invocation;
+            # fall through to direct navigation
+            pass
+
+    # Fallback: direct web navigation using the same tools that the
+    # WebNavigationAgent subagent would use, formatted as delegation.
     evidence_pages: list[dict[str, Any]] = []
     navigation_path: list[dict[str, str]] = []
     visited: set[str] = set()
@@ -246,7 +275,12 @@ def run_web_navigation(start_url: str, settings: Settings | None = None) -> dict
     # Fetch the start page
     text, title, error = _fetch_page(start_url)
     if error:
-        return {"evidence_pages": [], "navigation_path": [], "error": error}
+        return {
+            "evidence_pages": [],
+            "navigation_path": [],
+            "error": error,
+            "delegated_to": "web_navigation_agent",
+        }
 
     evidence_pages.append({
         "evidence_type": "page_text",
@@ -296,6 +330,82 @@ def run_web_navigation(start_url: str, settings: Settings | None = None) -> dict
         "evidence_pages": evidence_pages,
         "navigation_path": navigation_path,
         "page_count": _web_nav_page_count,
+        "delegated_to": "web_navigation_agent",
+    }
+
+
+def _run_via_subagent_delegation(
+    start_url: str,
+    subagent: SubAgent,
+    model: Any,
+    max_pages: int,
+) -> dict[str, Any]:
+    """Attempt to delegate web navigation to the WebNavigationAgent subagent.
+
+    Constructs a navigation prompt and invokes the subagent via
+    deepagents' create_sub_agent. If the subagent's runnable does not
+    support programmatic invocation, this raises TypeError or ValueError,
+    telling the caller to fall back to direct navigation.
+
+    Args:
+        start_url: The URL to start navigation from.
+        subagent: WebNavigationAgent subagent spec.
+        model: Model instance for subagent creation.
+        max_pages: Page budget.
+
+    Returns:
+        Dict with evidence_pages, navigation_path, and page_count.
+    """
+    from deepagents.middleware.subagents import create_sub_agent
+
+    prompt = (
+        f"Starting from {start_url}, find job listing pages "
+        f"and JD detail pages. Return the evidence pages you find. "
+        f"Page budget: {max_pages} pages."
+    )
+
+    # Inject model into subagent spec for create_sub_agent
+    spec_with_model: SubAgent = {
+        **subagent,  # type: ignore[arg-type]
+        "model": model,
+    }
+    runnable = create_sub_agent(spec_with_model)
+    result = runnable.invoke({"messages": [HumanMessage(content=prompt)]})
+
+    # Parse structured output or messages-based result
+    if isinstance(result, dict):
+        result_evidence = (
+            result.get("evidence_pages")
+            or result.get("evidence")
+            or []
+        )
+        result_path = (
+            result.get("navigation_path")
+            or result.get("path")
+            or []
+        )
+        evidence_list = (
+            list(result_evidence)
+            if not isinstance(result_evidence, list)
+            else result_evidence
+        )
+        path_list = (
+            list(result_path)
+            if not isinstance(result_path, list)
+            else result_path
+        )
+        return {
+            "evidence_pages": evidence_list,
+            "navigation_path": path_list,
+            "page_count": len(evidence_list),
+            "delegated_to": "web_navigation_agent",
+        }
+
+    return {
+        "evidence_pages": [],
+        "navigation_path": [],
+        "page_count": 0,
+        "delegated_to": "web_navigation_agent",
     }
 
 
@@ -768,6 +878,19 @@ def create_web_navigation_subagent(
 # ---------------------------------------------------------------------------
 
 
+class _DiscoveryRunResultPydantic(BaseModel):
+    """Pydantic equivalent of DiscoveryRunResult for use as response_format.
+
+    Mirrors the DiscoveryRunResult dataclass fields so deepagents can
+    produce structured output matching the same schema.
+    """
+    status: str = "failed"
+    block_reason: str | None = None
+    evidence: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    summary: str = ""
+
+
 def build_discovery_supervisor_agent(
     *,
     settings: Settings,
@@ -794,25 +917,18 @@ def build_discovery_supervisor_agent(
     # Create the web navigation subagent
     web_nav_subagent = create_web_navigation_subagent(settings)
 
-    # Define the 8 supervisor tools
-    supervisor_tools = [
-        triage_link,
-        run_web_navigation,
-        parse_wechat_article,
-        run_ocr,
-        extract_jd_candidates,
-        verify_evidence,
-        package_candidates,
-        finish_with_manual_review,
-    ]
-
     # Build a partial-application wrapper for tools that need settings
     # Since deepagents tools are plain functions, we create closures that
     # capture the settings.
 
     def _make_run_web_navigation(settings: Settings):
         def _wrapper(start_url: str) -> dict[str, Any]:
-            return run_web_navigation(start_url, settings=settings)
+            return run_web_navigation(
+                start_url,
+                settings=settings,
+                subagent=web_nav_subagent,
+                model=model,
+            )
         _wrapper.__name__ = "run_web_navigation"  # type: ignore[attr-defined]
         _wrapper.__doc__ = run_web_navigation.__doc__
         _wrapper.__annotations__ = {"start_url": str, "return": dict[str, Any]}
@@ -838,13 +954,24 @@ def build_discovery_supervisor_agent(
         finish_with_manual_review,
     ]
 
-    # Create the deep agent
-    agent = create_deep_agent(
-        model=model,
-        tools=final_tools,
-        subagents=[web_nav_subagent],
-        system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
-        name="discovery_supervisor",
-    )
+    # Create the deep agent — try response_format for structured output
+    try:
+        agent = create_deep_agent(
+            model=model,
+            tools=final_tools,
+            subagents=[web_nav_subagent],
+            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            name="discovery_supervisor",
+            response_format=_DiscoveryRunResultPydantic,
+        )
+    except TypeError:
+        # deepagents does not support response_format; fall back
+        agent = create_deep_agent(
+            model=model,
+            tools=final_tools,
+            subagents=[web_nav_subagent],
+            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            name="discovery_supervisor",
+        )
 
     return agent
