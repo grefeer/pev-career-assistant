@@ -33,6 +33,10 @@ class ExecutorCheckpoint(BaseModel):
     pending_field_key: str | None = None
     pending_effect_key: str | None | None = None
     issue_counts: dict[str, int]
+    adapter_id: str | None = None
+    adapter_version: str | None = None
+    site_page_key: str | None = None
+    repeat_signatures: dict[str, list[str]] = Field(default_factory=dict)
     saved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

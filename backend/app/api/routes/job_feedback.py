@@ -70,7 +70,14 @@ def _enforce_write_limit(
     limiter = getattr(
         request.app.state,
         "job_feedback_rate_limiter",
-        RedisFixedWindowRateLimiter(redis_client),
+        RedisFixedWindowRateLimiter(
+            redis_client,
+            secret=(
+                request.app.state.settings.rate_limit_hmac_secret.get_secret_value()
+                if request.app.state.settings.rate_limit_hmac_secret
+                else None
+            ),
+        ),
     )
     try:
         limiter.check(action="job-feedback-write", identity=user_id, limit=limit)

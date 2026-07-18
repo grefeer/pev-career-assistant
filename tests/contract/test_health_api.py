@@ -188,6 +188,21 @@ def test_ready_reports_all_dependencies_up() -> None:
     }
 
 
+def test_metrics_endpoint_exposes_prometheus_text() -> None:
+    client = _client_with_dependencies(
+        session_factory=lambda: HealthySession(),
+        redis_client=HealthyRedis(),
+        blob_store=HealthyBlobStore(),
+    )
+
+    response = client.get("/api/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "career_assistant_app_info" in response.text
+    assert "career_assistant_ready 1" in response.text
+
+
 def test_ensure_bucket_failure_closes_all_lifespan_owned_resources(
     monkeypatch: Any,
 ) -> None:

@@ -1,0 +1,51 @@
+groups:
+  - name: career-assistant-critical
+    rules:
+      - alert: AutoSubmitAttempt
+        expr: task_auto_submit_attempts > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Auto-submit attempt detected!"
+          description: "Safety gate may have been bypassed. Investigate immediately."
+
+      - alert: BackendDown
+        expr: up{job="career-assistant-backend"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend is unreachable"
+
+      - alert: CircuitBreakerOpen
+        expr: adapter_circuit_breaker_open == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Site adapter circuit breaker is open"
+
+      - alert: HighDiskUsage
+        expr: (1 - node_filesystem_avail_bytes / node_filesystem_size_bytes) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk usage > 90%"
+
+  - name: career-assistant-warning
+    rules:
+      - alert: TaskFailureRate
+        expr: rate(task_submitted_failed_total[1h]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Elevated task submission failure rate"
+
+      - alert: HighMemoryUsage
+        expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.9
+        for: 5m
+        labels:
+          severity: warning

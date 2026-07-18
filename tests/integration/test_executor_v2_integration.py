@@ -25,6 +25,13 @@ from executor.engine import (
     _v2_fields,
     _payload_fields,
 )
+from executor.adapters.base import (
+    BlockerInfo,
+    FillResult,
+    PageFingerprint,
+    RepeatSectionResult,
+    UploadResult,
+)
 from executor.mock_site.app import app as mock_app, telemetry
 from executor.protocol import (
     ExecutorField,
@@ -204,12 +211,19 @@ def test_v2_engine_with_v2_payload(
     })
 
     checkpoints = CheckpointStore(tmp_path / "checkpoints")
-    engine = ExecutorEngine(client=_FakeApiClient(), browser=browser, checkpoints=checkpoints)
+    adapter = _MockAdapter()
+    engine = ExecutorEngine(
+        client=_FakeApiClient(),
+        browser=browser,
+        checkpoints=checkpoints,
+        adapter=adapter,
+    )
 
     outcome = engine.run(payload=payload)
 
     # Same safety gate: single page bottom action is never auto-clicked
     assert outcome.kind == "ready_for_review"
+    assert adapter.fill_calls
     assert _telemetry()["final_clicks"] == 0
 
 
@@ -225,7 +239,12 @@ def test_v2_engine_ambiguous_safety_gate(
     })
 
     checkpoints = CheckpointStore(tmp_path / "checkpoints")
-    engine = ExecutorEngine(client=_FakeApiClient(), browser=browser, checkpoints=checkpoints)
+    engine = ExecutorEngine(
+        client=_FakeApiClient(),
+        browser=browser,
+        checkpoints=checkpoints,
+        adapter=_MockAdapter(),
+    )
 
     outcome = engine.run(payload=payload)
 
@@ -298,6 +317,59 @@ def test_v1_single_page_regression(
 
 def _telemetry() -> dict[str, object]:
     return telemetry.snapshot()
+
+
+class _MockAdapter:
+    adapter_id = "mock.local"
+    supported_domains = ["127.0.0.1"]
+    version = "1.0.0"
+
+    def __init__(self) -> None:
+        self.fill_calls: list[str] = []
+
+    def fingerprint_page(self, page) -> PageFingerprint:
+        return PageFingerprint(
+            url_pattern=page.url,
+            dom_hash="sha256:" + ("1" * 64),
+        )
+
+    def classify_topology(self, fp: PageFingerprint) -> str:
+        return "single_page"
+
+    def fill_field(self, page, field_key: str, value: str) -> FillResult:
+        self.fill_calls.append(field_key)
+        locator = page.locator(f'[data-field-key="{field_key}"]')
+        if locator.count() == 0:
+            return FillResult(
+                field_key=field_key,
+                strategy="mock",
+                value_written=value,
+                readback_match=False,
+                readback_value=None,
+                confidence=0.0,
+            )
+        locator.fill(value)
+        readback = locator.input_value()
+        return FillResult(
+            field_key=field_key,
+            strategy="mock",
+            value_written=value,
+            readback_match=readback == value,
+            readback_value=readback,
+            confidence=1.0 if readback == value else 0.0,
+        )
+
+    def handle_repeat_section(self, page, section_key, entries):
+        return RepeatSectionResult(section_key, 0, len(entries), len(entries), True)
+
+    def upload_attachment(self, page, field_key, file_path):
+        return UploadResult(field_key, file_path, True, "mock")
+
+    def detect_blocker(self, page) -> BlockerInfo | None:
+        return None
+
+    def save_page_progress(self, page) -> bool:
+        return False
 
 
 class _FakeApiClient:

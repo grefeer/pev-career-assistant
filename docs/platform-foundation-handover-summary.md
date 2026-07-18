@@ -87,6 +87,8 @@ flowchart LR
 - `20260717_0007`：职位反馈闭环（JobFeedback、JobFeedbackEvent）。
 - `20260718_0008`：证据化匹配、定制简历与投递快照（MatchReport、ResumeDraft、ApprovedResumeVersion、ApprovedResumeAttachment、ApplicationSnapshot）。
 - `7b757ef17d3f`：修复 MatchReport 状态 CHECK 约束（允许 pending/running 状态）。
+- `20260718_0009`：站点适配器注册表和投递任务 adapter 冻结字段。
+- `20260718_0010`：站点 rollout 字段、adapter 错误跟踪和观察站点表。
 
 ### 3.3 用户认证和授权
 
@@ -453,7 +455,7 @@ docker compose -p platform-foundation run --rm backend `
 
 ### 9.3 当前 Compose 运行态
 
-- 当前 `docker-compose.yml` schema-revision 标签为 `20260718_0008`。
+- 当前 `docker-compose.yml` schema-revision 标签为 `20260718_0010`。
 - `platform-foundation` 当前使用 MySQL `3307`、Redis `6380`、MinIO `19000/19001`、Backend `18000`、Frontend `15173`。
 - `GET /api/health/live`、`GET /api/health/ready` 和前端首页均返回 HTTP 200。
 - 当前开发库 `job_postings` 为 0 条；需要管理员触发腾讯同步并核验后方可验收真实职位匹配。

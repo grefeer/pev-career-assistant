@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend.app.api.router import api_router
 from backend.app.config import Settings, get_settings
+from backend.app.middleware import CorrelationIdMiddleware
 from backend.app.services.storage import EncryptedObjectStore, S3BlobStore
 from src.checkpointing import checkpointer_context
 from src.graph import build_graph
@@ -154,6 +155,7 @@ def create_app(
         app.state.blob_store = blob_store
     if session_factory is not None:
         app.state.session_factory = session_factory
+    app.add_middleware(CorrelationIdMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved.cors_origin_list,

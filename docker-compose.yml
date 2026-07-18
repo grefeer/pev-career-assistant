@@ -54,7 +54,7 @@ services:
   migrate:
     image: platform-foundation-backend:latest
     labels:
-      com.career-assistant.schema-revision: "20260718_0008"
+      com.career-assistant.schema-revision: "20260718_0010"
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -81,14 +81,15 @@ services:
       OBJECT_STORE_ACCESS_KEY: ${MINIO_ROOT_USER:?MINIO_ROOT_USER must be set}
       OBJECT_STORE_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD must be set}
       OBJECT_ENCRYPTION_KEY: ${OBJECT_ENCRYPTION_KEY:?OBJECT_ENCRYPTION_KEY must be set}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-gpt-4.1-mini}
-      ANALYST_MODEL: ${ANALYST_MODEL:-gpt-4o-mini}
-      REVIEWER_MODEL: ${REVIEWER_MODEL:-gpt-4.1}
-      OPTIMIZER_MODEL: ${OPTIMIZER_MODEL:-gpt-4.1}
-      COACH_MODEL: ${COACH_MODEL:-gpt-4.1}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.deepseek.com}
+      OPENAI_MODEL: ${OPENAI_MODEL:-deepseek-v4-flash}
+      SUPERVISOR_MODEL: ${SUPERVISOR_MODEL:-deepseek-v4-flash}
+      ANALYST_MODEL: ${ANALYST_MODEL:-deepseek-v4-flash}
+      REVIEWER_MODEL: ${REVIEWER_MODEL:-deepseek-v4-pro}
+      OPTIMIZER_MODEL: ${OPTIMIZER_MODEL:-deepseek-v4-pro}
+      COACH_MODEL: ${COACH_MODEL:-deepseek-v4-pro}
 
   backend:
     image: platform-foundation-backend:latest

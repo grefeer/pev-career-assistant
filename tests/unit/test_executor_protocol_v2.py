@@ -22,6 +22,8 @@ def test_executor_v2_fixture_is_parseable() -> None:
     assert len(payload.snapshot_id) == 36
     assert payload.target_url.host in {"127.0.0.1", "localhost"}
     assert isinstance(payload.state_version, int) and payload.state_version >= 0
+    assert payload.adapter is not None
+    assert payload.adapter.adapter_id == "mock.local"
 
     # non-sensitive fields
     assert "name" in payload.non_sensitive_fields
@@ -38,6 +40,7 @@ def test_executor_v2_fixture_is_parseable() -> None:
 
     # attachment IDs
     assert len(payload.attachment_ids) == 2
+    assert payload.adapter is not None
     assert all(len(aid) == 36 for aid in payload.attachment_ids)
 
 

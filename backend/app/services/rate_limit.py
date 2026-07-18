@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import ipaddress
 from dataclasses import dataclass
 from typing import Any
@@ -19,9 +20,17 @@ class RedisFixedWindowRateLimiter:
     redis: Any
     limit: int = 10
     window_seconds: int = 60
+    secret: str | None = None
 
     def check(self, *, action: str, identity: str, limit: int | None = None) -> None:
-        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        if self.secret:
+            digest = hmac.new(
+                self.secret.encode("utf-8"),
+                identity.encode("utf-8"),
+                "sha256",
+            ).hexdigest()
+        else:
+            digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         key = f"auth-rate:{action}:{digest}"
         try:
             pipe = self.redis.pipeline(transaction=True)

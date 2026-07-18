@@ -363,6 +363,13 @@ class ApplicationTask(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     task_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="simulation")
     simulation_scenario: Mapped[str | None] = mapped_column(String(100))
     request_idempotency_key: Mapped[str | None] = mapped_column(String(96))
+    adapter_id: Mapped[str | None] = mapped_column(String(64))
+    adapter_version: Mapped[str | None] = mapped_column(String(16))
+    adapter_status_at_dispatch: Mapped[str | None] = mapped_column(String(24))
+    site_adapter_error_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    site_adapter_last_error: Mapped[str | None] = mapped_column(String(256))
 
 
 class ApplicationEvent(Base):
@@ -875,4 +882,72 @@ class JobFeedbackEvent(UUIDPrimaryKeyMixin, Base):
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+# ── Site Adapter ───────────────────────────────────────────────────────────────
+
+
+class SiteAdapterStatus(StrEnum):
+    ACTIVE = "active"
+    CIRCUIT_BREAKER_OPEN = "circuit_breaker_open"
+    DEPRECATED = "deprecated"
+    READONLY = "readonly"
+    STAGED = "staged"
+
+
+class SiteAdapter(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "site_adapters"
+    __table_args__ = (
+        UniqueConstraint("adapter_id", name="uq_site_adapters_adapter_id"),
+    )
+    adapter_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    version: Mapped[str] = mapped_column(String(16), nullable=False)
+    supported_domains: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="active"
+    )
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    circuit_breaker_open: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    rollout_stage: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="readonly"
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_readonly_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+
+
+class ObservedSite(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "observed_sites"
+    __table_args__ = (
+        UniqueConstraint("site_code", name="uq_observed_sites_site_code"),
+    )
+    site_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    domains: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    page_samples_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="observing"
+    )
+    adapter_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="observation"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
     )

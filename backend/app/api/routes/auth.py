@@ -33,7 +33,14 @@ def _enforce_auth_rate_limit(
     limiter = getattr(
         request.app.state,
         "auth_rate_limiter",
-        RedisFixedWindowRateLimiter(request.app.state.redis),
+        RedisFixedWindowRateLimiter(
+            request.app.state.redis,
+            secret=(
+                request.app.state.settings.rate_limit_hmac_secret.get_secret_value()
+                if request.app.state.settings.rate_limit_hmac_secret
+                else None
+            ),
+        ),
     )
     peer = request.client.host if request.client else "unknown"
     identity = resolve_client_ip(

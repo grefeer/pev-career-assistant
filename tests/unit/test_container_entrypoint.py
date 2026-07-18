@@ -50,6 +50,24 @@ def test_entrypoint_derives_encoded_service_urls_and_executes_argv() -> None:
     assert executed == [("alembic", ["alembic", "upgrade", "head"])]
 
 
+def test_entrypoint_preserves_explicit_service_urls() -> None:
+    environment = {
+        "DATABASE_URL": "mysql+pymysql://app:db-value@mysql/career_assistant",
+        "REDIS_URL": "redis://:redis-value@redis:6379/0",
+    }
+    executed: list[tuple[str, list[str]]] = []
+
+    run(
+        ["uvicorn", "backend.app.main:app"],
+        environment,
+        lambda executable, argv: executed.append((executable, argv)),
+    )
+
+    assert environment["DATABASE_URL"] == "mysql+pymysql://app:db-value@mysql/career_assistant"
+    assert environment["REDIS_URL"] == "redis://:redis-value@redis:6379/0"
+    assert executed == [("uvicorn", ["uvicorn", "backend.app.main:app"])]
+
+
 @pytest.mark.parametrize("missing_name", ["DB_PASSWORD", "REDIS_PASSWORD"])
 def test_entrypoint_missing_credential_has_fixed_redacted_error(
     missing_name: str,
@@ -144,6 +162,7 @@ def test_compose_requires_minio_credentials_without_public_defaults() -> None:
         "REDIS_PASSWORD": "compose-redis-not-public",
         "APP_AUTH_SECRET": "a" * 32,
         "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
+        "COMPOSE_DISABLE_ENV_FILE": "1",
     }
     environment.pop("MINIO_ROOT_USER", None)
     environment.pop("MINIO_ROOT_PASSWORD", None)
@@ -191,7 +210,7 @@ def test_compose_declares_revision_and_respects_configured_host_ports() -> None:
     config: dict[str, Any] = json.loads(completed.stdout)
 
     assert config["services"]["migrate"]["labels"] == {
-        "com.career-assistant.schema-revision": "20260718_0008"
+        "com.career-assistant.schema-revision": "20260718_0010"
     }
     expected_ports = {
         "mysql": ("13306", 3306),
@@ -212,6 +231,58 @@ def test_compose_declares_revision_and_respects_configured_host_ports() -> None:
     )
 
 
+def test_production_compose_uses_runtime_safe_healthcheck_and_frontend_port() -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("docker compose is not available")
+    environment = {
+        **os.environ,
+        "DB_PASSWORD": "compose-db-not-public",
+        "REDIS_PASSWORD": "compose-redis-not-public",
+        "MINIO_ROOT_USER": "compose-minio-user-not-public",
+        "MINIO_ROOT_PASSWORD": "compose-minio-password-not-public",
+        "MYSQL_ROOT_PASSWORD": "compose-mysql-root-not-public",
+        "APP_AUTH_SECRET": "a" * 32,
+        "OBJECT_ENCRYPTION_KEY": "A" * 43 + "=",
+        "TRUSTED_PROXY_CIDRS": "172.16.0.0/12",
+        "RATE_LIMIT_HMAC_SECRET": "rate-limit-secret-with-at-least-32-chars",
+        "BACKEND_DIGEST": "sha256:" + "a" * 64,
+        "FRONTEND_DIGEST": "sha256:" + "b" * 64,
+        "PROMETHEUS_DIGEST": "sha256:" + "c" * 64,
+        "GRAFANA_DIGEST": "sha256:" + "d" * 64,
+        "GRAFANA_ADMIN_PASSWORD": "compose-grafana-not-public",
+    }
+
+    completed = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            "docker-compose.yml",
+            "-f",
+            "deploy/production/docker-compose.prod.yml",
+            "config",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    config: dict[str, Any] = json.loads(completed.stdout)
+
+    backend_healthcheck = config["services"]["backend"]["healthcheck"]["test"]
+    backend_healthcheck_text = " ".join(backend_healthcheck)
+    assert "curl" not in backend_healthcheck_text
+    assert "urllib.request" in backend_healthcheck_text
+    assert config["services"]["frontend"]["user"] == "1000:1000"
+    assert any(
+        str(port["published"]) == "443" and port["target"] == 8443
+        for port in config["services"]["frontend"]["ports"]
+    )
+
+
 def test_backend_image_contract_includes_admin_script() -> None:
     dockerfile = (ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
 
@@ -225,6 +296,8 @@ def test_frontend_dockerfile_uses_locked_reproducible_install() -> None:
     assert "COPY frontend/package*.json ./" in dockerfile
     assert "RUN npm ci" in dockerfile
     assert "RUN npm install" not in dockerfile
+    assert "chown -R 1000:1000" in dockerfile
+    assert 'ENTRYPOINT ["nginx", "-g", "daemon off;"]' in dockerfile
     assert dockerfile.index("COPY frontend/package*.json ./") < dockerfile.index(
         "COPY frontend/ ./"
     )

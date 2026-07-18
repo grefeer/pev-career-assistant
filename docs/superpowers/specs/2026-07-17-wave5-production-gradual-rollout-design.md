@@ -145,7 +145,7 @@ services:
       RATE_LIMIT_HMAC_SECRET: ${RATE_LIMIT_HMAC_SECRET}
       # ... 其余从 .env.prod 加载
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/ready"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -153,7 +153,7 @@ services:
   frontend:
     image: career-assistant-frontend@sha256:${FRONTEND_DIGEST}
     ports:
-      - "443:443"                  # HTTPS
+      - "443:8443"                 # HTTPS，容器内使用非特权端口
     volumes:
       - ./production/nginx/prod.conf:/etc/nginx/conf.d/default.conf:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
@@ -191,13 +191,13 @@ volumes:
 # deploy/production/nginx/prod.conf
 
 server {
-    listen 80;
+    listen 8080;
     server_name your-domain.com;
     return 301 https://$host$request_uri;
 }
 
 server {
-    listen 443 ssl http2;
+    listen 8443 ssl http2;
     server_name your-domain.com;
 
     ssl_certificate     /etc/letsencrypt/live/your-domain.com/fullchain.pem;

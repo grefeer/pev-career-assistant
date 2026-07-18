@@ -21,6 +21,21 @@ PROTOCOL_V2: Literal["executor.v2"] = "executor.v2"
 PROTOCOL_VERSION: Literal["executor.v1"] = PROTOCOL_V1
 
 
+class AdapterRef(BaseModel):
+    """Identifies the site adapter and version used for a v2 task.
+
+    The backend resolves the adapter from the job's apply_url domain and
+    freezes it into the task payload at dispatch time.  The executor must
+    verify that the adapter_id and MAJOR version match before opening any
+    external URL.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    adapter_id: str = Field(min_length=1, max_length=64)
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$")  # semver
+    min_engine_version: str = Field(default="0.1.0", pattern=r"^\d+\.\d+\.\d+$")
+
+
 class FieldConfidence(StrEnum):
     CONFIRMED = "confirmed"
     LOW = "low"
@@ -63,6 +78,7 @@ class ExecutorTaskPayloadV2(BaseModel):
     non_sensitive_fields: dict[str, Any] = Field(default_factory=dict)
     local_sensitive_requirements: list[dict[str, Any]] = Field(default_factory=list)
     attachment_ids: list[str] = Field(default_factory=list)
+    adapter: AdapterRef | None = None
 
 
 class TaskStatus(StrEnum):

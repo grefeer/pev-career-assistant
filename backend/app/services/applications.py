@@ -9,8 +9,10 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.base import utc_now
 from backend.app.db.models import (
+    ApplicationSnapshot,
     ApplicationTask,
     ApplicationTaskStatus,
+    SiteAdapter,
     TaskActor,
 )
 from backend.app.repositories import applications
@@ -259,8 +261,13 @@ def assign_and_dispatch_task(
         required_user_id=user_id,
     )
 
-    # ── 5. Bind device to task ─────────────────────────────────────────
+    # ── 5. Bind device and freeze adapter info ──────────────────────────
     task.device_id = device_id
+
+    # Resolve and freeze site adapter from snapshot's apply_url
+    if not _freeze_adapter_for_task(db, snapshot, task):
+        raise ValueError("site_adapter_unavailable")
+
     db.flush()
 
     # ── 6. Transition WAITING_FOR_DEVICE -> DISPATCHED ─────────────────
@@ -278,6 +285,47 @@ def assign_and_dispatch_task(
 
     db.commit()
     return task
+
+
+def _freeze_adapter_for_task(
+    db: Session, snapshot: ApplicationSnapshot, task: ApplicationTask,
+) -> bool:
+    """Resolve the site adapter for the snapshot's apply_url and freeze
+    adapter_id, adapter_version, and status on the task.
+
+    This is called during dispatch so the executor always sees the adapter
+    version that was active at dispatch time — even if the adapter is later
+    updated or disabled.
+    """
+    from urllib.parse import urlparse
+
+    job_snapshot = snapshot.job_snapshot or {}
+    apply_url = job_snapshot.get("apply_url", "")
+    if not apply_url:
+        return False
+
+    hostname = urlparse(apply_url).hostname or ""
+    if not hostname:
+        return False
+
+    adapters = (
+        db.query(SiteAdapter)
+        .filter(SiteAdapter.status == "active")
+        .filter(SiteAdapter.circuit_breaker_open == False)  # noqa: E712
+        .all()
+    )
+
+    def _hostname_matches(host: str, domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    for adapter in adapters:
+        domains = adapter.supported_domains or []
+        if any(_hostname_matches(hostname, d) for d in domains):
+            task.adapter_id = adapter.adapter_id
+            task.adapter_version = adapter.version
+            task.adapter_status_at_dispatch = adapter.status
+            return True
+    return False
 
 
 __all__ = [

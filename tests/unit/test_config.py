@@ -49,7 +49,41 @@ def test_production_rejects_object_credential_templates(value: str) -> None:
             app_env="production", app_auth_secret="x" * 32,
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://root@mysql/db", redis_url="redis://redis/0",
-            checkpoint_backend="redis", object_store_access_key=value,
+            checkpoint_backend="redis",
+            rate_limit_hmac_secret="rate-limit-secret-with-at-least-32-chars",
+            trusted_proxy_cidrs="172.16.0.0/12",
+            object_store_access_key=value,
+            object_store_secret_key="safe-production-object-secret",
+        )
+
+
+def test_production_requires_rate_limit_hmac_secret() -> None:
+    with pytest.raises(ValidationError, match="RATE_LIMIT_HMAC_SECRET"):
+        Settings(
+            app_env="production",
+            app_auth_secret="x" * 32,
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="mysql+pymysql://root@mysql/db",
+            redis_url="redis://redis/0",
+            checkpoint_backend="redis",
+            trusted_proxy_cidrs="172.16.0.0/12",
+            object_store_access_key="safe-production-object-key",
+            object_store_secret_key="safe-production-object-secret",
+        )
+
+
+def test_production_rejects_trust_all_proxy_cidr() -> None:
+    with pytest.raises(ValidationError, match="TRUSTED_PROXY_CIDRS"):
+        Settings(
+            app_env="production",
+            app_auth_secret="x" * 32,
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="mysql+pymysql://root@mysql/db",
+            redis_url="redis://redis/0",
+            checkpoint_backend="redis",
+            rate_limit_hmac_secret="rate-limit-secret-with-at-least-32-chars",
+            trusted_proxy_cidrs="0.0.0.0/0",
+            object_store_access_key="safe-production-object-key",
             object_store_secret_key="safe-production-object-secret",
         )
 

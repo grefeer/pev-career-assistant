@@ -1,0 +1,68 @@
+# Moka page fixture field definitions
+# Maps page index -> fields with control type, selector, and test value
+
+page_1_basic_info:
+  - field_key: name
+    control_type: text_input
+    selector: '[data-field-key="name"]'
+    label: 姓名
+    required: true
+    test_value: 张三
+
+  - field_key: gender
+    control_type: radio
+    selector: 'input[name="gender"][value="male"]'
+    label: 性别
+    required: true
+    test_value: male
+
+  - field_key: email
+    control_type: text_input
+    selector: '[data-field-key="email"]'
+    label: 邮箱
+    required: true
+    test_value: test@example.com
+
+  - field_key: phone
+    control_type: text_input
+    selector: '[data-field-key="phone"]'
+    label: 手机号码
+    required: true
+    test_value: "13800138000"
+
+  - field_key: school
+    control_type: text_input
+    selector: '[data-field-key="school"]'
+    label: 学校
+    required: true
+    test_value: 北京大学
+
+  - field_key: graduation_year
+    control_type: select
+    selector: '[data-field-key="graduation_year"]'
+    label: 毕业年份
+    required: true
+    test_value: "2025"
+
+page_5_skills:
+  - field_key: skills
+    control_type: multi_select
+    selector: '[data-field-key="skills"]'
+    label: 技能
+    required: true
+    test_value: Python,Rust,SQL
+
+  - field_key: certifications
+    control_type: text_input
+    selector: '[data-field-key="certifications"]'
+    label: 证书
+    required: false
+    test_value: CET-6
+
+page_6_attachments:
+  - field_key: resume_upload
+    control_type: file_upload
+    selector: 'input[type="file"][data-field-key="resume_upload"]'
+    label: 上传简历
+    required: true
+    test_value: /tmp/test_resume.pdf

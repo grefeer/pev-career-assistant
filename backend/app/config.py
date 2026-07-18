@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 import base64
 import binascii
+import ipaddress
 from pathlib import Path
 from typing import Literal
 
@@ -42,6 +43,7 @@ class Settings(BaseSettings):
     object_encryption_key: str
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     trusted_proxy_cidrs: str = ""
+    rate_limit_hmac_secret: SecretStr | None = Field(default=None, repr=False)
     tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
     test_tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
 
@@ -98,6 +100,17 @@ class Settings(BaseSettings):
             for value in object_credentials
         ):
             raise ValueError("OBJECT_STORE credentials must be replaced in production")
+        if self.is_production:
+            if self.rate_limit_hmac_secret is None:
+                raise ValueError("RATE_LIMIT_HMAC_SECRET is required in production")
+            if len(self.rate_limit_hmac_secret.get_secret_value()) < 32:
+                raise ValueError("RATE_LIMIT_HMAC_SECRET must contain at least 32 characters")
+            if not self.trusted_proxy_cidrs.strip():
+                raise ValueError("TRUSTED_PROXY_CIDRS is required in production")
+            for raw_cidr in self.trusted_proxy_cidrs.split(","):
+                network = ipaddress.ip_network(raw_cidr.strip(), strict=False)
+                if network.prefixlen == 0:
+                    raise ValueError("TRUSTED_PROXY_CIDRS must not trust all addresses")
         return self
 
 

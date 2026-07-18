@@ -15,7 +15,7 @@ from src.prompts import (
     RESUME_OPTIMIZER_PROMPT,
     SUPERVISOR_PROMPT,
 )
-from src.utils import get_base_url, get_model_name
+from src.utils import get_api_key, get_base_url, get_model_name
 
 
 # 角色到环境变量的映射表。
@@ -36,9 +36,11 @@ def build_llm(role: str, temperature: float = 0.2) -> ChatOpenAI:
         "model": get_model_name(ROLE_MODEL_ENV.get(role)),
         "temperature": temperature,
     }
+    api_key = get_api_key()
+    if api_key:
+        kwargs["api_key"] = api_key
     base_url = get_base_url()
-    if base_url:
-        kwargs["base_url"] = base_url
+    kwargs["base_url"] = base_url
     return ChatOpenAI(**kwargs)
 
 

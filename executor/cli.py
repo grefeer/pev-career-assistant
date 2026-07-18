@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 import httpx
 
+from executor.adapters.registry import get as get_adapter
+from executor.adapters import register_builtin_adapters
 from executor.browser import BrowserSession
 from executor.checkpoints import CheckpointStore
 from executor.client import ExecutorApiClient
@@ -96,8 +98,20 @@ def cmd_pair(args: argparse.Namespace) -> None:
 
 
 def cmd_run_simulation(args: argparse.Namespace) -> None:
-    """Run a simulation against a mock site."""
-    _ensure_loopback(args.base_url)
+    """Run a simulation against a mock site or a real site via an adapter."""
+    register_builtin_adapters()
+    adapter = None
+    adapter_id = getattr(args, "adapter", None)
+    if adapter_id:
+        adapter = get_adapter(adapter_id)
+        if adapter is None:
+            print(
+                f"Adapter not found: {adapter_id}", file=sys.stderr
+            )
+            sys.exit(1)
+    else:
+        _ensure_loopback(args.base_url)
+
     fixture = _load_fixture(args.fixture)
 
     data_dir = Path(args.data_dir)
@@ -110,7 +124,9 @@ def cmd_run_simulation(args: argparse.Namespace) -> None:
         user_data_dir=str(data_dir / "chrome-profile"),
     )
     checkpoints = CheckpointStore(checkpoint_dir)
-    engine = ExecutorEngine(client=client, browser=browser, checkpoints=checkpoints)
+    engine = ExecutorEngine(
+        client=client, browser=browser, checkpoints=checkpoints, adapter=adapter,
+    )
 
     try:
         outcome = engine.run(payload=fixture)
@@ -121,7 +137,19 @@ def cmd_run_simulation(args: argparse.Namespace) -> None:
 
 def cmd_resume_simulation(args: argparse.Namespace) -> None:
     """Resume a simulation from an existing checkpoint."""
-    _ensure_loopback(args.base_url)
+    register_builtin_adapters()
+    adapter = None
+    adapter_id = getattr(args, "adapter", None)
+    if adapter_id:
+        adapter = get_adapter(adapter_id)
+        if adapter is None:
+            print(
+                f"Adapter not found: {adapter_id}", file=sys.stderr
+            )
+            sys.exit(1)
+    else:
+        _ensure_loopback(args.base_url)
+
     fixture = _load_fixture(args.fixture)
 
     data_dir = Path(args.data_dir)
@@ -144,7 +172,9 @@ def cmd_resume_simulation(args: argparse.Namespace) -> None:
         user_data_dir=str(data_dir / "chrome-profile"),
     )
     checkpoints = CheckpointStore(checkpoint_dir)
-    engine = ExecutorEngine(client=client, browser=browser, checkpoints=checkpoints)
+    engine = ExecutorEngine(
+        client=client, browser=browser, checkpoints=checkpoints, adapter=adapter,
+    )
 
     try:
         outcome = engine.run(payload=fixture)
@@ -173,6 +203,7 @@ def main() -> None:
     run_parser.add_argument("--task-id")
     run_parser.add_argument("--fixture", required=True)
     run_parser.add_argument("--data-dir", required=True)
+    run_parser.add_argument("--adapter", help="Site adapter ID for real-site tasks")
 
     # resume-simulation subcommand
     resume_parser = subparsers.add_parser(
@@ -182,6 +213,7 @@ def main() -> None:
     resume_parser.add_argument("--task-id")
     resume_parser.add_argument("--fixture", required=True)
     resume_parser.add_argument("--data-dir", required=True)
+    resume_parser.add_argument("--adapter", help="Site adapter ID for real-site tasks")
 
     args = parser.parse_args()
 

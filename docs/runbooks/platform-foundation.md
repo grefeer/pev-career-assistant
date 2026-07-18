@@ -332,8 +332,8 @@ Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/live"
 $backendPort = if ($env:BACKEND_HOST_PORT) { $env:BACKEND_HOST_PORT } else { '8000' }
 $frontendPort = if ($env:FRONTEND_HOST_PORT) { $env:FRONTEND_HOST_PORT } else { '5173' }
 $revision = docker compose run --rm migrate alembic current
-if ($revision -notmatch '20260718_0008') {
-  throw 'Compose database is not at 20260718_0008'
+if ($revision -notmatch '20260718_0010') {
+  throw 'Compose database is not at 20260718_0010'
 }
 Invoke-RestMethod "http://127.0.0.1:$backendPort/api/health/ready" |
   ConvertTo-Json -Depth 4
@@ -345,7 +345,7 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 `BACKEND_HOST_PORT` 和 `FRONTEND_HOST_PORT`；MySQL、Redis 与 MinIO 的宿主端口也分别
 由 `MYSQL_HOST_PORT`、`REDIS_HOST_PORT`、`MINIO_HOST_PORT` 和
 `MINIO_CONSOLE_HOST_PORT` 控制。`migrate` 容器退出 0 不是 revision 证明，必须额外执行
-`alembic current` 并看到 `20260717_0005`。
+`alembic current` 并看到 `20260718_0010`。
 
 ## 职位反馈闭环
 
@@ -354,7 +354,7 @@ Compose 验证不得假定宿主端口为 8000/5173。检查命令必须使用�
 - 学生更新和撤回必须提交 `expected_version`。管理员通过 `GET /api/admin/job-feedback` 查看脱敏聚合，通过 `POST /api/admin/job-feedback/{feedback_id}/decision` 执行 `accept/resolve/reject`。
 - 反馈处置绝不改变职位状态。确认职位失效必须另行调用 `/api/admin/jobs/{job_id}/decision`，由 `JobReviewService` 写入 `JobVerification`。
 - 学生和管理员写限额分别为 20/分钟与 60/分钟；Redis 不可用时写操作返回 503。日志和管理员 DTO 不得包含提交者身份、说明原文或幂等 key。
-- schema head 固定为 `20260718_0008`，包含 `job_feedback` 和只追加的 `job_feedback_events`。
+- 当前 schema head 为 `20260718_0010`；职位反馈闭环由 `20260717_0007` 提供，投递任务流水线由 `20260718_0008` 及后续站点适配器迁移扩展。
 
 反馈专项验收：
 

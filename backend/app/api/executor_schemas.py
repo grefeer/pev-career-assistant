@@ -13,6 +13,18 @@ PROTOCOL_V2: Literal["executor.v2"] = "executor.v2"
 ProtocolVersion = Literal["executor.v1", "executor.v2"]
 
 
+# ── Adapter reference ────────────────────────────────────────────────────────────
+
+
+class AdapterRef(BaseModel):
+    """Identifies the site adapter and version frozen at dispatch time."""
+
+    model_config = ConfigDict(extra="forbid")
+    adapter_id: str = Field(min_length=1, max_length=64)
+    version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
+    min_engine_version: str = Field(default="0.1.0", pattern=r"^\d+\.\d+\.\d+$")
+
+
 # ── Shared field DTO ───────────────────────────────────────────────────────────
 
 
@@ -58,6 +70,7 @@ class ExecutorTaskPayloadV2(BaseModel):
     non_sensitive_fields: dict[str, Any] = Field(default_factory=dict)
     local_sensitive_requirements: list[dict[str, Any]] = Field(default_factory=list)
     attachment_ids: list[str] = Field(default_factory=list)
+    adapter: AdapterRef | None = None
 
 
 # ── Discriminated union ────────────────────────────────────────────────────────

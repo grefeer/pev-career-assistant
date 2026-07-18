@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from dataclasses import dataclass
+import json
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -15,7 +16,10 @@ else:
         """Minimal StrEnum polyfill for Python < 3.11."""
         pass
 
-from executor.browser import BrowserSession
+from executor.adapters.base import SiteAdapter
+from executor.adapters import register_builtin_adapters
+from executor.adapters.registry import get as get_registered_adapter
+from executor.browser import BrowserSession, FillReport
 from executor.checkpoints import (
     CheckpointStore,
     ExecutorCheckpoint,
@@ -128,6 +132,16 @@ def _payload_fields(
     return payload.fields
 
 
+def _stringify_adapter_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
 # ── Engine ─────────────────────────────────────────────────────────────────────
 
 
@@ -144,12 +158,14 @@ class ExecutorEngine:
         browser: BrowserSession,
         checkpoints: CheckpointStore,
         fault_point: FaultPoint | None = None,
+        adapter: SiteAdapter | None = None,
     ) -> None:
         self.client = client
         self.browser = browser
         self.checkpoints = checkpoints
         self._state: EngineState | None = None
         self._fault_point = fault_point
+        self._adapter = adapter
 
     # ------------------------------------------------------------------
     # Fault injection (recovery testing)
@@ -180,6 +196,8 @@ class ExecutorEngine:
         if state is None:
             return None
         try:
+            adapter_id = self._adapter.adapter_id if self._adapter else None
+            adapter_version = self._adapter.version if self._adapter else None
             cp = ExecutorCheckpoint(
                 protocol_version=PROTOCOL_VERSION,
                 task_id=state.task_id,
@@ -193,12 +211,62 @@ class ExecutorEngine:
                 pending_effect_key=pending_effect_key,
                 issue_counts=issue_counts
                 or {"missing": 0, "low": 0, "readback": 0, "defaulted": 0},
+                adapter_id=adapter_id,
+                adapter_version=adapter_version,
             )
             self.checkpoints.save(cp)
             return cp
         except Exception:
             logger.warning("failed to save checkpoint", exc_info=True)
             return None
+
+    def _target_url_allowed(
+        self, payload: ExecutorTaskPayload | ExecutorTaskPayloadV2
+    ) -> bool:
+        """Check whether the executor is permitted to open the target URL.
+
+        v1 (simulation) tasks are restricted to loopback only.
+        v2 (application) tasks require a matching, non-broken adapter whose
+        supported_domains cover the target hostname.  The MAJOR version must
+        also match between the payload's AdapterRef and the registered adapter.
+        """
+        hostname = urlsplit(str(payload.target_url)).hostname or ""
+
+        # v1 payloads: loopback only (preserves simulation safety)
+        if not isinstance(payload, ExecutorTaskPayloadV2):
+            return hostname in {"127.0.0.1", "localhost", "::1"}
+
+        # v2 without adapter ref: reject
+        adapter_ref = payload.adapter
+        if adapter_ref is None:
+            return False
+
+        # v2 with adapter: require matching registered adapter
+        if self._adapter is None:
+            register_builtin_adapters()
+            self._adapter = get_registered_adapter(adapter_ref.adapter_id)
+        if self._adapter is None:
+            return False
+        if self._adapter.adapter_id != adapter_ref.adapter_id:
+            return False
+
+        # MAJOR version must match (breaking topology changes)
+        adapter_major = adapter_ref.version.split(".")[0]
+        registered_major = self._adapter.version.split(".")[0]
+        if adapter_major != registered_major:
+            return False
+
+        # Domain must match one of the adapter's supported domains
+        def _hostname_matches(host: str, domain: str) -> bool:
+            return host == domain or host.endswith("." + domain)
+
+        if not any(
+            _hostname_matches(hostname, d)
+            for d in self._adapter.supported_domains
+        ):
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -257,12 +325,8 @@ class ExecutorEngine:
         if payload is None:
             return RunOutcome("failed_safe", "no_payload")
 
-        if urlsplit(str(payload.target_url)).hostname not in {
-            "127.0.0.1",
-            "localhost",
-            "::1",
-        }:
-            return RunOutcome("failed_safe", "target_not_loopback")
+        if not self._target_url_allowed(payload):
+            return RunOutcome("failed_safe", "target_not_allowed")
 
         # Check if we're in observation mode
         if detail and hasattr(detail, "status"):
@@ -326,6 +390,16 @@ class ExecutorEngine:
                 return RunOutcome(
                     "ready_for_review", "checkpoint_version_mismatch"
                 )
+
+            # MAJOR adapter version must match — different MAJOR means
+            # the page topology has breaking changes.
+            if self._adapter is not None and cp.adapter_version is not None:
+                cp_major = cp.adapter_version.split(".")[0]
+                reg_major = self._adapter.version.split(".")[0]
+                if cp_major != reg_major:
+                    return RunOutcome(
+                        "ready_for_review", "adapter_version_mismatch"
+                    )
 
             # Check for pending intermediate effect — don't retry the click
             if cp.pending_effect_key is not None:
@@ -442,7 +516,16 @@ class ExecutorEngine:
 
         # Fill confirmed fields
         try:
-            report = self.browser.fill_confirmed(fields_to_fill)
+            if isinstance(payload, ExecutorTaskPayloadV2) and self._adapter is not None:
+                report = self._fill_with_adapter(
+                    payload=payload,
+                    completed=completed,
+                    before_write=before_write,
+                    after_verified=after_verified,
+                    checkpoint=cp,
+                )
+            else:
+                report = self.browser.fill_confirmed(fields_to_fill)
         except InjectedCrash:
             raise
         except RuntimeError:
@@ -611,6 +694,88 @@ class ExecutorEngine:
                 return self._progress_failure(task_id, error)
 
         return RunOutcome("ready_for_review", "navigated")
+
+    def _fill_with_adapter(
+        self,
+        *,
+        payload: ExecutorTaskPayloadV2,
+        completed: set[str],
+        before_write,
+        after_verified,
+        checkpoint: ExecutorCheckpoint | None,
+    ) -> FillReport:
+        if self._adapter is None:
+            raise RuntimeError("adapter unavailable")
+
+        confirmed_keys: list[str] = []
+        missing_keys: list[str] = []
+        low_confidence_keys: list[str] = []
+        readback_mismatch_keys: list[str] = []
+        defaulted_keys: list[str] = []
+
+        page = self.browser.page
+        blocker = self._adapter.detect_blocker(page)
+        if blocker is not None:
+            raise RuntimeError(f"adapter blocker: {blocker.blocker_type}")
+
+        for field_key, raw_value in payload.non_sensitive_fields.items():
+            if field_key in completed:
+                continue
+            if raw_value is None:
+                missing_keys.append(field_key)
+                continue
+
+            if (
+                isinstance(raw_value, list)
+                and all(isinstance(item, dict) for item in raw_value)
+            ):
+                section_key = {
+                    "education": "education",
+                    "work_experience": "work_experience",
+                    "project_experience": "project_experience",
+                }.get(field_key)
+                if section_key is None:
+                    defaulted_keys.append(field_key)
+                    continue
+                result = self._adapter.handle_repeat_section(
+                    page,
+                    section_key,
+                    [
+                        {str(k): str(v) for k, v in item.items()}
+                        for item in raw_value
+                    ],
+                )
+                if result.dedup_verified:
+                    completed.add(field_key)
+                    confirmed_keys.append(field_key)
+                    continue
+                readback_mismatch_keys.append(field_key)
+                continue
+
+            value = _stringify_adapter_value(raw_value)
+            before_write(field_key)
+            result = self._adapter.fill_field(page, field_key, value)
+            if result.readback_match:
+                after_verified(field_key)
+                completed.add(field_key)
+                confirmed_keys.append(field_key)
+            elif result.confidence <= 0:
+                defaulted_keys.append(field_key)
+            else:
+                readback_mismatch_keys.append(field_key)
+
+        for req in payload.local_sensitive_requirements:
+            field_key = req.get("field_key")
+            if field_key and field_key not in completed:
+                missing_keys.append(field_key)
+
+        return FillReport(
+            confirmed_keys=confirmed_keys,
+            missing_keys=missing_keys,
+            low_confidence_keys=low_confidence_keys,
+            readback_mismatch_keys=readback_mismatch_keys,
+            defaulted_keys=defaulted_keys,
+        )
 
     def _run_observation(
         self,

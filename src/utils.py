@@ -42,12 +42,39 @@ def get_checkpoint_db_path() -> Path:
     return CHECKPOINT_DIR / "langgraph_checkpoints.sqlite"
 
 
-def get_base_url() -> str | None:
-    # 支持官方 OpenAI，也支持 OpenAI 兼容接口。
-    return os.getenv("OPENAI_BASE_URL")
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 
-def get_model_name(role_env: str | None = None, default: str = "gpt-4o-mini") -> str:
+def _get_windows_user_env(name: str) -> str | None:
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def get_api_key() -> str | None:
+    # DeepSeek 官方 API 兼容 OpenAI 格式；优先读取用户环境变量中的 DeepSeek key。
+    return (
+        os.getenv("DEEPSEEK_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or _get_windows_user_env("DEEPSEEK_API_KEY")
+        or _get_windows_user_env("OPENAI_API_KEY")
+    )
+
+
+def get_base_url() -> str:
+    # 默认使用 DeepSeek 的 OpenAI-compatible endpoint，仍允许 OPENAI_BASE_URL 覆盖。
+    return os.getenv("OPENAI_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL)
+
+
+def get_model_name(role_env: str | None = None, default: str = DEFAULT_DEEPSEEK_MODEL) -> str:
     # 第二版支持“按角色配置模型”：
     # 如果某个角色单独配置了模型，就优先使用；
     # 否则回退到全局 OPENAI_MODEL。

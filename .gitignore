@@ -36,6 +36,7 @@ htmlcov/
 checkpoints/
 data/app_users.json
 data/minio/
+data/
 minio-data/
 executor-data/checkpoints/
 executor-data/chrome-profile/

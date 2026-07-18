@@ -32,6 +32,7 @@
 
 - Python 3.13
 - LangGraph
+- DeepSeek API（OpenAI-compatible）
 - langchain-openai
 - FastAPI
 - Vue 3

@@ -20,6 +20,7 @@ from backend.app.services.applications import (
     TaskNotFoundError,
 )
 from backend.app.services.executor_v2_provider import (
+    ExecutorPayloadUnavailableError as V2ExecutorPayloadUnavailableError,
     SnapshotExecutorPayloadProvider,
 )
 
@@ -119,7 +120,10 @@ class ExecutorTaskService:
         # Dispatch by task_kind
         if task.task_kind == "application":
             v2_provider = SnapshotExecutorPayloadProvider(db)
-            payload = v2_provider.payload_for(task)
+            try:
+                payload = v2_provider.payload_for(task)
+            except (ValueError, V2ExecutorPayloadUnavailableError) as error:
+                raise ExecutorPayloadUnavailableError(task.id) from error
         else:
             payload = self.payload_provider.payload_for(task)
 
