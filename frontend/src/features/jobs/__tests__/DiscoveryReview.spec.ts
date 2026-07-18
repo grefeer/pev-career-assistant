@@ -155,7 +155,7 @@ describe("DiscoveryReview", () => {
 
     // retry buttons exist for non-running tasks
     const retryButtons = wrapper.findAll('[data-test="retry-task"]');
-    expect(retryButtons.length).toBeGreaterThanOrEqual(1);
+    expect(retryButtons.length).toBe(2);
   });
 
   it("switches to groups tab and renders grouped candidates", async () => {

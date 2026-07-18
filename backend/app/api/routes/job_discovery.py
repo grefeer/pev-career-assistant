@@ -182,6 +182,7 @@ def approve_job_discovery_candidate(
             source_id=candidate.source_id,
             external_record_id=candidate.external_record_id,
             raw_record_id=candidate.raw_record_id,
+            mapper_version="discovery-agent-v1",
             status=JobPostingStatus.PENDING_REVIEW,
             company_name=candidate.company_name or "",
             title=candidate.title or "",
