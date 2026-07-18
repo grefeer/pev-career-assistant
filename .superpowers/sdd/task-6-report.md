@@ -1,63 +1,55 @@
-# Task 6 Report: Windows device pairing, authentication, heartbeat, and revoke
+# Task 6: Phase 6 — Worker — Report
 
 ## Status
 
-Implemented the Task 6 device workflow only.
+Complete.
 
-## Delivered
+## Files Created
 
-- One-time pairing tickets stored at `pairing-ticket:{sha256(code)}` as JSON containing only `user_id` and `created_at`, with a 600-second TTL and atomic Redis `GETDEL` redemption.
-- Windows device issuance with `secrets.token_urlsafe(32)`; only the SHA-256 digest is stored in MySQL and authentication uses `hmac.compare_digest`.
-- MySQL-authoritative active/revoked device state, owner-scoped listing and revocation, and immediate rejection of revoked tokens.
-- Heartbeat persistence of `last_seen_at` and `version`, plus `device-online:{device_id}=1` with a 90-second Redis TTL.
-- Device online display derived only from Redis; losing online keys reports offline without changing MySQL device status.
-- Audit events for pairing-ticket creation, successful pairing, and revocation. Audit payload keys are restricted to `platform`, `version`, and `result` and do not include pairing codes, tokens, or public keys.
-- All six `/api/devices` endpoints with fixed 400/401/404 behavior and response models that do not expose `token_hash` or `public_key_pem`.
-- Application lifespan Redis client creation/closure. `REDIS_PASSWORD` is read only from the environment and is never logged or returned.
+| File | Lines | Purpose |
+|------|-------|---------|
+| `backend/app/services/job_discovery/worker.py` | 283 | `JobDiscoveryWorker` class with `run_once()` / `run_loop()` |
+| `scripts/run_job_discovery_worker.py` | 42 | CLI entry point supporting `--once` flag |
+| `tests/unit/test_job_discovery_worker.py` | 455 | 15 unit tests across 4 scenarios |
 
-## TDD evidence
+## Commit
 
-1. Initial unit RED: `python -m pytest tests/unit/test_device_service.py -v` failed during collection with `ModuleNotFoundError: No module named 'backend.app.services.devices'`.
-2. Exact service-interface RED: `create_pairing_ticket(user_id=...)` failed with the expected missing-`db` `TypeError`, then passed after adding the compatible optional audit-session argument.
-3. Device unit/contract GREEN: 11 tests passed, exercising fakeredis `GETDEL`, bytes JSON, pairing TTL (599-600 after Redis second rounding), online TTL (1-90), replay, revoke, heartbeat, redaction, credential response boundaries, and ownership isolation.
+`d9651b6fe0aaca3832de0f4c36e24d625993a29e` — `feat: add job discovery worker with polling loop and tests`
 
-## Final verification
+## Implementation Summary
 
-- `git diff --check`: passed.
-- `.venv\\Scripts\\python.exe -m compileall -q backend\\app`: passed.
-- `.venv\\Scripts\\python.exe -m pytest -v`: **244 passed, 2 skipped** in 33.05 seconds.
-- The two skips are pre-existing opt-in MySQL integration tests; no development Redis connection was used by the new tests.
+### worker.py
 
-## Notes / concerns
+- **`JobDiscoveryWorker(db_factory, settings)`** — polls `job_discovery_tasks` queue, claims tasks via `claim_next_task`, processes them with the Discovery Supervisor Agent, persists results.
+- **`run_once()`** — Opens a DB session, claims a task, builds `DiscoveryTaskInput` from the task + raw record fields, invokes the agent synchronously (`agent.invoke(...)`), parses the structured output (supports `structured_response` key, raw dict, or last-message JSON), persists evidence/candidates, and marks the task as succeeded/partial_success/needs_manual_review/failed. Returns 1 if processed, 0 if no tasks. Exceptions are caught, task marked as failed, returns 0.
+- **`run_loop(poll_interval=10.0)`** — Infinite loop calling `run_once()`, sleeping when queue is empty. Catches `KeyboardInterrupt`.
+- **Helper functions** — `_build_worker_id()` (hostname + PID), `_parse_agent_result()` (3-strategy result parsing), `_persist_evidence()`, `_persist_candidates()` (handle both `PageEvidence`/`NormalizedJobCandidate` dataclass instances and plain dicts from structured output).
 
-- Unit and contract tests use `fakeredis`; no real `redis-custom` integration was necessary for this task.
-- Ticket creation requires a DB session so no unaudited service-level bypass exists.
+### Entry Point
 
-## Review fix (2026-07-14)
+`scripts/run_job_discovery_worker.py` — Imports project root, checks `job_discovery_enabled` setting, supports `--once` flag for single-run mode.
 
-The review findings were addressed in a separate fix:
+### Test Coverage (15 tests)
 
-- Removed the optional-DB ticket creation path. Every ticket creation now requires a database session and a successful `AuditEvent` commit.
-- If ticket audit flush/commit fails, the SQLAlchemy transaction is rolled back and the newly written Redis ticket key is deleted; no usable unaudited ticket is returned.
-- Redemption now validates `created_at` from the consumed JSON and pre-generates the device id and token digest before persistence.
-- If device/audit persistence fails after `GETDEL`, the service rolls back and queries authoritative MySQL by both device id and token digest:
-  - If both identify the same committed device (for example, commit succeeded but its acknowledgement was lost), the original issued device/token is returned and the ticket is not restored.
-  - If neither exists, the original raw ticket JSON is restored only with Redis `SET NX` and only for the integer seconds remaining in its original 600-second window.
-  - If rollback/query cannot determine the result, or id/digest results conflict, `PairingPersistenceUncertainError` is raised and the ticket is not restored, preferring no duplicate credential issuance.
-- Malformed ticket JSON is consumed and is never restored.
-- Added explicit Pydantic response models and route `response_model` declarations for pairing tickets, device summary, pair response, list response, and heartbeat response. OpenAPI confirms only the pair response exposes `device_token`; list and `/me` expose no token hash, public key, or device token.
+| Test Class | Tests | Coverage |
+|---|---|---|
+| `TestWorkerId` | 1 | Worker ID format |
+| `TestParseAgentResult` | 5 | structured_response, direct dict, last message JSON, unparseable fallback, empty messages |
+| `TestSuccessfulTask` | 2 | Full succeeded flow (evidence + candidates persisted), partial_success |
+| `TestManualReviewTask` | 2 | `needs_manual_review` with block_reason, unknown block_reason fallback |
+| `TestCrashRecovery` | 2 | Agent exception -> `mark_task_failed`, empty queue returns 0 |
+| `TestRunLoop` | 3 | Loop iteration, sleep on empty, KeyboardInterrupt handling |
 
-### Review TDD evidence
+## Concerns
 
-- RED: ticket audit insert failure left a `pairing-ticket:*` key behind.
-- RED: paired audit flush failure and explicit pre-commit failure permanently consumed the code (`TTL == -2`).
-- RED: OpenAPI contained no named `PairingTicketResponse`/device response schemas.
-- GREEN: audit failure cleanup, flush compensation, explicit commit compensation, original-TTL preservation, NX race protection, malformed-ticket non-restoration, commit-ACK-loss recovery, and OpenAPI schema tests all pass.
+1. **Entry-point dependency**: `scripts/run_job_discovery_worker.py` imports from `backend.*` which requires the full project environment. This is consistent with other scripts in the project.
+2. **No integration test**: The worker is tested with mocked agent. An integration test with a real (or near-real) agent would increase confidence, but is not in the current scope.
+3. **agent.invoke() vs ainvoke()**: The worker uses synchronous `agent.invoke()` rather than `asyncio.run(agent.ainvoke(...))`. This is consistent with the synchronous `run_once()` signature in the spec. If async support is needed later, `run_once` can be made async and `asyncio.run()` or `asyncio.create_task()` used in the loop.
 
-### Review final verification
+## Test Results
 
-- Device unit/contract suite: **17 passed**.
-- Full suite: **250 passed, 2 skipped** in 47.95 seconds.
-- `ruff check` on all Task 6 production/test files: passed.
-- `mypy --explicit-package-bases --follow-imports=skip` on the Task 6 production files: passed with no issues. The flags are required by this repository's namespace-package layout and avoid unrelated pre-existing transitive modules.
-- `compileall`, `git diff --check`: passed.
+```
+193 passed (all job_discovery + config + mapper tests)
+```
+
+All existing tests continue to pass. No regressions.
