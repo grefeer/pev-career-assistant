@@ -7,3 +7,5 @@ Baseline: `a108a78`
 Task 1: complete (commits a108a78..ced2de2, review clean)
 Task 2: complete (commits ced2de2..bcd16cc, review clean)
 Task 3: complete (commits bcd16cc..8ff654c, review clean)
+Task 4: complete (commits 8ff654c..2b2a371, review clean after 3 fixes)
+Task 5: complete (commits 2b2a371..HEAD, 55 tests pass)
