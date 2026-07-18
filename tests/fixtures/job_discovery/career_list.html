@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>加入我们 - 星辰科技招聘</title>
+  <meta name="description" content="星辰科技招聘页面，查看最新职位信息，包括社会招聘、校园招聘和实习机会。">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; color: #333; background: #f5f7fa; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 20px; }
+    header { background: linear-gradient(135deg, #1a1a2e, #0f3460); color: white; padding: 3rem 0; text-align: center; }
+    header h1 { font-size: 2.2rem; margin-bottom: 0.5rem; }
+    header p { opacity: 0.85; font-size: 1.05rem; }
+    .tabs { display: flex; justify-content: center; gap: 0.5rem; margin: 2rem 0; }
+    .tab-btn { padding: 0.6rem 1.8rem; border: 2px solid #ddd; border-radius: 30px; background: white; cursor: pointer; font-size: 0.95rem; font-weight: 600; color: #555; transition: all 0.2s; }
+    .tab-btn.active { background: #0f3460; color: white; border-color: #0f3460; }
+    .tab-btn:hover:not(.active) { border-color: #0f3460; color: #0f3460; }
+    .job-list { display: flex; flex-direction: column; gap: 1rem; padding-bottom: 3rem; }
+    .job-card { background: white; border-radius: 12px; padding: 1.5rem 2rem; box-shadow: 0 2px 12px rgba(0,0,0,0.06); display: flex; justify-content: space-between; align-items: center; transition: transform 0.15s, box-shadow 0.15s; }
+    .job-card:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+    .job-info h3 { font-size: 1.15rem; color: #1a1a2e; margin-bottom: 0.4rem; }
+    .job-info h3 a { color: #1a1a2e; text-decoration: none; }
+    .job-info h3 a:hover { color: #0f3460; }
+    .job-meta { display: flex; flex-wrap: wrap; gap: 0.5rem 1.2rem; font-size: 0.88rem; color: #777; }
+    .job-meta span { display: flex; align-items: center; gap: 0.3rem; }
+    .job-type { display: inline-block; padding: 0.2rem 0.7rem; border-radius: 20px; font-size: 0.78rem; font-weight: 600; }
+    .type-fulltime { background: #e3f2fd; color: #1565c0; }
+    .type-intern { background: #fce4ec; color: #c62828; }
+    .type-campus { background: #e8f5e9; color: #2e7d32; }
+    .salary { color: #e65100 !important; font-weight: 600; }
+    .filter-bar { display: flex; gap: 1rem; padding: 1rem 0; flex-wrap: wrap; }
+    .filter-bar select, .filter-bar input { padding: 0.5rem 1rem; border: 2px solid #ddd; border-radius: 8px; font-size: 0.9rem; background: white; }
+    .filter-bar select:focus, .filter-bar input:focus { outline: none; border-color: #0f3460; }
+    .pagination { display: flex; justify-content: center; gap: 0.5rem; margin: 2rem 0; }
+    .page-btn { padding: 0.4rem 0.9rem; border: 1px solid #ddd; border-radius: 6px; background: white; cursor: pointer; color: #555; }
+    .page-btn.active { background: #0f3460; color: white; border-color: #0f3460; }
+    .no-jobs { text-align: center; padding: 4rem 2rem; color: #999; }
+    footer { background: #1a1a2e; color: rgba(255,255,255,0.7); text-align: center; padding: 2rem 0; font-size: 0.9rem; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <h1>加入星辰科技</h1>
+      <p>寻找志同道合的你，一起用技术改变世界</p>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="all">全部职位</button>
+      <button class="tab-btn" data-tab="campus">校园招聘</button>
+      <button class="tab-btn" data-tab="social">社会招聘</button>
+      <button class="tab-btn" data-tab="intern">实习</button>
+    </div>
+
+    <div class="filter-bar">
+      <select aria-label="工作地点">
+        <option value="">所有地点</option>
+        <option value="beijing">北京</option>
+        <option value="shenzhen">深圳</option>
+        <option value="shanghai">上海</option>
+        <option value="hangzhou">杭州</option>
+      </select>
+      <select aria-label="职位类别">
+        <option value="">所有类别</option>
+        <option value="engineer">技术研发</option>
+        <option value="product">产品</option>
+        <option value="design">设计</option>
+        <option value="marketing">市场</option>
+      </select>
+      <input type="text" placeholder="搜索职位名称..." aria-label="搜索职位">
+    </div>
+
+    <div class="job-list">
+      <article class="job-card" data-job-id="job-001">
+        <div class="job-info">
+          <h3><a href="/careers/job/001">高级算法工程师</a></h3>
+          <div class="job-meta">
+            <span>📍 深圳</span>
+            <span>🏢 技术研发部</span>
+            <span class="salary">💰 35K-55K</span>
+            <span class="job-type type-fulltime">全职</span>
+            <span>📅 2026-08-15 截止</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="job-card" data-job-id="job-002">
+        <div class="job-info">
+          <h3><a href="/careers/job/002">前端开发工程师</a></h3>
+          <div class="job-meta">
+            <span>📍 北京</span>
+            <span>🏢 平台研发部</span>
+            <span class="salary">💰 20K-35K</span>
+            <span class="job-type type-fulltime">全职</span>
+            <span>📅 2026-08-20 截止</span>
+          </div>
+        </div>
+      </article>
+    </div>
+
+    <div class="pagination">
+      <button class="page-btn" disabled>&laquo; 上一页</button>
+      <button class="page-btn active">1</button>
+      <button class="page-btn">2</button>
+      <button class="page-btn">3</button>
+      <button class="page-btn">下一页 &raquo;</button>
+    </div>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>&copy; 2026 星辰科技 StarCloud Technology Co., Ltd.</p>
+    </div>
+  </footer>
+</body>
+</html>

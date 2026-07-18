@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - 智联招聘企业版</title>
+  <meta name="description" content="智联招聘企业用户登录页面">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; background: #f0f2f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .login-container { background: white; border-radius: 16px; padding: 2.5rem; width: 420px; box-shadow: 0 8px 40px rgba(0,0,0,0.1); }
+    .login-header { text-align: center; margin-bottom: 2rem; }
+    .login-header .logo { font-size: 1.6rem; font-weight: 800; color: #0077ff; margin-bottom: 0.3rem; }
+    .login-header .subtitle { font-size: 0.9rem; color: #888; }
+    .login-header h1 { font-size: 1.3rem; color: #333; margin-top: 0.5rem; }
+    .form-group { margin-bottom: 1.2rem; }
+    .form-group label { display: block; font-size: 0.9rem; font-weight: 600; color: #555; margin-bottom: 0.4rem; }
+    .form-group input { width: 100%; padding: 0.75rem 1rem; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 0.95rem; transition: border-color 0.2s; }
+    .form-group input:focus { outline: none; border-color: #0077ff; }
+    .captcha-section { margin-bottom: 1.2rem; }
+    .captcha-section .captcha-label { font-size: 0.9rem; font-weight: 600; color: #555; margin-bottom: 0.4rem; display: block; }
+    .captcha-container { display: flex; gap: 0.5rem; align-items: center; }
+    .captcha-container input { flex: 1; padding: 0.75rem 1rem; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 0.95rem; }
+    .captcha-container input:focus { outline: none; border-color: #0077ff; }
+    .captcha-image { width: 120px; height: 44px; background: linear-gradient(135deg, #ffd54f, #ff8f00); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 1.4rem; font-weight: 800; color: #333; letter-spacing: 6px; font-style: italic; cursor: pointer; user-select: none; position: relative; }
+    .captcha-image .refresh { position: absolute; right: 4px; bottom: 2px; font-size: 0.6rem; color: rgba(0,0,0,0.3); }
+    .captcha-refresh { font-size: 0.8rem; color: #0077ff; cursor: pointer; text-decoration: none; white-space: nowrap; }
+    .captcha-refresh:hover { text-decoration: underline; }
+    .slider-captcha { border: 2px solid #e0e0e0; border-radius: 8px; padding: 0.5rem; margin-bottom: 1.2rem; background: #fafafa; }
+    .slider-captcha .slider-label { font-size: 0.85rem; color: #666; text-align: center; margin-bottom: 0.5rem; }
+    .slider-track { height: 40px; background: #e8e8e8; border-radius: 20px; position: relative; overflow: hidden; }
+    .slider-track .slider-fill { height: 100%; background: linear-gradient(90deg, #66bb6a, #43a047); width: 0%; transition: width 0.1s; border-radius: 20px; }
+    .slider-track .slider-thumb { position: absolute; top: 2px; left: 2px; width: 36px; height: 36px; background: white; border-radius: 50%; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; }
+    .slider-track .slider-thumb:active { box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
+    .captcha-error { color: #d32f2f; font-size: 0.82rem; margin-top: 0.3rem; display: none; }
+    .login-btn { width: 100%; padding: 0.8rem; background: #0077ff; color: white; border: none; border-radius: 8px; font-size: 1.05rem; font-weight: 700; cursor: pointer; margin-top: 0.5rem; }
+    .login-btn:hover { background: #005fcc; }
+    .login-btn:disabled { background: #b0c4de; cursor: not-allowed; }
+    .login-footer { text-align: center; margin-top: 1.2rem; font-size: 0.85rem; color: #999; }
+    .login-footer a { color: #0077ff; text-decoration: none; }
+    .login-footer a:hover { text-decoration: underline; }
+    .browser-check { background: #fff3e0; border: 1px solid #ffe082; border-radius: 8px; padding: 0.8rem; margin-bottom: 1.2rem; font-size: 0.82rem; color: #e65100; text-align: center; }
+    .antibot-note { background: #fce4ec; border: 1px solid #f8bbd0; border-radius: 8px; padding: 0.8rem; margin-bottom: 1.2rem; font-size: 0.82rem; color: #c62828; text-align: center; }
+    .antibot-note strong { display: block; margin-bottom: 0.3rem; }
+    .wechat-qr { text-align: center; padding: 1rem; margin-bottom: 1rem; }
+    .wechat-qr .qr-box { width: 180px; height: 180px; background: #f5f5f5; margin: 0 auto 0.5rem; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.85rem; color: #999; border: 1px dashed #ccc; }
+    .wechat-qr p { font-size: 0.85rem; color: #666; }
+    .tab-switch { display: flex; margin-bottom: 1.5rem; border-bottom: 2px solid #eee; }
+    .tab-switch .tab { flex: 1; text-align: center; padding: 0.6rem; cursor: pointer; color: #888; font-weight: 600; border-bottom: 2px solid transparent; margin-bottom: -2px; }
+    .tab-switch .tab.active { color: #0077ff; border-bottom-color: #0077ff; }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="login-header">
+      <div class="logo">智联招聘</div>
+      <div class="subtitle">企业招聘管理平台 · ZHAOPIN.COM</div>
+      <h1>企业用户登录</h1>
+    </div>
+
+    <div class="tab-switch">
+      <div class="tab active">密码登录</div>
+      <div class="tab">短信登录</div>
+      <div class="tab">微信扫码</div>
+    </div>
+
+    <div class="browser-check">请使用 Chrome、Edge 或 Safari 最新版本浏览器访问。如果您使用 IE 浏览器，部分功能可能受限。</div>
+
+    <form onsubmit="return false;">
+      <div class="form-group">
+        <label for="username">企业账号 / 手机号</label>
+        <input type="text" id="username" placeholder="请输入企业账号或手机号" autocomplete="username">
+      </div>
+
+      <div class="form-group">
+        <label for="password">登录密码</label>
+        <input type="password" id="password" placeholder="请输入密码" autocomplete="current-password">
+      </div>
+
+      <div class="captcha-section">
+        <label class="captcha-label">验证码</label>
+        <div class="captcha-container">
+          <input type="text" placeholder="输入图片中的验证码" maxlength="4">
+          <div class="captcha-image" title="点击刷新验证码">
+            B3XW
+            <span class="refresh">⟳</span>
+          </div>
+          <a href="#" class="captcha-refresh" onclick="return false;">换一张</a>
+        </div>
+      </div>
+
+      <div class="slider-captcha">
+        <div class="slider-label">请按住滑块，拖动完成拼图验证</div>
+        <div class="slider-track">
+          <div class="slider-fill" style="width: 0%;"></div>
+          <div class="slider-thumb" title="拖动滑块验证">→</div>
+        </div>
+        <div class="captcha-error">请完成安全验证</div>
+      </div>
+
+      <div class="antibot-note">
+        <strong>🤖 检测到异常访问</strong>
+        当前网络环境存在异常，系统已自动开启高级安全验证。请完成以下验证后继续操作。
+      </div>
+
+      <button class="login-btn" disabled>请先完成安全验证</button>
+    </form>
+
+    <div class="login-footer">
+      <a href="#">忘记密码？</a> | <a href="#">企业注册</a> | <a href="#">帮助中心</a>
+    </div>
+
+    <!-- Hidden note for crawlers: auth-wall detected -->
+    <!-- STATUS: needs_manual_review, block_reason: captcha -->
+  </div>
+</body>
+</html>

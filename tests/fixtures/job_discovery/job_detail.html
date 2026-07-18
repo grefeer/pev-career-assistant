@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>高级算法工程师 - 星辰科技</title>
+  <meta name="description" content="星辰科技正在招聘高级算法工程师，负责AI模型研发与优化。">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, "Microsoft YaHei", "PingFang SC", sans-serif; color: #333; background: #f5f7fa; line-height: 1.6; }
+    .container { max-width: 900px; margin: 0 auto; padding: 0 20px; }
+    .breadcrumb { padding: 1rem 0; font-size: 0.88rem; color: #888; }
+    .breadcrumb a { color: #0f3460; text-decoration: none; }
+    .breadcrumb a:hover { text-decoration: underline; }
+    .job-header { background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 2px 12px rgba(0,0,0,0.06); margin-bottom: 1.5rem; }
+    .job-header h1 { font-size: 1.8rem; color: #1a1a2e; margin-bottom: 0.8rem; }
+    .job-header .company { font-size: 1.1rem; color: #0f3460; font-weight: 600; margin-bottom: 1rem; }
+    .job-tags { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+    .tag { display: inline-block; padding: 0.3rem 0.8rem; border-radius: 6px; font-size: 0.82rem; background: #eef2f7; color: #555; }
+    .tag.salary { background: #fff3e0; color: #e65100; font-weight: 600; }
+    .tag.location { background: #e3f2fd; color: #1565c0; }
+    .tag.type { background: #e8f5e9; color: #2e7d32; }
+    .action-bar { display: flex; gap: 1rem; margin-top: 1.5rem; }
+    .btn { padding: 0.7rem 2rem; border-radius: 8px; font-size: 1rem; font-weight: 600; border: none; cursor: pointer; text-decoration: none; display: inline-block; }
+    .btn-primary { background: #0f3460; color: white; }
+    .btn-primary:hover { background: #1a4a7a; }
+    .btn-outline { background: white; color: #0f3460; border: 2px solid #0f3460; }
+    .btn-outline:hover { background: #f0f4ff; }
+    .job-section { background: white; border-radius: 16px; padding: 2rem; box-shadow: 0 2px 12px rgba(0,0,0,0.06); margin-bottom: 1.5rem; }
+    .job-section h2 { font-size: 1.3rem; color: #1a1a2e; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 2px solid #f0f2f5; }
+    .job-section ul { padding-left: 1.5rem; }
+    .job-section ul li { margin-bottom: 0.5rem; color: #444; }
+    .job-section p { color: #444; margin-bottom: 0.8rem; }
+    .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
+    .info-item { padding: 1rem; background: #f8f9fc; border-radius: 10px; }
+    .info-item dt { font-size: 0.82rem; color: #999; margin-bottom: 0.3rem; }
+    .info-item dd { font-size: 1rem; color: #333; font-weight: 600; }
+    .sidebar-box { background: white; border-radius: 16px; padding: 1.5rem; box-shadow: 0 2px 12px rgba(0,0,0,0.06); margin-bottom: 1.5rem; }
+    .sidebar-box h3 { font-size: 1.1rem; margin-bottom: 0.8rem; color: #1a1a2e; }
+    .sidebar-box p { font-size: 0.9rem; color: #666; margin-bottom: 0.5rem; }
+    footer { background: #1a1a2e; color: rgba(255,255,255,0.7); text-align: center; padding: 2rem 0; font-size: 0.9rem; margin-top: 2rem; }
+    .apply-section { background: linear-gradient(135deg, #e3f2fd, #f0f4ff); border-radius: 16px; padding: 2rem; text-align: center; }
+    .apply-section h2 { color: #0f3460; margin-bottom: 0.5rem; border: none; }
+    .apply-section p { color: #555; margin-bottom: 1.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <nav class="breadcrumb">
+      <a href="/">首页</a> &gt; <a href="/careers">加入我们</a> &gt; <span>高级算法工程师</span>
+    </nav>
+
+    <div class="job-header">
+      <h1>高级算法工程师</h1>
+      <div class="company">星辰科技 StarCloud Technology</div>
+      <div class="job-tags">
+        <span class="tag salary">35K-55K</span>
+        <span class="tag location">深圳 · 南山区</span>
+        <span class="tag type">全职</span>
+        <span class="tag">技术研发部</span>
+        <span class="tag">3-5年经验</span>
+        <span class="tag">硕士及以上</span>
+      </div>
+      <div class="action-bar">
+        <a href="/apply/job/001" class="btn btn-primary">立即投递</a>
+        <button class="btn btn-outline" onclick="alert('已收藏')">收藏职位</button>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1.5rem;">
+      <main>
+        <section class="job-section">
+          <h2>岗位职责</h2>
+          <ul>
+            <li>负责 NLP/CV 方向核心算法的研发、优化与落地，包括但不限于文本分类、实体识别、语义匹配、图像识别等方向。</li>
+            <li>参与大规模预训练模型的训练、微调与蒸馏工作，探索模型压缩和推理加速技术。</li>
+            <li>将前沿研究成果转化为实际产品能力，与工程团队紧密协作完成模型部署和性能调优。</li>
+            <li>跟踪学术界和工业界最新研究进展，定期进行技术分享和内部培训。</li>
+            <li>参与专利和技术文档的撰写，保护公司知识产权。</li>
+          </ul>
+        </section>
+
+        <section class="job-section">
+          <h2>任职要求</h2>
+          <ul>
+            <li>计算机、数学、统计等相关专业硕士及以上学历，博士优先。</li>
+            <li>3 年以上机器学习/深度学习算法研发经验，有大规模模型训练经验者优先。</li>
+            <li>精通 Python 编程，熟练使用 PyTorch 或 TensorFlow 等深度学习框架。</li>
+            <li>在 NLP、CV、或多模态学习中的至少一个方向有深入研究和实践经验。</li>
+            <li>熟悉 Transformer、BERT、GPT 等主流模型架构及其原理。</li>
+            <li>有良好的数学基础，熟悉线性代数、概率论和最优化方法。</li>
+            <li>发表过顶会论文或在知名竞赛中获得过优异成绩者优先。</li>
+          </ul>
+        </section>
+
+        <section class="job-section">
+          <h2>加分项</h2>
+          <ul>
+            <li>有模型压缩、量化、蒸馏等推理优化经验。</li>
+            <li>熟悉 C++/CUDA 编程，有 GPU 高性能计算经验。</li>
+            <li>有分布式训练框架（DeepSpeed、Megatron 等）使用经验。</li>
+            <li>有 Kubernetes、Docker 等容器化部署经验。</li>
+            <li>有 AI 相关开源项目贡献。</li>
+          </ul>
+        </section>
+
+        <section class="job-section">
+          <h2>薪酬福利</h2>
+          <ul>
+            <li>有竞争力的薪资：35K-55K/月 + 年终奖金（14-16薪）</li>
+            <li>股票期权激励计划</li>
+            <li>五险一金 + 补充商业保险</li>
+            <li>弹性工作制，支持混合办公</li>
+            <li>每年 2 次晋升评审机会</li>
+            <li>免费早午餐、下午茶、健身房</li>
+            <li>顶级配置开发设备（M系列 MacBook Pro / 高配工作站）</li>
+          </ul>
+        </section>
+      </main>
+
+      <aside>
+        <div class="sidebar-box">
+          <h3>职位信息</h3>
+          <p><strong>岗位名称：</strong>高级算法工程师</p>
+          <p><strong>所属部门：</strong>技术研发部</p>
+          <p><strong>工作地点：</strong>深圳市南山区科技园</p>
+          <p><strong>招聘人数：</strong>3人</p>
+          <p><strong>学历要求：</strong>硕士及以上</p>
+          <p><strong>工作经验：</strong>3-5年</p>
+          <p><strong>发布时间：</strong>2026-07-01</p>
+          <p><strong>截止日期：</strong>2026-08-15</p>
+        </div>
+
+        <div class="sidebar-box">
+          <h3>投递方式</h3>
+          <p>请将简历发送至：<a href="mailto:career@starcloud.com">career@starcloud.com</a></p>
+          <p>邮件标题格式：<strong>应聘岗位 - 姓名 - 学历 - 工作年限</strong></p>
+          <p>或点击下方按钮在线投递。</p>
+          <a href="/apply/job/001" class="btn btn-primary" style="width:100%;text-align:center;margin-top:0.8rem;">立即投递</a>
+        </div>
+
+        <div class="sidebar-box">
+          <h3>公司信息</h3>
+          <p><strong>公司全称：</strong>星辰科技有限公司</p>
+          <p><strong>公司规模：</strong>2000-5000人</p>
+          <p><strong>公司类型：</strong>民营科技企业</p>
+          <p><strong>行业领域：</strong>人工智能 / 云计算 / 大数据</p>
+          <p><strong>公司地址：</strong>深圳市南山区科技南路 18 号深圳湾科技生态园</p>
+        </div>
+      </aside>
+    </div>
+
+    <section class="apply-section">
+      <h2>加入星辰科技</h2>
+      <p>如果你对以上职位感兴趣，欢迎投递简历，我们将在 3 个工作日内与您联系。</p>
+      <a href="/apply/job/001" class="btn btn-primary">立即申请</a>
+      <a href="/careers" class="btn btn-outline" style="margin-left:1rem;">浏览更多职位</a>
+    </section>
+  </div>
+
+  <footer>
+    <div class="container">
+      <p>&copy; 2026 星辰科技 StarCloud Technology Co., Ltd.</p>
+    </div>
+  </footer>
+</body>
+</html>
