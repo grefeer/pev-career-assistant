@@ -72,6 +72,22 @@ export interface AdminJobListQuery {
   reviewStatus?: ReviewQueueStatus;
 }
 
+export type JobSourceKey = "tencent-27-referrals" | "tencent-intern-referrals";
+
+export interface JobSyncResponse {
+  run_id: string;
+  source_key: JobSourceKey;
+  status: "succeeded" | "failed" | "running";
+  pages_read: number;
+  records_read: number;
+  raw_snapshots_created: number;
+  postings_created: number;
+  postings_updated: number;
+  records_skipped_incomplete: number;
+  started_at: string;
+  finished_at: string;
+}
+
 export interface JobCompletionPayload {
   expected_version: number;
   company_name: string;

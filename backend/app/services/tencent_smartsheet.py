@@ -197,8 +197,8 @@ class TencentSmartsheetGateway:
             if not isinstance(value, Mapping):
                 raise TencentProtocolError("Tencent MCP returned malformed fields")
             field_id = value.get("field_id")
-            title = value.get("title")
-            field_type = value.get("type")
+            title = value.get("title") or value.get("field_title")
+            field_type = value.get("type") or value.get("field_type")
             if (
                 not _is_non_empty_string(field_id)
                 or not _is_non_empty_string(title)

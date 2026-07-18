@@ -7,12 +7,24 @@ import ipaddress
 from pathlib import Path
 from typing import Literal
 
+from dotenv import dotenv_values
 from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_APP_AUTH_SECRET = "replace-with-a-random-secret-of-at-least-32-characters"
+_TENCENT_TOKEN_ENV_NAMES = ("TENCENT_DOCS_TOKEN", "TEST_TENCENT_DOCS_TOKEN")
+
+
+def _literal_tencent_dotenv_values(path: Path = ROOT_DIR / ".env") -> dict[str, str]:
+    values = dotenv_values(path, interpolate=False)
+    result: dict[str, str] = {}
+    for env_name in _TENCENT_TOKEN_ENV_NAMES:
+        value = values.get(env_name)
+        if value:
+            result[env_name.lower()] = value
+    return result
 
 
 class Settings(BaseSettings):
@@ -22,6 +34,30 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[
+        PydanticBaseSettingsSource,
+        PydanticBaseSettingsSource,
+        PydanticBaseSettingsSource,
+        PydanticBaseSettingsSource,
+        PydanticBaseSettingsSource,
+    ]:
+        del settings_cls
+        return (
+            init_settings,
+            env_settings,
+            _literal_tencent_dotenv_values,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     app_env: Literal["development", "test", "production"] = "development"
     app_auth_secret: str

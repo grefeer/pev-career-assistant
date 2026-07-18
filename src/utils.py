@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -16,6 +16,11 @@ CHECKPOINT_DIR = ROOT_DIR / "checkpoints"
 def load_env() -> None:
     # 固定从项目根目录读取 .env，避免从不同工作目录运行时找不到配置。
     load_dotenv(ROOT_DIR / ".env")
+    literal_values = dotenv_values(ROOT_DIR / ".env", interpolate=False)
+    for name in ("TENCENT_DOCS_TOKEN", "TEST_TENCENT_DOCS_TOKEN"):
+        value = literal_values.get(name)
+        if value:
+            os.environ[name] = value
 
 
 def read_text(path: Path) -> str:

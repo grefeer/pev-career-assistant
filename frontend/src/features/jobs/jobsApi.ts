@@ -8,6 +8,8 @@ import type {
   JobDetail,
   JobListQuery,
   JobListResponse,
+  JobSourceKey,
+  JobSyncResponse,
 } from "./jobTypes";
 
 export function fetchVerifiedJobs(
@@ -54,6 +56,14 @@ export function fetchAdminVerifiedJobs(
     offset: String(query.offset),
   });
   return request<AdminJobListResponse>(`/admin/jobs/verified?${params.toString()}`, {}, token);
+}
+
+export function syncJobSource(token: string, sourceKey: JobSourceKey): Promise<JobSyncResponse> {
+  return request<JobSyncResponse>(
+    `/admin/job-sources/${encodeURIComponent(sourceKey)}/sync`,
+    { method: "POST" },
+    token,
+  );
 }
 
 export function saveJobCompletion(

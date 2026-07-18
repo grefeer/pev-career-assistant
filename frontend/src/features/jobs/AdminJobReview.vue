@@ -14,11 +14,13 @@ import {
   fetchAdminVerifiedJobs,
   fetchJobReviewQueue,
   saveJobCompletion,
+  syncJobSource,
 } from "./jobsApi";
 import type {
   AdminJobDetail,
   ExpireReasonCode,
   JobCompletionPayload,
+  JobSourceKey,
   JobSourceCandidate,
   RejectReasonCode,
   ReviewQueueStatus,
@@ -52,6 +54,10 @@ const expireReasons = [
   { code: "deadline_passed", label: "截止日期已过" },
   { code: "application_channel_unavailable", label: "投递渠道不可用" },
 ] as const satisfies ReadonlyArray<{ code: ExpireReasonCode; label: string }>;
+const syncSources = [
+  { key: "tencent-27-referrals", label: "同步 27 届内推" },
+  { key: "tencent-intern-referrals", label: "同步实习内推" },
+] as const satisfies ReadonlyArray<{ key: JobSourceKey; label: string }>;
 
 const mode = ref<"review" | "verified">("review");
 const queueJobs = ref<AdminJobDetail[]>([]);
@@ -65,6 +71,11 @@ const reviewStatus = ref<"" | ReviewQueueStatus>("");
 const appliedReviewStatus = ref<"" | ReviewQueueStatus>("");
 const listLoading = ref(false);
 const actionBusy = ref(false);
+const syncBusy = ref<"" | JobSourceKey>("");
+const syncResults = reactive<Record<JobSourceKey, string>>({
+  "tencent-27-referrals": "",
+  "tencent-intern-referrals": "",
+});
 const listError = ref("");
 const error = ref("");
 const message = ref("");
@@ -114,7 +125,7 @@ function interactionStamp(): string {
 const dirty = computed(
   () => mode.value === "review" && Boolean(selected.value) && completionSnapshot() !== baseline.value,
 );
-const interactionLocked = computed(() => actionBusy.value || listLoading.value);
+const interactionLocked = computed(() => actionBusy.value || listLoading.value || syncBusy.value !== "");
 function isManualApplicationChannel(value: string): boolean {
   return /^(?:mailto|qr|weixin|wechat):/i.test(value.trim());
 }
@@ -315,6 +326,23 @@ function apiErrorMessage(caught: unknown): string {
   return "职位审核操作失败，请稍后重试。";
 }
 
+function syncErrorMessage(caught: unknown): string {
+  if (!(caught instanceof ApiError)) return "智能表同步失败，请稍后重试。";
+  if (caught.status === 401) return "登录状态已失效，请重新登录。";
+  if (caught.status === 403) return "当前账号没有智能表同步权限。";
+  const detail = caught.detail;
+  const code = detail && typeof detail === "object"
+    ? (detail as Record<string, unknown>).error_code
+    : null;
+  if (code === "tencent_token_missing") return "未配置 TENCENT_DOCS_TOKEN，无法读取腾讯智能表。";
+  if (code === "tencent_auth_failed") return "腾讯文档令牌无效或权限不足。";
+  if (code === "tencent_rate_limited") return "腾讯文档接口限流，请稍后再试。";
+  if (code === "tencent_timeout") return "腾讯文档接口超时，请稍后重试。";
+  if (code === "tencent_protocol_error") return "腾讯智能表返回协议与当前解析器不一致，未能完成读取。";
+  if (code === "source_schema_changed") return "智能表字段结构发生变化，需要先更新映射规则。";
+  return "智能表同步失败，请稍后重试。";
+}
+
 function isExactStale(caught: unknown): boolean {
   if (!(caught instanceof ApiError) || caught.status !== 409) return false;
   return Boolean(
@@ -322,6 +350,25 @@ function isExactStale(caught: unknown): boolean {
     && typeof caught.detail === "object"
     && (caught.detail as Record<string, unknown>).error_code === "stale_job_review",
   );
+}
+
+async function syncSource(sourceKey: JobSourceKey): Promise<void> {
+  if (interactionLocked.value) return;
+  if (!confirmDraftLoss()) return;
+  resetFeedback();
+  syncResults[sourceKey] = "";
+  syncBusy.value = sourceKey;
+  try {
+    const outcome = await syncJobSource(props.token, sourceKey);
+    syncResults[sourceKey] = `同步完成：读取 ${outcome.records_read} 条，新增 ${outcome.postings_created} 条，更新 ${outcome.postings_updated} 条，跳过 ${outcome.records_skipped_incomplete} 条。`;
+    queueOffset.value = 0;
+    mode.value = "review";
+    await loadQueue();
+  } catch (caught) {
+    error.value = syncErrorMessage(caught);
+  } finally {
+    syncBusy.value = "";
+  }
 }
 
 async function handleActionError(
@@ -466,6 +513,18 @@ onBeforeUnmount(() => {
         <h1 id="review-title">职位审核台</h1>
         <p>对照来源候选值，补全可信字段，再执行明确的生命周期决策。</p>
       </div>
+      <div class="source-sync" aria-label="智能表同步">
+        <button
+          v-for="source in syncSources"
+          :key="source.key"
+          type="button"
+          :data-test="`sync-${source.key}`"
+          :disabled="interactionLocked"
+          @click="syncSource(source.key)"
+        >
+          {{ syncBusy === source.key ? "同步中…" : source.label }}
+        </button>
+      </div>
       <div class="mode-switch" aria-label="审核列表">
         <button
           type="button"
@@ -502,6 +561,14 @@ onBeforeUnmount(() => {
 
     <p v-if="listError" class="notice error" role="alert">{{ listError }}</p>
     <p v-if="message" class="notice success" role="status">{{ message }}</p>
+    <p
+      v-for="source in syncSources"
+      v-show="syncResults[source.key]"
+      :key="`result-${source.key}`"
+      class="notice success"
+      role="status"
+      :data-test="`sync-result-${source.key}`"
+    >{{ syncResults[source.key] }}</p>
     <p v-if="error" class="notice error" role="alert">{{ error }}</p>
 
     <div class="review-layout">
@@ -685,6 +752,13 @@ onBeforeUnmount(() => {
 .review-header {
   justify-content: space-between;
   margin-bottom: 1rem;
+}
+
+.source-sync {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
 }
 
 .review-header h1,

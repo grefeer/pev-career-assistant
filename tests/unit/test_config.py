@@ -1,7 +1,7 @@
 from pydantic import ValidationError
 import pytest
 
-from backend.app.config import Settings
+from backend.app.config import Settings, _literal_tencent_dotenv_values
 from tests.conftest import settings_override
 
 
@@ -109,3 +109,17 @@ def test_test_tencent_token_falls_back_to_runtime_token() -> None:
     )
 
     assert settings.effective_test_tencent_docs_token.get_secret_value() == "runtime-token"
+
+
+def test_tencent_dotenv_tokens_are_read_without_interpolation(tmp_path) -> None:
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        "TENCENT_DOCS_TOKEN='${literal-token}'\n"
+        "TEST_TENCENT_DOCS_TOKEN='${literal-test-token}'\n",
+        encoding="utf-8",
+    )
+
+    assert _literal_tencent_dotenv_values(dotenv_path) == {
+        "tencent_docs_token": "${literal-token}",
+        "test_tencent_docs_token": "${literal-test-token}",
+    }

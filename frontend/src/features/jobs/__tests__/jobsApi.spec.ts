@@ -7,6 +7,7 @@ import {
   fetchVerifiedJob,
   fetchVerifiedJobs,
   saveJobCompletion,
+  syncJobSource,
 } from "../jobsApi";
 
 describe("verified jobs API", () => {
@@ -136,5 +137,37 @@ describe("administrator jobs API", () => {
     expect(fetchMock.mock.calls[0][1].method).toBe("PATCH");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/admin/jobs/job%2F1/decision");
     expect(fetchMock.mock.calls[1][1].method).toBe("POST");
+  });
+
+  it("posts to a fixed Tencent job source sync route", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(
+      new Response(JSON.stringify({
+        run_id: "run-1",
+        source_key: "tencent-intern-referrals",
+        status: "succeeded",
+        pages_read: 1,
+        records_read: 2,
+        raw_snapshots_created: 2,
+        postings_created: 1,
+        postings_updated: 1,
+        records_skipped_incomplete: 0,
+        started_at: "2026-07-18T00:00:00Z",
+        finished_at: "2026-07-18T00:00:01Z",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await syncJobSource("admin-token", "tencent-intern-referrals");
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/api/admin/job-sources/tencent-intern-referrals/sync",
+    );
+    expect(fetchMock.mock.calls[0][1].method).toBe("POST");
+    expect(new Headers(fetchMock.mock.calls[0][1].headers).get("Authorization")).toBe(
+      "Bearer admin-token",
+    );
   });
 });

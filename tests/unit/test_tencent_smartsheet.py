@@ -199,6 +199,26 @@ def test_list_fields_parses_fields() -> None:
     ]
 
 
+def test_list_fields_accepts_current_tencent_field_key_names() -> None:
+    gateway = TencentSmartsheetGateway(
+        token="secret",
+        tool_caller=lambda *_: {
+            "error": "",
+            "fields": [
+                {
+                    "field_id": "f1",
+                    "field_title": "招聘岗位",
+                    "field_type": "text",
+                },
+            ],
+        },
+    )
+
+    fields = gateway.list_fields("file", "sheet")
+
+    assert fields == [gateway_module.TencentField("f1", "招聘岗位", "text")]
+
+
 def test_mcp_lifecycle_runs_inside_fifteen_second_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

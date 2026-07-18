@@ -8,6 +8,7 @@ import {
   fetchAdminVerifiedJobs,
   fetchJobReviewQueue,
   saveJobCompletion,
+  syncJobSource,
 } from "../jobsApi";
 import type { AdminJobDetail } from "../jobTypes";
 
@@ -16,6 +17,7 @@ vi.mock("../jobsApi", () => ({
   fetchAdminVerifiedJobs: vi.fn(),
   saveJobCompletion: vi.fn(),
   decideJob: vi.fn(),
+  syncJobSource: vi.fn(),
 }));
 
 const pending: AdminJobDetail = {
@@ -72,6 +74,19 @@ describe("AdminJobReview", () => {
       job({ status: "pending_review", review_version: 4 }),
     );
     vi.mocked(decideJob).mockResolvedValue(job({ status: "verified", review_version: 5 }));
+    vi.mocked(syncJobSource).mockResolvedValue({
+      run_id: "run-1",
+      source_key: "tencent-intern-referrals",
+      status: "succeeded",
+      pages_read: 1,
+      records_read: 2,
+      raw_snapshots_created: 2,
+      postings_created: 1,
+      postings_updated: 1,
+      records_skipped_incomplete: 0,
+      started_at: "2026-07-18T00:00:00Z",
+      finished_at: "2026-07-18T00:00:01Z",
+    });
   });
 
   it("renders only the eight normalized candidates and saves every completion field with the read version", async () => {
@@ -498,5 +513,30 @@ describe("AdminJobReview", () => {
     const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
     await flushPromises();
     expect(wrapper.text()).toContain("来源数据已变化，请对照候选值重新审核");
+  });
+
+  it("syncs Tencent smart sheets from the administrator review page and reloads the queue", async () => {
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="sync-tencent-intern-referrals"]').trigger("click");
+    await flushPromises();
+
+    expect(syncJobSource).toHaveBeenCalledWith("admin-token", "tencent-intern-referrals");
+    expect(fetchJobReviewQueue).toHaveBeenCalledTimes(2);
+    expect(wrapper.text()).toContain("同步完成：读取 2 条，新增 1 条，更新 1 条，跳过 0 条。");
+  });
+
+  it("explains Tencent sync protocol errors instead of showing a generic failure", async () => {
+    vi.mocked(syncJobSource).mockRejectedValue(
+      new ApiError(502, { error_code: "tencent_protocol_error", run_id: "run-1" }, "tencent_protocol_error"),
+    );
+    const wrapper = mount(AdminJobReview, { props: { token: "admin-token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="sync-tencent-27-referrals"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("腾讯智能表返回协议与当前解析器不一致");
   });
 });

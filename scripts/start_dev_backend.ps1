@@ -11,7 +11,11 @@ Set-Location $root
 if (Test-Path ".env") {
     Get-Content ".env" | ForEach-Object {
         if ($_ -match "^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$") {
-            [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+            $value = $matches[2].Trim()
+            if (($value.StartsWith("'") -and $value.EndsWith("'")) -or ($value.StartsWith('"') -and $value.EndsWith('"'))) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+            [Environment]::SetEnvironmentVariable($matches[1], $value, "Process")
         }
     }
 }
