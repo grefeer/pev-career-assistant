@@ -83,6 +83,17 @@ class Settings(BaseSettings):
     tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
     test_tencent_docs_token: SecretStr | None = Field(default=None, repr=False)
 
+    # Job Discovery Agent settings
+    # OCR is pluggable and defaults to needs_manual_review when unavailable.
+    job_discovery_enabled: bool = False
+    job_discovery_agent_version: str = "1.0.0"
+    job_discovery_model: str = "deepseek-v4-flash"
+    job_discovery_max_pages_per_task: int = Field(default=20, ge=1, le=100)
+    job_discovery_max_candidates_per_task: int = Field(default=10, ge=1, le=50)
+    job_discovery_task_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    job_discovery_browser_headless: bool = True
+    job_discovery_ocr_enabled: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

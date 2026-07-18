@@ -111,6 +111,86 @@ def test_test_tencent_token_falls_back_to_runtime_token() -> None:
     assert settings.effective_test_tencent_docs_token.get_secret_value() == "runtime-token"
 
 
+def test_job_discovery_defaults() -> None:
+    settings = Settings(
+        app_env="test",
+        app_auth_secret="test-secret-with-at-least-32-characters",
+        object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        database_url="sqlite+pysqlite:///:memory:",
+        redis_url="redis://localhost:6379/15",
+        checkpoint_backend="sqlite",
+    )
+    assert settings.job_discovery_enabled is False
+    assert settings.job_discovery_agent_version == "1.0.0"
+    assert settings.job_discovery_model == "deepseek-v4-flash"
+    assert settings.job_discovery_max_pages_per_task == 20
+    assert settings.job_discovery_max_candidates_per_task == 10
+    assert settings.job_discovery_task_timeout_seconds == 600
+    assert settings.job_discovery_browser_headless is True
+    assert settings.job_discovery_ocr_enabled is False
+
+
+class TestJobDiscoveryBounds:
+    def test_disabled_by_default(self) -> None:
+        settings = Settings(
+            app_env="test",
+            app_auth_secret="test-secret-with-at-least-32-characters",
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="sqlite+pysqlite:///:memory:",
+            redis_url="redis://localhost:6379/15",
+            checkpoint_backend="sqlite",
+        )
+        assert settings.job_discovery_enabled is False
+
+    def test_max_pages_accepts_lower_bound(self) -> None:
+        settings = Settings(
+            app_env="test",
+            app_auth_secret="test-secret-with-at-least-32-characters",
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="sqlite+pysqlite:///:memory:",
+            redis_url="redis://localhost:6379/15",
+            checkpoint_backend="sqlite",
+            job_discovery_max_pages_per_task=1,
+        )
+        assert settings.job_discovery_max_pages_per_task == 1
+
+    def test_max_pages_accepts_upper_bound(self) -> None:
+        settings = Settings(
+            app_env="test",
+            app_auth_secret="test-secret-with-at-least-32-characters",
+            object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            database_url="sqlite+pysqlite:///:memory:",
+            redis_url="redis://localhost:6379/15",
+            checkpoint_backend="sqlite",
+            job_discovery_max_pages_per_task=100,
+        )
+        assert settings.job_discovery_max_pages_per_task == 100
+
+    def test_max_pages_rejects_below_one(self) -> None:
+        with pytest.raises(ValidationError, match="job_discovery_max_pages_per_task"):
+            Settings(
+                app_env="test",
+                app_auth_secret="test-secret-with-at-least-32-characters",
+                object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                database_url="sqlite+pysqlite:///:memory:",
+                redis_url="redis://localhost:6379/15",
+                checkpoint_backend="sqlite",
+                job_discovery_max_pages_per_task=0,
+            )
+
+    def test_max_pages_rejects_above_one_hundred(self) -> None:
+        with pytest.raises(ValidationError, match="job_discovery_max_pages_per_task"):
+            Settings(
+                app_env="test",
+                app_auth_secret="test-secret-with-at-least-32-characters",
+                object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                database_url="sqlite+pysqlite:///:memory:",
+                redis_url="redis://localhost:6379/15",
+                checkpoint_backend="sqlite",
+                job_discovery_max_pages_per_task=101,
+            )
+
+
 def test_tencent_dotenv_tokens_are_read_without_interpolation(tmp_path) -> None:
     dotenv_path = tmp_path / ".env"
     dotenv_path.write_text(
