@@ -155,15 +155,21 @@ class MatchService:
                 profile_snapshot=profile_snapshot.__dict__,
             )
         except Exception:
-            return match_repo.finalize(
-                db, report_id, "failed", error_code="match_execution_interrupted"
+            return self._finalize_and_commit(
+                db,
+                report_id,
+                "failed",
+                error_code="match_execution_interrupted",
             )
 
         # --- Step 7: Validate and score ---
         computation_output = raw_result.get("result")
         if computation_output is None:
-            return match_repo.finalize(
-                db, report_id, "failed", error_code="match_model_validation_failed"
+            return self._finalize_and_commit(
+                db,
+                report_id,
+                "failed",
+                error_code="match_model_validation_failed",
             )
 
         # Convert to dicts for validation (Pydantic -> dict if needed)
@@ -185,14 +191,17 @@ class MatchService:
                 output_dict, job_snapshot, profile_snapshot
             )
         except MatchValidationError as e:
-            return match_repo.finalize(
-                db, report_id, "failed", error_code=e.error_code
+            return self._finalize_and_commit(
+                db,
+                report_id,
+                "failed",
+                error_code=e.error_code,
             )
 
         # Score
         score, components, priority = compute_score(computation_output)
 
-        return match_repo.finalize(
+        return self._finalize_and_commit(
             db,
             report_id,
             "completed",
@@ -209,6 +218,17 @@ class MatchService:
     def recover_stale(self, db: Session) -> int:
         """Recover stale (pending/running beyond timeout) matches."""
         return match_repo.recover_stale(db, timeout_minutes=STALE_TIMEOUT_MINUTES)
+
+    def _finalize_and_commit(
+        self,
+        db: Session,
+        report_id: str,
+        status: str,
+        **kwargs,
+    ) -> MatchReport:
+        report = match_repo.finalize(db, report_id, status, **kwargs)
+        db.commit()
+        return report
 
     def _resolve_session(
         self, db: Session, user_id: str, session_id: str | None

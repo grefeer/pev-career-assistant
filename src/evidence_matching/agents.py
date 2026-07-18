@@ -1,5 +1,7 @@
 import json
 from langchain_core.messages import HumanMessage
+from pydantic import ValidationError
+
 from .schemas import RequirementAssessment, ReferencedRecommendation, ReferencedRisk, MatchComputationOutput
 from .prompts import EXTRACT_REQUIREMENTS_PROMPT, MATCH_ASSESSMENT_PROMPT
 
@@ -37,18 +39,19 @@ async def assess_match(state: dict, model) -> dict:
     except json.JSONDecodeError:
         return {"error": "match_model_validation_failed", "next_step": "fail"}
 
-    # Parse into structured output
-    strengths = [RequirementAssessment(**a) for a in raw.get("strengths", [])]
-    gaps = [RequirementAssessment(**a) for a in raw.get("gaps", [])]
-    unknowns = [RequirementAssessment(**a) for a in raw.get("unknowns", [])]
-    risks = [ReferencedRisk(**a) for a in raw.get("risks", [])]
-    recommendation = ReferencedRecommendation(**raw.get("recommendation", {"text": "", "requirement_ids": []}))
-
-    result = MatchComputationOutput(
-        strengths=strengths,
-        gaps=gaps,
-        unknowns=unknowns,
-        risks=risks,
-        recommendation=recommendation,
-    )
+    try:
+        strengths = [RequirementAssessment(**a) for a in raw.get("strengths", [])]
+        gaps = [RequirementAssessment(**a) for a in raw.get("gaps", [])]
+        unknowns = [RequirementAssessment(**a) for a in raw.get("unknowns", [])]
+        risks = [ReferencedRisk(**a) for a in raw.get("risks", [])]
+        recommendation = ReferencedRecommendation(**raw.get("recommendation", {"text": "", "requirement_ids": []}))
+        result = MatchComputationOutput(
+            strengths=strengths,
+            gaps=gaps,
+            unknowns=unknowns,
+            risks=risks,
+            recommendation=recommendation,
+        )
+    except (TypeError, ValidationError):
+        return {"error": "match_model_validation_failed", "next_step": "fail"}
     return {"result": result, "next_step": "finish"}

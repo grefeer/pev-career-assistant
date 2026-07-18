@@ -29,6 +29,7 @@ from backend.app.db.models import (
     JobPostingStatus,
     JobSource,
     JobSourceProvider,
+    JobVerification,
     Profile,
     RawJobRecord,
     User,
@@ -178,6 +179,40 @@ def _ensure_verified_job_posting(
     return posting
 
 
+def _ensure_job_verification(db, *, posting: JobPosting) -> JobVerification:
+    """Return an existing verification event or create one for the fixture posting."""
+    existing = db.scalar(
+        select(JobVerification).where(JobVerification.job_id == posting.id)
+    )
+    if existing is not None:
+        print(f"  JobVerification already exists: {existing.id}")
+        return existing
+
+    verification = JobVerification(
+        job_id=posting.id,
+        actor_user_id=None,
+        action="verified",
+        from_status="pending_review",
+        to_status="verified",
+        review_version=posting.review_version,
+        field_snapshot={
+            "company_name": posting.company_name,
+            "title": posting.title,
+            "description_text": posting.description_text,
+            "locations": posting.locations,
+            "recruitment_types": posting.recruitment_types,
+            "industries": posting.industries,
+            "apply_url": posting.apply_url,
+            "gui_eligible": posting.gui_eligible,
+        },
+        reason_code=None,
+    )
+    db.add(verification)
+    db.flush()
+    print(f"  Created JobVerification: {verification.id}")
+    return verification
+
+
 def _ensure_profile(db, *, user: User) -> Profile:
     """Return an existing profile for the fixture user or create one."""
     profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
@@ -233,6 +268,7 @@ def main() -> int:
         source = _ensure_job_source(db)
         raw_record = _ensure_raw_job_record(db, source=source)
         posting = _ensure_verified_job_posting(db, source=source, raw_record=raw_record)
+        verification = _ensure_job_verification(db, posting=posting)
         profile = _ensure_profile(db, user=user)
         cpv = _ensure_confirmed_profile_version(db, profile=profile)
 
@@ -241,6 +277,7 @@ def main() -> int:
         print()
         print("All fixtures created successfully.")
         print(f"  Verified JobPosting:           {posting.id}")
+        print(f"  JobVerification:               {verification.id}")
         print(f"  ConfirmedProfileVersion:       {cpv.id}")
         return 0
     except Exception:

@@ -636,6 +636,36 @@ class TestMatchService:
         assert report.status == "failed"
         assert report.error_code == "match_model_validation_failed"
 
+    def test_final_status_is_committed(
+        self,
+        db: Session,
+        user: User,
+        analysis_session: AnalysisSession,
+        job_postings: tuple[JobPosting, JobVerification],
+        profile_version: ConfirmedProfileVersion,
+    ) -> None:
+        """Finalized reports remain visible after a caller-side rollback."""
+        job, _ = job_postings
+        mock_graph = MagicMock()
+        mock_graph.arun_sync.return_value = {"result": None}
+        service = self._make_service(mock_graph)
+
+        report = service.create_match(
+            db=db,
+            user_id=user.id,
+            job_id=job.id,
+            profile_version_id=profile_version.id,
+            idempotency_key="ik-final-commit-1",
+            analysis_session_id=analysis_session.id,
+        )
+
+        db.rollback()
+        persisted = db.get(MatchReport, report.id)
+
+        assert persisted is not None
+        assert persisted.status == "failed"
+        assert persisted.error_code == "match_model_validation_failed"
+
     # -- validation failure handling ---------------------------------------
 
     def test_validation_failure(

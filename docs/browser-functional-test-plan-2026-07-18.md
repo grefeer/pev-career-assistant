@@ -44,6 +44,9 @@
 | BFT-010 | 快照列表与详情 | 打开 `/snapshots`，访问不存在详情 | 列表可加载，详情错误态不白屏 |
 | BFT-011 | 设备页面 | 打开 `/devices` | 设备配对说明/占位页面可加载 |
 | BFT-012 | 控制台错误 | 浏览器测试过程中采集 console error | 无未处理运行时异常 |
+| BFT-013 | 腾讯智能表同步解析 | 管理员调用两个内置来源同步；核对 27 届表与实习表行为 | 27 届表不虚构岗位名；实习表完整记录可解析为岗位候选；真实上游错误需返回稳定错误码 |
+| BFT-014 | 完整岗位匹配触发 | 准备已核验岗位和已确认档案，在 `/matching` 选择两项并点击“开始匹配” | 不返回 500；MatchReport 终态被持久化；模型输出异常返回稳定错误码 |
+| BFT-015 | 当前源码 Logout | 点击侧边栏 Logout | 清理登录态并跳转 `/login`，受保护导航消失 |
 
 ## 5. 执行记录
 
@@ -61,6 +64,9 @@
 | BFT-010 | 通过 | 修复后 `/snapshots` 显示空态；`/snapshots/not-found` 显示错误态，不再 500/白屏。 |
 | BFT-011 | 通过 | `/devices` 显示未配对设备空态。 |
 | BFT-012 | 通过 | 浏览器测试过程中未采集到 console error。 |
+| BFT-013 | 阻塞/部分通过 | 当前源码后端显式加载 User-scope `TENCENT_DOCS_TOKEN` 后，两个真实来源均返回 `502 tencent_protocol_error`；本地 Mapper 单元测试覆盖 `tencent-27-referrals -> missing_title` 和 `tencent-intern-referrals -> NormalizedJobCandidate`。 |
+| BFT-014 | 通过/模型失败可诊断 | 通过浏览器注册 `bft_full_1784355914280`，准备确认档案后点击“开始匹配”；修复后不再因缺少 `JobVerification` 返回 500，且最新 MatchReport 终态可持久化。真实模型调用仍可能返回 `match_execution_interrupted` 或 `match_model_validation_failed`。 |
+| BFT-015 | 通过 | 在当前源码 Vite 端口点击 Logout 后跳转 `/login`，导航消失；旧 Docker/Nginx 15173 曾服务旧静态包，需重建容器后再用作当前源码验收。 |
 
 ## 6. 缺陷记录
 
@@ -68,3 +74,7 @@
 | --- | --- | --- | --- |
 | 未登录时仍显示工作台导航和 Logout | `AppShell` 无条件渲染导航，登录页也被 shell 包裹。 | `AppShell` 仅在 `isAuthenticated` 时显示导航；Logout 后主动跳转 `/login`；补充 App 测试断言。 | 浏览器退出后 `/login` 无导航；`npm --prefix frontend run test -- App.spec.ts` 通过。 |
 | Snapshot/Draft API 在开发库返回 500 | Alembic head 表结构与 ORM 分叉，缺少 `user_id`、幂等字段、`attachment_ids` 等列；测试库未覆盖真实迁移后的 schema。 | 新增 `20260718_0011_wave2_schema_alignment.py` 补齐列、索引、约束和状态枚举；迁移测试增加 Wave 2 列断言。 | 开发库 `alembic upgrade head` 到 `20260718_0011`；API 重放：snapshot list 200 空列表，missing snapshot/draft 404。 |
+| 匹配已核验 fixture 岗位返回 500 | fixture `JobPosting` 为 `verified`，但缺少对应 `JobVerification`，`build_verified_job_snapshot` 抛 `match_no_job_verification`；API 未映射该稳定错误码。 | `scripts/create_wave2_fixtures.py` 为 fixture 岗位创建 `JobVerification`；`POST /api/matches` 将 `match_no_job_verification` 映射为 422。 | 新增 API 回归测试；本地 fixture 脚本补齐验证记录后，浏览器触发匹配不再出现前置 500。 |
+| MatchReport 终态未持久化 | `MatchService` 在 pending/running 阶段 commit，但最终 `finalize()` 只 flush，调用结束后事务回滚会把报告留在 `running`。 | `MatchService` 所有 finalize 路径统一 `finalize + commit`。 | 新增 `test_final_status_is_committed`，回滚调用方事务后新查询仍为 `failed match_model_validation_failed`。 |
+| 模型结构化输出校验错误被归类为执行中断 | `assess_match` 只捕获 JSON 解析错误，Pydantic 结构错误会冒出图执行。 | 捕获 Pydantic `ValidationError` 并返回 `match_model_validation_failed` fail state。 | 新增 `test_assess_match_converts_structured_validation_errors_to_fail_state`；直接服务调用返回并持久化 `failed match_model_validation_failed`。 |
+| 真实腾讯智能表同步失败 | 当前真实上游调用两个内置来源均返回 `tencent_protocol_error`。 | 未改代码；该错误已稳定映射为 502，需后续检查腾讯 MCP 协议/令牌/表结构漂移。 | API 记录：`tencent-27-referrals` 与 `tencent-intern-referrals` 均为 `502`，不泄露令牌。 |

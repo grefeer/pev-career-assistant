@@ -33,6 +33,24 @@ class TestMatchesAPI:
         )
         assert resp.status_code in (404, 422)
 
+    async def test_create_match_verified_job_missing_verification_returns_422(
+        self, client: AsyncClient, auth_headers, mock_match_service
+    ):
+        mock_match_service.create_match.side_effect = ValueError(
+            "match_no_job_verification"
+        )
+        resp = await client.post(
+            "/api/matches",
+            json={
+                "job_id": "verified-job-without-event",
+                "profile_version_id": "pv-001",
+            },
+            headers={**auth_headers, "Idempotency-Key": "test-key-no-verification"},
+        )
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["code"] == "match_no_job_verification"
+
     async def test_create_match_idempotent(
         self, client: AsyncClient, auth_headers, mock_match_service
     ):

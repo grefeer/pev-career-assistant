@@ -42,7 +42,7 @@ def create_match(
         code = str(e)
         if code == "not_found":
             raise HTTPException(404, detail={"code": "not_found"})
-        if code == "match_not_verified_job":
+        if code in {"match_not_verified_job", "match_no_job_verification"}:
             raise HTTPException(422, detail={"code": code})
         if code == "idempotency_key_conflict":
             raise HTTPException(409, detail={"code": code})
