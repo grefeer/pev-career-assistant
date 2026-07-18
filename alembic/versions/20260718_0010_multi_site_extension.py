@@ -58,18 +58,8 @@ def upgrade() -> None:
         sa.Column(
             "adapter_kind", sa.String(16), nullable=False, server_default="observation"
         ),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("UTC_TIMESTAMP()"),
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("UTC_TIMESTAMP() ON UPDATE UTC_TIMESTAMP()"),
-        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
 
 

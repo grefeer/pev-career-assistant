@@ -99,6 +99,37 @@ describe("App root renders AppShell", () => {
     expect(wrapper.text()).toContain("student");
   });
 
+  it("passes the auth token into routed workspace components", async () => {
+    localStorage.setItem("job_assistant_token", "student-token");
+    apiMocks.fetchMe.mockResolvedValue(profile);
+    apiMocks.request.mockImplementation((path: string) => {
+      if (path === "/profiles") {
+        return Promise.resolve({ version: 0, evidence: [] });
+      }
+      if (path === "/resume-assets") {
+        return Promise.resolve({ assets: [] });
+      }
+      if (path === "/profile-versions") {
+        return Promise.resolve({ versions: [] });
+      }
+      return Promise.resolve({});
+    });
+
+    const auth = useAuth();
+    await auth.bootstrap();
+    const router = createRouterForTest();
+    await router.push("/profile");
+
+    mount(App, {
+      global: { plugins: [router] },
+    });
+    await flushPromises();
+
+    expect(apiMocks.request).toHaveBeenCalledWith("/profiles", {}, "student-token");
+    expect(apiMocks.request).toHaveBeenCalledWith("/resume-assets", {}, "student-token");
+    expect(apiMocks.request).toHaveBeenCalledWith("/profile-versions", {}, "student-token");
+  });
+
   it("shows admin links only for admin users", async () => {
     localStorage.setItem("job_assistant_token", "admin-token");
     apiMocks.fetchMe.mockResolvedValue(adminProfile);
@@ -196,6 +227,9 @@ describe("App root renders AppShell", () => {
     expect(router.currentRoute.value.path).toBe("/login");
     expect(wrapper.text()).toContain("登录");
     expect(wrapper.text()).toContain("进入工作台");
+    expect(wrapper.text()).not.toContain("Match");
+    expect(wrapper.text()).not.toContain("Jobs");
+    expect(wrapper.text()).not.toContain("Logout");
   });
 
   it("allows login via LoginPage", async () => {

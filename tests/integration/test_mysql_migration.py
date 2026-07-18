@@ -33,7 +33,7 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
-HEAD_REVISION = "7b757ef17d3f"
+HEAD_REVISION = "20260718_0011"
 BUSINESS_TABLES |= PROFILE_TABLES
 MANUAL_SUBMISSION_TABLES = {
     "user_job_submissions",
@@ -370,6 +370,40 @@ def test_mysql_migration_upgrade_and_downgrade(
             assert ("actor_user_id", "idempotency_key") in _column_sets(
                 feedback_inspector.get_unique_constraints("job_feedback_events")
             )
+            wave2_inspector = sa.inspect(engine)
+            match_columns = {
+                col["name"] for col in wave2_inspector.get_columns("match_reports")
+            }
+            assert {
+                "user_id",
+                "job_verification_id",
+                "job_snapshot",
+                "request_idempotency_key",
+                "request_hash",
+                "score_components",
+                "error_code",
+                "started_at",
+                "completed_at",
+            } <= match_columns
+            draft_columns = {
+                col["name"] for col in wave2_inspector.get_columns("resume_drafts")
+            }
+            assert {
+                "user_id",
+                "request_idempotency_key",
+                "request_hash",
+                "error_code",
+                "state_version",
+            } <= draft_columns
+            snapshot_columns = {
+                col["name"]
+                for col in wave2_inspector.get_columns("application_snapshots")
+            }
+            assert {
+                "request_idempotency_key",
+                "request_hash",
+                "attachment_ids",
+            } <= snapshot_columns
             _run_alembic("downgrade", "20260717_0006", env=env)
             assert _current_revision(engine) == "20260717_0006"
             assert "job_feedback" not in sa.inspect(engine).get_table_names()

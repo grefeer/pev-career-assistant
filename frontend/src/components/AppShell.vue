@@ -1,6 +1,6 @@
 <template>
   <div class="app-shell">
-    <nav class="shell-nav">
+    <nav v-if="isAuthenticated" class="shell-nav">
       <router-link to="/matching">Match</router-link>
       <router-link to="/jobs">Jobs</router-link>
       <router-link to="/profile">Profile</router-link>
@@ -13,17 +13,27 @@
       </template>
       <span class="spacer" />
       <span v-if="user">{{ user.nickname }} ({{ user.role }})</span>
-      <button @click="logout">Logout</button>
+      <button @click="handleLogout">Logout</button>
     </nav>
-    <main class="shell-main">
-      <router-view />
+    <main class="shell-main" :class="{ 'auth-main': !isAuthenticated }">
+      <router-view v-slot="{ Component }">
+        <component :is="Component" :token="token" />
+      </router-view>
     </main>
   </div>
 </template>
 
 <script setup lang="ts">
+import { useRouter } from 'vue-router'
 import { useAuth } from '../state/auth'
-const { user, isAdmin, logout } = useAuth()
+
+const router = useRouter()
+const { user, token, isAuthenticated, isAdmin, logout } = useAuth()
+
+function handleLogout() {
+  logout()
+  router.push('/login')
+}
 </script>
 
 <style scoped>
@@ -91,6 +101,10 @@ const { user, isAdmin, logout } = useAuth()
   flex: 1;
   padding: 1.6rem;
   overflow-y: auto;
+}
+
+.auth-main {
+  padding: 0;
 }
 
 @media (max-width: 1100px) {

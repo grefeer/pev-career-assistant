@@ -33,18 +33,8 @@ def upgrade() -> None:
         ),
         sa.Column("last_error_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_error_code", sa.String(64), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("UTC_TIMESTAMP()"),
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.text("UTC_TIMESTAMP() ON UPDATE UTC_TIMESTAMP()"),
-        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     # --- 2. application_tasks: adapter columns ---
@@ -63,39 +53,39 @@ def upgrade() -> None:
         ),
     )
 
-    site_adapters = sa.table(
-        "site_adapters",
-        sa.column("id", sa.String),
-        sa.column("adapter_id", sa.String),
-        sa.column("version", sa.String),
-        sa.column("supported_domains", sa.JSON),
-        sa.column("status", sa.String),
-    )
-    op.bulk_insert(
-        site_adapters,
-        [
-            {
-                "id": "00000000-0000-4000-8000-000000000901",
-                "adapter_id": "moka.dji",
-                "version": "1.0.0",
-                "supported_domains": ["moka.com", "mokahr.com", "zhaopin.dji.com"],
-                "status": "active",
-            },
-            {
-                "id": "00000000-0000-4000-8000-000000000902",
-                "adapter_id": "xpeng.feishu",
-                "version": "1.0.0",
-                "supported_domains": ["feishu.cn"],
-                "status": "active",
-            },
-            {
-                "id": "00000000-0000-4000-8000-000000000903",
-                "adapter_id": "iflytek.zhiye",
-                "version": "1.0.0",
-                "supported_domains": ["zhiye.com"],
-                "status": "active",
-            },
-        ],
+    op.execute(
+        """
+        INSERT INTO site_adapters (
+            id, adapter_id, version, supported_domains, status, created_at, updated_at
+        ) VALUES
+            (
+                '00000000-0000-4000-8000-000000000901',
+                'moka.dji',
+                '1.0.0',
+                JSON_ARRAY('moka.com', 'mokahr.com', 'zhaopin.dji.com'),
+                'active',
+                UTC_TIMESTAMP(),
+                UTC_TIMESTAMP()
+            ),
+            (
+                '00000000-0000-4000-8000-000000000902',
+                'xpeng.feishu',
+                '1.0.0',
+                JSON_ARRAY('feishu.cn'),
+                'active',
+                UTC_TIMESTAMP(),
+                UTC_TIMESTAMP()
+            ),
+            (
+                '00000000-0000-4000-8000-000000000903',
+                'iflytek.zhiye',
+                '1.0.0',
+                JSON_ARRAY('zhiye.com'),
+                'active',
+                UTC_TIMESTAMP(),
+                UTC_TIMESTAMP()
+            )
+        """
     )
 
 

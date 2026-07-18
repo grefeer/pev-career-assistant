@@ -16,7 +16,6 @@ class AuthRequest(BaseModel):
 
 
 class RegisterRequest(AuthRequest):
-    password: str = Field(..., min_length=8, max_length=1024)
     nickname: str = Field(..., min_length=1, max_length=120)
 
     @field_validator("nickname", mode="before")

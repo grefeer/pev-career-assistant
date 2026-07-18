@@ -301,9 +301,16 @@ def test_legacy_six_and_seven_character_argon2_users_can_login(
     assert response.json()["profile"]["account"] == account
 
 
-def test_new_registration_rejects_seven_character_password(client: TestClient) -> None:
+def test_new_registration_accepts_six_character_password(client: TestClient) -> None:
     response = client.post("/api/auth/register", json={
-        "account": "new-policy", "nickname": "New Policy", "password": "seven77",
+        "account": "new-policy", "nickname": "New Policy", "password": "123456",
+    })
+    assert response.status_code == 200
+
+
+def test_new_registration_rejects_five_character_password(client: TestClient) -> None:
+    response = client.post("/api/auth/register", json={
+        "account": "short-policy", "nickname": "Short Policy", "password": "12345",
     })
     assert response.status_code == 422
 
