@@ -18,6 +18,9 @@ from backend.app.db.models import (
     JobSyncRunStatus,
 )
 from backend.app.repositories import jobs
+from backend.app.services.job_discovery.tasks import (
+    JobDiscoveryTaskFactory,
+)
 from backend.app.services.job_mappers import (
     BUILTIN_SOURCES,
     MAPPERS,
@@ -47,6 +50,9 @@ class SyncOutcome:
     records_skipped_incomplete: int
     started_at: datetime
     finished_at: datetime
+    discovery_tasks_created: int = 0
+    discovery_tasks_existing: int = 0
+    discovery_tasks_skipped: int = 0
 
 
 class JobSyncFailedError(RuntimeError):
@@ -74,10 +80,16 @@ class JobSyncService:
         *,
         now: Callable[[], datetime] = utc_now,
         correlation_id_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
+        discovery_enabled: bool = False,
+        discovery_agent_version: str = "1.0.0",
     ) -> None:
         self.gateway = gateway
         self.now = now
         self.correlation_id_factory = correlation_id_factory
+        self.discovery_factory = JobDiscoveryTaskFactory(
+            enabled=discovery_enabled,
+            agent_version=discovery_agent_version,
+        )
 
     def sync(self, db: Session, *, source_key: str, actor_user_id: str) -> SyncOutcome:
         if source_key not in MAPPERS:
@@ -116,6 +128,9 @@ class JobSyncService:
         postings_created = 0
         postings_updated = 0
         records_skipped_incomplete = 0
+        discovery_tasks_created = 0
+        discovery_tasks_existing = 0
+        discovery_tasks_skipped = 0
         try:
             mapper.validate_schema(self.gateway.list_fields(file_id, sheet_id))
             offset = 0
@@ -145,6 +160,9 @@ class JobSyncService:
                 page_postings_created = 0
                 page_postings_updated = 0
                 page_records_skipped = 0
+                page_discovery_created = 0
+                page_discovery_existing = 0
+                page_discovery_skipped = 0
                 for record in page.records:
                     raw, created = jobs.insert_raw_snapshot(
                         db,
@@ -157,6 +175,18 @@ class JobSyncService:
                     )
                     if created:
                         page_raw_snapshots_created += 1
+                    discovery_counts = self.discovery_factory.create_tasks(
+                        db,
+                        source_id=source_id,
+                        raw_record_id=raw.id,
+                        external_record_id=record.record_id,
+                        source_key=persisted_source_key,
+                        payload_hash=canonical_payload_hash(record.field_values),
+                        record=record,
+                    )
+                    page_discovery_created += discovery_counts["created"]
+                    page_discovery_existing += discovery_counts["existing"]
+                    page_discovery_skipped += discovery_counts["skipped"]
                     mapped = mapper.map(record)
                     if isinstance(mapped, SkippedRecord):
                         page_records_skipped += 1
@@ -192,6 +222,9 @@ class JobSyncService:
                 postings_created += page_postings_created
                 postings_updated += page_postings_updated
                 records_skipped_incomplete += page_records_skipped
+                discovery_tasks_created += page_discovery_created
+                discovery_tasks_existing += page_discovery_existing
+                discovery_tasks_skipped += page_discovery_skipped
                 if not page.has_more:
                     if records_read != expected_total:
                         raise TencentProtocolError(
@@ -219,6 +252,9 @@ class JobSyncService:
                 postings_created=postings_created,
                 postings_updated=postings_updated,
                 records_skipped_incomplete=records_skipped_incomplete,
+                discovery_tasks_created=discovery_tasks_created,
+                discovery_tasks_existing=discovery_tasks_existing,
+                discovery_tasks_skipped=discovery_tasks_skipped,
                 started_at=started_at,
                 finished_at=finished.finished_at,
             )
@@ -239,6 +275,9 @@ class JobSyncService:
                         "postings_created": postings_created,
                         "postings_updated": postings_updated,
                         "records_skipped_incomplete": records_skipped_incomplete,
+                        "discovery_tasks_created": discovery_tasks_created,
+                        "discovery_tasks_existing": discovery_tasks_existing,
+                        "discovery_tasks_skipped": discovery_tasks_skipped,
                     },
                 )
             )

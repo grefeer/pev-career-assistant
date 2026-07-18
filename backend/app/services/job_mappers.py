@@ -269,6 +269,56 @@ class TencentInternReferralsMapper:
         )
 
 
+def extract_discovery_urls(record: TencentRecord, source_key: str) -> list[str]:
+    """Extract URLs from a record's fields for discovery task creation.
+
+    Scans field values for URL-type fields matching source-specific patterns
+    and returns deduplicated, validated http/https URLs.
+    """
+    if source_key == "tencent-27-referrals":
+        keywords = ("内推链接", "官网", "文章链接", "投递链接")
+    elif source_key == "tencent-intern-referrals":
+        keywords = ("投递链接", "申请链接", "交付链接")
+    else:
+        keywords = ()
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    for field_value in record.field_values:
+        title = field_value.get("field", "")
+        if not isinstance(title, str):
+            continue
+
+        matched = any(kw in title for kw in keywords)
+        if not matched:
+            if "链接" not in title and "URL" not in title.upper():
+                continue
+
+        for item in _items(field_value.get("url_value")):
+            if isinstance(item, Mapping) and isinstance(item.get("link"), str):
+                normalized = _normalize_url(item["link"].strip())
+                if normalized is not None and normalized not in seen:
+                    seen.add(normalized)
+                    urls.append(normalized)
+
+        for item in _items(field_value.get("text_value")):
+            if isinstance(item, Mapping) and isinstance(item.get("text"), str):
+                normalized = _normalize_url(item["text"].strip())
+                if normalized is not None and normalized not in seen:
+                    seen.add(normalized)
+                    urls.append(normalized)
+
+        raw_string = field_value.get("string_value")
+        if isinstance(raw_string, str) and raw_string.strip():
+            normalized = _normalize_url(raw_string.strip())
+            if normalized is not None and normalized not in seen:
+                seen.add(normalized)
+                urls.append(normalized)
+
+    return urls
+
+
 MAPPERS: dict[str, SourceMapper] = {
     "tencent-27-referrals": Tencent27ReferralsMapper(),
     "tencent-intern-referrals": TencentInternReferralsMapper(),

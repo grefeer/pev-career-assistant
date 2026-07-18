@@ -56,9 +56,14 @@ def get_job_sync_service(request: Request) -> JobSyncService:
     injected = getattr(request.app.state, "job_sync_service", None)
     if injected is not None:
         return cast(JobSyncService, injected)
-    secret = request.app.state.settings.tencent_docs_token
+    settings = request.app.state.settings
+    secret = settings.tencent_docs_token
     token = secret.get_secret_value() if secret is not None else None
-    return JobSyncService(TencentSmartsheetGateway(token=token))
+    return JobSyncService(
+        TencentSmartsheetGateway(token=token),
+        discovery_enabled=settings.job_discovery_enabled,
+        discovery_agent_version=settings.job_discovery_agent_version,
+    )
 
 
 def get_device_service(request: Request, redis_client=Depends(get_redis)):

@@ -548,6 +548,9 @@ def test_audit_payloads_are_whitelisted(db: Session) -> None:
         "postings_created",
         "postings_updated",
         "records_skipped_incomplete",
+        "discovery_tasks_created",
+        "discovery_tasks_existing",
+        "discovery_tasks_skipped",
     }
 
 
