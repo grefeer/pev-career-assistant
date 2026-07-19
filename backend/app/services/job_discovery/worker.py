@@ -36,12 +36,20 @@ from backend.app.repositories.job_discovery import (
 )
 from backend.app.services.job_discovery.deepagents_runner import (
     build_discovery_supervisor_agent,
+    package_candidates,
+    run_web_navigation,
+    standardize_from_record_fields,
+    verify_evidence,
 )
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
     DiscoveryTaskInput,
     NormalizedJobCandidate,
     PageEvidence,
+)
+from backend.app.services.job_discovery.tools import (
+    build_candidate_idempotency_key,
+    build_similarity_group_key,
 )
 
 
@@ -66,6 +74,8 @@ def _parse_agent_result(result_raw: dict[str, Any]) -> DiscoveryRunResult:
     """
     # Strategy 1 — structured_response from deepagents
     structured = result_raw.get("structured_response")
+    if hasattr(structured, "model_dump"):
+        structured = structured.model_dump()
     if isinstance(structured, dict) and "status" in structured:
         return DiscoveryRunResult(**structured)
 
@@ -143,40 +153,75 @@ def _persist_candidates(
     """
     for cand in candidates_list:
         if isinstance(cand, dict):
+            title = cand.get("title")
+            company_name = cand.get("company_name")
+            locations = cand.get("locations") or []
+            recruitment_types = cand.get("recruitment_types") or []
+            evidence_refs = cand.get("evidence_refs") or []
+            evidence_hash = _candidate_evidence_hash(evidence_refs, task.url_hash)
+            primary_location = locations[0] if locations else ""
+            primary_recruitment_type = recruitment_types[0] if recruitment_types else ""
+            idempotency_key = cand.get("idempotency_key") or build_candidate_idempotency_key(
+                company=company_name or "",
+                title=title or "",
+                location=primary_location,
+                apply_url=cand.get("apply_url") or "",
+                evidence_hash=evidence_hash,
+            )
+            similarity_group_key = cand.get("similarity_group_key") or build_similarity_group_key(
+                company=company_name or "",
+                title=title or "",
+                recruitment_type=primary_recruitment_type,
+                source_family=task.source_key,
+            )
             upsert_candidate(
                 db,
                 task_id=task.id,
                 source_id=cand.get("source_id", task.source_id),
                 raw_record_id=cand.get("raw_record_id", task.raw_record_id),
                 external_record_id=cand.get("external_record_id", task.external_record_id),
-                idempotency_key=cand.get("idempotency_key", ""),
-                similarity_group_key=cand.get("similarity_group_key", ""),
-                title=cand.get("title"),
-                company_name=cand.get("company_name"),
+                idempotency_key=idempotency_key,
+                similarity_group_key=similarity_group_key,
+                title=title,
+                company_name=company_name,
                 department=cand.get("department"),
                 description_text=cand.get("description_text"),
                 responsibilities=cand.get("responsibilities"),
                 requirements=cand.get("requirements"),
-                locations_json=cand.get("locations"),
-                recruitment_types_json=cand.get("recruitment_types"),
+                locations_json=locations,
+                recruitment_types_json=recruitment_types,
                 industries_json=cand.get("industries"),
                 apply_url=cand.get("apply_url"),
                 application_channel_json=cand.get("application_channel_json"),
                 deadline_text=cand.get("deadline_text"),
                 referral_code=cand.get("referral_code"),
                 confidence=cand.get("confidence"),
-                evidence_refs_json=cand.get("evidence_refs"),
+                evidence_refs_json=evidence_refs,
                 normalization_warnings_json=cand.get("normalization_warnings"),
             )
         else:
+            evidence_hash = _candidate_evidence_hash(cand.evidence_refs, task.url_hash)
+            primary_location = cand.locations[0] if cand.locations else ""
+            primary_recruitment_type = cand.recruitment_types[0] if cand.recruitment_types else ""
             upsert_candidate(
                 db,
                 task_id=task.id,
                 source_id=task.source_id,
                 raw_record_id=task.raw_record_id,
                 external_record_id=task.external_record_id,
-                idempotency_key="",
-                similarity_group_key="",
+                idempotency_key=build_candidate_idempotency_key(
+                    company=cand.company_name or "",
+                    title=cand.title or "",
+                    location=primary_location,
+                    apply_url=cand.apply_url or "",
+                    evidence_hash=evidence_hash,
+                ),
+                similarity_group_key=build_similarity_group_key(
+                    company=cand.company_name or "",
+                    title=cand.title or "",
+                    recruitment_type=primary_recruitment_type,
+                    source_family=task.source_key,
+                ),
                 title=cand.title,
                 company_name=cand.company_name,
                 department=cand.department,
@@ -194,6 +239,60 @@ def _persist_candidates(
                 evidence_refs_json=cand.evidence_refs if cand.evidence_refs else None,
                 normalization_warnings_json=cand.normalization_warnings if cand.normalization_warnings else None,
             )
+
+
+def _candidate_evidence_hash(
+    evidence_refs: list[dict[str, Any]] | None,
+    fallback: str,
+) -> str:
+    if evidence_refs:
+        for ref in evidence_refs:
+            value = ref.get("content_hash") or ref.get("hash")
+            if isinstance(value, str) and value:
+                return value
+    return fallback
+
+
+def _fallback_with_record_fields_if_agent_missed_evidence(
+    result: DiscoveryRunResult,
+    *,
+    task: JobDiscoveryTask,
+    task_input: DiscoveryTaskInput,
+    settings: Settings,
+) -> DiscoveryRunResult:
+    """Recover when the LLM agent gives up despite readable public evidence."""
+    if not task.source_key.startswith("tencent-"):
+        return result
+    if result.candidates and result.evidence:
+        return result
+    navigation = run_web_navigation(task.source_url, settings=settings)
+    evidence = navigation.get("evidence_pages") or []
+    if not evidence:
+        return result
+    candidates_json = standardize_from_record_fields(
+        json.dumps(task_input.record_fields, ensure_ascii=False),
+        json.dumps(evidence, ensure_ascii=False),
+        task.source_url,
+    )
+    verified_json = verify_evidence(
+        candidates_json,
+        json.dumps(evidence, ensure_ascii=False),
+    )
+    evidence_hash = evidence[0].get("content_hash") or task.url_hash
+    candidates = json.loads(
+        package_candidates(verified_json, evidence_hash, task.source_key)
+    )
+    if not candidates:
+        return result
+    return DiscoveryRunResult(
+        status="succeeded",
+        evidence=evidence,
+        candidates=candidates,
+        summary=(
+            "Agent returned no candidates; deterministic record-field fallback "
+            f"produced {len(candidates)} candidate(s)"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,16 +366,39 @@ class JobDiscoveryWorker:
 
             # 4. Build and run the agent
             agent = build_discovery_supervisor_agent(settings=self.settings)
-            result_raw = agent.invoke({
-                "messages": [
-                    HumanMessage(
-                        content=json.dumps(asdict(task_input), ensure_ascii=False)
+            agent_error: Exception | None = None
+            try:
+                agent_input = {
+                    "messages": [
+                        HumanMessage(
+                            content=json.dumps(asdict(task_input), ensure_ascii=False)
+                        )
+                    ]
+                }
+                try:
+                    result_raw = agent.invoke(
+                        agent_input,
+                        config={"recursion_limit": 50},
                     )
-                ]
-            })
-
-            # 5. Parse the result
-            result = _parse_agent_result(result_raw)
+                except TypeError as exc:
+                    if "config" not in str(exc):
+                        raise
+                    result_raw = agent.invoke(agent_input)
+                result = _parse_agent_result(result_raw)
+            except Exception as agent_exc:
+                agent_error = agent_exc
+                result = DiscoveryRunResult(
+                    status="failed",
+                    summary=f"Agent invocation failed: {agent_exc}",
+                )
+            result = _fallback_with_record_fields_if_agent_missed_evidence(
+                result,
+                task=task,
+                task_input=task_input,
+                settings=self.settings,
+            )
+            if agent_error is not None and not result.candidates and not result.evidence:
+                raise agent_error
 
             # 6. Persist evidence and candidates
             _persist_evidence(db, task, result.evidence)

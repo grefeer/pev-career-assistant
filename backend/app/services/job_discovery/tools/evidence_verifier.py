@@ -15,7 +15,6 @@ _STALE_YEAR_THRESHOLD = 2024
 
 def _check_stale(description_text: str) -> bool:
     """Heuristic check: does the description reference a year before the threshold?"""
-    import re
 
     years = re.findall(r"\b(20[0-9]{2})\b", description_text)
     for y_str in years:

@@ -25,6 +25,9 @@ _EMAIL_PATTERN = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 # Inaccessible content markers that indicate the article cannot be read.
 _INACCESSIBLE_MARKERS: list[str] = [
+    "环境异常",
+    "完成验证后即可继续访问",
+    "去验证",
     "请在微信客户端打开",
     "请长按识别二维码",
     "请在微信中打开",

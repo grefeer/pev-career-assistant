@@ -27,12 +27,13 @@ from backend.app.db.models import (
     JobSourceProvider,
     RawJobRecord,
 )
-from backend.app.services.job_discovery.schemas import DiscoveryRunResult
 from backend.app.services.job_discovery.worker import (
     JobDiscoveryWorker,
     _build_worker_id,
+    _fallback_with_record_fields_if_agent_missed_evidence,
     _parse_agent_result,
 )
+from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +167,23 @@ class TestParseAgentResult:
         assert result.status == "succeeded"
         assert len(result.candidates) == 1
 
+    def test_pydantic_structured_response(self) -> None:
+        class FakeStructuredResponse:
+            def model_dump(self) -> dict:
+                return {
+                    "status": "succeeded",
+                    "block_reason": None,
+                    "evidence": [],
+                    "candidates": [{"title": "Engineer"}],
+                    "summary": "Done",
+                }
+
+        result = _parse_agent_result(
+            {"structured_response": FakeStructuredResponse()}
+        )
+        assert result.status == "succeeded"
+        assert len(result.candidates) == 1
+
     def test_direct_dict(self) -> None:
         raw = {"status": "failed", "summary": "Something broke"}
         result = _parse_agent_result(raw)
@@ -190,6 +208,57 @@ class TestParseAgentResult:
         raw = {"messages": []}
         result = _parse_agent_result(raw)
         assert result.status == "failed"
+
+    @patch("backend.app.services.job_discovery.worker.package_candidates")
+    @patch("backend.app.services.job_discovery.worker.verify_evidence")
+    @patch("backend.app.services.job_discovery.worker.standardize_from_record_fields")
+    @patch("backend.app.services.job_discovery.worker.run_web_navigation")
+    def test_record_field_fallback_builds_candidate(
+        self,
+        mock_navigation: MagicMock,
+        mock_standardize: MagicMock,
+        mock_verify: MagicMock,
+        mock_package: MagicMock,
+        settings: Any,
+    ) -> None:
+        mock_navigation.return_value = {
+            "evidence_pages": [
+                {
+                    "evidence_type": "page_text",
+                    "url": "https://example.test/job",
+                    "content_hash": "hash1",
+                    "text_excerpt": "岗位 招聘 投递",
+                }
+            ]
+        }
+        mock_standardize.return_value = '[{"title":"Engineer"}]'
+        mock_verify.return_value = '[{"title":"Engineer"}]'
+        mock_package.return_value = '[{"title":"Engineer","idempotency_key":"k","similarity_group_key":"g"}]'
+        task = MagicMock(
+            source_url="https://example.test/job",
+            url_hash="urlhash",
+            source_key="tencent-27-referrals",
+        )
+        task_input = DiscoveryTaskInput(
+            source_id="source",
+            raw_record_id="raw",
+            external_record_id="record",
+            source_key="tencent-27-referrals",
+            source_url="https://example.test/job",
+            url_hash="urlhash",
+            record_fields=[],
+        )
+
+        result = _fallback_with_record_fields_if_agent_missed_evidence(
+            DiscoveryRunResult(status="needs_manual_review", summary="blocked"),
+            task=task,
+            task_input=task_input,
+            settings=settings,
+        )
+
+        assert result.status == "succeeded"
+        assert len(result.evidence) == 1
+        assert len(result.candidates) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +336,67 @@ class TestSuccessfulTask:
             assert len(candidates) == 1
             assert candidates[0].title == "Software Engineer"
             assert candidates[0].idempotency_key == "cand-1"
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    def test_worker_generates_missing_candidate_keys(
+        self,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        engine: Engine,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+    ) -> None:
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "block_reason": None,
+                "evidence": [
+                    {
+                        "evidence_type": "page_text",
+                        "url": "https://example.com/jobs/1",
+                        "title": "Job Page",
+                        "content_hash": "ev-hash-1",
+                        "text_excerpt": "Some text",
+                        "metadata": {"page_num": 1},
+                    }
+                ],
+                "candidates": [
+                    {
+                        "title": "Software Engineer",
+                        "company_name": "Example Corp",
+                        "locations": ["Beijing"],
+                        "recruitment_types": ["Internship"],
+                        "apply_url": "https://example.com/apply/1",
+                        "confidence": 0.95,
+                    },
+                    {
+                        "title": "Product Manager",
+                        "company_name": "Example Corp",
+                        "locations": ["Shanghai"],
+                        "recruitment_types": ["Internship"],
+                        "apply_url": "https://example.com/apply/2",
+                        "confidence": 0.9,
+                    },
+                ],
+                "summary": "Found 2 candidates",
+            }
+        }
+        mock_build_agent.return_value = mock_agent
+
+        result = worker.run_once()
+
+        assert result == 1
+        with Session(engine) as verify_session:
+            candidates = verify_session.query(DiscoveredJobCandidate).order_by(
+                DiscoveredJobCandidate.title
+            ).all()
+            assert len(candidates) == 2
+            assert all(c.idempotency_key for c in candidates)
+            assert all(c.similarity_group_key for c in candidates)
+            assert candidates[0].idempotency_key != candidates[1].idempotency_key
 
     @patch("backend.app.services.job_discovery.worker.claim_next_task")
     @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")

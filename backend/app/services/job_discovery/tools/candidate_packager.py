@@ -45,15 +45,14 @@ def build_similarity_group_key(
     """Build a grouping key for similarity-based deduplication.
 
     Normalized grouping: first 3 chars of canonicalized company +
-    first 3 chars of canonicalized title + recruitment_type + source_family.
+    first 3 chars of canonicalized title + recruitment_type.
 
     Args:
         company: Company name.
         title: Job title.
         recruitment_type: Type of recruitment (e.g. internship, full_time,
                           campus_recruitment).
-        source_family: Source family identifier (e.g. tencent_smartsheet,
-                       wechat_article, web).
+        source_family: Ignored. Kept for backwards-compatible call sites.
 
     Returns:
         Group key string for bucketing similar candidates.
@@ -61,6 +60,5 @@ def build_similarity_group_key(
     company_prefix = (company or "").strip().lower()[:3]
     title_prefix = (title or "").strip().lower()[:3]
     rec_type = (recruitment_type or "unknown").strip().lower()
-    src_family = (source_family or "unknown").strip().lower()
 
-    return f"{company_prefix}::{title_prefix}::{rec_type}::{src_family}"
+    return f"{company_prefix}::{title_prefix}::{rec_type}"

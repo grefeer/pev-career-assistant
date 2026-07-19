@@ -91,9 +91,9 @@ npm.cmd --prefix frontend run test -- DiscoveryReview.spec.ts
 
 2. **OCR 支持默认关闭**：`job_discovery_ocr_enabled` 默认为 `false`。微信公众号图片类岗位（`wechat_image.html` 场景）需要 OCR 才能提取文字，当前会标记为图片占位。
 
-3. **Web Navigation Agent 为直连模式**：Deep Agents 暂不支持程序化 SubAgent 调用，`run_web_navigation()` 使用 fallback 直连模式（`requests.get`），而非通过 SubAgent 的 LLM 驱动浏览。页面数严格受限（默认 20 页）。
+3. **Web Navigation Agent 已改为 DeepAgent 驱动**：`run_web_navigation()` 现在启动独立的 `web_navigation_agent` DeepAgent，由 LLM 在工具循环中根据页面观察选择下一步动作。页面数严格受限（默认 20 页）。
 
-4. **无真实浏览器集成**：框架使用 `requests` 库获取页面文本，不支持 JavaScript 渲染、SPA 页面或需要执行 JS 的站点。真实浏览器集成（Playwright/Selenium）为后续开发项。
+4. **浏览器渲染只处理公开内容**：Web Navigation Agent 已具备 Playwright 渲染读取工具，可用于 JavaScript 渲染或 SPA 页面；登录、验证码、人机验证、反爬或权限限制仍不会绕过，需挂起为 `needs_manual_review`。
 
 5. **幂等 key 含 Agent 版本**：更新 Agent 版本会生成不同 idempotency key，导致同一 URL 产生新任务。此行为设计如此，但在版本迭代时需注意任务数量增长。
 

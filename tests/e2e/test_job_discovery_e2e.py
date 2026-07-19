@@ -18,7 +18,6 @@ via Playwright's ``route`` API (no external HTTP server needed for page fixtures
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
@@ -27,7 +26,7 @@ from urllib.parse import urlparse
 
 import pytest
 import requests
-from playwright.sync_api import Browser, BrowserContext, Page, Route, expect
+from playwright.sync_api import Browser, BrowserContext, Page, Route, expect, sync_playwright
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -40,16 +39,6 @@ FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://127.0.0.1:5173")
 ADMIN_USERNAME = os.environ.get("E2E_ADMIN_USERNAME", "admin@test.com")
 ADMIN_PASSWORD = os.environ.get("E2E_ADMIN_PASSWORD", "admin123456")
 
-# ---------------------------------------------------------------------------
-# Markers
-# ---------------------------------------------------------------------------
-
-needs_dev_server = pytest.mark.skipif(
-    not os.environ.get("E2E_SKIP_DEV_CHECK"),
-    reason="Requires running dev server. Set E2E_SKIP_DEV_CHECK=1 to force.",
-)
-
-
 def _dev_server_reachable() -> bool:
     """Check if the backend dev server is reachable."""
     try:
@@ -57,6 +46,16 @@ def _dev_server_reachable() -> bool:
         return resp.status_code == 200
     except (requests.ConnectionError, requests.Timeout):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Markers
+# ---------------------------------------------------------------------------
+
+needs_dev_server = pytest.mark.skipif(
+    not os.environ.get("E2E_SKIP_DEV_CHECK") and not _dev_server_reachable(),
+    reason="Requires running dev server. Set E2E_SKIP_DEV_CHECK=1 to force.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +70,14 @@ def browser_context_args(browser_context_args: dict[str, Any]) -> dict[str, Any]
 
 
 @pytest.fixture(scope="session")
-def browser(browser: Browser) -> Generator[Browser, None, None]:
-    """Expose the Playwright Browser fixture (session-scoped)."""
-    yield browser
+def browser() -> Generator[Browser, None, None]:
+    """Launch Chromium without relying on pytest-playwright fixtures."""
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            yield browser
+        finally:
+            browser.close()
 
 
 @pytest.fixture
@@ -565,7 +569,7 @@ class TestFixturePages:
         self._serve_fixture_page(page, "company_homepage.html", "https://example.com/")
         expect(page.locator("body")).to_be_visible()
         # Check that "加入我们" link exists
-        careers_link = page.locator('a[href="/careers"]')
+        careers_link = page.locator('a[href="/careers"]').first
         expect(careers_link).to_be_visible()
         expect(careers_link).to_contain_text(re.compile(r"加入我们|Careers", re.IGNORECASE))
 
@@ -590,9 +594,9 @@ class TestFixturePages:
         expect(page.locator("h2", has_text="加分项")).to_be_visible()
         expect(page.locator("h2", has_text="薪酬福利")).to_be_visible()
         # Check company name
-        expect(page.locator("text=星辰科技 StarCloud Technology")).to_be_visible()
+        expect(page.get_by_text("星辰科技 StarCloud Technology", exact=True)).to_be_visible()
         # Check salary range displayed
-        expect(page.locator("text=35K-55K")).to_be_visible()
+        expect(page.get_by_text("35K-55K", exact=True)).to_be_visible()
 
     def test_wechat_text_renders_job_content(self, page: Page) -> None:
         """Verify WeChat text article fixture renders job posting content."""
@@ -603,7 +607,7 @@ class TestFixturePages:
         # Check that email delivery instructions are present
         expect(page.locator("text=campus@starcloud.com")).to_be_visible()
         # Check recruitment details
-        expect(page.locator("text=算法工程师")).to_be_visible()
+        expect(page.get_by_text("算法工程师（NLP方向）— 深圳/北京/杭州")).to_be_visible()
         expect(page.locator("text=后端开发工程师")).to_be_visible()
         # Check deadline
         expect(page.locator("text=2026 年 8 月 31 日")).to_be_visible()
@@ -622,7 +626,7 @@ class TestFixturePages:
         image_placeholders = page.locator(".image-placeholder")
         expect(image_placeholders.first).to_be_visible()
         # Check referral code is present
-        expect(page.locator("text=NTABC123")).to_be_visible()
+        expect(page.get_by_text("NTABC123", exact=True)).to_be_visible()
         # Check email delivery instructions
         expect(page.locator("text=referral@tencent-careers.com")).to_be_visible()
 

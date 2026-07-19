@@ -119,8 +119,8 @@ def triage_link(url: str) -> TriageResult:
         return TriageResult(
             site_type="wechat_article",
             confidence=1.0,
-            recommended_action="parse_wechat_article",
-            notes="WeChat article URL",
+            recommended_action="run_web_navigation",
+            notes="WeChat article URL; use browser navigation to fetch public article text before parsing",
         )
 
     # --- blocked ---

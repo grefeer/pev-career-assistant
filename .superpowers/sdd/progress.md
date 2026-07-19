@@ -15,3 +15,7 @@ Task 6: complete (commits d363080..afcbb66, review clean — minor latent datacl
 Task 7: complete — admin API routes + discovery review UI. 195 backend tests + 93 frontend tests pass.
 Task 7: complete (commits afcbb66..975e0dc, review clean after mapper_version fix)
 Task 8: complete (commit c4e3a28, 10 files: 6 HTML fixtures, 11 Playwright tests, 3 docs)
+Task 8: complete (commits 975e0dc..c4e3a28, final phases 8-9 done)
+
+FINAL REVIEW: complete (commits a108a78..c4e3a28, 13 commits, 9 phases, merge approved)
+Known non-blocking gaps: OCR scaffold, no browser engine, subagent delegation fallback, dataclass-branch defaults

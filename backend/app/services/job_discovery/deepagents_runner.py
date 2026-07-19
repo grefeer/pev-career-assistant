@@ -29,8 +29,6 @@ from backend.app.services.job_discovery.schemas import (
     NormalizedJobCandidate,
     OcrResult,
     PageEvidence,
-    TriageResult,
-    WechatArticleResult,
 )
 from backend.app.services.job_discovery.tools import (
     triage_link as _triage_link,
@@ -75,6 +73,8 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
         kwargs["api_key"] = api_key
     base_url = get_base_url()
     kwargs["base_url"] = base_url
+    if "deepseek" in base_url.lower() and settings.job_discovery_model.startswith("deepseek-v4"):
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     return ChatOpenAI(**kwargs)
 
 
@@ -137,6 +137,8 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
 
     Returns (text, title, None) on success, (None, None, error_message) on failure.
     """
+    global _web_nav_page_count, _web_nav_current_url, _web_nav_history
+
     domain_err = _is_blocked_domain(url)
     if domain_err:
         return None, None, f"Cannot access blocked domain: {url}"
@@ -144,6 +146,17 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
     budget_err = _check_page_budget()
     if budget_err:
         return None, None, budget_err
+
+    # ── WeChat articles: try ReadGZH proxy first ──
+    if _is_wechat_url(url):
+        text, title, error = _fetch_wechat_via_readgzh(url)
+        if error is None:
+            _web_nav_page_count += 1
+            if _web_nav_current_url:
+                _web_nav_history.append(_web_nav_current_url)
+            _web_nav_current_url = url
+            return text, title, None
+        # ReadGZH failed; fall through to regular fetch + browser fallback
 
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -157,7 +170,14 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
         title = _extract_page_title(html)
         text = _extract_page_text(html)
 
-        global _web_nav_page_count, _web_nav_current_url, _web_nav_history
+        if _needs_browser_fallback(url, text):
+            browser_text, browser_title, browser_error = _fetch_page_with_browser(url)
+            if browser_error is None:
+                text = browser_text or ""
+                title = browser_title or title
+            else:
+                return None, None, f"WeChat verification wall: {browser_error}"
+
         _web_nav_page_count += 1
         if _web_nav_current_url:
             _web_nav_history.append(_web_nav_current_url)
@@ -166,6 +186,140 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
         return text, title, None
     except requests.RequestException as e:
         return None, None, f"HTTP error fetching {url}: {e}"
+
+
+def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | None]:
+    """Fetch a WeChat article via the ReadGZH proxy service.
+
+    ReadGZH (https://readgzh.site) is a server-side proxy that bypasses
+    WeChat's client fingerprinting to return clean, AI-readable article HTML.
+    Articles are permanently cached — repeated reads incur zero credit cost.
+
+    Supports optional API key via READGZH_API_KEY environment variable to
+    bypass the 10-request/day anonymous IP limit.
+
+    Args:
+        url: The mp.weixin.qq.com article URL.
+
+    Returns:
+        (text_content, title, None) on success,
+        (None, None, error_message) on failure.
+    """
+    import os as _os
+
+    try:
+        headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
+        api_key = _os.environ.get("READGZH_API_KEY", "")
+        # Fallback: try reading from .env files (worktree root, then main project root)
+        if not api_key:
+            try:
+                from pathlib import Path as _Path
+                from dotenv import dotenv_values as _dotenv_values
+                _candidates = [
+                    _Path(__file__).resolve().parents[4] / ".env",   # worktree root
+                    _Path(__file__).resolve().parents[7] / ".env",   # main project root
+                ]
+                for _p in _candidates:
+                    if _p.exists():
+                        _vals = _dotenv_values(_p, interpolate=False)
+                        _key = _vals.get("READGZH_API_KEY") or _vals.get("readgzh_api_key")
+                        if _key:
+                            api_key = _key
+                            break
+            except Exception:
+                pass
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        api_url = f"https://api.readgzh.site/rd?url={url}"
+        resp = requests.get(api_url, timeout=30, headers=headers)
+        resp.raise_for_status()
+        raw = resp.text
+
+        # ── Detect ReadGZH JSON error responses ──
+        if not raw or len(raw) < 200:
+            return None, None, "ReadGZH returned empty or too-short response"
+
+        # ReadGZH returns JSON on errors (rate limit, invalid URL, etc.)
+        if raw.strip().startswith("{"):
+            try:
+                error_data = json.loads(raw)
+                if isinstance(error_data, dict) and not error_data.get("success", True):
+                    code = error_data.get("code", "unknown")
+                    message = error_data.get("message", "Unknown ReadGZH error")
+                    return None, None, f"ReadGZH API error [{code}]: {message}"
+            except json.JSONDecodeError:
+                pass  # Not JSON, proceed as HTML
+
+        # ── Check for WeChat verification wall in response ──
+        if "环境异常" in raw and "完成验证后即可继续访问" in raw:
+            return None, None, "ReadGZH proxy could not bypass WeChat verification"
+
+        title = _extract_page_title(raw)
+        text = _extract_page_text(raw)
+
+        if not text or len(text.strip()) < 50:
+            return None, None, "ReadGZH returned content with insufficient text"
+
+        return text, title, None
+    except requests.RequestException as e:
+        return None, None, f"ReadGZH fetch failed: {e}"
+
+
+def _is_wechat_url(url: str) -> bool:
+    """Check if a URL is a WeChat MP article."""
+    try:
+        return "mp.weixin.qq.com" in urlsplit(url).netloc.lower()
+    except ValueError:
+        return False
+
+
+def _needs_browser_fallback(url: str, text: str) -> bool:
+    """Return True when a requests fetch likely hit a JS/browser gate."""
+    try:
+        domain = urlsplit(url).netloc.lower()
+    except ValueError:
+        return False
+    if "mp.weixin.qq.com" in domain and (
+        "环境异常" in text or "完成验证后即可继续访问" in text
+    ):
+        return True
+    return False
+
+
+def _fetch_page_with_browser(url: str) -> tuple[str | None, str | None, str | None]:
+    """Fetch page text with Playwright for pages that require a real browser.
+
+    This does not solve captcha or bypass auth. It only renders public pages
+    that are readable in a normal headless browser session.
+    """
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None, None, "Playwright is not installed"
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125 Safari/537.36"
+                )
+            )
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.wait_for_timeout(3_000)
+            title = page.title()
+            text = page.locator("body").inner_text(timeout=10_000)
+            browser.close()
+            if "环境异常" in text and "完成验证后即可继续访问" in text:
+                return None, None, "Browser page still requires verification"
+            return text, title, None
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        return None, None, f"Browser fetch failed: {exc}"
 
 
 def _extract_page_title(html: str) -> str:
@@ -231,21 +385,16 @@ def run_web_navigation(
 ) -> dict[str, Any]:
     """Navigate from a start URL to discover job JD evidence pages.
 
-    Delegates to the WebNavigationAgent subagent for web page navigation.
-    The subagent opens pages, extracts links, follows career-related ones,
-    and collects evidence pages up to the configured page budget.
-
-    If deepagents supports programmatic subagent invocation, the task is
-    delegated to the registered WebNavigationAgent subagent. Otherwise,
-    the navigation is performed directly using the same tools that would
-    be available to the subagent, and the result is formatted to reflect
-    subagent delegation.
+    Runs the WebNavigationAgent DeepAgent for web page navigation. The agent
+    opens pages, reads DOM/text, extracts links, chooses next actions from
+    observations, and collects evidence pages up to the configured budget.
 
     Args:
         start_url: The URL to start navigation from.
         settings: Optional Settings object (defaults to 20-page budget).
-        subagent: Optional WebNavigationAgent subagent spec for delegation.
-        model: Optional model instance for subagent invocation.
+        subagent: Deprecated compatibility parameter. The standalone DeepAgent
+            path is used regardless.
+        model: Optional model instance for the WebNavigationAgent.
 
     Returns:
         Dict with evidence_pages (list of PageEvidence-like dicts),
@@ -256,82 +405,58 @@ def run_web_navigation(
                  if settings else 20)
     _reset_web_nav_state(max_pages=max_pages)
 
-    # Attempt delegation to WebNavigationAgent subagent
-    # if deepagents supports programmatic subagent invocation
-    if subagent is not None and model is not None:
-        try:
-            return _run_via_subagent_delegation(start_url, subagent, model, max_pages)
-        except Exception:
-            # deepagents does not support programmatic subagent invocation;
-            # fall through to direct navigation
-            pass
-
-    # Fallback: direct web navigation using the same tools that the
-    # WebNavigationAgent subagent would use, formatted as delegation.
-    evidence_pages: list[dict[str, Any]] = []
-    navigation_path: list[dict[str, str]] = []
-    visited: set[str] = set()
-
-    # Fetch the start page
-    text, title, error = _fetch_page(start_url)
-    if error:
+    try:
+        parsed = urlsplit(start_url)
+    except ValueError as exc:
         return {
             "evidence_pages": [],
             "navigation_path": [],
-            "error": error,
+            "page_count": 0,
+            "error": f"Invalid URL: {exc}",
+            "delegated_to": "web_navigation_agent",
+        }
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return {
+            "evidence_pages": [],
+            "navigation_path": [],
+            "page_count": 0,
+            "error": f"Invalid URL: {start_url}",
+            "delegated_to": "web_navigation_agent",
+        }
+    if _is_blocked_domain(start_url):
+        return {
+            "evidence_pages": [],
+            "navigation_path": [],
+            "page_count": 0,
+            "error": f"Cannot access blocked domain: {start_url}",
             "delegated_to": "web_navigation_agent",
         }
 
-    evidence_pages.append({
-        "evidence_type": "page_text",
-        "url": start_url,
-        "title": title,
-        "content_hash": hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
-        "text_excerpt": (text or "")[:2000],
-        "metadata": {"page_num": _web_nav_page_count},
-    })
-    navigation_path.append({"url": start_url, "title": title or ""})
-    visited.add(start_url)
-
-    # Check if there are career-related links to follow
-    # (We only do one level of following for the initial implementation)
+    if settings is None:
+        settings = Settings()
+    _reset_nav_state(max_pages=max_pages)
+    agent = build_web_navigation_agent(settings=settings, model=model)
+    prompt = (
+        f"Starting URL: {start_url}\n"
+        f"Page budget: {max_pages}\n\n"
+        "Find credible job list pages and JD detail pages. Use your tools in a loop. "
+        "Open the page, inspect visible text and links, follow likely career/job links, "
+        "and if the page is a JavaScript-rendered recruitment SPA, call "
+        "extract_rendered_job_evidence to capture public job-detail JSON/XHR evidence. "
+        "and stop when you have JD evidence or a precise blocking reason. "
+        "Return structured evidence_pages, navigation_path, page_count, and error if blocked."
+    )
     try:
-        resp = requests.get(start_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
-            links = _extract_links_from_html(resp.text, start_url)
-            # Find career-related links
-            career_keywords = re.compile(
-                r"(career|job|jobs|recruit|position|openings|join\s*us|campus|"
-                r"招聘|职位|校园|加入我们| careers?|求职)",
-                re.IGNORECASE,
-            )
-            career_links = [l for l in links if career_keywords.search(l["url"]) or career_keywords.search(l["text"])]
-
-            for link in career_links[:3]:  # Follow up to 3 career links
-                if link["url"] in visited or _web_nav_page_count >= max_pages:
-                    continue
-                text2, title2, error2 = _fetch_page(link["url"])
-                if error2:
-                    continue
-                evidence_pages.append({
-                    "evidence_type": "page_text",
-                    "url": link["url"],
-                    "title": title2,
-                    "content_hash": hashlib.sha256((text2 or "").encode("utf-8")).hexdigest(),
-                    "text_excerpt": (text2 or "")[:2000],
-                    "metadata": {"page_num": _web_nav_page_count},
-                })
-                navigation_path.append({"url": link["url"], "title": title2 or ""})
-                visited.add(link["url"])
-    except requests.RequestException:
-        pass
-
-    return {
-        "evidence_pages": evidence_pages,
-        "navigation_path": navigation_path,
-        "page_count": _web_nav_page_count,
-        "delegated_to": "web_navigation_agent",
-    }
+        result = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+    except Exception as exc:  # noqa: BLE001 - agent/model providers raise heterogeneous errors
+        return {
+            "evidence_pages": [],
+            "navigation_path": [],
+            "page_count": _nav_page_count,
+            "error": f"WebNavigationAgent failed: {exc}",
+            "delegated_to": "web_navigation_agent",
+        }
+    return _parse_web_navigation_agent_result(result)
 
 
 def _run_via_subagent_delegation(
@@ -548,6 +673,193 @@ def package_candidates(
     return json.dumps(packaged, ensure_ascii=False)
 
 
+def standardize_from_record_fields(
+    record_fields_json: str,
+    evidence_json: str,
+    source_url: str,
+) -> str:
+    """Build candidate JSON from Tencent record fields plus evidence text.
+
+    This is a deterministic fallback tool for real Tencent rows where the
+    source page is a rendered article or a dynamic career site and not all
+    standard fields appear as labelled JD text.
+    """
+    record_fields = json.loads(record_fields_json or "[]")
+    evidence_data = json.loads(evidence_json or "[]")
+    record = _record_field_map(record_fields)
+    evidence_text = _join_evidence_text(evidence_data)
+
+    company = (
+        record.get("公司名称")
+        or record.get("企业名称")
+        or _regex_first(evidence_text, r"(?:公司名称|企业名称|招聘单位)[:：]?\s*([^\n。；;]{2,60})")
+    )
+    title = record.get("招聘岗位") or _title_from_evidence(evidence_text, company)
+    if not title and company:
+        title = f"{company}招聘信息"
+
+    if not company and title:
+        company = _company_from_title(title)
+
+    if not title and not company:
+        return "[]"
+
+    locations = _split_field_values(record.get("工作地点"))
+    recruitment_types = _split_field_values(record.get("招聘类型"))
+    if not recruitment_types:
+        recruitment_types = _infer_recruitment_types(f"{title or ''}\n{evidence_text}")
+    industries = _split_field_values(record.get("多选") or record.get("行业类型"))
+    referral_code = record.get("内推码") or record.get("内推码(区分大小写)")
+
+    candidate = NormalizedJobCandidate(
+        title=title,
+        company_name=company,
+        description_text=evidence_text[:2000] if evidence_text else title or "",
+        locations=locations,
+        recruitment_types=recruitment_types,
+        industries=industries,
+        apply_url=source_url,
+        deadline_text=record.get("截止日期"),
+        referral_code=referral_code,
+        confidence=_record_fallback_confidence(title, company, evidence_text),
+        evidence_refs=[
+            {
+                "url": item.get("url"),
+                "content_hash": item.get("content_hash"),
+                "evidence_type": item.get("evidence_type"),
+            }
+            for item in evidence_data
+            if isinstance(item, dict) and item.get("content_hash")
+        ],
+        normalization_warnings=["standardized_from_tencent_record_fields"],
+    )
+    return json.dumps([_asdict(candidate)], ensure_ascii=False)
+
+
+def _record_field_map(record_fields: list[dict[str, Any]]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for field in record_fields:
+        name = field.get("field")
+        if not isinstance(name, str) or not name:
+            continue
+        parts: list[str] = []
+        text_value = field.get("text_value")
+        if isinstance(text_value, dict):
+            for item in text_value.get("items", []):
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        option_value = field.get("option_value")
+        if isinstance(option_value, dict):
+            for item in option_value.get("items", []):
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+        url_value = field.get("url_value")
+        if isinstance(url_value, dict):
+            for item in url_value.get("items", []):
+                if isinstance(item, dict) and isinstance(item.get("link"), str):
+                    parts.append(item["link"])
+        string_value = field.get("string_value")
+        if isinstance(string_value, str):
+            parts.append(string_value)
+        value = "、".join(part.strip() for part in parts if part.strip())
+        if value:
+            values[name] = value
+    return values
+
+
+def _join_evidence_text(evidence_data: list[dict[str, Any]]) -> str:
+    parts = []
+    for item in evidence_data:
+        if isinstance(item, dict) and isinstance(item.get("text_excerpt"), str):
+            parts.append(item["text_excerpt"])
+    return "\n".join(parts).strip()
+
+
+def _regex_first(text: str, pattern: str) -> str | None:
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+def _title_from_evidence(text: str, company: str | None) -> str | None:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if not first_line:
+        return None
+    if "丨" in first_line and company:
+        preferred = next(
+            (
+                segment.strip()
+                for segment in first_line.split("丨")
+                if company in segment
+            ),
+            "",
+        )
+        if preferred:
+            first_line = preferred
+    if company and first_line.startswith(company):
+        first_line = first_line[len(company):].strip("丨|- ：:")
+    title = re.sub(
+        r"(招聘启事|招聘简章|招募全面启动|火热启动|正式启动)[！!。．.]*$",
+        "",
+        first_line,
+    ).strip()
+    if "实习" in title and len(title) <= 80:
+        return title
+    if any(word in title for word in ("招聘", "校招", "内推", "岗位")) and len(title) <= 80:
+        return title
+    return first_line[:80]
+
+
+def _company_from_title(title: str) -> str | None:
+    match = re.match(r"(.{2,40}?)(?:20\d{2}届|暑期|实习|校园|校招|招聘)", title)
+    if match:
+        return match.group(1).strip("丨|- ：:")
+    return None
+
+
+def _split_field_values(value: str | None) -> list[str]:
+    if not value:
+        return []
+    seen: set[str] = set()
+    results: list[str] = []
+    for part in re.split(r"[、，,；;/\s]+", value):
+        item = part.strip()
+        if item and item not in seen:
+            seen.add(item)
+            results.append(item)
+    return results
+
+
+def _infer_recruitment_types(text: str) -> list[str]:
+    results: list[str] = []
+    if re.search(r"实习|intern", text, re.IGNORECASE):
+        results.append("internship")
+    if re.search(r"校招|校园|应届|20\d{2}届|campus|graduate", text, re.IGNORECASE):
+        results.append("campus_recruitment")
+    if re.search(r"社招|全职|full.?time", text, re.IGNORECASE):
+        results.append("full_time")
+    return results
+
+
+def _record_fallback_confidence(
+    title: str | None,
+    company: str | None,
+    evidence_text: str,
+) -> float:
+    score = 0.0
+    if title:
+        score += 0.35
+    if company:
+        score += 0.30
+    if len(evidence_text) >= 100:
+        score += 0.25
+    if any(word in evidence_text for word in ("岗位", "招聘", "职责", "要求", "投递")):
+        score += 0.10
+    return min(score, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # 8.  finish_with_manual_review (tool wrapper)
 # ---------------------------------------------------------------------------
@@ -604,11 +916,24 @@ def open_url(url: str) -> str:
     Returns:
         Page text content, or error message if the page cannot be accessed.
     """
+    global _nav_page_count, _nav_current_url, _nav_history
+
     if _is_blocked_domain(url):
         return f"ERROR: Cannot access blocked domain: {url}"
     budget_err = _nav_budget_check()
     if budget_err:
         return f"ERROR: {budget_err}"
+
+    # ── WeChat articles: try ReadGZH proxy first ──
+    if _is_wechat_url(url):
+        text, title, error = _fetch_wechat_via_readgzh(url)
+        if error is None:
+            _nav_page_count += 1
+            if _nav_current_url:
+                _nav_history.append(_nav_current_url)
+            _nav_current_url = url
+            return text or "(empty page)"
+        # ReadGZH failed; fall through to regular fetch
 
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -616,7 +941,13 @@ def open_url(url: str) -> str:
         html = resp.text
         text = _extract_page_text(html)
 
-        global _nav_page_count, _nav_current_url, _nav_history
+        if _needs_browser_fallback(url, text):
+            browser_text, browser_title, browser_error = _fetch_page_with_browser(url)
+            if browser_error is None:
+                text = browser_text or ""
+            else:
+                return f"ERROR: WeChat verification wall: {browser_error}"
+
         _nav_page_count += 1
         if _nav_current_url:
             _nav_history.append(_nav_current_url)
@@ -625,6 +956,194 @@ def open_url(url: str) -> str:
         return text or "(empty page)"
     except requests.RequestException as e:
         return f"ERROR: Could not open {url}: {e}"
+
+
+def open_rendered_url(url: str) -> str:
+    """Open a URL in a headless browser and return rendered visible text.
+
+    Use this when ``open_url`` returns an empty shell, a JavaScript app, or a
+    page whose useful content is loaded after browser rendering.
+
+    Args:
+        url: The URL to open in a browser.
+
+    Returns:
+        JSON string with url, title, text, and page_count, or an error object.
+    """
+    if _is_blocked_domain(url):
+        return json.dumps({"error": f"Cannot access blocked domain: {url}"}, ensure_ascii=False)
+    budget_err = _nav_budget_check()
+    if budget_err:
+        return json.dumps({"error": budget_err}, ensure_ascii=False)
+
+    text, title, error = _fetch_page_with_browser(url)
+    if error:
+        return json.dumps({"error": error, "url": url}, ensure_ascii=False)
+
+    global _nav_page_count, _nav_current_url, _nav_history
+    _nav_page_count += 1
+    if _nav_current_url:
+        _nav_history.append(_nav_current_url)
+    _nav_current_url = url
+
+    return json.dumps(
+        {
+            "url": url,
+            "title": title or "",
+            "text": (text or "")[:10000],
+            "page_count": _nav_page_count,
+        },
+        ensure_ascii=False,
+    )
+
+
+def extract_rendered_job_evidence(url: str) -> str:
+    """Open a rendered recruitment page and extract job-detail evidence.
+
+    This browser tool captures public recruitment JSON/XHR payloads emitted by
+    JavaScript-rendered pages and converts recognized job records into the
+    same evidence shape expected by downstream extraction.
+
+    Args:
+        url: The public recruitment URL to inspect.
+
+    Returns:
+        JSON string with evidence_pages, navigation_path, page_count, and error.
+    """
+    if _is_blocked_domain(url):
+        return json.dumps({"evidence_pages": [], "error": f"Cannot access blocked domain: {url}"}, ensure_ascii=False)
+    budget_err = _nav_budget_check()
+    if budget_err:
+        return json.dumps({"evidence_pages": [], "error": budget_err}, ensure_ascii=False)
+
+    try:
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return json.dumps({"evidence_pages": [], "error": "Playwright is not installed"}, ensure_ascii=False)
+
+    payloads: list[dict[str, Any]] = []
+    response_urls: list[str] = []
+
+    def capture_response(response: Any) -> None:
+        response_url = getattr(response, "url", "")
+        if "campus-talent.alibaba.com" not in response_url or "/position/search" not in response_url:
+            return
+        try:
+            payloads.append(json.loads(response.text()))
+            response_urls.append(response_url)
+        except Exception:
+            return
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125 Safari/537.36"
+                )
+            )
+            page.on("response", capture_response)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PlaywrightTimeoutError:
+                page.wait_for_timeout(3_000)
+            title = page.title()
+            browser.close()
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
+
+    evidence_pages: list[dict[str, Any]] = []
+    for payload in payloads:
+        evidence_pages.extend(_alibaba_position_evidence_from_search_payload(payload, url))
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in evidence_pages:
+        key = str((item.get("metadata") or {}).get("position_id") or item.get("content_hash") or item.get("title"))
+        if key and key not in deduped:
+            deduped[key] = item
+    evidence_pages = list(deduped.values())
+
+    global _nav_page_count, _nav_current_url, _nav_history
+    _nav_page_count += 1
+    if _nav_current_url:
+        _nav_history.append(_nav_current_url)
+    _nav_current_url = url
+
+    return json.dumps(
+        {
+            "evidence_pages": evidence_pages,
+            "navigation_path": [{"url": url, "title": title or "", "action": "extract_rendered_job_evidence"}],
+            "page_count": _nav_page_count,
+            "error": None if evidence_pages else "No recognized rendered job evidence found",
+            "metadata": {"captured_response_count": len(payloads), "response_urls": response_urls[:5]},
+        },
+        ensure_ascii=False,
+    )
+
+
+def _alibaba_position_evidence_from_search_payload(
+    payload: dict[str, Any],
+    source_url: str,
+) -> list[dict[str, Any]]:
+    """Convert Alibaba campus ``/position/search`` JSON into JD evidence."""
+    content = payload.get("content") if isinstance(payload, dict) else None
+    datas = content.get("datas") if isinstance(content, dict) else None
+    if not isinstance(datas, list):
+        return []
+
+    evidence: list[dict[str, Any]] = []
+    for item in datas:
+        if not isinstance(item, dict):
+            continue
+        position_id = str(item.get("id") or "").strip()
+        title = str(item.get("name") or "").strip()
+        description = str(item.get("description") or "").strip()
+        requirement = str(item.get("requirement") or "").strip()
+        if not title or not (description or requirement):
+            continue
+        locations = item.get("workLocations") if isinstance(item.get("workLocations"), list) else []
+        circles = item.get("circleNames") if isinstance(item.get("circleNames"), list) else []
+        text = "\n".join(
+            part
+            for part in [
+                f"岗位名称: {title}",
+                f"工作地点: {'、'.join(str(x) for x in locations if x)}" if locations else "",
+                f"招聘批次: {item.get('batchName') or ''}".strip(),
+                f"岗位类别: {item.get('categoryName') or ''}".strip(),
+                f"业务/公司: {'、'.join(str(x) for x in circles if x)}" if circles else "",
+                f"岗位职责:\n{description}" if description else "",
+                f"任职要求:\n{requirement}" if requirement else "",
+            ]
+            if part and not part.endswith(": ")
+        )
+        evidence_url = f"{source_url}#position-{position_id}" if position_id else source_url
+        content_hash = hashlib.sha256(
+            json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        evidence.append(
+            {
+                "evidence_type": "job_detail_json",
+                "url": evidence_url,
+                "title": title,
+                "content_hash": content_hash,
+                "text_excerpt": text[:4000],
+                "metadata": {
+                    "position_id": position_id,
+                    "source_api": "alibaba_position_search",
+                    "locations": locations,
+                    "circleNames": circles,
+                    "categoryName": item.get("categoryName"),
+                    "categoryType": item.get("categoryType"),
+                    "batchName": item.get("batchName"),
+                },
+            }
+        )
+    return evidence
 
 
 def read_dom(url: str) -> str:
@@ -800,6 +1319,8 @@ Goal: Starting from a public URL, find credible job list pages and JD detail pag
 
 Allowed actions:
 - Open pages.
+- Open pages in a headless browser when static HTML is empty or JavaScript-rendered.
+- Extract rendered job evidence from public recruitment XHR/JSON when a page is an SPA.
 - Read visible text and DOM links.
 - Follow navigation links likely related to Careers, Jobs, Join Us, Campus Recruitment, Internships, Recruiting, or Chinese equivalents.
 - Capture evidence screenshots and page text.
@@ -851,6 +1372,8 @@ def create_web_navigation_subagent(
 
     web_nav_tools = [
         open_url,
+        open_rendered_url,
+        extract_rendered_job_evidence,
         read_dom,
         extract_links,
         click_link,
@@ -889,6 +1412,94 @@ class _DiscoveryRunResultPydantic(BaseModel):
     evidence: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     summary: str = ""
+
+
+class _WebNavigationResultPydantic(BaseModel):
+    """Structured result returned by the Web Navigation Agent."""
+
+    evidence_pages: list[dict[str, Any]] = []
+    navigation_path: list[dict[str, str]] = []
+    page_count: int = 0
+    error: str | None = None
+
+
+def _parse_web_navigation_agent_result(result: Any) -> dict[str, Any]:
+    """Normalize DeepAgent web navigation output into the public tool shape."""
+    if hasattr(result, "model_dump"):
+        result = result.model_dump()
+
+    if not isinstance(result, dict):
+        return {
+            "evidence_pages": [],
+            "navigation_path": [],
+            "page_count": 0,
+            "error": f"Unexpected web navigation agent result type: {type(result).__name__}",
+            "delegated_to": "web_navigation_agent",
+        }
+
+    structured = result.get("structured_response")
+    if hasattr(structured, "model_dump"):
+        structured = structured.model_dump()
+    if isinstance(structured, dict):
+        data = structured
+    else:
+        data = result
+
+    evidence_pages = data.get("evidence_pages") or data.get("evidence") or []
+    navigation_path = data.get("navigation_path") or data.get("path") or []
+    if not isinstance(evidence_pages, list):
+        evidence_pages = []
+    if not isinstance(navigation_path, list):
+        navigation_path = []
+
+    page_count = data.get("page_count")
+    if not isinstance(page_count, int):
+        page_count = len(evidence_pages)
+
+    normalized = {
+        "evidence_pages": evidence_pages,
+        "navigation_path": navigation_path,
+        "page_count": page_count,
+        "delegated_to": "web_navigation_agent",
+    }
+    if data.get("error"):
+        normalized["error"] = str(data["error"])
+    return normalized
+
+
+def build_web_navigation_agent(
+    *,
+    settings: Settings,
+    model: ChatOpenAI | None = None,
+) -> Any:
+    """Build the standalone DeepAgent used for web navigation.
+
+    This is the real Web Navigation Agent: an LLM loop that observes tool
+    outputs and autonomously chooses the next navigation action.
+    """
+    if model is None:
+        model = _build_job_discovery_llm(settings)
+
+    global _nav_max_pages
+    _nav_max_pages = settings.job_discovery_max_pages_per_task
+
+    return create_deep_agent(
+        model=model,
+        tools=[
+            open_url,
+            open_rendered_url,
+            extract_rendered_job_evidence,
+            read_dom,
+            extract_links,
+            click_link,
+            get_visible_text,
+            screenshot,
+            go_back,
+        ],
+        system_prompt=_WEB_NAVIGATION_SYSTEM_PROMPT,
+        name="web_navigation_agent",
+        response_format=_WebNavigationResultPydantic,
+    )
 
 
 def build_discovery_supervisor_agent(
@@ -949,6 +1560,7 @@ def build_discovery_supervisor_agent(
         parse_wechat_article,
         _make_run_ocr(settings),
         extract_jd_candidates,
+        standardize_from_record_fields,
         verify_evidence,
         package_candidates,
         finish_with_manual_review,

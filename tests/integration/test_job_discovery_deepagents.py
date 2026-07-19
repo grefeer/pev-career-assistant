@@ -11,24 +11,20 @@ Tests cover:
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
-import os
-import sys
-from dataclasses import asdict
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from deepagents import create_deep_agent
-from deepagents.middleware.subagents import SubAgent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from backend.app.config import Settings
 from backend.app.services.job_discovery.deepagents_runner import (
     _asdict,
+    _alibaba_position_evidence_from_search_payload,
+    _build_job_discovery_llm,
     _is_blocked_domain,
     _SUPERVISOR_SYSTEM_PROMPT,
     _WEB_NAVIGATION_SYSTEM_PROMPT,
@@ -53,10 +49,8 @@ from backend.app.services.job_discovery.deepagents_runner import (
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
     NormalizedJobCandidate,
-    OcrResult,
     PageEvidence,
     TriageResult,
-    WechatArticleResult,
 )
 
 
@@ -149,7 +143,7 @@ class TestTriageLink:
     def test_wechat_url(self) -> None:
         result = triage_link("https://mp.weixin.qq.com/s/abc123")
         assert result["site_type"] == "wechat_article"
-        assert result["recommended_action"] == "parse_wechat_article"
+        assert result["recommended_action"] == "run_web_navigation"
 
     def test_blocked_domain(self) -> None:
         result = triage_link("https://www.linkedin.com/jobs/123")
@@ -525,12 +519,13 @@ class TestCreateWebNavigationSubagent:
 
         # Should have tools
         assert "tools" in spec
-        assert len(spec["tools"]) == 7
+        assert len(spec["tools"]) == 9
 
         # Tool names
         tool_names = {t.__name__ for t in spec["tools"]}
         assert tool_names == {
-            "open_url", "read_dom", "extract_links", "click_link",
+            "open_url", "open_rendered_url", "extract_rendered_job_evidence",
+            "read_dom", "extract_links", "click_link",
             "get_visible_text", "screenshot", "go_back",
         }
 
@@ -589,6 +584,17 @@ class TestBuildDiscoverySupervisorAgent:
         assert agent is not None
         assert hasattr(agent, "ainvoke")
 
+    @patch("backend.app.services.job_discovery.deepagents_runner.ChatOpenAI")
+    def test_deepseek_v4_disables_thinking_for_tool_choice(
+        self, mock_chat_openai: Any, settings: Settings
+    ) -> None:
+        """DeepSeek V4 thinking mode rejects deepagents' tool_choice requests."""
+        settings.job_discovery_model = "deepseek-v4-flash"
+        _build_job_discovery_llm(settings)
+        assert mock_chat_openai.call_args.kwargs["extra_body"] == {
+            "thinking": {"type": "disabled"}
+        }
+
     def test_agent_has_subagent(self, settings: Settings) -> None:
         """Test that the built agent has the web navigation subagent registered."""
         # We can't easily inspect the subagents from the compiled graph,
@@ -604,6 +610,51 @@ class TestBuildDiscoverySupervisorAgent:
 
 class TestRunWebNavigation:
     """Test the run_web_navigation tool."""
+
+    @patch("backend.app.services.job_discovery.deepagents_runner.requests.get")
+    @patch("backend.app.services.job_discovery.deepagents_runner.create_deep_agent")
+    def test_invokes_deepagent_web_navigator_not_static_requests(
+        self,
+        mock_create_deep_agent: MagicMock,
+        mock_requests_get: MagicMock,
+        settings: Settings,
+    ) -> None:
+        """Web navigation must be an LLM tool loop, not a requests/link script."""
+        mock_requests_get.side_effect = AssertionError("static requests fallback was used")
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "structured_response": {
+                "evidence_pages": [
+                    {
+                        "evidence_type": "page_text",
+                        "url": "https://company.example.com/jobs/ai",
+                        "title": "AI Engineer",
+                        "content_hash": "hash-ai",
+                        "text_excerpt": "岗位职责: build agents\n任职要求: python",
+                        "metadata": {"page_num": 1},
+                    }
+                ],
+                "navigation_path": [
+                    {"url": "https://company.example.com", "title": "Home"},
+                    {"url": "https://company.example.com/jobs/ai", "title": "AI Engineer"},
+                ],
+                "page_count": 2,
+            }
+        }
+        mock_create_deep_agent.return_value = mock_agent
+
+        result = run_web_navigation(
+            "https://company.example.com",
+            settings=settings,
+            model=MagicMock(spec=ChatOpenAI),
+        )
+
+        assert result["evidence_pages"][0]["title"] == "AI Engineer"
+        assert result["page_count"] == 2
+        assert result["delegated_to"] == "web_navigation_agent"
+        mock_create_deep_agent.assert_called_once()
+        mock_agent.invoke.assert_called_once()
+        mock_requests_get.assert_not_called()
 
     def test_blocked_domain(self, settings: Settings) -> None:
         result = run_web_navigation("https://www.linkedin.com/jobs", settings=settings)
@@ -621,6 +672,52 @@ class TestRunWebNavigation:
             settings=settings,
         )
         assert "error" in result or "evidence_pages" in result
+
+
+class TestRenderedJobEvidence:
+    """Test rendered job evidence extraction helpers."""
+
+    def test_alibaba_position_search_payload_yields_one_evidence_per_job(self) -> None:
+        payload = {
+            "content": {
+                "datas": [
+                    {
+                        "id": "199903220038",
+                        "name": "AI应用研发工程师",
+                        "workLocations": ["北京", "杭州", "上海"],
+                        "description": "1、负责 AI 应用工程研发。",
+                        "requirement": "1、熟悉 Python 和 Agent 框架。",
+                        "categoryName": "技术类",
+                        "categoryType": "internship",
+                        "batchName": "阿里巴巴2027届实习生",
+                        "circleNames": ["淘宝闪购"],
+                    },
+                    {
+                        "id": "199903220039",
+                        "name": "AI应用算法工程师",
+                        "workLocations": ["杭州"],
+                        "description": "1、负责算法建模。",
+                        "requirement": "1、熟悉机器学习。",
+                        "categoryName": "算法类",
+                        "categoryType": "internship",
+                        "batchName": "阿里巴巴2027届实习生",
+                        "circleNames": ["淘宝闪购"],
+                    },
+                ]
+            }
+        }
+
+        evidence = _alibaba_position_evidence_from_search_payload(
+            payload,
+            "https://campus-talent.alibaba.com/campus/position?batchId=100000540002",
+        )
+
+        assert [item["title"] for item in evidence] == ["AI应用研发工程师", "AI应用算法工程师"]
+        assert all(item["evidence_type"] == "job_detail_json" for item in evidence)
+        assert all(item["content_hash"] for item in evidence)
+        assert "岗位职责" in evidence[0]["text_excerpt"]
+        assert "任职要求" in evidence[0]["text_excerpt"]
+        assert evidence[0]["metadata"]["position_id"] == "199903220038"
 
 
 # =========================================================================

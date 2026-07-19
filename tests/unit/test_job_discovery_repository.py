@@ -1,24 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
-from backend.app.db.base import Base, utc_now
+from backend.app.db.base import Base
 from backend.app.db.models import (
-    DiscoveredJobCandidate,
     DiscoveredJobCandidateStatus,
     DiscoveryBlockReason,
-    JobDiscoveryEvidence,
-    JobDiscoveryTask,
     JobDiscoveryTaskStatus,
+    JobPosting,
     JobSource,
     JobSourceProvider,
     RawJobRecord,
+    User,
+    UserRole,
 )
+from backend.app.api.routes.job_discovery import approve_job_discovery_candidate
 from backend.app.repositories import job_discovery
 
 
@@ -581,3 +581,85 @@ class TestListReviewGroups:
 
         assert len(groups) == 1
         assert groups[0]["similarity_group_key"] == "group-a"
+
+
+class TestApproveDiscoveryCandidate:
+    def test_same_raw_record_multiple_candidates_create_distinct_postings(
+        self, db: Session
+    ) -> None:
+        admin = User(
+            id="admin",
+            account="admin",
+            nickname="Admin",
+            password_hash="unused",
+            role=UserRole.ADMIN,
+        )
+        db.add(admin)
+        source = create_source(db)
+        record = create_raw_record(db, source.id)
+        task, _ = job_discovery.create_or_get_task(
+            db, **default_task_kwargs(source_id=source.id, raw_record_id=record.id)
+        )
+
+        first = job_discovery.upsert_candidate(
+            db,
+            task_id=task.id,
+            source_id=source.id,
+            raw_record_id=record.id,
+            external_record_id="same-record",
+            idempotency_key="candidate-one-key",
+            similarity_group_key="group-a",
+            title="后端开发工程师",
+            company_name="示例公司",
+            department=None,
+            description_text="后端 JD",
+            responsibilities=None,
+            requirements=None,
+            locations_json=["北京"],
+            recruitment_types_json=["实习"],
+            industries_json=None,
+            apply_url="https://example.com/jobs/backend",
+            application_channel_json=None,
+            deadline_text=None,
+            referral_code=None,
+            confidence=0.9,
+            evidence_refs_json=None,
+            normalization_warnings_json=None,
+        )
+        second = job_discovery.upsert_candidate(
+            db,
+            task_id=task.id,
+            source_id=source.id,
+            raw_record_id=record.id,
+            external_record_id="same-record",
+            idempotency_key="candidate-two-key",
+            similarity_group_key="group-a",
+            title="前端开发工程师",
+            company_name="示例公司",
+            department=None,
+            description_text="前端 JD",
+            responsibilities=None,
+            requirements=None,
+            locations_json=["上海"],
+            recruitment_types_json=["实习"],
+            industries_json=None,
+            apply_url="https://example.com/jobs/frontend",
+            application_channel_json=None,
+            deadline_text=None,
+            referral_code=None,
+            confidence=0.9,
+            evidence_refs_json=None,
+            normalization_warnings_json=None,
+        )
+        db.commit()
+
+        approve_job_discovery_candidate(first.id, admin, db)
+        approve_job_discovery_candidate(second.id, admin, db)
+
+        postings = db.query(JobPosting).order_by(JobPosting.title).all()
+        assert len(postings) == 2
+        assert {posting.title for posting in postings} == {
+            "前端开发工程师",
+            "后端开发工程师",
+        }
+        assert len({posting.external_record_id for posting in postings}) == 2

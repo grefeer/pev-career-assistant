@@ -7,7 +7,6 @@ Every test verifies that the tool is:
 3. Graceful — empty/missing/bad input produces structured defaults
 """
 
-import hashlib
 import struct
 import zlib
 
@@ -61,7 +60,7 @@ class TestLinkTriage:
     def test_wechat_article(self):
         result = triage_link("https://mp.weixin.qq.com/s/abc123def456")
         assert result.site_type == "wechat_article"
-        assert result.recommended_action == "parse_wechat_article"
+        assert result.recommended_action == "run_web_navigation"
         assert result.confidence == 1.0
 
     def test_blocked_domain(self):
@@ -688,9 +687,18 @@ class TestCandidatePackager:
         )
         assert key1 == key2
 
+    def test_similarity_group_key_groups_across_tencent_sheets(self):
+        key1 = build_similarity_group_key(
+            "腾讯科技", "后端开发工程师", "实习", "tencent-27-referrals",
+        )
+        key2 = build_similarity_group_key(
+            "腾讯科技", "后端开发工程师", "实习", "tencent-intern-referrals",
+        )
+        assert key1 == key2
+
     def test_similarity_group_key_empty_prefixes(self):
         key = build_similarity_group_key("", "", "", "")
-        assert key == "::::unknown::unknown"
+        assert key == "::::unknown"
 
     def test_similarity_group_key_similar_roles(self):
         """Roles with same prefix should get same group key."""

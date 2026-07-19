@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -71,6 +72,12 @@ def _candidate_not_found() -> HTTPException:
 
 def _candidate_conflict(message: str) -> HTTPException:
     return HTTPException(status_code=409, detail=message)
+
+
+def _posting_external_record_id(candidate: DiscoveredJobCandidate) -> str:
+    suffix = hashlib.sha256(candidate.idempotency_key.encode("utf-8")).hexdigest()[:16]
+    prefix = candidate.external_record_id[:75]
+    return f"{prefix}::jd::{suffix}"
 
 
 @router.get("/admin/job-discovery/tasks", response_model=JobDiscoveryTaskListResponse)
@@ -156,11 +163,12 @@ def approve_job_discovery_candidate(
         raise _candidate_conflict("候选记录状态不允许审批通过。")
 
     candidate.status = DiscoveredJobCandidateStatus.approved
+    posting_external_record_id = _posting_external_record_id(candidate)
 
     existing_posting = db.scalar(
         select(JobPosting).where(
             JobPosting.source_id == candidate.source_id,
-            JobPosting.external_record_id == candidate.external_record_id,
+            JobPosting.external_record_id == posting_external_record_id,
         )
     )
 
@@ -180,7 +188,7 @@ def approve_job_discovery_candidate(
     else:
         posting = JobPosting(
             source_id=candidate.source_id,
-            external_record_id=candidate.external_record_id,
+            external_record_id=posting_external_record_id,
             raw_record_id=candidate.raw_record_id,
             mapper_version="discovery-agent-v1",
             status=JobPostingStatus.PENDING_REVIEW,

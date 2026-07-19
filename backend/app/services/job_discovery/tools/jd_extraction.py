@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import urlsplit
 
 from backend.app.services.job_discovery.schemas import NormalizedJobCandidate
 
