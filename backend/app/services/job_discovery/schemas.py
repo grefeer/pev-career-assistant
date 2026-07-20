@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -78,3 +79,32 @@ class DiscoveryRunResult:
     evidence: list[PageEvidence] = field(default_factory=list)
     candidates: list[NormalizedJobCandidate] = field(default_factory=list)
     summary: str = ""
+
+
+@dataclass
+class StrategyRecord:
+    """In-memory representation of a matched strategy (decoupled from ORM)."""
+    id: str
+    url_pattern: str
+    site_type: str
+    description: str = ""
+    priority: int = 0
+    adapter: str | None = None
+    plan_yaml: str = ""
+    status: str = "active"
+    success_count: int = 0
+
+    @classmethod
+    def from_orm(cls, orm_obj: Any) -> "StrategyRecord":
+        """Build from a JobDiscoveryStrategy ORM instance."""
+        return cls(
+            id=orm_obj.id,
+            url_pattern=orm_obj.url_pattern,
+            site_type=orm_obj.site_type,
+            description=orm_obj.description or "",
+            priority=orm_obj.priority,
+            adapter=orm_obj.adapter,
+            plan_yaml=orm_obj.plan_yaml,
+            status=orm_obj.status,
+            success_count=orm_obj.success_count,
+        )

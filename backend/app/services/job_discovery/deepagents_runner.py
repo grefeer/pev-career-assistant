@@ -1146,6 +1146,180 @@ def _alibaba_position_evidence_from_search_payload(
     return evidence
 
 
+def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
+    """Call the Alibaba campus position search JSON API directly.
+
+    Extracts the batch ID and share code from the source SPA URL,
+    then calls the ``/position/search`` API endpoint directly,
+    bypassing the browser-based SPA rendering entirely.
+
+    Args:
+        url: The Alibaba campus SPA URL (e.g. ``https://campus-talent.alibaba.com/
+             campus/position?batchId=...&campusShareCode=...``).
+
+    Returns:
+        The parsed JSON response from the position search API.
+
+    Raises:
+        requests.RequestException: If the API call fails.
+        ValueError: If the response is not valid JSON.
+    """
+    from urllib.parse import urlencode, urlparse
+
+    parsed = urlparse(url)
+    # Build the search API URL from the same base host
+    api_base = f"{parsed.scheme}://{parsed.netloc}/position/search"
+
+    # Extract relevant query parameters from the original URL
+    params: dict[str, str] = {}
+    if parsed.query:
+        for pair in parsed.query.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                from urllib.parse import unquote_plus
+                params[k] = unquote_plus(v)
+
+    # Preserve batchId and campusShareCode — these are the key params
+    # the Alibaba SPA sends to its search API.
+    filtered: dict[str, str] = {}
+    for key in ("batchId", "campusShareCode", "batchIds"):
+        if key in params:
+            filtered[key] = params[key]
+
+    query_string = urlencode(filtered)
+    api_url = f"{api_base}?{query_string}" if query_string else api_base
+
+    resp = requests.get(
+        api_url,
+        timeout=30,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": url,
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _generic_position_evidence_from_payload(
+    payload: dict[str, Any],
+    source_url: str,
+) -> list[dict[str, Any]]:
+    """Convert an arbitrary JSON payload that may contain job data into evidence.
+
+    Walks the payload looking for objects that have job-like fields (title,
+    name, position, description, requirement, etc.) and converts each into
+    a ``job_detail_json`` PageEvidence entry.
+    """
+    evidence: list[dict[str, Any]] = []
+
+    # --- Helper: recursively find job-like objects ---
+    def _walk(obj: Any, depth: int = 0) -> list[dict[str, Any]]:
+        if depth > 5:
+            return []
+        results: list[dict[str, Any]] = []
+        if isinstance(obj, dict):
+            # Check if this dict looks like a job record
+            keys_lower = {k.lower() for k in obj.keys() if isinstance(k, str)}
+            job_indicators = keys_lower & {
+                "name", "title", "position", "positionname", "jobname",
+                "description", "requirement", "responsibilities",
+                "company", "companyname", "employer",
+                "location", "locations", "worklocations", "city",
+                "department", "category", "categoryname",
+                "id", "positionid", "jobid", "requisitionid",
+            }
+            if len(job_indicators) >= 2:
+                results.append(obj)
+            # Also walk nested values
+            for _k, v in obj.items():
+                results.extend(_walk(v, depth + 1))
+        elif isinstance(obj, list):
+            for item in obj[:200]:  # cap per level
+                results.extend(_walk(item, depth + 1))
+        return results
+
+    job_objects = _walk(payload)
+
+    seen_ids: set[str] = set()
+    for item in job_objects:
+        title = (
+            str(item.get("name") or item.get("title") or item.get("positionName") or item.get("jobName") or "")
+        ).strip()
+        description = (
+            str(item.get("description") or item.get("jobDescription") or "")
+        ).strip()
+        requirement = (
+            str(item.get("requirement") or item.get("requirements") or item.get("qualifications") or "")
+        ).strip()
+
+        if not title:
+            continue
+        if not description and not requirement:
+            continue
+
+        # Build unique key to deduplicate
+        position_id = str(
+            item.get("id") or item.get("positionId") or item.get("jobId") or item.get("requisitionId") or ""
+        ).strip()
+        if position_id and position_id in seen_ids:
+            continue
+        if position_id:
+            seen_ids.add(position_id)
+
+        # Extract location info
+        locations = item.get("workLocations") or item.get("locations") or item.get("location") or []
+        if isinstance(locations, str):
+            locations = [locations]
+        location_str = "、".join(str(x) for x in locations if x) if isinstance(locations, list) else str(locations)
+
+        # Build the evidence text
+        parts = [f"岗位名称: {title}"]
+        if location_str:
+            parts.append(f"工作地点: {location_str}")
+        company = str(item.get("companyName") or item.get("company") or item.get("employer") or "").strip()
+        if company:
+            parts.append(f"公司名称: {company}")
+        category = str(item.get("categoryName") or item.get("category") or "").strip()
+        if category:
+            parts.append(f"岗位类别: {category}")
+        dept = str(item.get("department") or item.get("departmentName") or "").strip()
+        if dept:
+            parts.append(f"所属部门: {dept}")
+        if description:
+            parts.append(f"岗位职责:\n{description}")
+        if requirement:
+            parts.append(f"任职要求:\n{requirement}")
+
+        text = "\n".join(parts)
+        content_hash = hashlib.sha256(
+            json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        # Truncate text_excerpt to avoid overflowing LLM context window.
+        evidence.append({
+            "evidence_type": "job_detail_json",
+            "url": source_url,
+            "title": title,
+            "content_hash": content_hash,
+            "text_excerpt": text[:1500],
+            "metadata": {
+                "position_id": position_id,
+                "source": "rendered_xhr",
+                "locations": locations if isinstance(locations, list) else [locations] if locations else [],
+                "company_name": company,
+                "category": category,
+                "department": dept,
+            },
+        })
+
+    return evidence
+
+
 def read_dom(url: str) -> str:
     """Read the DOM of a page as simplified text.
 
