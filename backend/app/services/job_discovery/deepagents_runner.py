@@ -79,6 +79,85 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
 
 
 # ---------------------------------------------------------------------------
+# Prompt loading and assembly
+# ---------------------------------------------------------------------------
+
+from pathlib import Path
+
+_PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+
+
+def _load_prompt(name: str) -> str:
+    """Load a prompt template file by name (without .txt extension)."""
+    path = _PROMPT_DIR / f"{name}.txt"
+    if not path.exists():
+        # Fallback: return empty string for missing files during migration
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def build_supervisor_prompt(snapshot_context: dict | None = None) -> str:
+    """Assemble the Supervisor system prompt from template files.
+
+    Args:
+        snapshot_context: If provided, the Supervisor is taking over from
+            a failed SnapshotExecutor / Adapter. Contains completed_steps,
+            failed_step, source, and strategy_id.
+
+    Returns:
+        Complete system prompt string for the Supervisor Agent.
+    """
+    parts: list[str] = [_load_prompt("supervisor_base")]
+
+    if snapshot_context is None:
+        parts.append(_load_prompt("supervisor_clean_start"))
+    else:
+        template = _load_prompt("supervisor_snapshot_fallback")
+        if template:
+            ctx = {
+                "source": snapshot_context.get("source", "unknown"),
+                "strategy_id": snapshot_context.get("strategy_id", "unknown"),
+                "failed_step_count": len(snapshot_context.get("completed_steps", [])) + 1,
+                "completed_steps": _format_snapshot_steps(
+                    snapshot_context.get("completed_steps", [])
+                ),
+                "failed_step_tool": snapshot_context.get("failed_step", {}).get("tool", ""),
+                "failed_step_params": json.dumps(
+                    snapshot_context.get("failed_step", {}).get("params", {}),
+                    ensure_ascii=False,
+                ),
+                "failed_step_error": str(
+                    snapshot_context.get("failed_step", {}).get("error", "")
+                ),
+            }
+            parts.append(template.format(**ctx))
+
+    return "\n\n".join(parts)
+
+
+def _format_snapshot_steps(completed_steps: list[dict]) -> str:
+    """Format completed snapshot steps as human-readable text."""
+    if not completed_steps:
+        return "(none)"
+    lines = []
+    for i, step in enumerate(completed_steps, 1):
+        tool = step.get("tool", "?")
+        params_summary = _summarize_params(step.get("params", {}))
+        lines.append(f"  {i}. {tool}({params_summary}) — succeeded")
+    return "\n".join(lines)
+
+
+def _summarize_params(params: dict) -> str:
+    """Create a short summary of tool parameters for display."""
+    if not params:
+        return ""
+    keys = list(params.keys())
+    if len(keys) <= 2:
+        return ", ".join(f"{k}=..." for k in keys)
+    return f"{', '.join(f'{k}=...' for k in keys[:2])}, ..."
+
+
+# ---------------------------------------------------------------------------
 # Blocked domains (same set as link_triage)
 # ---------------------------------------------------------------------------
 
@@ -1027,8 +1106,10 @@ def extract_rendered_job_evidence(url: str) -> str:
     response_urls: list[str] = []
 
     def capture_response(response: Any) -> None:
+        """Capture JSON responses from any recruitment API (not just Alibaba)."""
         response_url = getattr(response, "url", "")
-        if "campus-talent.alibaba.com" not in response_url or "/position/search" not in response_url:
+        content_type = (getattr(response, "headers", {}) or {}).get("content-type", "")
+        if "json" not in content_type and "javascript" not in content_type:
             return
         try:
             payloads.append(json.loads(response.text()))
@@ -1059,7 +1140,7 @@ def extract_rendered_job_evidence(url: str) -> str:
 
     evidence_pages: list[dict[str, Any]] = []
     for payload in payloads:
-        evidence_pages.extend(_alibaba_position_evidence_from_search_payload(payload, url))
+        evidence_pages.extend(_generic_position_evidence_from_payload(payload, url))
 
     deduped: dict[str, dict[str, Any]] = {}
     for item in evidence_pages:
@@ -1084,66 +1165,6 @@ def extract_rendered_job_evidence(url: str) -> str:
         },
         ensure_ascii=False,
     )
-
-
-def _alibaba_position_evidence_from_search_payload(
-    payload: dict[str, Any],
-    source_url: str,
-) -> list[dict[str, Any]]:
-    """Convert Alibaba campus ``/position/search`` JSON into JD evidence."""
-    content = payload.get("content") if isinstance(payload, dict) else None
-    datas = content.get("datas") if isinstance(content, dict) else None
-    if not isinstance(datas, list):
-        return []
-
-    evidence: list[dict[str, Any]] = []
-    for item in datas:
-        if not isinstance(item, dict):
-            continue
-        position_id = str(item.get("id") or "").strip()
-        title = str(item.get("name") or "").strip()
-        description = str(item.get("description") or "").strip()
-        requirement = str(item.get("requirement") or "").strip()
-        if not title or not (description or requirement):
-            continue
-        locations = item.get("workLocations") if isinstance(item.get("workLocations"), list) else []
-        circles = item.get("circleNames") if isinstance(item.get("circleNames"), list) else []
-        text = "\n".join(
-            part
-            for part in [
-                f"岗位名称: {title}",
-                f"工作地点: {'、'.join(str(x) for x in locations if x)}" if locations else "",
-                f"招聘批次: {item.get('batchName') or ''}".strip(),
-                f"岗位类别: {item.get('categoryName') or ''}".strip(),
-                f"业务/公司: {'、'.join(str(x) for x in circles if x)}" if circles else "",
-                f"岗位职责:\n{description}" if description else "",
-                f"任职要求:\n{requirement}" if requirement else "",
-            ]
-            if part and not part.endswith(": ")
-        )
-        evidence_url = f"{source_url}#position-{position_id}" if position_id else source_url
-        content_hash = hashlib.sha256(
-            json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
-        evidence.append(
-            {
-                "evidence_type": "job_detail_json",
-                "url": evidence_url,
-                "title": title,
-                "content_hash": content_hash,
-                "text_excerpt": text[:4000],
-                "metadata": {
-                    "position_id": position_id,
-                    "source_api": "alibaba_position_search",
-                    "locations": locations,
-                    "circleNames": circles,
-                    "categoryName": item.get("categoryName"),
-                    "categoryType": item.get("categoryType"),
-                    "batchName": item.get("batchName"),
-                },
-            }
-        )
-    return evidence
 
 
 def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
@@ -1506,22 +1527,8 @@ Rules:
 - Return discovered JD evidence pages and discovery path.
 - Do not extract final standardized jobs; the supervisor will call extraction tools."""
 
-# System prompt for the Discovery Supervisor Agent (verbatim from spec)
-_SUPERVISOR_SYSTEM_PROMPT = """\
-You are the Discovery Supervisor Agent for a campus career assistant.
-
-Goal: Given a Tencent smart sheet raw record and one source URL, discover job JD evidence, extract standard job candidates, verify evidence, and return a structured result.
-
-Rules:
-- Use tools in a loop. Decide the next action from observations.
-- Do not bypass login, captcha, anti-bot, permission, or paywall barriers.
-- If blocked by login, captcha, anti-bot, unavailable WeChat content, or permission limits, finish as needs_manual_review with a precise reason.
-- Do not write to the database. Return structured evidence and candidates only.
-- Respect all budgets enforced by tools.
-- Prefer evidence from official company, official career site, public WeChat article, or direct recruitment page.
-- Email application instructions are valid application channels. Extract email, subject hint, materials, and original instruction.
-- If information is insufficient, ask tools for more evidence or finish as needs_manual_review.
-- Never invent company, title, location, deadline, or apply method."""
+# Backward-compatible alias for tests / external consumers
+_SUPERVISOR_SYSTEM_PROMPT = build_supervisor_prompt()
 
 
 def create_web_navigation_subagent(
@@ -1680,21 +1687,25 @@ def build_discovery_supervisor_agent(
     *,
     settings: Settings,
     model: ChatOpenAI | None = None,
+    snapshot_context: dict | None = None,
 ) -> Any:
     """Build the Discovery Supervisor Agent using deepagents.
 
     Creates a compiled LangGraph agent with:
     - 8 supervisor tools wrapping Phase 4 deterministic functions
     - A WebNavigationAgent subagent for web navigation
-    - Structured output via DiscoveryRunResult (if supported) or tool-based
+    - Structured output via DiscoveryRunResult
+    - Optional snapshot_context for breakpoint takeover
 
     Args:
-        settings: Application settings (model name, page budget, etc.).
-        model: Optional pre-built ChatOpenAI instance. If None, one is
-               created from settings.
+        settings: Application settings.
+        model: Optional pre-built ChatOpenAI instance.
+        snapshot_context: If provided, Supervisor takes over from a failed
+            SnapshotExecutor/Adapter. Injects completed steps and failed
+            step info into the system prompt.
 
     Returns:
-        A CompiledStateGraph (deep agent) ready for invocation.
+        A CompiledStateGraph ready for invocation.
     """
     if model is None:
         model = _build_job_discovery_llm(settings)
@@ -1703,9 +1714,6 @@ def build_discovery_supervisor_agent(
     web_nav_subagent = create_web_navigation_subagent(settings)
 
     # Build a partial-application wrapper for tools that need settings
-    # Since deepagents tools are plain functions, we create closures that
-    # capture the settings.
-
     def _make_run_web_navigation(settings: Settings):
         def _wrapper(start_url: str) -> dict[str, Any]:
             return run_web_navigation(
@@ -1740,13 +1748,18 @@ def build_discovery_supervisor_agent(
         finish_with_manual_review,
     ]
 
-    # Create the deep agent — try response_format for structured output
+    # Build prompt from template files
+    system_prompt = build_supervisor_prompt(snapshot_context)
+
+    # Adjust recursion_limit for fallback mode (fewer tool calls expected)
+    recursion_limit = 30 if snapshot_context is not None else 50
+
     try:
         agent = create_deep_agent(
             model=model,
             tools=final_tools,
             subagents=[web_nav_subagent],
-            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             name="discovery_supervisor",
             response_format=_DiscoveryRunResultPydantic,
         )
@@ -1756,7 +1769,7 @@ def build_discovery_supervisor_agent(
             model=model,
             tools=final_tools,
             subagents=[web_nav_subagent],
-            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             name="discovery_supervisor",
         )
 

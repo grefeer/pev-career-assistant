@@ -25,14 +25,13 @@ class AlibabaSPAAdapter(DomainAdapter):
         trajectory: TrajectoryBuffer,
     ) -> DiscoveryRunResult:
         """Execute via direct API call. Delegates to the existing
-        _fetch_alibaba_search_api and _alibaba_position_evidence_from_search_payload
-        functions in deepagents_runner for now.
+        _fetch_alibaba_search_api and _generic_position_evidence_from_payload
+        functions in deepagents_runner.
 
         In a follow-up, those functions should be extracted to a shared utility module.
         """
         from backend.app.services.job_discovery.deepagents_runner import (
             _fetch_alibaba_search_api,
-            _alibaba_position_evidence_from_search_payload,
             _generic_position_evidence_from_payload,
             verify_evidence,
             package_candidates,
@@ -42,9 +41,7 @@ class AlibabaSPAAdapter(DomainAdapter):
 
         try:
             search_data = _fetch_alibaba_search_api(task.source_url)
-            evidence = _alibaba_position_evidence_from_search_payload(search_data, task.source_url)
-            if not evidence:
-                evidence = _generic_position_evidence_from_payload(search_data, task.source_url)
+            evidence = _generic_position_evidence_from_payload(search_data, task.source_url)
             trajectory.record_step("alibaba_evidence_extract", "ok", {},
                                    {"evidence_count": len(evidence)})
         except Exception as exc:
