@@ -979,14 +979,55 @@ _nav_max_pages: int = 20
 _nav_history: list[str] = []
 _nav_current_url: str | None = None
 
+# Per-run page fetch cache — avoids redundant ReadGZH / HTTP calls when
+# multiple WebNavigationAgent tools (open_url, read_dom, extract_links,
+# get_visible_text) request the same URL within a single run.
+_page_cache: dict[str, tuple[str | None, str | None, str | None]] = {}
+# url → (raw_html_or_text, title, error_or_none)
+
 
 def _reset_nav_state(max_pages: int = 20) -> None:
-    """Reset subagent navigation state."""
-    global _nav_page_count, _nav_max_pages, _nav_history, _nav_current_url
+    """Reset subagent navigation state and page cache."""
+    global _nav_page_count, _nav_max_pages, _nav_history, _nav_current_url, _page_cache
     _nav_page_count = 0
     _nav_max_pages = max_pages
     _nav_history = []
     _nav_current_url = None
+    _page_cache = {}
+
+
+def _cached_fetch(url: str) -> tuple[str | None, str | None, str | None]:
+    """Fetch *url* with page-level caching.
+
+    WeChat URLs go through ReadGZH; all others use ``requests.get``.
+    The raw response (HTML / text, title, error) is cached per URL so
+    subsequent tool calls (``read_dom``, ``extract_links``, etc.) for
+    the same URL reuse the cached result at zero external cost.
+
+    Returns:
+        ``(content, title, error_or_none)`` — *content* is raw HTML for
+        non-WeChat URLs and extracted visible text for WeChat URLs.
+    """
+    if url in _page_cache:
+        return _page_cache[url]
+
+    if _is_wechat_url(url):
+        text, title, error = _fetch_wechat_via_readgzh(url)
+        _page_cache[url] = (text, title, error)
+        return _page_cache[url]
+
+    # Regular HTTP fetch
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        html = _fix_response_encoding(resp)
+        title = _extract_page_title(html)
+        _page_cache[url] = (html, title, None)
+        return _page_cache[url]
+    except requests.RequestException as exc:
+        err = f"HTTP error fetching {url}: {exc}"
+        _page_cache[url] = (None, None, err)
+        return _page_cache[url]
 
 
 def _nav_budget_check() -> str | None:
@@ -999,11 +1040,10 @@ def _nav_budget_check() -> str | None:
 def open_url(url: str) -> str:
     """Open a URL and return its visible text content.
 
-    Args:
-        url: The URL to open.
+    Uses ``_cached_fetch`` so repeated tool calls for the same URL within
+    one run hit the local cache instead of re-invoking ReadGZH / HTTP.
 
-    Returns:
-        Page text content, or error message if the page cannot be accessed.
+    Page-budget accounting still happens exactly once per unique URL.
     """
     global _nav_page_count, _nav_current_url, _nav_history
 
@@ -1013,38 +1053,34 @@ def open_url(url: str) -> str:
     if budget_err:
         return f"ERROR: {budget_err}"
 
-    # ── WeChat articles: try ReadGZH proxy first ──
-    if _is_wechat_url(url):
-        text, title, error = _fetch_wechat_via_readgzh(url)
-        if error is None:
-            _nav_page_count += 1
-            if _nav_current_url:
-                _nav_history.append(_nav_current_url)
-            _nav_current_url = url
-            return text or "(empty page)"
-        # ReadGZH failed; fall through to regular fetch
+    was_cached = url in _page_cache
+    content, title, error = _cached_fetch(url)
 
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        html = resp.text
-        text = _extract_page_text(html)
+    if error is not None:
+        return f"ERROR: Could not open {url}: {error}"
 
-        if _needs_browser_fallback(url, text):
-            browser_text, browser_title, browser_error = _fetch_page_with_browser(url)
-            if browser_error is None:
-                text = browser_text or ""
-            else:
-                return f"ERROR: WeChat verification wall: {browser_error}"
-
+    if not was_cached:
         _nav_page_count += 1
         if _nav_current_url:
             _nav_history.append(_nav_current_url)
         _nav_current_url = url
 
-        return text or "(empty page)"
-    except requests.RequestException as e:
-        return f"ERROR: Could not open {url}: {e}"
+    # For WeChat URLs, _cached_fetch returns extracted text directly.
+    # For regular URLs it returns raw HTML — extract visible text.
+    if _is_wechat_url(url):
+        return content or "(empty page)"
+
+    html = content or ""
+    text = _extract_page_text(html)
+
+    if _needs_browser_fallback(url, text):
+        browser_text, browser_title, browser_error = _fetch_page_with_browser(url)
+        if browser_error is None:
+            text = browser_text or ""
+        else:
+            return f"ERROR: WeChat verification wall: {browser_error}"
+
+    return text or "(empty page)"
 
 
 def open_rendered_url(url: str) -> str:
@@ -1430,11 +1466,7 @@ def _generic_position_evidence_from_payload(
 def read_dom(url: str) -> str:
     """Read the DOM of a page as simplified text.
 
-    Args:
-        url: The URL to read.
-
-    Returns:
-        Simplified DOM text, or error message.
+    Uses ``_cached_fetch`` — reuses an earlier ``open_url`` fetch when available.
     """
     if _is_blocked_domain(url):
         return f"ERROR: Cannot access blocked domain: {url}"
@@ -1442,37 +1474,32 @@ def read_dom(url: str) -> str:
     if budget_err:
         return f"ERROR: {budget_err}"
 
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        html = resp.text
-        # Return a simplified DOM: strip only script/style but keep structure
-        html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.IGNORECASE | re.DOTALL)
-        html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.IGNORECASE | re.DOTALL)
-        html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
-        # Condense whitespace
-        html = re.sub(r">\s+<", ">\n<", html)
-        html = re.sub(r"\n{3,}", "\n\n", html)
+    was_cached = url in _page_cache
+    content, title, error = _cached_fetch(url)
+    if error is not None:
+        return f"ERROR: Could not read {url}: {error}"
 
+    if not was_cached:
         global _nav_page_count, _nav_current_url, _nav_history
         _nav_page_count += 1
         if _nav_current_url:
             _nav_history.append(_nav_current_url)
         _nav_current_url = url
 
-        return html[:10000] or "(empty page)"
-    except requests.RequestException as e:
-        return f"ERROR: Could not read {url}: {e}"
+    html = content or ""
+    # Strip script/style but keep structure
+    html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
+    html = re.sub(r">\s+<", ">\n<", html)
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    return html[:10000] or "(empty page)"
 
 
 def extract_links(url: str) -> str:
     """Extract all links from a page.
 
-    Args:
-        url: The URL to extract links from.
-
-    Returns:
-        JSON string of link objects with url and text fields.
+    Uses ``_cached_fetch`` — reuses an earlier fetch when available.
     """
     if _is_blocked_domain(url):
         return json.dumps({"error": f"Cannot access blocked domain: {url}"})
@@ -1480,32 +1507,28 @@ def extract_links(url: str) -> str:
     if budget_err:
         return json.dumps({"error": budget_err})
 
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        html = resp.text
-        links = _extract_links_from_html(html, url)
+    was_cached = url in _page_cache
+    content, title, error = _cached_fetch(url)
+    if error is not None:
+        return json.dumps({"error": f"Could not extract links from {url}: {error}"})
 
+    if not was_cached:
         global _nav_page_count, _nav_current_url, _nav_history
         _nav_page_count += 1
         if _nav_current_url:
             _nav_history.append(_nav_current_url)
         _nav_current_url = url
 
-        return json.dumps(links, ensure_ascii=False)
-    except requests.RequestException as e:
-        return json.dumps({"error": f"Could not extract links from {url}: {e}"})
+    html = content or ""
+    links = _extract_links_from_html(html, url)
+    return json.dumps(links, ensure_ascii=False)
 
 
 def click_link(url: str, link_text: str) -> str:
     """Follow a link on a page by matching link text.
 
-    Args:
-        url: The current page URL to scan for links.
-        link_text: The text of the link to follow.
-
-    Returns:
-        Content of the followed page, or error.
+    Uses ``_cached_fetch`` for the current page scan; the followed link
+    is fetched directly since it is a new URL.
     """
     if _is_blocked_domain(url):
         return f"ERROR: Cannot access blocked domain: {url}"
@@ -1513,37 +1536,39 @@ def click_link(url: str, link_text: str) -> str:
     if budget_err:
         return f"ERROR: {budget_err}"
 
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        html = resp.text
-        links = _extract_links_from_html(html, url)
+    content, title, error = _cached_fetch(url)
+    if error is not None:
+        return f"ERROR: Could not read {url}: {error}"
 
-        # Find the link whose text matches (case-insensitive, substring)
-        target_url: str | None = None
-        for link in links:
-            if link_text.lower() in link["text"].lower():
-                target_url = link["url"]
-                break
+    html = content or ""
+    links = _extract_links_from_html(html, url)
+
+    # Find the link whose text matches (case-insensitive, substring)
+    target_url: str | None = None
+    for link in links:
+        if link_text.lower() in link["text"].lower():
+            target_url = link["url"]
+            break
 
         if not target_url:
             return f"ERROR: No link with text '{link_text}' found on {url}"
 
         # Follow the link
-        resp2 = requests.get(target_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp2.raise_for_status()
-        html2 = resp2.text
-        text2 = _extract_page_text(html2)
-
         global _nav_page_count, _nav_current_url, _nav_history
-        _nav_page_count += 1
-        if _nav_current_url:
-            _nav_history.append(_nav_current_url)
-        _nav_current_url = target_url
+        try:
+            resp2 = requests.get(target_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            resp2.raise_for_status()
+            html2 = resp2.text
+            text2 = _extract_page_text(html2)
 
-        return text2 or "(empty page)"
-    except requests.RequestException as e:
-        return f"ERROR: Could not follow link: {e}"
+            _nav_page_count += 1
+            if _nav_current_url:
+                _nav_history.append(_nav_current_url)
+            _nav_current_url = target_url
+
+            return text2 or "(empty page)"
+        except requests.RequestException as e:
+            return f"ERROR: Could not follow link: {e}"
 
 
 def get_visible_text(url: str) -> str:
