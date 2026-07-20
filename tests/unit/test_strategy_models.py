@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base
@@ -63,6 +63,11 @@ class TestJobDiscoveryStrategy:
                 JobDiscoveryStrategy.url_pattern.like("example.com/%")
             )).all()
             assert len(rows) == 2
+        # Explicit index inspection via Inspector
+        insp = inspect(engine)
+        indexes = insp.get_indexes("job_discovery_strategies")
+        index_names = [idx["name"] for idx in indexes]
+        assert "ix_job_discovery_strategies_pattern" in index_names
 
 
 class TestJobDiscoveryTrajectory:
