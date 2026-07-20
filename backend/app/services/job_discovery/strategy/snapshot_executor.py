@@ -1,0 +1,282 @@
+"""SnapshotExecutor -- deterministic replay of a strategy's YAML plan steps.
+
+Calls the same tool functions as the Supervisor Agent but without LLM planning.
+On step failure, returns a SnapshotExecutionResult that signals the caller to
+hand over to the Supervisor Agent with snapshot_context injected.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+import yaml
+
+from backend.app.services.job_discovery.schemas import (
+    DiscoveryRunResult,
+    DiscoveryTaskInput,
+    NormalizedJobCandidate,
+    PageEvidence,
+    StrategyRecord,
+)
+from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
+
+
+@dataclass
+class SnapshotExecutionResult(DiscoveryRunResult):
+    """Extended result carrying snapshot_context when Supervisor takeover is needed."""
+
+    needs_supervisor_fallback: bool = False
+    snapshot_context: dict[str, Any] | None = None
+
+
+class SnapshotExecutor:
+    """Replay a YAML plan step-by-step against real tool functions.
+
+    On any step failure, short-circuits and returns a result with embedded
+    snapshot_context for Supervisor takeover.
+    """
+
+    # Field aliases for domain objects where logical template names differ
+    # from actual attribute names (e.g. {{task.url}} -> task.source_url)
+    _FIELD_ALIASES: dict[str, dict[str, str]] = {
+        "DiscoveryTaskInput": {"url": "source_url"},
+    }
+
+    def __init__(
+        self,
+        strategy: StrategyRecord,
+        task: DiscoveryTaskInput,
+        trajectory: TrajectoryBuffer,
+    ) -> None:
+        self.strategy = strategy
+        self.task = task
+        self.trajectory = trajectory
+        self._context: dict[str, Any] = {"task": task, "prev": None}
+
+    def execute(self) -> DiscoveryRunResult:
+        """Execute the plan. Returns SnapshotExecutionResult on any step failure."""
+        steps = self._parse_plan()
+        completed: list[dict[str, Any]] = []
+
+        for i, step in enumerate(steps):
+            params = self._resolve_template(step.get("params", {}))
+            tool_name = step["tool"]
+
+            try:
+                result = _call_tool_by_name(tool_name, **params)
+                self.trajectory.record_step(tool_name, "ok", params, result)
+                self._context["prev"] = {"result": result}
+                completed.append({"tool": tool_name, "params": params, "result": result})
+            except Exception as exc:
+                self.trajectory.record_step(tool_name, "failed", params, None, error=exc)
+                return SnapshotExecutionResult(
+                    status="failed",
+                    summary=f"Snapshot step {i+1} ({tool_name}) failed: {exc}",
+                    needs_supervisor_fallback=True,
+                    snapshot_context=self.trajectory.to_snapshot_context(),
+                )
+
+        # All steps succeeded -- construct final result from collected outputs
+        return self._build_final_result(completed)
+
+    # -- internal -----------------------------------------------------------
+
+    def _parse_plan(self) -> list[dict[str, Any]]:
+        """Parse the YAML plan_yaml string into step dicts."""
+        parsed = yaml.safe_load(self.strategy.plan_yaml)
+        if isinstance(parsed, dict) and "plan" in parsed:
+            return parsed["plan"]
+        if isinstance(parsed, list):
+            return parsed
+        raise ValueError(f"Invalid plan_yaml format for strategy {self.strategy.id}")
+
+    def _resolve_template(
+        self,
+        params: dict[str, Any],
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve ``{{}}`` template variables in param values.
+
+        When *context* is provided it is used instead of the executor's
+        internal ``self._context`` (useful for testing isolated resolution).
+        Missing fields resolve to Python ``None``.
+        """
+        ctx = context if context is not None else self._context
+        resolved: dict[str, Any] = {}
+        for key, value in params.items():
+            if isinstance(value, str) and "{{" in value:
+                resolved[key] = self._substitute(value, ctx)
+            else:
+                resolved[key] = value
+        return resolved
+
+    def _substitute(self, template: str, context: dict[str, Any]) -> Any:
+        """Substitute a single ``{{...}}`` expression against *context*.
+
+        Supports::
+
+            {{task.url}}, {{task.source_key}}, {{prev.result}},
+            {{prev.result.xxx}}
+
+        Single-level nesting only (``task`` / ``prev`` are the root keys).
+        Missing fields resolve to Python ``None``.
+
+        The ``"None"`` string ambiguity is handled by the caller
+        (``_resolve_template``) which only invokes this method when
+        ``"{{"`` is present in the value -- a literal string ``"None"``
+        is therefore never passed here.
+        """
+        _aliases = self._FIELD_ALIASES
+
+        def _replacer(match: re.Match) -> str:
+            expr = match.group(1).strip()
+            parts = expr.split(".")
+            value: Any = context
+            for i, p in enumerate(parts):
+                if isinstance(value, dict):
+                    value = value.get(p)
+                elif isinstance(value, (list, tuple)) and isinstance(p, int):
+                    try:
+                        value = value[p]
+                    except (IndexError, TypeError):
+                        value = None
+                elif hasattr(value, p):
+                    value = getattr(value, p, None)
+                else:
+                    # Check field aliases for known domain types
+                    cls_name = type(value).__name__
+                    if cls_name in _aliases and p in _aliases[cls_name]:
+                        aliased = _aliases[cls_name][p]
+                        if hasattr(value, aliased):
+                            value = getattr(value, aliased, None)
+                        else:
+                            value = None
+                    else:
+                        value = None
+                    if value is None:
+                        break
+            if value is None:
+                return "None"
+            if isinstance(value, (dict, list)):
+                import json
+
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        result = re.sub(r"\{\{(.+?)\}\}", _replacer, template)
+        if result == "None":
+            return None
+        return result
+
+    def _build_final_result(self, completed: list[dict[str, Any]]) -> DiscoveryRunResult:
+        """Build ``DiscoveryRunResult`` from the completed steps."""
+        evidence: list[PageEvidence] = []
+        candidates: list[NormalizedJobCandidate] = []
+
+        for step in completed:
+            result = step.get("result")
+            if isinstance(result, dict):
+                if "evidence_type" in result:
+                    evidence.append(PageEvidence(**result))
+                elif isinstance(result.get("candidates"), list):
+                    candidates_data = result["candidates"]
+                    candidates = [
+                        NormalizedJobCandidate(**c)
+                        for c in candidates_data
+                        if isinstance(c, dict)
+                    ]
+                elif isinstance(result.get("evidence"), list):
+                    evidence_data = result["evidence"]
+                    evidence = [
+                        PageEvidence(**e)
+                        for e in evidence_data
+                        if isinstance(e, dict)
+                    ]
+            if isinstance(result, list) and result:
+                first = result[0] if isinstance(result[0], dict) else None
+                if first and isinstance(first, dict):
+                    if "evidence_type" in first:
+                        evidence = [
+                            PageEvidence(**e)
+                            for e in result
+                            if isinstance(e, dict)
+                        ]
+                    else:
+                        candidates = [
+                            NormalizedJobCandidate(**c)
+                            for c in result
+                            if isinstance(c, dict)
+                        ]
+
+        # If the last step returned a JSON string, try to parse
+        last_result = completed[-1].get("result") if completed else None
+        if isinstance(last_result, str):
+            import json
+
+            try:
+                parsed = json.loads(last_result)
+                if isinstance(parsed, list):
+                    candidates = [
+                        NormalizedJobCandidate(**c)
+                        for c in parsed
+                        if isinstance(c, dict)
+                    ]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return DiscoveryRunResult(
+            status="succeeded",
+            evidence=evidence,
+            candidates=candidates,
+            summary=(
+                f"SnapshotExecutor completed {len(completed)} steps, "
+                f"found {len(candidates)} candidate(s)"
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tool dispatch -- maps tool name strings from YAML to actual functions
+# ---------------------------------------------------------------------------
+
+_TOOL_REGISTRY: dict[str, Any] = {}
+
+
+def _ensure_tool_registry() -> None:
+    """Lazy-init the tool registry to avoid circular imports."""
+    if _TOOL_REGISTRY:
+        return
+    from backend.app.services.job_discovery.deepagents_runner import (
+        extract_jd_candidates,
+        finish_with_manual_review,
+        ocr_images_from_urls,
+        package_candidates,
+        parse_wechat_article,
+        run_ocr,
+        standardize_from_record_fields,
+        triage_link,
+        verify_evidence,
+    )
+
+    _TOOL_REGISTRY.update({
+        "triage_link": triage_link,
+        "parse_wechat_article": parse_wechat_article,
+        "run_ocr": run_ocr,
+        "ocr_images_from_urls": ocr_images_from_urls,
+        "extract_jd_candidates": extract_jd_candidates,
+        "verify_evidence": verify_evidence,
+        "package_candidates": package_candidates,
+        "standardize_from_record_fields": standardize_from_record_fields,
+        "finish_with_manual_review": finish_with_manual_review,
+        "run_web_navigation": None,  # dispatched via worker context, not snapshot
+    })
+
+
+def _call_tool_by_name(name: str, **kwargs: Any) -> Any:
+    """Call a tool function by its YAML name."""
+    _ensure_tool_registry()
+    tool = _TOOL_REGISTRY.get(name)
+    if tool is None:
+        raise ValueError(f"Unknown or unavailable tool in snapshot: {name}")
+    return tool(**kwargs)
