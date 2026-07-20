@@ -87,11 +87,21 @@ from pathlib import Path
 _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
 
-def _load_prompt(name: str) -> str:
-    """Load a prompt template file by name (without .txt extension)."""
+def _load_prompt(name: str, required: bool = True) -> str:
+    """Load a prompt template file by name (without .txt extension).
+
+    Args:
+        name: Prompt file name without .txt extension.
+        required: If True, raises FileNotFoundError when the file is missing.
+                  If False, returns empty string (for optional templates).
+
+    Raises:
+        FileNotFoundError: If required=True and the file does not exist.
+    """
     path = _PROMPT_DIR / f"{name}.txt"
     if not path.exists():
-        # Fallback: return empty string for missing files during migration
+        if required:
+            raise FileNotFoundError(f"Required prompt file missing: {path}")
         return ""
     return path.read_text(encoding="utf-8")
 
@@ -107,12 +117,12 @@ def build_supervisor_prompt(snapshot_context: dict | None = None) -> str:
     Returns:
         Complete system prompt string for the Supervisor Agent.
     """
-    parts: list[str] = [_load_prompt("supervisor_base")]
+    parts: list[str] = [_load_prompt("supervisor_base", required=True)]
 
     if snapshot_context is None:
-        parts.append(_load_prompt("supervisor_clean_start"))
+        parts.append(_load_prompt("supervisor_clean_start", required=False))
     else:
-        template = _load_prompt("supervisor_snapshot_fallback")
+        template = _load_prompt("supervisor_snapshot_fallback", required=False)
         if template:
             ctx = {
                 "source": snapshot_context.get("source", "unknown"),
@@ -1750,9 +1760,6 @@ def build_discovery_supervisor_agent(
 
     # Build prompt from template files
     system_prompt = build_supervisor_prompt(snapshot_context)
-
-    # Adjust recursion_limit for fallback mode (fewer tool calls expected)
-    recursion_limit = 30 if snapshot_context is not None else 50
 
     try:
         agent = create_deep_agent(
