@@ -1,0 +1,17 @@
+## Current state: continuing from breakpoint
+
+The following steps have been completed by {source} (strategy {strategy_id}) — you do not need to repeat them:
+
+{completed_steps}
+
+Step {failed_step_count} failed:
+- Tool: {failed_step_tool}
+- Input: {failed_step_params}
+- Error: {failed_step_error}
+
+Continue execution from this breakpoint. You can:
+1. Retry the failed step (if the error is transient).
+2. Choose an alternative tool chain to skip the step.
+3. If unrecoverable, call finish_with_manual_review.
+
+Note: Output from completed steps is already saved in context. Do not re-execute completed steps to save tokens and time.

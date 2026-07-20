@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
@@ -165,7 +166,7 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
         if "text/html" not in content_type and "text/plain" not in content_type:
             return None, None, f"Non-text content type: {content_type}"
 
-        html = resp.text
+        html = _fix_response_encoding(resp)
         # Extract title and text
         title = _extract_page_title(html)
         text = _extract_page_text(html)
@@ -234,7 +235,8 @@ def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | N
         api_url = f"https://api.readgzh.site/rd?url={url}"
         resp = requests.get(api_url, timeout=30, headers=headers)
         resp.raise_for_status()
-        raw = resp.text
+
+        raw = _fix_response_encoding(resp)
 
         # ── Detect ReadGZH JSON error responses ──
         if not raw or len(raw) < 200:
@@ -261,9 +263,67 @@ def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | N
         if not text or len(text.strip()) < 50:
             return None, None, "ReadGZH returned content with insufficient text"
 
+        # ── Detect header-only / metadata-only responses ──
+        # Some WeChat articles have their real body (JD content) behind a
+        # verification wall or embedded in images. ReadGZH may return only
+        # the title, date, source, and navigation links — no actual article.
+        # These need browser fallback to get image URLs for OCR.
+        _ARTICLE_BODY_MARKERS = [
+            "岗位", "职位", "要求", "职责", "招聘", "申请", "投递",
+            "实习", "校招", "面试", "入职", "报名", "联系", "方式",
+        ]
+        body_score = sum(1 for m in _ARTICLE_BODY_MARKERS if m in text)
+        if body_score < 3:
+            # Quick browser attempt with timeout guard
+            import threading as _threading
+            browser_result: list[tuple[str | None, str | None, str | None]] = []
+            def _browser_worker():
+                try:
+                    browser_result.append(_fetch_page_with_browser(url))
+                except Exception:
+                    browser_result.append((None, None, "Browser worker exception"))
+            t = _threading.Thread(target=_browser_worker, daemon=True)
+            t.start()
+            t.join(timeout=15)  # 15-second timeout — don't block the agent
+            if browser_result:
+                browser_text, browser_title, browser_err = browser_result[0]
+                if browser_err is None and browser_text:
+                    combined = text + "\n" + browser_text
+                    if len(browser_text.strip()) > len(text.strip()):
+                        return combined, title or browser_title, None
+            else:
+                # Browser timed out — not critical, continue with ReadGZH text
+                pass
+            # If browser also failed, flag as blocked if no body at all
+            if body_score == 0:
+                return None, None, (
+                    "ReadGZH returned header-only (no article body). "
+                    "Article may require WeChat client or is image-only."
+                )
+
         return text, title, None
     except requests.RequestException as e:
         return None, None, f"ReadGZH fetch failed: {e}"
+
+
+def _fix_response_encoding(resp: requests.Response) -> str:
+    """Get response text with correct encoding for Chinese content.
+
+    ReadGZH and some Chinese sites return UTF-8 HTML without setting the
+    charset in Content-Type, causing requests to default to ISO-8859-1
+    and produce mojibake. This detects and fixes the encoding.
+    """
+    raw = resp.text
+    # Try UTF-8 re-decode if the detected encoding is a Latin variant
+    if resp.encoding and resp.encoding.lower() in ("iso-8859-1", "latin-1", "latin1", ""):
+        try:
+            raw_utf8 = resp.content.decode("utf-8")
+            # Heuristic: if UTF-8 decode produces CJK characters, it's likely correct
+            if any("一" <= c <= "鿿" for c in raw_utf8):
+                return raw_utf8
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return raw
 
 
 def _is_wechat_url(url: str) -> bool:
@@ -435,6 +495,32 @@ def run_web_navigation(
     if settings is None:
         settings = Settings()
     _reset_nav_state(max_pages=max_pages)
+
+    # ── Shortcut: known SPA career sites ──
+    # For JS-rendered SPAs that load positions via XHR (Alibaba campus, etc.),
+    # skip the LLM agent loop and directly capture rendered job evidence.
+    # This avoids recursion-limit issues and is much faster.
+    _SPA_CAREER_DOMAINS = {
+        "campus-talent.alibaba.com",
+        "talent.alibaba.com",
+        "campus.alibaba.com",
+    }
+    try:
+        domain = urlsplit(start_url).netloc.lower()
+    except ValueError:
+        domain = ""
+    if domain in _SPA_CAREER_DOMAINS:
+        result_json = extract_rendered_job_evidence(start_url)
+        result = json.loads(result_json)
+        evidence_pages = result.get("evidence_pages") or []
+        return {
+            "evidence_pages": evidence_pages,
+            "navigation_path": [{"url": start_url, "title": "", "action": "extract_rendered_job_evidence"}],
+            "page_count": 1,
+            "delegated_to": "web_navigation_agent",
+            "metadata": result.get("metadata"),
+        }
+
     agent = build_web_navigation_agent(settings=settings, model=model)
     prompt = (
         f"Starting URL: {start_url}\n"
@@ -584,6 +670,77 @@ def run_ocr(image_base64: str, settings: Settings | None = None) -> dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# 5a.  ocr_images_from_urls (tool wrapper)
+# ---------------------------------------------------------------------------
+
+def ocr_images_from_urls(image_urls_json: str) -> str:
+    """Download images from URLs and run OCR on each one.
+
+    Use this after parse_wechat_article returns image URLs. Many WeChat
+    articles embed critical JD information (position titles, requirements,
+    application instructions, referral codes) inside images, not in text.
+    By OCR'ing every image, you recover data that would otherwise be invisible.
+
+    Args:
+        image_urls_json: JSON string array of image URLs,
+            e.g. '["https://mmbiz.qpic.cn/...", "https://..."]'
+
+    Returns:
+        JSON string with per-image OCR results:
+        [{"url": "...", "ocr_text": "...", "confidence": 0.95, "error": null}, ...]
+        The ``ocr_text`` field contains the full extracted text from each image,
+        suitable for JD extraction and evidence verification.
+    """
+    try:
+        urls = json.loads(image_urls_json)
+        if isinstance(urls, str):
+            urls = [urls]
+        if not isinstance(urls, list):
+            return json.dumps({"error": "Expected JSON array of image URLs"}, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return json.dumps(
+            {"error": f"Invalid JSON input: {str(image_urls_json)[:200]}"},
+            ensure_ascii=False,
+        )
+
+    results: list[dict[str, Any]] = []
+    for img_url in urls[:20]:  # safety cap at 20 images
+        if not isinstance(img_url, str) or not img_url.startswith("http"):
+            results.append({"url": str(img_url)[:120], "ocr_text": "", "confidence": 0.0, "error": "Invalid URL"})
+            continue
+        try:
+            # WeChat CDN requires Referer to serve images
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://mp.weixin.qq.com/",
+            }
+            resp = requests.get(img_url, timeout=30, headers=headers)
+            resp.raise_for_status()
+            image_bytes = resp.content
+            # Validate: if the response is HTML (error page) rather than an image, skip
+            if len(image_bytes) < 100:
+                results.append({"url": img_url, "ocr_text": "", "confidence": 0.0, "error": "Downloaded file too small"})
+                continue
+            if image_bytes[:15].strip().startswith(b"<"):
+                results.append({"url": img_url, "ocr_text": "", "confidence": 0.0, "error": "Downloaded HTML instead of image"})
+                continue
+            ocr_result = _ocr_image(image_bytes, ocr_enabled=True)
+            results.append({
+                "url": img_url,
+                "ocr_text": ocr_result.full_text,
+                "confidence": round(ocr_result.confidence, 4),
+                "warnings": ocr_result.warnings,
+                "error": None,
+            })
+        except requests.RequestException as exc:
+            results.append({"url": img_url, "ocr_text": "", "confidence": 0.0, "error": f"Download failed: {exc}"})
+        except Exception as exc:
+            results.append({"url": img_url, "ocr_text": "", "confidence": 0.0, "error": f"OCR failed: {exc}"})
+
+    return json.dumps(results, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # 5.  extract_jd_candidates (tool wrapper)
 # ---------------------------------------------------------------------------
 
@@ -618,9 +775,119 @@ def verify_evidence(candidates_json: str, evidence_json: str) -> str:
     candidates_data = json.loads(candidates_json)
     evidence_data = json.loads(evidence_json)
 
+    # ── Normalize evidence dicts ──
+    # The LLM agent may use non-standard field names (e.g. "text" instead of
+    # "text_excerpt", "hash" instead of "content_hash"). Map common aliases
+    # before constructing dataclass instances.
+    _EVIDENCE_FIELD_MAP: dict[str, str] = {
+        "text": "text_excerpt",
+        "hash": "content_hash",
+        "content": "text_excerpt",
+        "body": "text_excerpt",
+        "page_text": "text_excerpt",
+        "description": "text_excerpt",
+        "type": "evidence_type",
+        "page_type": "evidence_type",
+    }
+    normalized_evidence: list[dict[str, Any]] = []
+    for e in evidence_data:
+        if not isinstance(e, dict):
+            continue
+        norm: dict[str, Any] = {}
+        for k, v in e.items():
+            mapped = _EVIDENCE_FIELD_MAP.get(k, k)
+            norm[mapped] = v
+        # Ensure required fields have defaults
+        norm.setdefault("content_hash", hashlib.sha256(
+            json.dumps(e, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest())
+        norm.setdefault("evidence_type", "page_text")
+        norm.setdefault("title", None)
+        norm.setdefault("url", None)
+        norm.setdefault("text_excerpt", None)
+        norm.setdefault("metadata", None)
+        # Keep only valid PageEvidence fields
+        valid_keys = {"evidence_type", "url", "title", "content_hash", "text_excerpt", "metadata"}
+        norm = {k: v for k, v in norm.items() if k in valid_keys}
+        normalized_evidence.append(norm)
+
+    # ── Normalize candidate dicts ──
+    # The LLM agent may use non-standard field names (e.g. "position_title"
+    # instead of "title", "company" instead of "company_name").
+    _CANDIDATE_FIELD_MAP: dict[str, str] = {
+        "position_title": "title",
+        "job_title": "title",
+        "position_name": "title",
+        "job_name": "title",
+        "name": "title",
+        "position": "title",
+        "company": "company_name",
+        "employer": "company_name",
+        "organization": "company_name",
+        "location": "locations",
+        "city": "locations",
+        "work_location": "locations",
+        "description": "description_text",
+        "jd_text": "description_text",
+        "job_description": "description_text",
+        "detail": "description_text",
+        "recruitment_type": "recruitment_types",
+        "job_type": "recruitment_types",
+        "type": "recruitment_types",
+        "industry": "industries",
+        "deadline": "deadline_text",
+        "apply_method": "application_channel_json",
+        "application_channel": "application_channel_json",
+        "application_method": "application_channel_json",
+        "referral": "referral_code",
+        "code": "referral_code",
+    }
+    normalized_candidates: list[dict[str, Any]] = []
+    for c in candidates_data:
+        if not isinstance(c, dict):
+            continue
+        norm: dict[str, Any] = {}
+        for k, v in c.items():
+            mapped = _CANDIDATE_FIELD_MAP.get(k, k)
+            # Handle singular → list conversion for list fields
+            if mapped in ("locations", "recruitment_types", "industries") and isinstance(v, str):
+                v = [v] if v else []
+            norm[mapped] = v
+        # If "locations" is still a str, wrap it
+        if isinstance(norm.get("locations"), str):
+            norm["locations"] = [norm["locations"]] if norm["locations"] else []
+        if isinstance(norm.get("recruitment_types"), str):
+            norm["recruitment_types"] = [norm["recruitment_types"]] if norm["recruitment_types"] else []
+        # Ensure minimum fields exist
+        norm.setdefault("title", None)
+        norm.setdefault("company_name", None)
+        norm.setdefault("department", None)
+        norm.setdefault("description_text", "")
+        norm.setdefault("responsibilities", "")
+        norm.setdefault("requirements", "")
+        norm.setdefault("locations", [])
+        norm.setdefault("recruitment_types", [])
+        norm.setdefault("industries", [])
+        norm.setdefault("apply_url", None)
+        norm.setdefault("application_channel_json", None)
+        norm.setdefault("deadline_text", None)
+        norm.setdefault("referral_code", None)
+        norm.setdefault("confidence", 0.0)
+        norm.setdefault("evidence_refs", [])
+        norm.setdefault("normalization_warnings", [])
+        # Keep only valid NormalizedJobCandidate fields
+        valid_candidate_keys = {
+            "title", "company_name", "department", "description_text",
+            "responsibilities", "requirements", "locations", "recruitment_types",
+            "industries", "apply_url", "application_channel_json", "deadline_text",
+            "referral_code", "confidence", "evidence_refs", "normalization_warnings",
+        }
+        norm = {k: v for k, v in norm.items() if k in valid_candidate_keys}
+        normalized_candidates.append(norm)
+
     # Reconstruct dataclass instances
-    candidates = [NormalizedJobCandidate(**c) for c in candidates_data]
-    evidence = [PageEvidence(**e) for e in evidence_data]
+    candidates = [NormalizedJobCandidate(**c) for c in normalized_candidates]
+    evidence = [PageEvidence(**e) for e in normalized_evidence]
 
     verified = _verify_evidence(candidates, evidence)
     return json.dumps(_asdict(verified), ensure_ascii=False)
@@ -684,8 +951,8 @@ def standardize_from_record_fields(
     source page is a rendered article or a dynamic career site and not all
     standard fields appear as labelled JD text.
     """
-    record_fields = json.loads(record_fields_json or "[]")
-    evidence_data = json.loads(evidence_json or "[]")
+    record_fields = _safe_parse_json_arg(record_fields_json, "record_fields_json")
+    evidence_data = _safe_parse_json_arg(evidence_json, "evidence_json")
     record = _record_field_map(record_fields)
     evidence_text = _join_evidence_text(evidence_data)
 
@@ -734,6 +1001,61 @@ def standardize_from_record_fields(
         normalization_warnings=["standardized_from_tencent_record_fields"],
     )
     return json.dumps([_asdict(candidate)], ensure_ascii=False)
+
+
+def _safe_parse_json_arg(value: Any, arg_name: str) -> list[dict[str, Any]]:
+    """Parse a tool argument that may be a JSON string or already a list/dict.
+
+    LLM agents may pass tool arguments as:
+    - A JSON string (correct)
+    - An already-parsed Python list/dict (deepagents framework coercion)
+    - A malformed string or mismatched type (LLM hallucination)
+
+    Returns a list of dicts, or an empty list on any parse failure.
+    Logs a warning on unexpected input so we can monitor tool misuse.
+    """
+    if isinstance(value, list):
+        # Already parsed — filter to only dict items
+        dicts = [item for item in value if isinstance(item, dict)]
+        if len(dicts) != len(value):
+            logger.warning(
+                "standardize_from_record_fields arg %s contained %d non-dict items "
+                "(total=%d). LLM likely passed simplified field names.",
+                arg_name, len(value) - len(dicts), len(value),
+            )
+        return dicts
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                dicts = [item for item in parsed if isinstance(item, dict)]
+                if len(dicts) != len(parsed):
+                    logger.warning(
+                        "standardize_from_record_fields arg %s (JSON string) contained "
+                        "%d non-dict items (total=%d).",
+                        arg_name, len(parsed) - len(dicts), len(parsed),
+                    )
+                return dicts
+            if isinstance(parsed, dict):
+                return [parsed]
+            logger.warning(
+                "standardize_from_record_fields arg %s parsed to %s, expected list[dict].",
+                arg_name, type(parsed).__name__,
+            )
+            return []
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                "standardize_from_record_fields arg %s is not valid JSON: %s",
+                arg_name, exc,
+            )
+            return []
+    logger.warning(
+        "standardize_from_record_fields arg %s has unexpected type %s.",
+        arg_name, type(value).__name__,
+    )
+    return []
 
 
 def _record_field_map(record_fields: list[dict[str, Any]]) -> dict[str, str]:
@@ -938,7 +1260,7 @@ def open_url(url: str) -> str:
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
-        html = resp.text
+        html = _fix_response_encoding(resp)
         text = _extract_page_text(html)
 
         if _needs_browser_fallback(url, text):
@@ -1027,12 +1349,41 @@ def extract_rendered_job_evidence(url: str) -> str:
     response_urls: list[str] = []
 
     def capture_response(response: Any) -> None:
+        """Capture all JSON API responses that may contain job/position data.
+
+        Generic — works for Alibaba, Tencent, and any other career site
+        that loads positions via XHR/JSON.
+        """
         response_url = getattr(response, "url", "")
-        if "campus-talent.alibaba.com" not in response_url or "/position/search" not in response_url:
-            return
+        content_type = ""
         try:
-            payloads.append(json.loads(response.text()))
-            response_urls.append(response_url)
+            content_type = response.headers.get("content-type", "")
+        except Exception:
+            pass
+
+        # Only capture responses that look like JSON APIs
+        if "application/json" not in content_type and "json" not in content_type:
+            # Also try common API path patterns
+            is_api_path = any(
+                pattern in response_url
+                for pattern in (
+                    "/position/", "/positions", "/job/", "/jobs/",
+                    "/api/", "/search", "/list", "/query",
+                    "/campus", "/recruit", "/career",
+                )
+            )
+            if not is_api_path:
+                return
+
+        try:
+            body = response.text()
+            if not body or len(body) < 20:
+                return
+            data = json.loads(body)
+            # Accept any JSON object or array that might hold job data
+            if isinstance(data, (dict, list)):
+                payloads.append(data)
+                response_urls.append(response_url)
         except Exception:
             return
 
@@ -1059,7 +1410,11 @@ def extract_rendered_job_evidence(url: str) -> str:
 
     evidence_pages: list[dict[str, Any]] = []
     for payload in payloads:
-        evidence_pages.extend(_alibaba_position_evidence_from_search_payload(payload, url))
+        # Try Alibaba-specific extraction first, then generic extraction
+        extracted = _alibaba_position_evidence_from_search_payload(payload, url)
+        if not extracted:
+            extracted = _generic_position_evidence_from_payload(payload, url)
+        evidence_pages.extend(extracted)
 
     deduped: dict[str, dict[str, Any]] = {}
     for item in evidence_pages:
@@ -1125,13 +1480,16 @@ def _alibaba_position_evidence_from_search_payload(
         content_hash = hashlib.sha256(
             json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
+        # Truncate text_excerpt to avoid overflowing LLM context window.
+        # Large evidence payloads can trigger summarization middleware bugs
+        # where tool call/response pairings are broken.
         evidence.append(
             {
                 "evidence_type": "job_detail_json",
                 "url": evidence_url,
                 "title": title,
                 "content_hash": content_hash,
-                "text_excerpt": text[:4000],
+                "text_excerpt": text[:1500],
                 "metadata": {
                     "position_id": position_id,
                     "source_api": "alibaba_position_search",
@@ -1144,6 +1502,125 @@ def _alibaba_position_evidence_from_search_payload(
             }
         )
     return evidence
+
+
+def _generic_position_evidence_from_payload(
+    payload: dict[str, Any],
+    source_url: str,
+) -> list[dict[str, Any]]:
+    """Convert an arbitrary JSON payload that may contain job data into evidence.
+
+    Walks the payload looking for objects that have job-like fields (title,
+    name, position, description, requirement, etc.) and converts each into
+    a ``job_detail_json`` PageEvidence entry.
+    """
+    evidence: list[dict[str, Any]] = []
+
+    # --- Helper: recursively find job-like objects ---
+    def _walk(obj: Any, depth: int = 0) -> list[dict[str, Any]]:
+        if depth > 5:
+            return []
+        results: list[dict[str, Any]] = []
+        if isinstance(obj, dict):
+            # Check if this dict looks like a job record
+            keys_lower = {k.lower() for k in obj.keys() if isinstance(k, str)}
+            job_indicators = keys_lower & {
+                "name", "title", "position", "positionname", "jobname",
+                "description", "requirement", "responsibilities",
+                "company", "companyname", "employer",
+                "location", "locations", "worklocations", "city",
+                "department", "category", "categoryname",
+                "id", "positionid", "jobid", "requisitionid",
+            }
+            if len(job_indicators) >= 2:
+                results.append(obj)
+            # Also walk nested values
+            for _k, v in obj.items():
+                results.extend(_walk(v, depth + 1))
+        elif isinstance(obj, list):
+            for item in obj[:200]:  # cap per level
+                results.extend(_walk(item, depth + 1))
+        return results
+
+    job_objects = _walk(payload)
+
+    seen_ids: set[str] = set()
+    for item in job_objects:
+        title = (
+            str(item.get("name") or item.get("title") or item.get("positionName") or item.get("jobName") or "")
+        ).strip()
+        description = (
+            str(item.get("description") or item.get("jobDescription") or "")
+        ).strip()
+        requirement = (
+            str(item.get("requirement") or item.get("requirements") or item.get("qualifications") or "")
+        ).strip()
+
+        if not title:
+            continue
+        if not description and not requirement:
+            continue
+
+        # Build unique key to deduplicate
+        position_id = str(
+            item.get("id") or item.get("positionId") or item.get("jobId") or item.get("requisitionId") or ""
+        ).strip()
+        if position_id and position_id in seen_ids:
+            continue
+        if position_id:
+            seen_ids.add(position_id)
+
+        # Extract location info
+        locations = item.get("workLocations") or item.get("locations") or item.get("location") or []
+        if isinstance(locations, str):
+            locations = [locations]
+        location_str = "、".join(str(x) for x in locations if x) if isinstance(locations, list) else str(locations)
+
+        # Build the evidence text
+        parts = [f"岗位名称: {title}"]
+        if location_str:
+            parts.append(f"工作地点: {location_str}")
+        company = str(item.get("companyName") or item.get("company") or item.get("employer") or "").strip()
+        if company:
+            parts.append(f"公司名称: {company}")
+        category = str(item.get("categoryName") or item.get("category") or "").strip()
+        if category:
+            parts.append(f"岗位类别: {category}")
+        dept = str(item.get("department") or item.get("departmentName") or "").strip()
+        if dept:
+            parts.append(f"所属部门: {dept}")
+        if description:
+            parts.append(f"岗位职责:\n{description}")
+        if requirement:
+            parts.append(f"任职要求:\n{requirement}")
+
+        text = "\n".join(parts)
+        content_hash = hashlib.sha256(
+            json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+        evidence.append({
+            "evidence_type": "job_detail_json",
+            "url": source_url,
+            "title": title,
+            "content_hash": content_hash,
+            "text_excerpt": text[:1500],
+            "metadata": {
+                "position_id": position_id,
+                "source": "rendered_xhr",
+                "locations": locations if isinstance(locations, list) else [locations] if locations else [],
+                "company_name": company,
+                "category": category,
+                "department": dept,
+            },
+        })
+
+    return evidence
+
+
+# ---------------------------------------------------------------------------
+# Web nav tools — read_dom, extract_links, etc.
+# ---------------------------------------------------------------------------
 
 
 def read_dom(url: str) -> str:
@@ -1164,7 +1641,7 @@ def read_dom(url: str) -> str:
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
-        html = resp.text
+        html = _fix_response_encoding(resp)
         # Return a simplified DOM: strip only script/style but keep structure
         html = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.IGNORECASE | re.DOTALL)
         html = re.sub(r"<style[^>]*>.*?</style>", "", html, flags=re.IGNORECASE | re.DOTALL)
@@ -1311,43 +1788,81 @@ def go_back() -> str:
 # Web Navigation Subagent builder
 # ---------------------------------------------------------------------------
 
-# System prompt for the Web Navigation Agent (verbatim from spec)
+# System prompt for the Web Navigation Agent
 _WEB_NAVIGATION_SYSTEM_PROMPT = """\
-You are the Web Navigation Agent.
+You are the Web Navigation Agent. Find ALL job listing pages and JD detail pages starting from a URL and return evidence.
 
-Goal: Starting from a public URL, find credible job list pages and JD detail pages.
+## Tools
+- open_url(url): Fetch visible text (use first).
+- open_rendered_url(url): Real browser render. Use when open_url returns empty/JS-only.
+- extract_rendered_job_evidence(url): Browser + XHR capture. Use for SPAs (Alibaba campus etc).
+- extract_links(url): Get all links. Use to find career/job nav.
+- click_link(url, text): Follow a link by text.
+- read_dom, get_visible_text, go_back, screenshot: Additional navigation tools.
 
-Allowed actions:
-- Open pages.
-- Open pages in a headless browser when static HTML is empty or JavaScript-rendered.
-- Extract rendered job evidence from public recruitment XHR/JSON when a page is an SPA.
-- Read visible text and DOM links.
-- Follow navigation links likely related to Careers, Jobs, Join Us, Campus Recruitment, Internships, Recruiting, or Chinese equivalents.
-- Capture evidence screenshots and page text.
+## Strategy
+- **Career SPAs** (Alibaba/join.qq.com/campus sites): Use extract_rendered_job_evidence directly — these load jobs via XHR.
+- **Career homepages**: open_url → extract_links → find "加入我们/校园招聘/实习/Careers/Jobs/Campus" links → click → open detail pages.
+- **WeChat (mp.weixin.qq.com)**: open_url (fetched via ReadGZH proxy). Return text as evidence.
+- **Job detail pages**: open_url, read text, return as evidence.
+- Find ALL positions, not just one. Return evidence_pages for each.
+- Budget enforced. Stop on login/captcha/block — report reason. Don't extract final JD fields.
+"""
 
-Rules:
-- Stay within the tool-enforced page budget.
-- Do not attempt login.
-- Do not solve captcha or anti-bot challenges.
-- Return discovered JD evidence pages and discovery path.
-- Do not extract final standardized jobs; the supervisor will call extraction tools."""
-
-# System prompt for the Discovery Supervisor Agent (verbatim from spec)
+# System prompt for the Discovery Supervisor Agent
 _SUPERVISOR_SYSTEM_PROMPT = """\
-You are the Discovery Supervisor Agent for a campus career assistant.
+You are the Discovery Supervisor Agent. Given a Tencent sheet record and a URL, discover ALL job descriptions, extract candidates, verify evidence, and return a DiscoveryRunResult.
 
-Goal: Given a Tencent smart sheet raw record and one source URL, discover job JD evidence, extract standard job candidates, verify evidence, and return a structured result.
+## Workflow (Plan → Act → Verify → Finish)
 
-Rules:
-- Use tools in a loop. Decide the next action from observations.
-- Do not bypass login, captcha, anti-bot, permission, or paywall barriers.
-- If blocked by login, captcha, anti-bot, unavailable WeChat content, or permission limits, finish as needs_manual_review with a precise reason.
-- Do not write to the database. Return structured evidence and candidates only.
-- Respect all budgets enforced by tools.
-- Prefer evidence from official company, official career site, public WeChat article, or direct recruitment page.
-- Email application instructions are valid application channels. Extract email, subject hint, materials, and original instruction.
-- If information is insufficient, ask tools for more evidence or finish as needs_manual_review.
-- Never invent company, title, location, deadline, or apply method."""
+### Step 1: Triage
+Call triage_link(url). Then follow the path for the returned site_type.
+
+### Step 2: Act by URL type
+
+**WeChat article (wechat_article / mp.weixin.qq.com):**
+1. Fetch content: call run_web_navigation(url) to get article via ReadGZH proxy.
+2. Parse: call parse_wechat_article(html, url) to get title, text, image_urls, and email instructions.
+3. OCR images (REQUIRED when image_urls not empty): call ocr_images_from_urls(json.dumps(image_urls)). JD info is often embedded in WeChat images.
+4. Combine: article text + OCR text from all images = complete content.
+5. Extract: call extract_jd_candidates(combined_text, url). If returns empty but you see JD info, manually build candidate dicts using record_fields for company/title/location hints.
+6. **Follow official recruitment links in the article text** (IMPORTANT — many WeChat articles say "点击阅读原文投递" or include a career site URL):
+   - Scan article text + OCR text for URLs like campus.xxx.com, xxx.com/careers, join.xxx.com, xxx.zhaopin.com.
+   - If a career site URL is found: call run_web_navigation(career_url) to get richer JD evidence.
+   - Extract full JD from the career site (follow the career site path below).
+   - Use the career site URL as apply_url (more trustworthy than WeChat article URL).
+   - Merge: WeChat text provides company/title/context; career site provides detailed JD/responsibilities/requirements.
+7. For email-only articles: extract email address, subject format, materials needed. Set application_channel_json to {"type":"email","email":"...","subject_hint":"..."}.
+
+**Career site / Job detail (career_site, job_detail, official_site):**
+1. Navigate: call run_web_navigation(url). Web Navigation Agent explores the site and returns evidence pages with text and job data.
+2. For each evidence page, call extract_jd_candidates(text, url).
+3. For SPA pages (Alibaba campus, etc.), evidence comes as job_detail_json with structured fields already extracted.
+4. Fallback: if no candidates but you have record_fields, call standardize_from_record_fields.
+
+**Blocked / invalid:** Call finish_with_manual_review(reason).
+
+### Step 3: Verify
+Call verify_evidence(candidates_json, evidence_json). Rejected candidates may need evidence_refs fixed and re-verified.
+
+### Step 4: Package
+Call package_candidates(verified_json, evidence_hash, source_key). Set status to "succeeded" (found candidates), "partial_success" (budget exhausted), "needs_manual_review" (blocked), or "failed".
+
+## Critical Rules
+- Never invent data. Use evidence or record_fields.
+- Never bypass login/captcha/anti-bot — mark needs_manual_review.
+- Multiple positions → multiple candidates. Extract ALL of them.
+- Always OCR WeChat images. JD data is often in images, not text.
+- Use record_fields (公司名称, 招聘岗位, 工作地点) to fill missing fields.
+- Email-only applications ARE valid candidates — extract instructions.
+
+## Stopping Conditions (to avoid infinite loops)
+- **Maximum 12 tool calls per task.** If you've made 10+ calls and have no candidates, use standardize_from_record_fields as a fallback, then finish.
+- **If run_web_navigation returns no useful evidence** (empty text, blocked, or only metadata): call standardize_from_record_fields with record_fields + any evidence, then finish.
+- **If extract_jd_candidates returns empty twice** for the same text: stop retrying. Use standardize_from_record_fields or finish with needs_manual_review.
+- **If you've tried both the text path AND the OCR path** for a WeChat article and found no JD: finish. The article likely doesn't contain job listings.
+- After triage_link + run_web_navigation + parse_wechat_article + extract_jd_candidates: if you have candidates, verify and package them. If not, call standardize_from_record_fields. Do NOT loop back to navigation.
+"""
 
 
 def create_web_navigation_subagent(
@@ -1374,6 +1889,7 @@ def create_web_navigation_subagent(
         open_url,
         open_rendered_url,
         extract_rendered_job_evidence,
+        ocr_images_from_urls,
         read_dom,
         extract_links,
         click_link,
@@ -1386,7 +1902,7 @@ def create_web_navigation_subagent(
         "name": "web_navigation_agent",
         "description": (
             "Navigates web pages to discover job JD evidence. "
-            "Provides page text, links, and screenshots. "
+            "Provides page text, links, OCR of page images, and screenshots. "
             "Enforces page budget and domain safety."
         ),
         "system_prompt": _WEB_NAVIGATION_SYSTEM_PROMPT,
@@ -1394,6 +1910,105 @@ def create_web_navigation_subagent(
     }
 
     return subagent
+
+
+# ---------------------------------------------------------------------------
+# Prompt template loading
+# ---------------------------------------------------------------------------
+
+_PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
+
+
+def _load_prompt(name: str, required: bool = True) -> str:
+    """Load a prompt template file by name (without .txt extension).
+
+    Args:
+        name: Template name. Loads prompts/{name}.txt.
+        required: If True, raises FileNotFoundError when file is missing.
+                  If False, returns empty string for missing files.
+
+    Returns:
+        Template content as string.
+
+    Raises:
+        FileNotFoundError: If required=True and the file does not exist.
+    """
+    path = _PROMPT_DIR / f"{name}.txt"
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(
+                f"Required prompt template not found: {path}"
+            )
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def build_supervisor_prompt(snapshot_context: dict | None = None) -> str:
+    """Assemble the Supervisor system prompt from template files.
+
+    Always loads supervisor_base.txt. When snapshot_context is None,
+    appends supervisor_clean_start.txt (optional). When snapshot_context
+    is provided, interpolates it into supervisor_snapshot_fallback.txt
+    (optional) so the Supervisor can resume from a failed snapshot step.
+
+    Args:
+        snapshot_context: If provided, the Supervisor is taking over from
+            a failed SnapshotExecutor / Adapter. Contains completed_steps,
+            failed_step, source, and strategy_id.
+
+    Returns:
+        Complete system prompt string for the Supervisor Agent.
+    """
+    parts: list[str] = [_load_prompt("supervisor_base", required=True)]
+
+    if snapshot_context is None:
+        clean_start = _load_prompt("supervisor_clean_start", required=False)
+        if clean_start:
+            parts.append(clean_start)
+    else:
+        template = _load_prompt("supervisor_snapshot_fallback", required=False)
+        if template:
+            ctx = {
+                "source": snapshot_context.get("source", "unknown"),
+                "strategy_id": snapshot_context.get("strategy_id", "unknown"),
+                "failed_step_count": len(snapshot_context.get("completed_steps", [])) + 1,
+                "completed_steps": _format_snapshot_steps(
+                    snapshot_context.get("completed_steps", [])
+                ),
+                "failed_step_tool": snapshot_context.get("failed_step", {}).get("tool", ""),
+                "failed_step_params": json.dumps(
+                    snapshot_context.get("failed_step", {}).get("params", {}),
+                    ensure_ascii=False,
+                ),
+                "failed_step_error": str(
+                    snapshot_context.get("failed_step", {}).get("error", "")
+                ),
+            }
+            parts.append(template.format(**ctx))
+
+    return "\n\n".join(parts)
+
+
+def _format_snapshot_steps(completed_steps: list[dict]) -> str:
+    """Format completed snapshot steps as human-readable text."""
+    if not completed_steps:
+        return "(none)"
+    lines = []
+    for i, step in enumerate(completed_steps, 1):
+        tool = step.get("tool", "?")
+        params_summary = _summarize_params(step.get("params", {}))
+        lines.append(f"  {i}. {tool}({params_summary}) — succeeded")
+    return "\n".join(lines)
+
+
+def _summarize_params(params: dict) -> str:
+    """Create a short summary of tool parameters for display."""
+    if not params:
+        return ""
+    keys = list(params.keys())
+    if len(keys) <= 2:
+        return ", ".join(f"{k}=..." for k in keys)
+    return f"{', '.join(f'{k}=...' for k in keys[:2])}, ..."
 
 
 # ---------------------------------------------------------------------------
@@ -1489,6 +2104,7 @@ def build_web_navigation_agent(
             open_url,
             open_rendered_url,
             extract_rendered_job_evidence,
+            ocr_images_from_urls,
             read_dom,
             extract_links,
             click_link,
@@ -1506,6 +2122,7 @@ def build_discovery_supervisor_agent(
     *,
     settings: Settings,
     model: ChatOpenAI | None = None,
+    snapshot_context: dict | None = None,
 ) -> Any:
     """Build the Discovery Supervisor Agent using deepagents.
 
@@ -1513,11 +2130,15 @@ def build_discovery_supervisor_agent(
     - 8 supervisor tools wrapping Phase 4 deterministic functions
     - A WebNavigationAgent subagent for web navigation
     - Structured output via DiscoveryRunResult (if supported) or tool-based
+    - Optional snapshot_context for breakpoint takeover
 
     Args:
         settings: Application settings (model name, page budget, etc.).
         model: Optional pre-built ChatOpenAI instance. If None, one is
                created from settings.
+        snapshot_context: If provided, Supervisor takes over from a failed
+            SnapshotExecutor/Adapter. Injects completed steps and failed
+            step info into the system prompt.
 
     Returns:
         A CompiledStateGraph (deep agent) ready for invocation.
@@ -1558,6 +2179,7 @@ def build_discovery_supervisor_agent(
         triage_link,
         _make_run_web_navigation(settings),
         parse_wechat_article,
+        ocr_images_from_urls,
         _make_run_ocr(settings),
         extract_jd_candidates,
         standardize_from_record_fields,
@@ -1566,13 +2188,16 @@ def build_discovery_supervisor_agent(
         finish_with_manual_review,
     ]
 
+    # Build prompt from template files
+    system_prompt = build_supervisor_prompt(snapshot_context)
+
     # Create the deep agent — try response_format for structured output
     try:
         agent = create_deep_agent(
             model=model,
             tools=final_tools,
             subagents=[web_nav_subagent],
-            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             name="discovery_supervisor",
             response_format=_DiscoveryRunResultPydantic,
         )
@@ -1582,7 +2207,7 @@ def build_discovery_supervisor_agent(
             model=model,
             tools=final_tools,
             subagents=[web_nav_subagent],
-            system_prompt=_SUPERVISOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             name="discovery_supervisor",
         )
 

@@ -84,3 +84,39 @@ The original build concern above is resolved by the regenerated frontend lockfil
 - RED proved that both the backend entrypoint and Redis runtime helper accepted CR/LF in credentials. GREEN rejects CR/LF (the backend rejects all ASCII control characters) with fixed redacted errors that never echo values.
 - The executable Redis helper tests pass credentials containing single quotes, double quotes, and backslashes, authenticate successfully, and verify `/tmp/redis.conf` mode 0600. Separate CR/LF tests exit 78 with only the fixed error.
 - RED also proved the business MySQL engine inherited the 2-second probe timeout. GREEN separates the lifespan-owned readiness engine from the global business engine and verifies disposal during `ensure_bucket()` failure.
+
+## 6. Fix applied
+
+### Finding 1: Removed dead recursion_limit
+
+Removed the unused `recursion_limit = 30 if snapshot_context is not None else 50` line. The variable was set in `build_discovery_supervisor_agent()` but never passed to `create_deep_agent`. The function now omits it entirely.
+
+### Finding 2: _load_prompt raises for missing required files
+
+Added `required: bool = True` parameter to `_load_prompt()`. When `required=True` and the file is missing, `FileNotFoundError` is raised. When `required=False`, returns empty string (previous default behavior).
+
+Updated `build_supervisor_prompt()` calls:
+- `_load_prompt("supervisor_base", required=True)` — base is required
+- `_load_prompt("supervisor_clean_start", required=False)` — mode templates optional
+- `_load_prompt("supervisor_snapshot_fallback", required=False)` — mode templates optional
+
+Also added:
+- `build_supervisor_prompt()` function that assembles the supervisor prompt from template files, accepting optional `snapshot_context` for breakpoint takeover
+- Three prompt template files: `prompts/supervisor_base.txt`, `prompts/supervisor_clean_start.txt`, `prompts/supervisor_snapshot_fallback.txt`
+- `_format_snapshot_steps()` and `_summarize_params()` helper functions
+
+**Test results after fix:**
+```
+============================= test session starts =============================
+platform win32 -- Python 3.12.5, pytest-8.4.2, pluggy-1.6.0
+cachedir: .pytest_cache
+rootdir: D:\Python\langgraph-multi-agent-career-assistant-main
+configfile: pyproject.toml
+plugins: anyio-4.14.2, langsmith-0.10.3, asyncio-1.4.0
+asyncio: mode=Mode.STRICT
+collecting ... collected 63 items / 62 deselected / 1 selected
+
+tests/integration/test_job_discovery_deepagents.py::TestSupervisorSystemPrompt::test_prompt_contains_key_elements PASSED [100%]
+
+====================== 1 passed, 62 deselected in 5.85s =======================
+```

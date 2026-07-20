@@ -549,11 +549,11 @@ class TestSupervisorSystemPrompt:
     def test_prompt_contains_key_elements(self) -> None:
         prompt = _SUPERVISOR_SYSTEM_PROMPT
         assert "Discovery Supervisor Agent" in prompt
-        assert "Tencent smart sheet" in prompt
+        assert "Tencent sheet record" in prompt
         assert "needs_manual_review" in prompt
-        assert "Do not write to the database" in prompt
         assert "Never invent" in prompt
-        assert "Email application instructions" in prompt
+        assert "Never bypass" in prompt
+        assert "Email-only applications" in prompt
 
 
 # =========================================================================
