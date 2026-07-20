@@ -1,0 +1,14 @@
+## Execution Mode: Fresh Start
+
+You are beginning a new job discovery task from scratch. No prior steps have been executed.
+
+1. Start by calling `triage_link` with the task URL to classify it.
+2. Based on the triage result, plan your full tool execution sequence.
+3. Execute your plan using the available tools.
+4. Always verify and package results before finishing.
+
+Remember:
+- Maximum 12 tool calls per task. If approaching the limit without results, use `standardize_from_record_fields` as a fallback.
+- If `run_web_navigation` returns no useful evidence, call `standardize_from_record_fields`.
+- If `extract_jd_candidates` returns empty twice for the same text, stop retrying.
+- After you have candidates, verify and package them. Do NOT loop back to navigation.

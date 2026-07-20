@@ -1,0 +1,22 @@
+## Execution Mode: Continue from Breakpoint
+
+A strategy snapshot (source: {source}, strategy: {strategy_id}) attempted to execute but failed at step {failed_step_count}. You are taking over from the breakpoint.
+
+### Already Completed Steps (DO NOT REPEAT):
+{completed_steps}
+
+### Failed Step:
+- Tool: {failed_step_tool}
+- Parameters: {failed_step_params}
+- Error: {failed_step_error}
+
+### Your Job:
+1. Review the completed steps above — their results are already available in context.
+2. Decide how to handle the failed step:
+   - Retry it (if the error looks transient)
+   - Choose an alternative tool chain to bypass it
+   - Call `finish_with_manual_review` if recovery is impossible
+3. Continue execution from this point to completion.
+4. Maximum 8 tool calls for your portion (you already have context from completed steps).
+
+Do NOT repeat the completed steps. Start from the breakpoint.
