@@ -7,6 +7,7 @@ are available for persistence (via to_dict).
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -70,7 +71,7 @@ class TrajectoryBuffer:
             "error_type": type(error).__name__ if error else None,
             "duration_ms": duration_ms,
             "is_fallback": is_fallback,
-            "timestamp": time.monotonic(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         if status == "failed" and not self._failed:
             self._failed = True
@@ -85,7 +86,7 @@ class TrajectoryBuffer:
         """
         fail_idx = self.failed_step_index
         if fail_idx is None:
-            return {}
+            return {"completed_steps": [], "failed_step": None}
         completed = self._steps[:fail_idx]
         failed = self._steps[fail_idx]
         return {
