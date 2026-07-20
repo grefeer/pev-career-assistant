@@ -39,23 +39,15 @@ class AlibabaSPAAdapter(DomainAdapter):
 
         trajectory.record_step("alibaba_api_fetch", "ok", {"url": task.source_url})
 
-        try:
-            search_data = _fetch_alibaba_search_api(task.source_url)
-            evidence = _generic_position_evidence_from_payload(search_data, task.source_url)
-            trajectory.record_step("alibaba_evidence_extract", "ok", {},
-                                   {"evidence_count": len(evidence)})
-        except Exception as exc:
-            trajectory.record_step("alibaba_api_fetch", "failed", {"url": task.source_url},
-                                   error=exc)
-            return DiscoveryRunResult(
-                status="failed",
-                summary=f"Alibaba SPA adapter API call failed: {exc}",
-            )
+        search_data = _fetch_alibaba_search_api(task.source_url)
+        evidence = _generic_position_evidence_from_payload(search_data, task.source_url)
+        trajectory.record_step("alibaba_evidence_extract", "ok", {},
+                               {"evidence_count": len(evidence)})
 
         if not evidence:
-            return DiscoveryRunResult(
-                status="failed",
-                summary="No job evidence found in Alibaba search API response",
+            raise RuntimeError(
+                "Alibaba SPA adapter: API call succeeded but no job evidence "
+                "found in the response payload"
             )
 
         # Use deterministic tools for JD extraction / verification / packaging
