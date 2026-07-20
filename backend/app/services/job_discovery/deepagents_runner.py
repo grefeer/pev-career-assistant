@@ -1181,8 +1181,14 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
     """Call the Alibaba campus position search JSON API directly.
 
     Extracts the batch ID and share code from the source SPA URL,
-    then calls the ``/position/search`` API endpoint directly,
-    bypassing the browser-based SPA rendering entirely.
+    then POSTs to the ``/position/search`` API endpoint.  Uses a
+    ``requests.Session`` to capture cookies from the main landing page
+    first, which avoids 403 anti-bot rejections on the search endpoint.
+
+    If the direct API call fails (405, 403, timeout, etc.), falls back to
+    the Playwright browser-based ``extract_rendered_job_evidence`` path,
+    which navigates the full SPA and captures XHR responses from the real
+    browser environment.
 
     Args:
         url: The Alibaba campus SPA URL (e.g. ``https://campus-talent.alibaba.com/
@@ -1192,14 +1198,14 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
         The parsed JSON response from the position search API.
 
     Raises:
-        requests.RequestException: If the API call fails.
+        requests.RequestException: If both direct API and browser fallback fail.
         ValueError: If the response is not valid JSON.
     """
-    from urllib.parse import urlencode, urlparse
+    from urllib.parse import urlencode, urlparse, unquote_plus
 
     parsed = urlparse(url)
-    # Build the search API URL from the same base host
-    api_base = f"{parsed.scheme}://{parsed.netloc}/position/search"
+    api_url = f"{parsed.scheme}://{parsed.netloc}/position/search"
+    landing_url = f"{parsed.scheme}://{parsed.netloc}/campus/index"
 
     # Extract relevant query parameters from the original URL
     params: dict[str, str] = {}
@@ -1207,34 +1213,104 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
         for pair in parsed.query.split("&"):
             if "=" in pair:
                 k, v = pair.split("=", 1)
-                from urllib.parse import unquote_plus
                 params[k] = unquote_plus(v)
 
-    # Preserve batchId and campusShareCode — these are the key params
-    # the Alibaba SPA sends to its search API.
-    filtered: dict[str, str] = {}
+    # Build the POST body — Alibaba's /position/search expects JSON
+    body: dict[str, object] = {"pageSize": 50, "pageNum": 1}
     for key in ("batchId", "campusShareCode", "batchIds"):
         if key in params:
-            filtered[key] = params[key]
+            body[key] = params[key]
 
-    query_string = urlencode(filtered)
-    api_url = f"{api_base}?{query_string}" if query_string else api_base
+    common_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+    }
 
-    resp = requests.get(
-        api_url,
-        timeout=30,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125 Safari/537.36"
-            ),
-            "Accept": "application/json, text/plain, */*",
-            "Referer": url,
-        },
+    session = requests.Session()
+
+    # ── Step 1: warm the session by visiting the landing page ──
+    try:
+        landing_resp = session.get(
+            landing_url,
+            timeout=15,
+            headers={**common_headers, "Referer": url},
+        )
+        landing_resp.raise_for_status()
+    except requests.RequestException:
+        # Landing page is optional — proceed without cookies
+        pass
+
+    # ── Step 2: POST to the search API ──
+    direct_error: str | None = None
+    try:
+        resp = session.post(
+            api_url,
+            json=body,
+            timeout=30,
+            headers={
+                **common_headers,
+                "Referer": landing_url,
+                "Origin": f"{parsed.scheme}://{parsed.netloc}",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
+        if resp.status_code == 200 and len(resp.text) > 50:
+            data = resp.json()
+            if isinstance(data, dict) and (data.get("content") or data.get("data")):
+                return data
+            # Response is valid JSON but doesn't contain expected keys;
+            # fall through to the browser path.
+            direct_error = f"API returned 200 but unrecognised shape: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
+        else:
+            direct_error = (
+                f"Direct POST {api_url} returned {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+    except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+        direct_error = f"Direct POST {api_url} failed: {exc}"
+
+    # ── Step 3: fall back to Playwright browser-based extraction ──
+    try:
+        result_json = extract_rendered_job_evidence(url)
+        result = json.loads(result_json)
+        evidence_pages = result.get("evidence_pages") or []
+        if evidence_pages:
+            # Convert evidence_pages back to a search-like payload so the
+            # caller can process it with _generic_position_evidence_from_payload
+            return {
+                "content": {"datas": [
+                    _evidence_to_position_item(ev) for ev in evidence_pages
+                ]},
+            }
+        direct_error = f"{direct_error}; browser fallback found no evidence pages"
+    except Exception as browser_exc:
+        direct_error = f"{direct_error}; browser fallback also failed: {browser_exc}"
+
+    raise requests.RequestException(
+        f"Alibaba position search failed: {direct_error}"
     )
-    resp.raise_for_status()
-    return resp.json()
+
+
+def _evidence_to_position_item(ev: dict[str, Any]) -> dict[str, Any]:
+    """Convert a single evidence dict into a position-item dict matching the
+    expected ``content.datas[]`` shape so that ``_generic_position_evidence_from_payload``
+    can process it."""
+    meta = ev.get("metadata") or {}
+    return {
+        "id": meta.get("position_id", ""),
+        "name": ev.get("title", ""),
+        "description": ev.get("text_excerpt", ""),
+        "requirement": "",
+        "workLocations": meta.get("locations") or [],
+        "circleNames": meta.get("circleNames") or [],
+        "categoryName": meta.get("categoryName", ""),
+        "batchName": meta.get("batchName", ""),
+    }
 
 
 def _generic_position_evidence_from_payload(
