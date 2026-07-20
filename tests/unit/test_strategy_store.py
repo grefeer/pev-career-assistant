@@ -15,6 +15,7 @@ from backend.app.services.job_discovery.strategy.strategy_store import (
     increment_success,
     get_strategies_due_for_health_check,
     record_health_check,
+    validate_plan_yaml,
 )
 
 
@@ -171,3 +172,65 @@ class TestHealthCheck:
         assert updated is not None
         assert updated.error_count == 1
         assert updated.last_error_reason == "site_changed"
+
+
+class TestValidatePlanYaml:
+    def test_validate_plan_yaml_valid(self):
+        plan = """
+plan:
+  - tool: triage_link
+    params:
+      url: "{{task.url}}"
+    expect: "classify URL"
+    on_error: "skip"
+  - tool: extract_jd_candidates
+    params:
+      page_text: "{{prev.result.text}}"
+      url: "{{task.url}}"
+    expect: "extract JDs"
+    on_error: "retry_then_skip"
+"""
+        errors = validate_plan_yaml(plan)
+        assert errors == []
+
+    def test_validate_plan_yaml_unknown_root(self):
+        plan = """
+plan:
+  - tool: test
+    params:
+      url: "{{unknown.field}}"
+"""
+        errors = validate_plan_yaml(plan)
+        assert len(errors) == 1
+        assert "unknown root 'unknown'" in errors[0]
+
+    def test_validate_plan_yaml_deep_nesting(self):
+        plan = """
+plan:
+  - tool: test
+    params:
+      url: "{{prev.result.a.b}}"
+"""
+        errors = validate_plan_yaml(plan)
+        assert len(errors) == 1
+        assert "nesting too deep" in errors[0]
+
+    def test_validate_plan_yaml_invalid_yaml(self):
+        errors = validate_plan_yaml("{bad: yaml: {{task.url}}")
+        assert len(errors) == 1
+        assert "Invalid YAML" in errors[0]
+
+    def test_validate_plan_yaml_not_a_list(self):
+        errors = validate_plan_yaml("not_a_list: true")
+        assert len(errors) == 1
+        assert "must contain a list" in errors[0]
+
+    def test_validate_plan_yaml_inline_list(self):
+        """Test that a YAML doc with an inline list (no 'plan' key) still validates."""
+        plan = """
+- tool: triage_link
+  params:
+    url: "{{task.url}}"
+"""
+        errors = validate_plan_yaml(plan)
+        assert errors == []

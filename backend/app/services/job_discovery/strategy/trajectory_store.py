@@ -1,8 +1,10 @@
 """TrajectoryStore -- persist execution trajectories and schedule LLM annotations."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import JobDiscoveryTrajectory
@@ -101,6 +103,18 @@ def get_pending_annotations(db: Session) -> list[JobDiscoveryTrajectory]:
         for t in results
         if t.annotations and t.annotations.get("_annotation_pending") is True
     ]
+
+
+def purge_old_trajectories(db: Session, retention_days: int) -> int:
+    """Delete trajectories older than retention_days. Returns count deleted."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    result = db.execute(
+        delete(JobDiscoveryTrajectory).where(
+            JobDiscoveryTrajectory.created_at < cutoff
+        )
+    )
+    db.commit()
+    return result.rowcount
 
 
 def _map_status(result: DiscoveryRunResult, trajectory: TrajectoryBuffer) -> str:

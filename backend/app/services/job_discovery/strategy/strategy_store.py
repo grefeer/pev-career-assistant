@@ -13,14 +13,59 @@ Key design notes:
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import yaml
 from sqlalchemy import and_, case, func, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import JobDiscoveryStrategy
 from backend.app.services.job_discovery.strategy.error_classifier import classify_error
+
+
+_ALLOWED_TEMPLATE_ROOTS = {"task", "prev"}
+_MAX_NESTING = 2  # task.field or prev.result.field (2 levels below root)
+
+
+def validate_plan_yaml(plan_yaml: str) -> list[str]:
+    """Validate all {{...}} template references in a plan YAML.
+
+    Returns list of error messages (empty = valid).
+    """
+    errors: list[str] = []
+    try:
+        plan = yaml.safe_load(plan_yaml)
+    except yaml.YAMLError as exc:
+        return [f"Invalid YAML: {exc}"]
+    steps = plan.get("plan", plan) if isinstance(plan, dict) else plan
+    if not isinstance(steps, list):
+        return ["plan_yaml must contain a list of steps"]
+
+    template_pattern = re.compile(r"\{\{(.+?)\}\}")
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            errors.append(f"step {i}: must be a dict, got {type(step).__name__}")
+            continue
+        params = step.get("params", {})
+        for key, value in (params.items() if isinstance(params, dict) else {}):
+            if not isinstance(value, str):
+                continue
+            for match in template_pattern.finditer(value):
+                var_path = match.group(1).strip()
+                parts = var_path.split(".")
+                if parts[0] not in _ALLOWED_TEMPLATE_ROOTS:
+                    errors.append(
+                        f"step {i} param '{key}': unknown root '{parts[0]}' "
+                        f"in '{{{{{var_path}}}}}'. Allowed: {_ALLOWED_TEMPLATE_ROOTS}"
+                    )
+                elif len(parts) - 1 > _MAX_NESTING:
+                    errors.append(
+                        f"step {i} param '{key}': nesting too deep in "
+                        f"'{{{{{var_path}}}}}'. Max: {_MAX_NESTING} level"
+                    )
+    return errors
 
 
 def get_active_strategies(db: Session) -> list[JobDiscoveryStrategy]:

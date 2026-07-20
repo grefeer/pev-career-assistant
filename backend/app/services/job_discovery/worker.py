@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import time
@@ -60,12 +61,16 @@ from backend.app.services.job_discovery.strategy.snapshot_executor import (
 )
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
 from backend.app.services.job_discovery.strategy.trajectory_store import (
+    purge_old_trajectories,
     save_trajectory,
     schedule_annotation,
 )
 from backend.app.services.job_discovery.strategy import strategy_store as strat_store
 from backend.app.services.job_discovery.schemas import StrategyRecord
 from backend.app.services.job_discovery.strategy import error_classifier
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +482,13 @@ class JobDiscoveryWorker:
                             )
                             snapshot_context = trajectory.to_snapshot_context()
                             executor_type = "supervisor"
-                            strategy_record = None  # Clear so we don't double-record
+                            # Increment error count BEFORE clearing strategy_record
+                            strat_store.increment_error_count(db, strategy_record.id, {
+                                "tool": strategy_record.adapter,
+                                "reason": error_classifier.classify_error(str(adapter_exc)),
+                                "message": str(adapter_exc)[:500],
+                            })
+                            strategy_record = None  # Clear so supervisor outcome isn't double-counted
                     else:
                         # ── Fast path: SnapshotExecutor ──
                         executor_type = "snapshot"
@@ -489,6 +500,15 @@ class JobDiscoveryWorker:
                         if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
                             snapshot_context = snap_result.snapshot_context
                             executor_type = "supervisor"
+                            # Increment error count BEFORE clearing strategy_record
+                            fail_idx = trajectory.failed_step_index
+                            if fail_idx is not None and trajectory.steps:
+                                failed_step = trajectory.steps[fail_idx]
+                                strat_store.increment_error_count(db, strategy_record.id, {
+                                    "tool": failed_step.get("tool", "snapshot"),
+                                    "reason": error_classifier.classify_error(failed_step.get("error", "")),
+                                    "message": str(failed_step.get("error", ""))[:500],
+                                })
                             strategy_record = None
                         else:
                             result = snap_result
@@ -663,10 +683,24 @@ class JobDiscoveryWorker:
         interval, performs an HTTP HEAD against each derived base URL, and
         records the result.  Failures are caught and logged via the strategy
         store's error counter so the strategy can be automatically degraded.
+
+        Also purges old trajectories based on ``trajectory_retention_days``.
         """
         try:
             db = self.db_factory()
             try:
+                # ── Purge old trajectories ──────────────────────────────
+                if self.settings.trajectory_retention_days > 0:
+                    try:
+                        deleted = purge_old_trajectories(
+                            db, self.settings.trajectory_retention_days
+                        )
+                        if deleted > 0:
+                            logger.info("Purged %d old trajectories", deleted)
+                    except Exception:
+                        db.rollback()
+
+                # ── Health checks ───────────────────────────────────────
                 due = strat_store.get_strategies_due_for_health_check(
                     db,
                     interval_hours=self.settings.strategy_health_check_interval_hours,
