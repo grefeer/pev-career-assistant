@@ -94,6 +94,14 @@ class Settings(BaseSettings):
     job_discovery_browser_headless: bool = True
     job_discovery_ocr_enabled: bool = False
 
+    # Strategy Router settings
+    job_discovery_strategy_enabled: bool = False
+    strategy_degradation_threshold: int = Field(default=3, ge=1, le=10)
+    strategy_recovery_threshold: int = Field(default=2, ge=1, le=10)
+    trajectory_retention_days: int = Field(default=90, ge=7, le=365)
+    strategy_health_check_interval_hours: int = Field(default=24, ge=1, le=168)
+    trajectory_annotation_enabled: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
