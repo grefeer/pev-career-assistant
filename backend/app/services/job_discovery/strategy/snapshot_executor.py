@@ -48,11 +48,25 @@ class SnapshotExecutor:
         strategy: StrategyRecord,
         task: DiscoveryTaskInput,
         trajectory: TrajectoryBuffer,
+        tool_dependencies: dict[str, Any] | None = None,
     ) -> None:
         self.strategy = strategy
         self.task = task
         self.trajectory = trajectory
         self._context: dict[str, Any] = {"task": task, "prev": None}
+        self._runtime_tools: dict[str, Any] = {}
+        if tool_dependencies:
+            self._inject_runtime_tools(tool_dependencies)
+
+    def _inject_runtime_tools(self, deps: dict[str, Any]) -> None:
+        """Inject runtime-dependent tools (settings/model/subagent) from worker context.
+
+        Currently wraps ``run_web_navigation`` which depends on objects
+        (settings, model, subagent) only available inside the Supervisor.
+        """
+        run_web_navigation = deps.get("run_web_navigation")
+        if run_web_navigation:
+            self._runtime_tools["run_web_navigation"] = run_web_navigation
 
     def execute(self) -> DiscoveryRunResult:
         """Execute the plan. Returns SnapshotExecutionResult on any step failure."""
@@ -63,8 +77,9 @@ class SnapshotExecutor:
             params = self._resolve_template(step.get("params", {}))
             tool_name = step["tool"]
 
+            # All step errors are terminal -- trigger Supervisor fallback
             try:
-                result = _call_tool_by_name(tool_name, **params)
+                result = _call_tool_by_name(tool_name, executor=self, **params)
                 self.trajectory.record_step(tool_name, "ok", params, result)
                 self._context["prev"] = {"result": result}
                 completed.append({"tool": tool_name, "params": params, "result": result})
@@ -181,33 +196,33 @@ class SnapshotExecutor:
                     evidence.append(PageEvidence(**result))
                 elif isinstance(result.get("candidates"), list):
                     candidates_data = result["candidates"]
-                    candidates = [
+                    candidates.extend(
                         NormalizedJobCandidate(**c)
                         for c in candidates_data
                         if isinstance(c, dict)
-                    ]
+                    )
                 elif isinstance(result.get("evidence"), list):
                     evidence_data = result["evidence"]
-                    evidence = [
+                    evidence.extend(
                         PageEvidence(**e)
                         for e in evidence_data
                         if isinstance(e, dict)
-                    ]
+                    )
             if isinstance(result, list) and result:
                 first = result[0] if isinstance(result[0], dict) else None
                 if first and isinstance(first, dict):
                     if "evidence_type" in first:
-                        evidence = [
+                        evidence.extend(
                             PageEvidence(**e)
                             for e in result
                             if isinstance(e, dict)
-                        ]
+                        )
                     else:
-                        candidates = [
+                        candidates.extend(
                             NormalizedJobCandidate(**c)
                             for c in result
                             if isinstance(c, dict)
-                        ]
+                        )
 
         # If the last step returned a JSON string, try to parse
         last_result = completed[-1].get("result") if completed else None
@@ -217,11 +232,11 @@ class SnapshotExecutor:
             try:
                 parsed = json.loads(last_result)
                 if isinstance(parsed, list):
-                    candidates = [
+                    candidates.extend(
                         NormalizedJobCandidate(**c)
                         for c in parsed
                         if isinstance(c, dict)
-                    ]
+                    )
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -250,7 +265,6 @@ def _ensure_tool_registry() -> None:
     from backend.app.services.job_discovery.deepagents_runner import (
         extract_jd_candidates,
         finish_with_manual_review,
-        ocr_images_from_urls,
         package_candidates,
         parse_wechat_article,
         run_ocr,
@@ -263,18 +277,26 @@ def _ensure_tool_registry() -> None:
         "triage_link": triage_link,
         "parse_wechat_article": parse_wechat_article,
         "run_ocr": run_ocr,
-        "ocr_images_from_urls": ocr_images_from_urls,
         "extract_jd_candidates": extract_jd_candidates,
         "verify_evidence": verify_evidence,
         "package_candidates": package_candidates,
         "standardize_from_record_fields": standardize_from_record_fields,
         "finish_with_manual_review": finish_with_manual_review,
-        "run_web_navigation": None,  # dispatched via worker context, not snapshot
+        "run_web_navigation": None,  # runtime-injected via worker context, not in static registry
     })
 
 
-def _call_tool_by_name(name: str, **kwargs: Any) -> Any:
-    """Call a tool function by its YAML name."""
+def _call_tool_by_name(name: str, *, executor: Any = None, **kwargs: Any) -> Any:
+    """Call a tool function by its YAML name.
+
+    Checks runtime-injected tools (per-instance, set by worker via
+    ``tool_dependencies``) first, then falls back to the static
+    module-level registry.
+    """
+    # Check runtime tools first (per-instance, injected by worker)
+    if executor is not None and name in executor._runtime_tools:
+        return executor._runtime_tools[name](**kwargs)
+    # Fall back to static registry
     _ensure_tool_registry()
     tool = _TOOL_REGISTRY.get(name)
     if tool is None:
