@@ -1146,6 +1146,7 @@ class JobDiscoveryStrategy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     avg_duration_s: Mapped[float | None] = mapped_column(Float)
     degradation_threshold: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    recovery_threshold: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     _trajectories: Mapped[list["JobDiscoveryTrajectory"]] = relationship(
         back_populates="_strategy", lazy="raise",

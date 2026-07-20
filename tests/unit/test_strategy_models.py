@@ -34,6 +34,7 @@ class TestJobDiscoveryStrategy:
             assert s.error_count == 0
             assert s.consecutive_ok == 0
             assert s.degradation_threshold == 3
+            assert s.recovery_threshold == 2
 
     def test_create_with_adapter(self, engine):
         s = JobDiscoveryStrategy(

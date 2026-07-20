@@ -7,10 +7,9 @@ Key design notes:
 - ``avg_duration_s`` stores the **latest** observed duration, not a rolling
   average.  This is intentional -- the plan trades statistical precision for
   implementation simplicity and instantaneous responsiveness.
-- ``increment_success`` uses ``degradation_threshold`` for the recovery CASE
-  expression (not a separate ``recovery_threshold``).  The model has no
-  recovery_threshold column; the same threshold governs both degradation and
-  recovery.
+- ``increment_success`` uses ``recovery_threshold`` for the recovery CASE
+  expression. ``degradation_threshold`` governs degradation to ``unavailable``
+  while ``recovery_threshold`` governs recovery from ``degraded`` to ``active``.
 """
 from __future__ import annotations
 
@@ -83,7 +82,8 @@ def increment_success(
     """Atomically increment success counters and reset error streak.
 
     Recovers status from ``degraded`` to ``active`` when ``consecutive_ok``
-    reaches ``degradation_threshold``.
+    reaches ``recovery_threshold`` (distinct from ``degradation_threshold``
+    which governs the degradation direction).
 
     Args:
         db: Active database session.
@@ -100,7 +100,7 @@ def increment_success(
         "status": case(
             (and_(
                 JobDiscoveryStrategy.status == "degraded",
-                JobDiscoveryStrategy.consecutive_ok + 1 >= JobDiscoveryStrategy.degradation_threshold,
+                JobDiscoveryStrategy.consecutive_ok + 1 >= JobDiscoveryStrategy.recovery_threshold,
             ), "active"),
             else_=JobDiscoveryStrategy.status,
         ),

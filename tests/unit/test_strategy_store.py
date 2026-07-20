@@ -109,7 +109,8 @@ class TestIncrementSuccess:
 
     def test_recovery_from_degraded(self, db):
         s = JobDiscoveryStrategy(url_pattern="a/*", site_type="wechat", plan_yaml="plan: []",
-                                 consecutive_ok=1, status="degraded", degradation_threshold=2)
+                                 consecutive_ok=1, status="degraded",
+                                 degradation_threshold=3, recovery_threshold=2)
         db.add(s)
         db.commit()
         sid = s.id

@@ -39,6 +39,7 @@ def upgrade() -> None:
     sa.Column('success_count', sa.Integer(), nullable=False),
     sa.Column('avg_duration_s', sa.Float(), nullable=True),
     sa.Column('degradation_threshold', sa.Integer(), nullable=False),
+    sa.Column('recovery_threshold', sa.Integer(), nullable=False),
     sa.Column('last_health_check_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
