@@ -837,9 +837,25 @@ def verify_evidence(candidates_json: str, evidence_json: str) -> str:
     candidates_data = json.loads(candidates_json)
     evidence_data = json.loads(evidence_json)
 
-    # Reconstruct dataclass instances
+    # Normalize field names from LLM/WebNavigationAgent output.
+    # The LLM often produces "type" instead of "evidence_type" and
+    # may include extra keys that PageEvidence does not accept.
+    _EVIDENCE_FIELD_ALIASES = {
+        "type": "evidence_type",
+        "content": "text_excerpt",
+        "page_text": "text_excerpt",
+        "text": "text_excerpt",
+        "description": "text_excerpt",
+    }
+    for e in evidence_data:
+        for src, dst in _EVIDENCE_FIELD_ALIASES.items():
+            if src in e and dst not in e:
+                e[dst] = e.pop(src)
+
+    # Reconstruct dataclass instances — only pass known fields
+    _EVI_FIELDS = {f.name for f in PageEvidence.__dataclass_fields__.values()}
     candidates = [NormalizedJobCandidate(**c) for c in candidates_data]
-    evidence = [PageEvidence(**e) for e in evidence_data]
+    evidence = [PageEvidence(**{k: v for k, v in e.items() if k in _EVI_FIELDS}) for e in evidence_data]
 
     verified = _verify_evidence(candidates, evidence)
     return json.dumps(_asdict(verified), ensure_ascii=False)
@@ -1125,6 +1141,19 @@ def _reset_nav_state(max_pages: int = 20) -> None:
     _nav_current_url = None
     _page_cache = {}
     _wechat_raw_html_cache = {}
+
+
+def _fix_response_encoding(resp: requests.Response) -> str:
+    """Auto-detect encoding and decode response text, fixing mojibake.
+
+    Many Chinese career sites serve pages with a misconfigured or missing
+    ``Content-Type charset``, causing ``requests`` to fall back to
+    ISO-8859-1 and produce garbled text.  This helper applies the detected
+    apparent encoding (or UTF-8 as a safe default) before decoding.
+    """
+    if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp.text
 
 
 def _cached_fetch(url: str) -> tuple[str | None, str | None, str | None]:

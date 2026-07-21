@@ -63,3 +63,5 @@ logs/
 .claude/
 # Local isolated development worktrees
 .worktrees/
+
+.playwright-cli/
