@@ -140,6 +140,52 @@ def _extract_title_via_regex(html_content: str) -> str | None:
     return None
 
 
+def _extract_images_via_regex(html_content: str) -> list[str]:
+    """Extract image URLs from arbitrary HTML using regex.
+
+    Looks for data-src (WeChat convention) first, then regular src.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+    # data-src first (WeChat's lazy-loading attribute)
+    for m in re.finditer(r'<img[^>]+data-src=["\']([^"\']+)["\']', html_content, re.IGNORECASE):
+        url = m.group(1).strip()
+        if url and url not in seen and not url.startswith("data:"):
+            urls.append(url)
+            seen.add(url)
+    # Then regular src
+    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', html_content, re.IGNORECASE):
+        url = m.group(1).strip()
+        if url and url not in seen and not url.startswith("data:"):
+            urls.append(url)
+            seen.add(url)
+    return urls
+
+
+def _extract_all_visible_text(html_content: str) -> str:
+    """Extract all visible text from arbitrary HTML by stripping tags.
+
+    Used as a last-resort fallback when the WeChat-specific parsers
+    (HTMLParser with js_content, regex extraction) both fail. Handles
+    ReadGZH proxy output and other simplified/cleaned HTML formats.
+    """
+    if not html_content:
+        return ""
+    # Remove script and style blocks
+    text = re.sub(r"<script[^>]*>.*?</script>", "", html_content, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    # Replace block tags with newlines
+    text = re.sub(r"</?(?:p|div|br|li|h[1-6]|tr|blockquote|section|article)[^>]*>", "\n", text, flags=re.IGNORECASE)
+    # Strip remaining HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # Decode common entities
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ")
+    text = text.replace("&quot;", "\"").replace("&#39;", "'").replace("&apos;", "'")
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def _scan_inaccessible_markers(html_content: str, text_content: str) -> str | None:
     """Check for markers that indicate the article is inaccessible."""
     reasons = []
@@ -155,6 +201,11 @@ def parse_wechat_article(html_content: str, url: str) -> WechatArticleResult:
     This is a pure, deterministic parser -- no network, no LLM.
     Returns a WechatArticleResult with extracted title, text, images,
     and delivery instructions if found.
+
+    Works with:
+    - Native WeChat HTML (has #js_content div with article body)
+    - ReadGZH proxy output (cleaned/simplified HTML without #js_content)
+    - Any HTML page that might be a WeChat article
     """
     html_content = html_content or ""
     url = url or ""
@@ -177,7 +228,17 @@ def parse_wechat_article(html_content: str, url: str) -> WechatArticleResult:
     else:
         text_content = _extract_text_via_regex(html_content) or ""
 
+    # --- Fallback: strip all HTML tags when both parser and regex fail ---
+    # This handles ReadGZH proxy output and other non-standard WeChat HTML
+    # that doesn't have the js_content div.
+    if not text_content.strip():
+        text_content = _extract_all_visible_text(html_content)
+
     image_urls = parser._image_urls
+
+    # --- Fallback image extraction for non-standard HTML ---
+    if not image_urls:
+        image_urls = _extract_images_via_regex(html_content)
 
     # --- Scan for email delivery instructions ---
     combined = html_content + "\n" + text_content

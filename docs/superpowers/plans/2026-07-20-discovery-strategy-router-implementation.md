@@ -300,6 +300,7 @@ class JobDiscoveryStrategy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     avg_duration_s: Mapped[float | None] = mapped_column(Float)
     degradation_threshold: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    recovery_threshold: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
     last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     _trajectories: Mapped[list["JobDiscoveryTrajectory"]] = relationship(
         back_populates="_strategy", lazy="raise",
@@ -612,6 +613,7 @@ are available for persistence (via to_dict).
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -675,7 +677,7 @@ class TrajectoryBuffer:
             "error_type": type(error).__name__ if error else None,
             "duration_ms": duration_ms,
             "is_fallback": is_fallback,
-            "timestamp": time.monotonic(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         if status == "failed" and not self._failed:
             self._failed = True
@@ -1043,12 +1045,15 @@ def increment_success(
         "status": case(
             (and_(
                 JobDiscoveryStrategy.status == "degraded",
-                JobDiscoveryStrategy.consecutive_ok + 1 >= JobDiscoveryStrategy.degradation_threshold,
+                JobDiscoveryStrategy.consecutive_ok + 1 >= JobDiscoveryStrategy.recovery_threshold,
             ), "active"),
             else_=JobDiscoveryStrategy.status,
         ),
     }
     if duration_s is not None:
+        # NOTE: stores latest duration (not a rolling average); field name
+        # avg_duration_s is kept for DB compatibility. A future migration
+        # may compute a true exponential moving average here.
         values["avg_duration_s"] = duration_s
     db.execute(
         update(JobDiscoveryStrategy)
@@ -1294,6 +1299,10 @@ class StrategyRouter:
     """
 
     def __init__(self, db: Session) -> None:
+        # Load all active strategies into memory. The strategy table is
+        # expected to be small (< 100 rows), so a full load + linear
+        # fnmatch scan is acceptable. If the table grows beyond that,
+        # switch to DB-level LIKE / REGEXP filtering.
         self._strategies = get_active_strategies(db)
 
     def match(self, url: str) -> JobDiscoveryStrategy | None:
@@ -1351,7 +1360,7 @@ git commit -m "feat: add StrategyRouter for URL pattern matching"
 ### Task 5: DomainAdapter Base + AlibabaSPAAdapter
 
 **Files:**
-- Create: `backend/app/services/job_discovery/adapt4ers/__init__.py` (empty)
+- Create: `backend/app/services/job_discovery/adapters/__init__.py` (empty)
 - Create: `backend/app/services/job_discovery/adapters/base.py`
 - Create: `backend/app/services/job_discovery/adapters/alibaba_spa.py`
 - Create: `tests/unit/test_domain_adapter.py`
@@ -1763,6 +1772,35 @@ class TestSnapshotExecutor:
 
         assert result.status == "succeeded"
         assert len(result.candidates) > 0
+
+    def test_runtime_tools_injection(self, strategy, task):
+        """Verify that tool_dependencies are registered as callable runtime tools."""
+        buf = TrajectoryBuffer(task_id="t1", strategy_id="s1", executor_type="snapshot")
+        executor = SnapshotExecutor(
+            strategy, task, buf,
+            tool_dependencies={
+                "settings": MagicMock(),
+                "web_nav_subagent": MagicMock(),
+                "model": MagicMock(),
+            },
+        )
+        assert "run_web_navigation" in executor._runtime_tools
+        assert callable(executor._runtime_tools["run_web_navigation"])
+
+    def test_resolve_template_literal_none_string(self, strategy, task):
+        """A literal 'None' string (no template markers) should stay as 'None' string."""
+        buf = TrajectoryBuffer(task_id="t1", strategy_id="s1", executor_type="snapshot")
+        executor = SnapshotExecutor(strategy, task, buf)
+        # Not a template — the string "None" should remain "None"
+        result = executor._resolve_template({"key": "None"})
+        assert result["key"] == "None"
+
+    def test_resolve_template_missing_field_is_none(self, strategy, task):
+        """A missing field resolved through {{}} should become Python None."""
+        buf = TrajectoryBuffer(task_id="t1", strategy_id="s1", executor_type="snapshot")
+        executor = SnapshotExecutor(strategy, task, buf)
+        result = executor._resolve_template({"key": "{{prev.result.no_such_field}}"})
+        assert result["key"] is None
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1819,11 +1857,38 @@ class SnapshotExecutor:
         strategy: StrategyRecord,
         task: DiscoveryTaskInput,
         trajectory: TrajectoryBuffer,
+        tool_dependencies: dict[str, Any] | None = None,
     ) -> None:
         self.strategy = strategy
         self.task = task
         self.trajectory = trajectory
         self._context: dict[str, Any] = {"task": task, "prev": None}
+        self._runtime_tools: dict[str, Any] = {}
+        if tool_dependencies:
+            self._inject_runtime_tools(tool_dependencies)
+
+    def _inject_runtime_tools(self, deps: dict[str, Any]) -> None:
+        """Register tools that need runtime dependencies (settings, model, subagent).
+
+        These tools cannot be stored in the static _TOOL_REGISTRY because they
+        require per-task injected objects that aren't available at import time.
+        """
+        from backend.app.services.job_discovery.deepagents_runner import run_web_navigation
+
+        settings = deps.get("settings")
+        subagent = deps.get("web_nav_subagent")
+        model = deps.get("model")
+
+        def _wrapped_run_web_navigation(start_url: str) -> dict[str, Any]:
+            return run_web_navigation(
+                start_url, settings=settings, subagent=subagent, model=model,
+            )
+
+        _wrapped_run_web_navigation.__name__ = "run_web_navigation"
+        _wrapped_run_web_navigation.__doc__ = run_web_navigation.__doc__
+        _wrapped_run_web_navigation.__annotations__ = {"start_url": str, "return": dict[str, Any]}
+
+        self._runtime_tools["run_web_navigation"] = _wrapped_run_web_navigation
 
     def execute(self) -> DiscoveryRunResult:
         """Execute the plan. Returns SnapshotExecutionResult on any step failure."""
@@ -1836,7 +1901,7 @@ class SnapshotExecutor:
             on_error = step.get("on_error", "skip")
 
             try:
-                result = _call_tool_by_name(tool_name, **params)
+                result = _call_tool_by_name(tool_name, executor=self, **params)
                 self.trajectory.record_step(tool_name, "ok", params, result)
                 self._context["prev"] = {"result": result}
                 completed.append({"tool": tool_name, "params": params, "result": result})
@@ -1868,7 +1933,11 @@ class SnapshotExecutor:
         resolved: dict[str, Any] = {}
         for key, value in params.items():
             if isinstance(value, str) and "{{" in value:
-                resolved[key] = self._substitute(value)
+                result = self._substitute(value)
+                # A missing field produces the string "None" after substitution.
+                # Only convert to Python None when the original value actually
+                # contained a template marker (not a literal "None" string).
+                resolved[key] = None if (result == "None" and "{{" in value) else result
             else:
                 resolved[key] = value
         return resolved
@@ -1980,13 +2049,23 @@ def _ensure_tool_registry() -> None:
         "package_candidates": package_candidates,
         "standardize_from_record_fields": standardize_from_record_fields,
         "finish_with_manual_review": finish_with_manual_review,
-        "run_web_navigation": None,  # dispatched via worker context, not snapshot
+        # run_web_navigation is NOT in the static registry — it requires
+        # runtime dependencies (settings, model, subagent) injected via
+        # SnapshotExecutor._runtime_tools (see _inject_runtime_tools).
     })
 
 
-def _call_tool_by_name(name: str, **kwargs: Any) -> Any:
-    """Call a tool function by its YAML name."""
+def _call_tool_by_name(name: str, *, executor: SnapshotExecutor | None = None, **kwargs: Any) -> Any:
+    """Call a tool function by its YAML name.
+
+    Checks executor._runtime_tools first for tools that need injected
+    dependencies (e.g. run_web_navigation), then falls back to the static
+    _TOOL_REGISTRY.
+    """
     _ensure_tool_registry()
+    # Runtime tools take precedence (injected dependencies)
+    if executor is not None and name in executor._runtime_tools:
+        return executor._runtime_tools[name](**kwargs)
     tool = _TOOL_REGISTRY.get(name)
     if tool is None:
         raise ValueError(f"Unknown or unavailable tool in snapshot: {name}")
@@ -1999,7 +2078,7 @@ def _call_tool_by_name(name: str, **kwargs: Any) -> Any:
 .\.venv\Scripts\python.exe -m pytest tests/unit/test_snapshot_executor.py -v
 ```
 
-Expected: all passed except the integration tests that mock `_call_tool_by_name` (6 tests).
+Expected: all passed except the integration tests that mock `_call_tool_by_name` (9 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -2201,7 +2280,7 @@ def save_trajectory(
         post_steps = buf_dict["steps"][fail_idx+1:]
         traj.completed_steps = [s for s in pre_steps if s["status"] == "ok"]
         traj.fallback_trace = [s for s in post_steps if s["is_fallback"]]
-        traj.overall_status = "partial_fallback" if post_steps else "failed"
+        # overall_status already set by _map_status() above
     else:
         traj.completed_steps = [s for s in buf_dict["steps"] if s["status"] == "ok"]
 
@@ -2221,16 +2300,20 @@ def schedule_annotation(db: Session, trajectory_id: str) -> None:
 
 
 def _map_status(result: DiscoveryRunResult, trajectory: TrajectoryBuffer) -> str:
-    """Derive overall_status from result and trajectory state."""
-    if trajectory.failed_step_index is not None:
-        # Check if there were fallback steps recorded after failure
+    """Derive overall_status from result and trajectory state.
+
+    This is the single source of truth for overall_status in the trajectory row.
+    """
+    fail_idx = trajectory.failed_step_index
+    if fail_idx is not None:
+        # Check if there were fallback steps recorded after the failure
         buf_dict = trajectory.to_dict()
-        if fail_idx := trajectory.failed_step_index:
-            has_fallback = any(
-                s.get("is_fallback") for s in buf_dict["steps"][fail_idx+1:]
-            )
-            return "partial_fallback" if has_fallback else "failed"
-        return "failed"
+        # NOTE: fail_idx can be 0 (first step failed), must use "is not None"
+        has_fallback = any(
+            s.get("is_fallback")
+            for s in buf_dict["steps"][fail_idx + 1:]
+        )
+        return "partial_fallback" if has_fallback else "failed"
     return result.status if result.status in ("succeeded", "partial_success") else result.status
 ```
 
@@ -2609,6 +2692,9 @@ def build_discovery_supervisor_agent(
             subagents=[web_nav_subagent],
             system_prompt=system_prompt,
             name="discovery_supervisor",
+            # _DiscoveryRunResultPydantic is defined earlier in this module
+            # (existing code, not part of this refactor — wraps DiscoveryRunResult
+            # as a Pydantic model for deepagents' response_format).
             response_format=_DiscoveryRunResultPydantic,
         )
     except TypeError:
@@ -2724,6 +2810,10 @@ from backend.app.services.job_discovery.strategy.trajectory_store import (
 )
 from backend.app.services.job_discovery.strategy import strategy_store as strat_store
 from backend.app.services.job_discovery.schemas import StrategyRecord
+from backend.app.services.job_discovery.deepagents_runner import (
+    _build_job_discovery_llm,
+    create_web_navigation_subagent,
+)
 from backend.app.services.job_discovery.strategy import error_classifier
 ```
 
@@ -2737,6 +2827,11 @@ Replace the current agent invocation with:
             trajectory: TrajectoryBuffer | None = None
             snapshot_context: dict | None = None
             executor_type: str = "supervisor"
+
+            # Build LLM model + subagent once (used by both SnapshotExecutor
+            # and Supervisor Agent paths).
+            _llm = _build_job_discovery_llm(self.settings)
+            _web_nav = create_web_navigation_subagent(self.settings)
 
             if self.settings.job_discovery_strategy_enabled:
                 router = StrategyRouter(db)
@@ -2771,7 +2866,14 @@ Replace the current agent invocation with:
                     else:
                         # ── Fast path: SnapshotExecutor ──
                         executor_type = "snapshot"
-                        snap = SnapshotExecutor(strategy_record, task_input, trajectory)
+                        snap = SnapshotExecutor(
+                            strategy_record, task_input, trajectory,
+                            tool_dependencies={
+                                "settings": self.settings,
+                                "web_nav_subagent": _web_nav,
+                                "model": _llm,
+                            },
+                        )
                         snap_result = snap.execute()
                         if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
                             snapshot_context = snap_result.snapshot_context
@@ -2792,6 +2894,7 @@ Replace the current agent invocation with:
                 try:
                     agent = build_discovery_supervisor_agent(
                         settings=self.settings,
+                        model=_llm,
                         snapshot_context=snapshot_context,
                     )
                     agent_input = {
@@ -2843,7 +2946,7 @@ Replace the current agent invocation with:
                     url_pattern=url_pattern,
                 )
                 # Schedule annotation for supervisor-only and fallback paths
-                if trailing_executor == "supervisor" or result.status == "partial_fallback":
+                if executor_type == "supervisor" or result.status == "partial_fallback":
                     if self.settings.trajectory_annotation_enabled:
                         schedule_annotation(db, trajectory_id)
             except Exception:
@@ -2906,22 +3009,77 @@ def _load_adapter(adapter_path: str):
     return getattr(module, class_name)()
 ```
 
-**Edit 2e: Add health check trigger in `run_once()` return path:**
+**Edit 2e: Add `_idle_cycles` to `__init__` and `_run_health_checks` method, and update `run_loop`:**
 
-After the task processing (when `run_once()` returns 1), add idle-cycle health check:
+Add to `__init__` after `self.worker_id = _build_worker_id()`:
 
 ```python
-            # ── 8. Health check on idle ────────────────────────────────
-            # Not part of run_once directly — handled in run_loop via a counter.
-            # Add a class-level counter:
-            # self._idle_cycles = 0 (in __init__)
-            # In run_loop:
-            #   if processed == 0:
-            #       self._idle_cycles += 1
-            #       if self._idle_cycles % 10 == 0:
-            #           self._run_health_checks()
-            #   else:
-            #       self._idle_cycles = 0
+        self._idle_cycles = 0
+```
+
+Add `_run_health_checks` method to the `JobDiscoveryWorker` class:
+
+```python
+    def _run_health_checks(self) -> None:
+        """Run reachability checks on strategies due for verification.
+
+        Only called during idle cycles (queue empty) to avoid delaying
+        task processing. Failures increment error_count atomically;
+        consecutive failures trigger automatic unavailable marking.
+        """
+        db = self.db_factory()
+        try:
+            strategies = strat_store.get_strategies_due_for_health_check(
+                db, interval_hours=self.settings.strategy_health_check_interval_hours,
+            )
+            if not strategies:
+                return
+            for strategy in strategies:
+                try:
+                    # Lightweight HTTP HEAD check to verify site is reachable.
+                    # Replace "*" with "test" to form a plausible URL for
+                    # pattern-based strategies (e.g. "campus*.alibaba.com/*" →
+                    # "https://campus.alibaba.com/test").
+                    check_url = strategy.url_pattern.replace("*", "test")
+                    if not check_url.startswith("http"):
+                        check_url = f"https://{check_url}"
+                    resp = requests.head(check_url, timeout=10, allow_redirects=True)
+                    ok = resp.status_code < 500
+                    detail = f"HTTP {resp.status_code}"
+                except Exception as exc:
+                    ok = False
+                    detail = str(exc)[:200]
+                strat_store.record_health_check(db, strategy.id, ok=ok, detail=detail)
+            db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+```
+
+Update `run_loop` to track idle cycles and trigger health checks:
+
+```python
+    def run_loop(self, *, poll_interval: float = 10.0) -> None:
+        """Continuously poll and process tasks until interrupted.
+
+        Parameters
+        ----------
+        poll_interval:
+            Seconds to sleep between polls when the queue is empty.
+        """
+        try:
+            while True:
+                processed = self.run_once()
+                if processed == 0:
+                    self._idle_cycles += 1
+                    if self._idle_cycles % 10 == 0:
+                        self._run_health_checks()
+                    time.sleep(poll_interval)
+                else:
+                    self._idle_cycles = 0
+        except KeyboardInterrupt:
+            pass
 ```
 
 - [ ] **Step 3: Verify worker.py imports resolve**

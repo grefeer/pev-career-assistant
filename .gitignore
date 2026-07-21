@@ -60,6 +60,6 @@ logs/
 
 # Tool run artifacts
 .codex-run/
-
+.claude/
 # Local isolated development worktrees
 .worktrees/

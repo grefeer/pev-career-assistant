@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+import logging
+import os
 import struct
+import tempfile
+from pathlib import Path
 
 from backend.app.services.job_discovery.schemas import OcrResult
+
+logger = logging.getLogger(__name__)
 
 # Height threshold for slicing tall images (pixels).
 _SLICE_HEIGHT_THRESHOLD = 2000
 # Overlap between consecutive slices (pixels).
 _SLICE_OVERLAP = 100
+
+# Minimum confidence threshold for considering OCR text as valid.
+_MIN_TEXT_CONFIDENCE = 0.5
+
+# Default OCR version for PaddleOCR (v5 avoids PIR/oneDNN compatibility issues on Windows).
+_DEFAULT_OCR_VERSION = "PP-OCRv5"
 
 
 def _parse_png_dimensions(image_bytes: bytes) -> tuple[int, int] | None:
@@ -114,19 +126,163 @@ def _count_slices(height: int, threshold: int, overlap: int) -> int:
     return slices
 
 
-def _check_ocr_available() -> bool:
-    """Check if an OCR engine is available (paddleocr or tesseract)."""
+def _check_paddleocr_available() -> bool:
+    """Check if PaddleOCR is importable."""
     try:
         import paddleocr  # noqa: F401
         return True
     except ImportError:
-        pass
+        return False
+
+
+def _check_tesseract_available() -> bool:
+    """Check if pytesseract is importable."""
     try:
         import pytesseract  # noqa: F401
         return True
     except ImportError:
-        pass
-    return False
+        return False
+
+
+def _check_ocr_available() -> bool:
+    """Check if any OCR engine is available."""
+    return _check_paddleocr_available() or _check_tesseract_available()
+
+
+def _run_paddleocr(image_bytes: bytes) -> tuple[str, float, list[str]]:
+    """Run PaddleOCR on image bytes.
+
+    Writes bytes to a temp file (PaddleOCR requires a file path), then runs
+    PP-OCRv5 with Chinese language model and textline orientation detection.
+
+    If the image is in WebP format, converts to PNG first since PaddleOCR
+    may not support WebP natively.
+
+    Returns:
+        (full_text, confidence, warnings)
+    """
+    import paddleocr
+
+    # Workaround for oneDNN PIR attribute conversion bug on Windows.
+    # Must be set before any PaddleOCR model is created.
+    if "FLAGS_use_onednn" not in os.environ:
+        os.environ["FLAGS_use_onednn"] = "0"
+
+    suffix = _detect_image_suffix(image_bytes)
+    warnings: list[str] = []
+
+    # ── Convert WebP to PNG ──
+    if suffix == ".webp":
+        try:
+            from PIL import Image
+            from io import BytesIO
+            img = Image.open(BytesIO(image_bytes))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+            suffix = ".png"
+        except Exception as exc:
+            warnings.append(f"WebP→PNG conversion failed: {exc}")
+            return "", 0.0, warnings
+
+    tmp_path = None
+
+    try:
+        # Write to temp file — PaddleOCR needs a path, not bytes
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(image_bytes)
+            tmp_path = f.name
+
+        ocr = paddleocr.PaddleOCR(
+            use_textline_orientation=True,
+            lang="ch",
+            ocr_version=_DEFAULT_OCR_VERSION,
+        )
+        result = ocr.predict(tmp_path)
+
+        all_texts: list[str] = []
+        all_scores: list[float] = []
+
+        for page in result:
+            texts = page["rec_texts"]
+            scores = page["rec_scores"]
+            for text, score in zip(texts, scores):
+                if score >= _MIN_TEXT_CONFIDENCE and text.strip():
+                    all_texts.append(text.strip())
+                    all_scores.append(score)
+
+        if not all_texts:
+            warnings.append("PaddleOCR found no text above confidence threshold")
+            return "", 0.0, warnings
+
+        full_text = "\n".join(all_texts)
+        avg_confidence = sum(all_scores) / len(all_scores)
+
+        return full_text, avg_confidence, warnings
+
+    except Exception as exc:
+        warnings.append(f"PaddleOCR error: {exc}")
+        logger.warning("PaddleOCR failed: %s", exc)
+        return "", 0.0, warnings
+
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _run_tesseract(image_bytes: bytes) -> tuple[str, float, list[str]]:
+    """Run Tesseract OCR (pytesseract) on image bytes.
+
+    Requires Tesseract engine installed separately on the system.
+
+    Returns:
+        (full_text, confidence, warnings)
+    """
+    warnings: list[str] = []
+
+    try:
+        import pytesseract
+        from PIL import Image
+        from io import BytesIO
+
+        img = Image.open(BytesIO(image_bytes))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, lang="chi_sim+eng")
+        texts: list[str] = []
+        confs: list[float] = []
+
+        for text, conf in zip(data["text"], data["conf"]):
+            conf_f = float(conf) / 100.0
+            if text.strip() and conf_f >= _MIN_TEXT_CONFIDENCE:
+                texts.append(text.strip())
+                confs.append(conf_f)
+
+        if not texts:
+            warnings.append("Tesseract found no text above confidence threshold")
+            return "", 0.0, warnings
+
+        full_text = "\n".join(texts)
+        avg_confidence = sum(confs) / len(confs)
+
+        return full_text, avg_confidence, warnings
+
+    except Exception as exc:
+        warnings.append(f"Tesseract error: {exc}")
+        logger.warning("Tesseract failed: %s", exc)
+        return "", 0.0, warnings
+
+
+def _detect_image_suffix(image_bytes: bytes) -> str:
+    """Detect image file suffix from magic bytes."""
+    if len(image_bytes) >= 8 and image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if len(image_bytes) >= 2 and image_bytes[:2] == b"\xff\xd8":
+        return ".jpg"
+    if len(image_bytes) >= 4 and image_bytes[:4] == b"RIFF":
+        return ".webp"
+    return ".png"  # fallback
 
 
 def ocr_image(image_bytes: bytes, ocr_enabled: bool = True) -> OcrResult:
@@ -136,8 +292,8 @@ def ocr_image(image_bytes: bytes, ocr_enabled: bool = True) -> OcrResult:
     - Checks if OCR is enabled (config flag)
     - Inspects image dimensions
     - Slices tall images for segmented processing
-    - Checks OCR engine availability
-    - Returns structured results (placeholder — actual OCR not performed)
+    - Runs PaddleOCR (primary) or Tesseract (fallback) for text extraction
+    - Returns structured results with extracted text and confidence
 
     No network I/O, no database access, no LLM calls.
     """
@@ -189,11 +345,12 @@ def ocr_image(image_bytes: bytes, ocr_enabled: bool = True) -> OcrResult:
             )
 
     # --- Check OCR engine availability ---
-    ocr_available = _check_ocr_available()
-    if not ocr_available:
+    has_paddleocr = _check_paddleocr_available()
+    has_tesseract = _check_tesseract_available()
+
+    if not has_paddleocr and not has_tesseract:
         warnings.append(
-            "No OCR engine available (paddleocr / pytesseract not installed) — "
-            "returning placeholder result"
+            "No OCR engine available (paddleocr / pytesseract not installed)"
         )
         return OcrResult(
             full_text="",
@@ -203,13 +360,27 @@ def ocr_image(image_bytes: bytes, ocr_enabled: bool = True) -> OcrResult:
             needs_manual_review=True,
         )
 
-    # Placeholder: actual OCR would run here
-    # When OCR is available but we haven't integrated it yet, indicate manual review
-    warnings.append("OCR engine detected but text extraction is not yet integrated")
+    # --- Run OCR ---
+    # Prefer PaddleOCR (better Chinese text support), fall back to Tesseract
+    if has_paddleocr:
+        full_text, confidence, engine_warnings = _run_paddleocr(image_bytes)
+        warnings.extend(engine_warnings)
+    else:
+        full_text, confidence, engine_warnings = _run_tesseract(image_bytes)
+        warnings.extend(engine_warnings)
+
+    # --- Determine if manual review is needed ---
+    needs_manual_review = False
+    if not full_text:
+        needs_manual_review = True
+        warnings.append("OCR produced no usable text — manual review required")
+    elif confidence < 0.6:
+        warnings.append(f"Low OCR confidence ({confidence:.2f}) — manual review recommended")
+
     return OcrResult(
-        full_text="",
-        confidence=0.0,
+        full_text=full_text,
+        confidence=round(confidence, 4),
         slice_count=slice_count,
         warnings=warnings,
-        needs_manual_review=True,
+        needs_manual_review=needs_manual_review,
     )

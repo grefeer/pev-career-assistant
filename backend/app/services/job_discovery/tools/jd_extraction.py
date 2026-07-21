@@ -265,28 +265,32 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
     """Parse job description text using deterministic keyword heuristics.
 
     This is a pure function — no LLM, no DB, no network.
-    Returns 0-2 NormalizedJobCandidate objects with confidence scores.
+    Returns 0-10 NormalizedJobCandidate objects with confidence scores.
+
+    For structured pages (with clear section headers like 岗位职责/任职要求),
+    extracts precise fields. For unstructured text (WeChat articles, OCR results),
+    uses aggressive heuristics to extract whatever information is available.
 
     Args:
-        page_text: Raw text content from a job detail page.
+        page_text: Raw text content from a job detail page or article.
         url: The source URL for reference.
 
     Returns:
-        List of extracted candidates (typically 0 or 1, max 2 for dual-post pages).
+        List of extracted candidates (0-10, one per distinct position).
     """
     page_text = page_text or ""
 
     if not page_text.strip():
         return []
 
-    # Split multi-job pages into individual segments (max 2)
+    # Split multi-job pages into individual segments
     segments = _split_multi_job_page(page_text)
 
     results: list[NormalizedJobCandidate] = []
     seen_dedup_keys: set[str] = set()
 
     for segment in segments:
-        if len(results) >= 2:
+        if len(results) >= 10:
             break
 
         title, title_conf = _extract_title(segment)
@@ -301,10 +305,21 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
         referral_code = _extract_referral_code(segment)
 
         has_section_content = bool(responsibilities or requirements)
-        confidence = _estimate_confidence(
-            title, company, responsibilities, requirements, has_section_content
-        )
 
+        # ── Fallback for unstructured text ──
+        # When no structured sections are found (common in WeChat articles,
+        # OCR text), treat the full segment as a description and extract
+        # whatever we can from keywords and context.
+        uses_unstructured_fallback = False
+        if not responsibilities and not requirements and not title:
+            # Try harder: look for position-related keywords anywhere in text
+            fm_title = _fuzzy_extract_title(segment)
+            if fm_title:
+                title = fm_title
+                title_conf = 0.5
+            uses_unstructured_fallback = True
+
+        # Build warnings
         warnings: list[str] = []
         if not title:
             warnings.append("No job title found via heuristics")
@@ -313,19 +328,34 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
         if not locations:
             warnings.append("No location information found")
 
-        # Build description_text from what we have
+        # ── Build description_text ──
         desc_parts = []
         if responsibilities:
             desc_parts.append(responsibilities)
         if requirements:
             desc_parts.append(requirements)
-        description_text = "\n\n".join(desc_parts) if desc_parts else segment[:2000]
+        if desc_parts:
+            description_text = "\n\n".join(desc_parts)
+        elif uses_unstructured_fallback and len(segment.strip()) >= 20:
+            # For unstructured text, use the full segment as description
+            # (trimmed to a reasonable length)
+            description_text = segment.strip()[:4000]
+        else:
+            description_text = segment[:2000]
 
-        # Deduplicate by title + company to avoid identical candidates from overlapping segments
+        # ── Deduplicate by title + company ──
         dedup_key = f"{title or ''}|{company or ''}"
         if dedup_key in seen_dedup_keys:
             continue
         seen_dedup_keys.add(dedup_key)
+
+        # ── Adjusted confidence for unstructured text ──
+        confidence = _estimate_confidence(
+            title, company, responsibilities, requirements, has_section_content
+        )
+        if uses_unstructured_fallback:
+            # Reduce confidence but keep above "too low to use"
+            confidence = max(confidence, 0.35)
 
         candidate = NormalizedJobCandidate(
             title=title,
@@ -346,4 +376,140 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
 
         results.append(candidate)
 
+    # ── If still no results, try whole-text extraction ──
+    if not results:
+        result = _extract_from_unstructured_text(page_text, url)
+        if result:
+            results.append(result)
+
     return results
+
+
+def _fuzzy_extract_title(text: str) -> str | None:
+    """Try to find a job title in unstructured text using keyword proximity.
+
+    Looks for patterns like:
+    - "招募XXX岗位" / "招聘XXX" / "招收XXX(实习)"
+    - "岗位包括：XXX、YYY" / "职位：XXX"
+    - "面向XXX专业招聘XXX"
+    """
+    # Pattern 1: 招募/招聘/招收 + job-like noun phrase (or just the recruitment prefix)
+    m = re.search(
+        r"(?:招募|招聘|招收|急招)[：:\s]*"
+        r"(.{2,60}?(?:工程师|经理|专员|设计师|分析师|运营|开发|"
+        r"实习生|实习|培训生|管培生|顾问|助理|主管|总监|代表|"
+        r"岗位|职位|人员|人才))",
+        text,
+    )
+    if m:
+        return m.group(1).strip()[:60]
+
+    # Pattern 1b: Company丨Recruitment Title (WeChat article title format)
+    m = re.search(r"(.{2,40})[丨\|\-]\s*(.{2,60}?(?:招聘|实习|校招|招募|内推|春招|秋招).{0,30})", text)
+    if m:
+        # Return the part after 丨 as the title (more likely the job description)
+        return m.group(2).strip()[:60]
+
+    # Pattern 2: title-like line starting with position keywords
+    m = re.search(
+        r"(?:岗位|职位|招聘岗位|招聘职位)[：:\s]*"
+        r"(.{2,60})",
+        text,
+    )
+    if m:
+        candidate = m.group(1).strip()
+        # Filter out lines that are clearly not job titles
+        if len(candidate) <= 60 and not candidate.startswith("http"):
+            return candidate
+
+    # Pattern 3: line ending with 岗 or 岗位
+    for line in text.splitlines():
+        line = line.strip()
+        m = re.match(r"(.{2,30}(?:岗|岗位))$", line)
+        if m:
+            title_text = m.group(1)
+            if not any(skip in title_text for skip in ("投递", "招聘", "求职", "关注")):
+                return title_text
+
+    # Pattern 4: 丨 separated title (common in WeChat article titles)
+    # Use 2+ chars prefix to capture "XX招聘丨YY" style titles
+    m = re.search(r"(.{2,60}?(?:招聘|实习|校招|内推|招募|春招|秋招).{0,30})", text)
+    if m:
+        raw = m.group(1).strip()
+        # Clean up: strip leading/trailing separators and repeated content
+        raw = re.sub(r"^[丨|\-\s]+", "", raw)
+        raw = re.sub(r"[丨|\-\s]+$", "", raw)
+        if len(raw) <= 80:
+            return raw[:60]
+
+    # Pattern 5: First meaningful line looks like a title
+    first_line = text.strip().split("\n")[0].strip() if text.strip() else ""
+    if first_line and len(first_line) >= 4 and len(first_line) <= 100:
+        # Check if it contains recruitment-related keywords
+        rec_kw = ["招聘", "实习", "校招", "招募", "内推", "春招", "秋招", "岗位", "入职"]
+        if any(kw in first_line for kw in rec_kw):
+            # Clean up common prefixes
+            clean = re.sub(r"^(?:原创|分享|收藏|点赞|在看)\s*", "", first_line)
+            clean = re.sub(r"\s*!{1,3}$", "", clean)
+            return clean[:60]
+
+    return None
+
+
+def _extract_from_unstructured_text(text: str, url: str) -> NormalizedJobCandidate | None:
+    """Last-resort extraction from completely unstructured text.
+
+    Used when structured section headers and fuzzy title extraction both fail.
+    Treats the entire text as a job description and tries to extract at minimum
+    a plausible title and recruitment type.
+    """
+    text = text.strip()
+    if len(text) < 50:
+        return None
+
+    # Must have at least some recruitment-related keywords
+    recruitment_keywords = ["招聘", "实习", "校招", "内推", "岗位", "投递", "简历", "面试",
+                            "intern", "campus", "recruit", "job", "career"]
+    keyword_hits = sum(1 for kw in recruitment_keywords if kw.lower() in text.lower())
+    if keyword_hits < 2:
+        return None
+
+    # Try fuzzy title extraction
+    title = _fuzzy_extract_title(text)
+
+    # Try to find company name
+    company = None
+    for pattern in _COMPANY_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            company = m.group(1).strip()
+            break
+
+    # If still no company, check first line for company-like content
+    if not company:
+        first_line = text.split("\n")[0].strip()
+        if "丨" in first_line:
+            parts = first_line.split("丨")
+            if parts:
+                company = parts[0].strip()[:60]
+
+    recruitment_types = _detect_recruitment_types(text)
+    locations = _extract_locations(text)
+    deadline = _extract_deadline(text)
+    referral_code = _extract_referral_code(text)
+
+    return NormalizedJobCandidate(
+        title=title or "招聘信息",
+        company_name=company,
+        description_text=text[:4000],
+        locations=locations,
+        recruitment_types=recruitment_types,
+        apply_url=url,
+        deadline_text=deadline,
+        referral_code=referral_code,
+        confidence=0.30,
+        normalization_warnings=[
+            "Unstructured text extraction — fields may be incomplete",
+            "No structured sections found; full text used as description",
+        ],
+    )

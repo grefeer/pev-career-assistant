@@ -9,6 +9,7 @@ Every test verifies that the tool is:
 
 import struct
 import zlib
+from unittest.mock import patch
 
 from backend.app.services.job_discovery.schemas import (
     DiscoveryTaskInput,
@@ -301,6 +302,22 @@ def _make_minimal_jpeg(width: int, height: int) -> bytes:
 
 
 class TestOcrPipeline:
+    """Tests for OCR pipeline — mocks PaddleOCR/Tesseract to keep tests fast."""
+
+    # Path to the _run_paddleocr function for mocking
+    _PADDLEOCR_PATH = (
+        "backend.app.services.job_discovery.tools.ocr_pipeline._run_paddleocr"
+    )
+    _TESSERACT_PATH = (
+        "backend.app.services.job_discovery.tools.ocr_pipeline._run_tesseract"
+    )
+    _CHECK_PADDLE_PATH = (
+        "backend.app.services.job_discovery.tools.ocr_pipeline._check_paddleocr_available"
+    )
+    _CHECK_TESS_PATH = (
+        "backend.app.services.job_discovery.tools.ocr_pipeline._check_tesseract_available"
+    )
+
     def test_ocr_disabled(self):
         result = ocr_image(b"some bytes", ocr_enabled=False)
         assert result.needs_manual_review is True
@@ -312,34 +329,105 @@ class TestOcrPipeline:
         assert result.needs_manual_review is True
         assert result.full_text == ""
 
-    def test_png_dimension_parsing(self):
+    def test_png_dimension_parsing_no_engine(self):
+        """When no engine is available, dimension parsing still works."""
         png_bytes = _make_minimal_png(100, 200)
-        result = ocr_image(png_bytes, ocr_enabled=True)
+        with patch(self._CHECK_PADDLE_PATH, return_value=False), \
+             patch(self._CHECK_TESS_PATH, return_value=False):
+            result = ocr_image(png_bytes, ocr_enabled=True)
         assert isinstance(result, OcrResult)
         assert "No OCR engine available" in " ".join(result.warnings)
 
     def test_tall_image_slicing(self):
         png_bytes = _make_minimal_png(800, 3000)
-        result = ocr_image(png_bytes, ocr_enabled=True)
+        with patch(self._CHECK_PADDLE_PATH, return_value=False), \
+             patch(self._CHECK_TESS_PATH, return_value=False):
+            result = ocr_image(png_bytes, ocr_enabled=True)
         warnings_text = " ".join(result.warnings)
         assert "overlapping slices" in warnings_text or "3000px" in warnings_text
 
-    def test_jpeg_dimension_parsing(self):
+    def test_jpeg_dimension_parsing_no_engine(self):
+        """When no engine is available, JPEG dimension parsing still works."""
         jpeg_bytes = _make_minimal_jpeg(640, 480)
-        result = ocr_image(jpeg_bytes, ocr_enabled=True)
+        with patch(self._CHECK_PADDLE_PATH, return_value=False), \
+             patch(self._CHECK_TESS_PATH, return_value=False):
+            result = ocr_image(jpeg_bytes, ocr_enabled=True)
         assert isinstance(result, OcrResult)
+        assert "No OCR engine available" in " ".join(result.warnings)
 
     def test_unsupported_format(self):
         result = ocr_image(b"\x00\x01\x02\x03not an image", ocr_enabled=True)
         warnings_text = " ".join(result.warnings)
         assert "Could not parse image dimensions" in warnings_text
 
-    def test_deterministic(self):
-        png_bytes = _make_minimal_png(10, 10)
-        r1 = ocr_image(png_bytes, ocr_enabled=True)
-        r2 = ocr_image(png_bytes, ocr_enabled=True)
+    def test_deterministic_disabled(self):
+        """OCR-disabled path is always deterministic."""
+        r1 = ocr_image(b"abc", ocr_enabled=False)
+        r2 = ocr_image(b"abc", ocr_enabled=False)
         assert r1.needs_manual_review == r2.needs_manual_review
         assert r1.warnings == r2.warnings
+
+    def test_paddleocr_success(self):
+        """PaddleOCR extracts text successfully."""
+        png_bytes = _make_minimal_png(200, 400)
+        mock_text = "软件工程师\n北京\n本科及以上"
+        with patch(self._CHECK_PADDLE_PATH, return_value=True), \
+             patch(self._PADDLEOCR_PATH, return_value=(mock_text, 0.95, [])):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        assert result.full_text == mock_text
+        assert result.confidence == 0.95
+        assert result.slice_count == 1
+        assert result.needs_manual_review is False
+        assert result.warnings == []
+
+    def test_paddleocr_empty_result(self):
+        """PaddleOCR finds no text → needs manual review."""
+        png_bytes = _make_minimal_png(200, 400)
+        with patch(self._CHECK_PADDLE_PATH, return_value=True), \
+             patch(self._PADDLEOCR_PATH, return_value=("", 0.0, ["no text"])):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        assert result.full_text == ""
+        assert result.needs_manual_review is True
+
+    def test_paddleocr_low_confidence(self):
+        """Low confidence adds warning."""
+        png_bytes = _make_minimal_png(200, 400)
+        mock_text = "some barely readable text"
+        with patch(self._CHECK_PADDLE_PATH, return_value=True), \
+             patch(self._PADDLEOCR_PATH, return_value=(mock_text, 0.45, [])):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        assert result.full_text == mock_text
+        assert "Low OCR confidence" in " ".join(result.warnings)
+
+    def test_paddleocr_error_fallback(self):
+        """PaddleOCR error returns empty with warnings."""
+        png_bytes = _make_minimal_png(200, 400)
+        with patch(self._CHECK_PADDLE_PATH, return_value=True), \
+             patch(self._PADDLEOCR_PATH, return_value=("", 0.0, ["PaddleOCR error: something broke"])):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        assert result.full_text == ""
+        assert result.needs_manual_review is True
+
+    def test_tesseract_fallback(self):
+        """When PaddleOCR unavailable, Tesseract is used."""
+        png_bytes = _make_minimal_png(200, 400)
+        mock_text = "Software Engineer"
+        with patch(self._CHECK_PADDLE_PATH, return_value=False), \
+             patch(self._CHECK_TESS_PATH, return_value=True), \
+             patch(self._TESSERACT_PATH, return_value=(mock_text, 0.88, [])):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        assert result.full_text == mock_text
+        assert result.confidence == 0.88
+        assert result.needs_manual_review is False
+
+    def test_tall_image_dimensions_parsed(self):
+        """Tall image slicing count is computed even without OCR engine."""
+        png_bytes = _make_minimal_png(800, 5000)
+        with patch(self._CHECK_PADDLE_PATH, return_value=False), \
+             patch(self._CHECK_TESS_PATH, return_value=False):
+            result = ocr_image(png_bytes, ocr_enabled=True)
+        warnings_text = " ".join(result.warnings)
+        assert "overlapping slices" in warnings_text or "5000px" in warnings_text
 
 
 # ============================================================================
