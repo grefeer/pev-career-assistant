@@ -11,6 +11,7 @@ import binascii
 import hashlib
 import json
 import re
+import time
 from dataclasses import asdict, is_dataclass
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -67,6 +68,12 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
     kwargs: dict[str, Any] = {
         "model": settings.job_discovery_model,
         "temperature": 0.2,
+        # Bound every single LLM HTTP call and the retry backoff chain so a
+        # stalled DeepSeek response cannot hang the Web Navigation Agent loop
+        # indefinitely (the wall-clock budget in _nav_budget_check only fires
+        # between tool calls, not during an in-flight model request).
+        "request_timeout": 120,
+        "max_retries": 2,
     }
     api_key = get_api_key()
     if api_key:
@@ -537,7 +544,10 @@ def run_web_navigation(
 
     if settings is None:
         settings = Settings()
-    _reset_nav_state(max_pages=max_pages)
+    _reset_nav_state(
+        max_pages=max_pages,
+        time_budget=float(getattr(settings, "job_discovery_task_timeout_seconds", 0) or 0),
+    )
     agent = build_web_navigation_agent(settings=settings, model=model)
     prompt = (
         f"Starting URL: {start_url}\n"
@@ -550,16 +560,74 @@ def run_web_navigation(
         "Return structured evidence_pages, navigation_path, page_count, and error if blocked."
     )
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=prompt)]})
+        # Deterministic baseline: capture the start URL's rendered evidence
+        # directly. This MUST NOT depend on the inner Web Navigation Agent LLM
+        # choosing to call ``extract_rendered_job_evidence`` - on career-site
+        # SPAs the LLM frequently concludes "cannot navigate" and calls
+        # ``finish_with_manual_review`` instead, yielding zero evidence. The
+        # baseline guarantees at least the publicly-rendered ``page_text``
+        # evidence (with the loose title-extractor fallback) so job listings
+        # are still surfaced. The agent may add follow-up evidence below.
+        baseline_evidence: list[dict[str, Any]] = []
+        # WeChat articles are fetched via the ReadGZH proxy through
+        # ``parse_wechat_article`` (the verification wall blocks direct
+        # Playwright); skip the baseline there so we do not waste a browser
+        # session capturing wall text. Only career sites benefit from it.
+        _is_wechat = "mp.weixin.qq.com" in start_url
+        if not _is_wechat:
+            try:
+                _baseline_raw = extract_rendered_job_evidence(start_url)
+                _baseline_parsed = (
+                    json.loads(_baseline_raw) if isinstance(_baseline_raw, str) else _baseline_raw
+                )
+                if isinstance(_baseline_parsed, dict):
+                    baseline_evidence = list(_baseline_parsed.get("evidence_pages") or [])
+            except Exception:  # noqa: BLE001 - baseline is best-effort; agent may still help
+                baseline_evidence = []
+
+        # Bound the inner Web Navigation Agent loop explicitly (super-steps)
+        # and pair it with the wall-clock budget checked in _nav_budget_check.
+        result = agent.invoke(
+            {"messages": [HumanMessage(content=prompt)]},
+            config={"recursion_limit": 30},
+        )
     except Exception as exc:  # noqa: BLE001 - agent/model providers raise heterogeneous errors
         return {
-            "evidence_pages": [],
+            "evidence_pages": baseline_evidence,
+            "candidates": [],
+            "evidence_hash": "",
             "navigation_path": [],
             "page_count": _nav_page_count,
             "error": f"WebNavigationAgent failed: {exc}",
             "delegated_to": "web_navigation_agent",
         }
-    return _parse_web_navigation_agent_result(result)
+    nav_result = _parse_web_navigation_agent_result(result)
+    agent_evidence = nav_result.get("evidence_pages") or []
+    # Merge agent-captured evidence with the deterministic baseline, deduping
+    # by content_hash so the same page captured twice is only extracted once.
+    merged: dict[str, dict[str, Any]] = {}
+    for page in list(agent_evidence) + list(baseline_evidence):
+        if not isinstance(page, dict):
+            continue
+        key = page.get("content_hash") or page.get("url") or ""
+        if key and key not in merged:
+            merged[key] = page
+    evidence_pages = list(merged.values())
+    nav_result["evidence_pages"] = evidence_pages
+    # Deterministically extract+verify candidates from captured evidence so the
+    # final result never depends on the Supervisor LLM wiring evidence_refs
+    # (which verify_evidence requires) or on a single concatenated page_text
+    # (which the 2-segment extractor ceiling would cap at 2 jobs). Each evidence
+    # page is extracted independently, yielding one candidate per job-detail page.
+    try:
+        candidates, evidence_hash = _extract_and_verify_candidates_from_evidence(
+            evidence_pages, start_url
+        )
+    except Exception:  # noqa: BLE001 - degrade gracefully; evidence_pages remain
+        candidates, evidence_hash = [], ""
+    nav_result["candidates"] = candidates
+    nav_result["evidence_hash"] = evidence_hash
+    return nav_result
 
 
 def _run_via_subagent_delegation(
@@ -1124,6 +1192,12 @@ _nav_page_count: int = 0
 _nav_max_pages: int = 20
 _nav_history: list[str] = []
 _nav_current_url: str | None = None
+# Wall-clock budget for a single Web Navigation Agent run (seconds). Set per
+# run_web_navigation() call from settings.job_discovery_task_timeout_seconds so
+# a slow/hung LLM-tool loop on one site cannot run unbounded. Checked in
+# _nav_budget_check() on every page-fetching tool call.
+_nav_start_time: float = 0.0
+_nav_time_budget: float = 0.0
 
 # Per-run page fetch cache — avoids redundant ReadGZH / HTTP calls when
 # multiple WebNavigationAgent tools (open_url, read_dom, extract_links,
@@ -1132,15 +1206,24 @@ _page_cache: dict[str, tuple[str | None, str | None, str | None]] = {}
 # url → (raw_html_or_text, title, error_or_none)
 
 
-def _reset_nav_state(max_pages: int = 20) -> None:
-    """Reset subagent navigation state and page cache."""
+def _reset_nav_state(max_pages: int = 20, time_budget: float = 0.0) -> None:
+    """Reset subagent navigation state and page cache.
+
+    Args:
+        max_pages: Page-fetch budget for this run.
+        time_budget: Wall-clock budget in seconds (0 = no time limit). The
+            clock starts now.
+    """
     global _nav_page_count, _nav_max_pages, _nav_history, _nav_current_url, _page_cache, _wechat_raw_html_cache
+    global _nav_start_time, _nav_time_budget
     _nav_page_count = 0
     _nav_max_pages = max_pages
     _nav_history = []
     _nav_current_url = None
     _page_cache = {}
     _wechat_raw_html_cache = {}
+    _nav_start_time = time.monotonic()
+    _nav_time_budget = float(time_budget)
 
 
 def _fix_response_encoding(resp: requests.Response) -> str:
@@ -1191,9 +1274,15 @@ def _cached_fetch(url: str) -> tuple[str | None, str | None, str | None]:
 
 
 def _nav_budget_check() -> str | None:
-    """Check page budget for subagent navigation."""
+    """Check page and wall-clock budgets for subagent navigation."""
     if _nav_page_count >= _nav_max_pages:
         return f"Page budget exhausted ({_nav_page_count}/{_nav_max_pages})"
+    if _nav_time_budget > 0:
+        elapsed = time.monotonic() - _nav_start_time
+        if elapsed > _nav_time_budget:
+            return (
+                f"Time budget exhausted ({elapsed:.0f}s > {_nav_time_budget:.0f}s)"
+            )
     return None
 
 
@@ -1310,6 +1399,8 @@ def extract_rendered_job_evidence(url: str) -> str:
 
     payloads: list[dict[str, Any]] = []
     response_urls: list[str] = []
+    rendered_text: str = ""
+    title: str = ""
 
     def capture_response(response: Any) -> None:
         """Capture JSON responses from any recruitment API (not just Alibaba)."""
@@ -1339,7 +1430,37 @@ def extract_rendered_job_evidence(url: str) -> str:
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except PlaywrightTimeoutError:
                 page.wait_for_timeout(3_000)
+            # Scroll to trigger lazy-loaded job XHR (infinite scroll /
+            # pagination). The response callback stays armed, so each newly
+            # captured batch is converted into evidence below. Stop after two
+            # consecutive scrolls that add no new network captures.
+            empty_cycles = 0
+            for _ in range(10):
+                before = len(payloads)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=4_000)
+                except PlaywrightTimeoutError:
+                    page.wait_for_timeout(1_500)
+                if len(payloads) > before:
+                    empty_cycles = 0
+                else:
+                    empty_cycles += 1
+                    if empty_cycles >= 2:
+                        break
             title = page.title()
+            # Capture the rendered DOM text as a fallback evidence source.
+            # Many career-site SPAs (Moka, Feishu, Mioffice, PDD) encrypt their
+            # job-list XHR payloads (`{"data": "<base64>"}`) so the XHR path
+            # above yields nothing, but the *rendered* DOM publicly shows job
+            # titles / categories to any visitor without login. Capturing that
+            # visible text (what a human user sees) is legitimate evidence that
+            # the downstream extractor can fall back on. This never bypasses
+            # login/captcha/anti-bot - it only reads already-rendered content.
+            try:
+                rendered_text = page.locator("body").inner_text(timeout=10_000)
+            except (PlaywrightError, PlaywrightTimeoutError):
+                rendered_text = ""
             browser.close()
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
@@ -1354,6 +1475,23 @@ def extract_rendered_job_evidence(url: str) -> str:
         if key and key not in deduped:
             deduped[key] = item
     evidence_pages = list(deduped.values())
+
+    # Always surface the rendered DOM text as a ``page_text`` evidence page so
+    # the extraction helper has a fallback when XHR payloads are encrypted or
+    # empty. The full rendered text (capped) is stored as ``text_excerpt`` and
+    # its hash as ``content_hash``; the helper's loose title extractor reads
+    # this when the strict JD-detail regexes find nothing.
+    if rendered_text.strip():
+        evidence_pages.append(
+            {
+                "evidence_type": "page_text",
+                "url": url,
+                "title": title or "",
+                "content_hash": hashlib.sha256(rendered_text.encode("utf-8")).hexdigest(),
+                "text_excerpt": rendered_text[:8000],
+                "metadata": {"source": "rendered_dom", "position_id": ""},
+            }
+        )
 
     global _nav_page_count, _nav_current_url, _nav_history
     _nav_page_count += 1
@@ -1679,32 +1817,34 @@ def click_link(url: str, link_text: str) -> str:
     html = content or ""
     links = _extract_links_from_html(html, url)
 
-    # Find the link whose text matches (case-insensitive, substring)
+    # Find the link whose text matches (case-insensitive, substring).
+    # Examine ALL links before deciding (the previous indentation returned
+    # "no link found" on the first non-matching link and never followed any).
     target_url: str | None = None
     for link in links:
         if link_text.lower() in link["text"].lower():
             target_url = link["url"]
             break
 
-        if not target_url:
-            return f"ERROR: No link with text '{link_text}' found on {url}"
+    if not target_url:
+        return f"ERROR: No link with text '{link_text}' found on {url}"
 
-        # Follow the link
-        global _nav_page_count, _nav_current_url, _nav_history
-        try:
-            resp2 = requests.get(target_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            resp2.raise_for_status()
-            html2 = resp2.text
-            text2 = _extract_page_text(html2)
+    # Follow the link
+    global _nav_page_count, _nav_current_url, _nav_history
+    try:
+        resp2 = requests.get(target_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp2.raise_for_status()
+        html2 = resp2.text
+        text2 = _extract_page_text(html2)
 
-            _nav_page_count += 1
-            if _nav_current_url:
-                _nav_history.append(_nav_current_url)
-            _nav_current_url = target_url
+        _nav_page_count += 1
+        if _nav_current_url:
+            _nav_history.append(_nav_current_url)
+        _nav_current_url = target_url
 
-            return text2 or "(empty page)"
-        except requests.RequestException as e:
-            return f"ERROR: Could not follow link: {e}"
+        return text2 or "(empty page)"
+    except requests.RequestException as e:
+        return f"ERROR: Could not follow link: {e}"
 
 
 def get_visible_text(url: str) -> str:
@@ -1893,6 +2033,212 @@ def _parse_web_navigation_agent_result(result: Any) -> dict[str, Any]:
     if data.get("error"):
         normalized["error"] = str(data["error"])
     return normalized
+
+
+def _extract_title_only_candidates(
+    text: str,
+    page_url: str,
+    ref: dict[str, Any],
+) -> list[NormalizedJobCandidate]:
+    """Loose fallback: pull likely job titles from rendered list-page text.
+
+    Used only when the strict JD-detail extractor (which matches
+    ``岗位职责:``/``任职要求:`` patterns) finds nothing usable on a
+    ``page_text`` evidence page. Career-site list pages render job *titles*
+    publicly but not JD bodies - the detail pages are gated behind
+    privacy/consent interstitials that this system never circumvents (per the
+    security hard gate). Reading the already-rendered, publicly-visible title
+    text is legitimate; it yields *title-only* candidates (no responsibilities
+    / requirements), clearly flagged via ``normalization_warnings`` so reviewers
+    know the JD body was not captured.
+
+    Args:
+        text: Rendered DOM text (``body.inner_text``) of the list page.
+        page_url: URL of the page (used as ``apply_url``).
+        ref: Evidence-ref dict to attach to every candidate.
+
+    Returns:
+        List of title-only NormalizedJobCandidate objects (deduped by title).
+    """
+    # Strong, specific suffixes - bare category words (运营/市场/产品/销售)
+    # are deliberately excluded so they are not mistaken for job titles.
+    suffixes = (
+        "工程师", "分析师", "架构师", "设计师", "科学家", "专家",
+        "管培生", "管培", "专员", "实习生", "顾问", "助理",
+        "研究员", "产品经理", "项目经理", "运营经理", "研发经理",
+        "负责人", "总监", "主管", "经理",
+    )
+    # Lines ending with these are category/section headers, not job titles.
+    bad_endings = ("招聘", "类", "项目", "中心", "介绍", "说明", "详情", "更多")
+    # Lines containing sentence punctuation are prose, not titles.
+    sentence_punct = re.compile(r"[，。、；：！？]")
+    numbered = re.compile(r"^\d")
+
+    candidates: list[NormalizedJobCandidate] = []
+    seen: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or len(line) > 30 or len(line) < 2:
+            continue
+        # Drop campaign prefix like 【2027秋招】 and trailing parenthetical /
+        # "-届" suffixes so the suffix check sees the bare title.
+        _zw = "​‌‍﻿"
+        _dash_class = "-–‐—"
+        for _ch in _zw:
+            line = line.replace(_ch, "")
+        cleaned = re.sub(r"^[【][^】]*[】]\s*", "", line)
+        cleaned = re.sub(r"（[^）]*）$", "", cleaned)
+        cleaned = re.sub(rf"[{_dash_class}][^{_dash_class}]*$", "", cleaned)
+        for _ch in _zw:
+            cleaned = cleaned.replace(_ch, "")
+        cleaned = cleaned.strip(f" {_dash_class}·")
+        if not cleaned or len(cleaned) > 30 or len(cleaned) < 2:
+            continue
+        if cleaned.endswith(bad_endings):
+            continue
+        if sentence_punct.search(cleaned) or numbered.search(cleaned):
+            continue
+        if not any(cleaned.endswith(s) for s in suffixes):
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        candidates.append(
+            NormalizedJobCandidate(
+                title=cleaned,
+                apply_url=page_url,
+                description_text="",
+                locations=[],
+                recruitment_types=[],
+                industries=[],
+                evidence_refs=[ref],
+                normalization_warnings=[
+                    "Title-only candidate: extracted from rendered list page; "
+                    "JD body not captured (detail page blocked by interstitial)"
+                ],
+            )
+        )
+        if len(candidates) >= 80:
+            break
+    return candidates
+
+
+def _extract_and_verify_candidates_from_evidence(
+    evidence_pages: list[dict[str, Any]],
+    source_url: str,
+) -> tuple[list[dict[str, Any]], str]:
+    """Deterministically extract and verify candidates from captured evidence.
+
+    For each evidence page, run the deterministic JD extractor on its
+    ``text_excerpt`` and attach an ``evidence_ref`` pointing at that page's
+    ``content_hash``/``url`` so the verifier's ``evidence_refs`` requirement is
+    satisfied (the standard ``extract_jd_candidates`` path leaves refs empty,
+    which ``verify_evidence`` would otherwise reject). Each page is extracted
+    independently, so a page text containing a single job yields a single
+    candidate - sidestepping the page-text 2-segment extractor ceiling.
+
+    Returns ``(candidate_dicts, evidence_hash)`` where each candidate dict is
+    packaged with idempotency/similarity keys ready for persistence.
+    """
+    if not evidence_pages:
+        return [], ""
+
+    _EVI_FIELDS = {f.name for f in PageEvidence.__dataclass_fields__.values()}
+    evidence_objs: list[PageEvidence] = []
+    for page in evidence_pages:
+        if not isinstance(page, dict):
+            continue
+        fields = {k: v for k, v in page.items() if k in _EVI_FIELDS}
+        # ``evidence_type`` is the one required PageEvidence field; some
+        # evidence-page dicts produced by the Web Navigation Agent omit it.
+        fields.setdefault("evidence_type", "page_text")
+        evidence_objs.append(PageEvidence(**fields))
+
+    all_candidates: list[NormalizedJobCandidate] = []
+    for page, ev_obj in zip(evidence_pages, evidence_objs):
+        if not isinstance(page, dict):
+            continue
+        text = page.get("text_excerpt") or ""
+        if not text.strip():
+            continue
+        page_url = page.get("url") or source_url
+        extracted = _extract_jd_candidates(text, page_url)
+        ref = {
+            "url": ev_obj.url,
+            "content_hash": ev_obj.content_hash,
+            "evidence_type": ev_obj.evidence_type,
+        }
+        # ``page_text`` evidence from a career-site *list* page has no JD-detail
+        # structure, so the strict extractor returns nothing (or only spurious
+        # section-header "candidates"). Fall back to the loose title extractor
+        # so the publicly-rendered job titles are still surfaced. Detail pages
+        # (whose candidates carry non-empty responsibilities/requirements) are
+        # left untouched.
+        is_page_text = (page.get("evidence_type") == "page_text") or (
+            str(ev_obj.evidence_type) == "page_text"
+        )
+        has_detail = any(
+            (getattr(c, "responsibilities", "") or getattr(c, "requirements", ""))
+            for c in extracted
+        )
+        # On a list ``page_text`` with no JD-detail structure the strict
+        # extractor returns only spurious section-header "candidates"
+        # (e.g. ``在招职位`` / ``最新职位``); discard those and fall back to
+        # the loose title extractor so the real job titles are surfaced.
+        # Detail pages keep their strict candidates untouched.
+        keep_strict = (not is_page_text) or has_detail
+        if keep_strict:
+            for cand in extracted:
+                # Sanitize titles: the strict extractor occasionally yields a
+                # candidate whose title is only zero-width/whitespace (e.g. on
+                # a landing page whose first heading is a styled glyph, or a
+                # testimonial block misread as a JD body). A candidate with no
+                # usable title is not a real job listing - drop it outright
+                # rather than letting a ``​`` title leak through.
+                _t = cand.title or ""
+                for _ch in "​‌‍﻿\t":
+                    _t = _t.replace(_ch, "")
+                _t = _t.strip()
+                if not _t:
+                    continue
+                cand.title = _t
+                cand.evidence_refs = [ref]
+                all_candidates.append(cand)
+        if is_page_text and not has_detail:
+            all_candidates.extend(
+                _extract_title_only_candidates(text, page_url, ref)
+            )
+
+    verified = _verify_evidence(all_candidates, evidence_objs)
+
+    evidence_hash = hashlib.sha256(
+        json.dumps(evidence_pages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    try:
+        source_family = urlsplit(source_url).netloc.lower() or "career_site"
+    except ValueError:
+        source_family = "career_site"
+
+    packaged: list[dict[str, Any]] = []
+    for cand in verified:
+        d = _asdict(cand)
+        company = d.get("company_name") or ""
+        title = d.get("title") or ""
+        locations = d.get("locations") or []
+        location = locations[0] if locations else "unknown"
+        apply_url = d.get("apply_url") or source_url
+        rec_types = d.get("recruitment_types") or []
+        recruitment_type = rec_types[0] if rec_types else "unknown"
+        d["idempotency_key"] = build_candidate_idempotency_key(
+            company=company, title=title, location=location,
+            apply_url=apply_url, evidence_hash=evidence_hash,
+        )
+        d["similarity_group_key"] = build_similarity_group_key(
+            company=company, title=title,
+            recruitment_type=recruitment_type, source_family=source_family,
+        )
+        packaged.append(d)
+    return packaged, evidence_hash
 
 
 def build_web_navigation_agent(

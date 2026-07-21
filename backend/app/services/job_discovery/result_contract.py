@@ -125,6 +125,9 @@ def _collect_tool_outputs(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str
                 pages = payload.get("evidence_pages") or payload.get("evidence") or []
                 if isinstance(pages, list):
                     evidence.extend(item for item in pages if isinstance(item, dict))
+                cands = payload.get("candidates")
+                if isinstance(cands, list):
+                    candidates.extend(item for item in cands if isinstance(item, dict))
         elif tool_name == "package_candidates" and isinstance(payload, list):
             candidates.extend(item for item in payload if isinstance(item, dict))
     return evidence, candidates
