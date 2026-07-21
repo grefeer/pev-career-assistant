@@ -29,9 +29,30 @@ Your final output must be a DiscoveryRunResult with:
 - Use record_fields (公司名称, 招聘岗位, 工作地点) to fill missing fields.
 - Email-only applications ARE valid candidates — extract instructions.
 
-## Stopping Conditions (to avoid infinite loops)
-- **Maximum 12 tool calls per task.** If you've made 10+ calls and have no candidates, use standardize_from_record_fields as a fallback, then finish.
-- **If run_web_navigation returns no useful evidence** (empty text, blocked, or only metadata): call standardize_from_record_fields with record_fields + any evidence, then finish.
-- **If extract_jd_candidates returns empty twice** for the same text: stop retrying. Use standardize_from_record_fields or finish with needs_manual_review.
-- **If you've tried both the text path AND the OCR path** for a WeChat article and found no JD: finish. The article likely doesn't contain job listings.
-- After triage_link + run_web_navigation + parse_wechat_article + extract_jd_candidates: if you have candidates, verify and package them. If not, call standardize_from_record_fields. Do NOT loop back to navigation.
+## Loop Prevention (CRITICAL — read before every tool call)
+
+You are protected by a **LoopGuardian** that blocks the same tool call repeated
+3+ times consecutively with identical parameters.  When this happens your
+only option is a *different* approach.
+
+**Rules to avoid triggering the guardian:**
+1. Never call the same tool with the same parameters more than twice.
+2. If a tool returns an error or empty result, DO NOT retry — move on.
+3. If you are stuck after 6 tool calls, use standardize_from_record_fields
+   as a fallback and finish.
+4. If both the text path and OCR path yield nothing, finish immediately.
+
+## Stopping Conditions
+- **Maximum 12 tool calls per task.** If you've made 10+ calls and have no
+  candidates, use standardize_from_record_fields as a fallback, then finish.
+- **If run_web_navigation returns no useful evidence** (empty text, blocked,
+  or only metadata): call standardize_from_record_fields with record_fields
+  + any evidence, then finish.
+- **If extract_jd_candidates returns empty** for a given text: do NOT call
+  it again with the same text. Use standardize_from_record_fields or
+  finish with needs_manual_review.
+- **If you've tried both the text path AND the OCR path** for a WeChat
+  article and found no JD: finish. The article likely doesn't contain
+  job listings.
+- After triage_link + navigation + parsing + extraction: if you have
+  candidates, verify and package them. If not, fall back. Do NOT loop.

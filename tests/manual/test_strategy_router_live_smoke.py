@@ -41,7 +41,7 @@ from backend.app.services.job_discovery.deepagents_runner import (
     _build_job_discovery_llm,
     run_web_navigation,
 )
-from backend.app.services.job_discovery.schemas import DiscoveryTaskInput
+from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
 from backend.app.services.job_discovery.strategy.strategy_router import StrategyRouter
 from backend.app.services.job_discovery.strategy.strategy_store import get_active_strategies
 from backend.app.services.job_discovery.strategy.snapshot_executor import (
@@ -63,17 +63,23 @@ MAX_PAGES = 5
 RECURSION_LIMIT = 100  # enough for WebNavigationAgent (deep agent) + Supervisor pipeline
 
 # Seed strategy YAML plans
-# WeChat plan: triage only (deterministic, no LLM). Post-triage pipeline
-# (navigation → parsing → extraction) is handled by Supervisor takeover.
+# WeChat plan: triage → fetch via ReadGZH → deterministic JD extraction.
+# All three steps are deterministic (no LLM planning), completing in
+# ~5-15 s instead of routing through the Supervisor + WebNavigationAgent
+# deep-agent pipeline which takes 2-7 minutes.
 WECHAT_PLAN_YAML = """
 plan:
   - tool: triage_link
     params:
       url: "{{task.source_url}}"
+  - tool: fetch_wechat_article
+    params:
+      url: "{{task.source_url}}"
+  - tool: extract_jd_candidates
+    params:
+      page_text: "{{prev.result.text}}"
+      url: "{{task.source_url}}"
 """
-# Note: triage_link classifies the URL as wechat/career_site/blocked.
-# After triage succeeds, Supervisor takeover handles the full pipeline
-# (navigation → parsing → extraction → verification → packaging).
 
 
 # -- Env setup ----------------------------------------------------------------
@@ -301,11 +307,21 @@ def execute_with_strategy_router(
             executor_type = "partial_fallback"
             snapshot_context = snap_result.snapshot_context
         elif not snap_result.candidates:
-            # Snapshot succeeded (e.g. triage only) but LLM extraction needed.
-            # Run Supervisor in clean-start mode — triage result was minimal.
-            print(f"  -> Supervisor handoff (Snapshot OK but 0 candidates, running full pipeline)")
-            executor_type = "partial_fallback"
-            snapshot_context = None  # clean start, don't confuse supervisor
+            # Snapshot succeeded but 0 candidates.
+            # If the article was blocked (verification wall), skip the
+            # expensive Supervisor handoff — there is nothing to extract.
+            if _snapshot_has_manual_review_flag(trajectory):
+                print(f"  -> Blocked article (needs_manual_review), skipping Supervisor")
+                result = DiscoveryRunResult(
+                    status="needs_manual_review",
+                    evidence=snap_result.evidence,
+                    candidates=[],
+                    summary="WeChat article blocked by verification wall",
+                )
+            else:
+                print(f"  -> Supervisor handoff (Snapshot OK but 0 candidates, running full pipeline)")
+                executor_type = "partial_fallback"
+                snapshot_context = None  # clean start, don't confuse supervisor
         else:
             result = snap_result
 
@@ -357,6 +373,15 @@ def execute_with_strategy_router(
         "strategy_matched": strategy_record is not None,
         "strategy_pattern": strategy_record.url_pattern if strategy_record else None,
     }
+
+
+def _snapshot_has_manual_review_flag(trajectory: TrajectoryBuffer) -> bool:
+    """Check whether any snapshot step returned needs_manual_review=True."""
+    for step in trajectory.steps:
+        result = step.get("result")
+        if isinstance(result, dict) and result.get("needs_manual_review") is True:
+            return True
+    return False
 
 
 def _load_adapter_class(adapter_path: str):

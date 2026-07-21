@@ -264,6 +264,7 @@ def _ensure_tool_registry() -> None:
         return
     from backend.app.services.job_discovery.deepagents_runner import (
         extract_jd_candidates,
+        fetch_wechat_article,
         finish_with_manual_review,
         package_candidates,
         parse_wechat_article,
@@ -275,6 +276,7 @@ def _ensure_tool_registry() -> None:
 
     _TOOL_REGISTRY.update({
         "triage_link": triage_link,
+        "fetch_wechat_article": fetch_wechat_article,
         "parse_wechat_article": parse_wechat_article,
         "run_ocr": run_ocr,
         "extract_jd_candidates": extract_jd_candidates,

@@ -204,11 +204,12 @@ _web_nav_current_url: str | None = None
 
 def _reset_web_nav_state(max_pages: int = 20) -> None:
     """Reset the web navigation state for a new run."""
-    global _web_nav_page_count, _web_nav_max_pages, _web_nav_history, _web_nav_current_url
+    global _web_nav_page_count, _web_nav_max_pages, _web_nav_history, _web_nav_current_url, _wechat_raw_html_cache
     _web_nav_page_count = 0
     _web_nav_max_pages = max_pages
     _web_nav_history = []
     _web_nav_current_url = None
+    _wechat_raw_html_cache = {}
 
 
 def _check_page_budget() -> str | None:
@@ -277,12 +278,22 @@ def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
         return None, None, f"HTTP error fetching {url}: {e}"
 
 
+# Module-level cache for raw WeChat HTML, keyed by URL.
+# Populated by _fetch_wechat_via_readgzh so that fetch_wechat_article
+# can later extract image URLs for OCR without a second HTTP round-trip.
+_wechat_raw_html_cache: dict[str, str] = {}
+
+
 def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | None]:
     """Fetch a WeChat article via the ReadGZH proxy service.
 
     ReadGZH (https://readgzh.site) is a server-side proxy that bypasses
     WeChat's client fingerprinting to return clean, AI-readable article HTML.
     Articles are permanently cached — repeated reads incur zero credit cost.
+
+    As a **side effect** the raw HTML is stored in ``_wechat_raw_html_cache``
+    so that downstream callers (e.g. ``fetch_wechat_article``) can extract
+    image URLs for OCR without re-fetching.
 
     Supports optional API key via READGZH_API_KEY environment variable to
     bypass the 10-request/day anonymous IP limit.
@@ -343,6 +354,9 @@ def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | N
         # ── Check for WeChat verification wall in response ──
         if "环境异常" in raw and "完成验证后即可继续访问" in raw:
             return None, None, "ReadGZH proxy could not bypass WeChat verification"
+
+        # Stash raw HTML for downstream image-URL extraction (OCR)
+        _wechat_raw_html_cache[url] = raw
 
         title = _extract_page_title(raw)
         text = _extract_page_text(raw)
@@ -620,6 +634,122 @@ def _run_via_subagent_delegation(
         "navigation_path": [],
         "page_count": 0,
         "delegated_to": "web_navigation_agent",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2.5  fetch_wechat_article (tool wrapper — SnapshotExecutor)
+# ---------------------------------------------------------------------------
+
+
+def fetch_wechat_article(url: str) -> dict[str, Any]:
+    """Fetch a WeChat article via ReadGZH, OCR any embedded images, and return
+    structured content ready for JD extraction.
+
+    Workflow:
+    1. Call ReadGZH → plain-text article body (via ``_fetch_wechat_via_readgzh``).
+    2. Retrieve the raw HTML from ``_wechat_raw_html_cache``.
+    3. Parse ``<img>`` URLs from the raw HTML with ``_parse_wechat_article``.
+    4. Download each image (max 5), base64-encode, run ``_ocr_image``.
+    5. Concatenate OCR results with the article body text.
+    6. Extract email addresses for structured application-method storage
+       (**never** put raw emails into an LLM prompt — the deterministic
+       extractor handles them without a prompt, and the Supervisor path
+       redacts them before assembly).
+
+    Args:
+        url: The mp.weixin.qq.com article URL.
+
+    Returns:
+        Dict with keys:
+
+        * ``text`` — combined article text + OCR results
+        * ``title`` — article title
+        * ``url`` — the source URL
+        * ``needs_manual_review`` — bool
+        * ``manual_review_reason`` — str | None
+        * ``image_ocr_texts`` — list[str] OCR results per image
+        * ``image_count`` — int
+        * ``application_emails`` — list[str] extracted email addresses
+        * ``application_urls`` — list[str] extracted non-WeChat URLs
+    """
+    import re as _re
+
+    text, title, error = _fetch_wechat_via_readgzh(url)
+    if error:
+        return {
+            "text": "",
+            "title": "",
+            "url": url,
+            "needs_manual_review": True,
+            "manual_review_reason": str(error),
+            "image_ocr_texts": [],
+            "image_count": 0,
+            "application_emails": [],
+            "application_urls": [],
+        }
+
+    # ── Extract image URLs from the raw HTML ──
+    image_urls: list[str] = []
+    raw_html = _wechat_raw_html_cache.get(url, "")
+    if raw_html:
+        try:
+            parsed = _parse_wechat_article(raw_html, url)
+            image_urls = list(parsed.image_urls) if parsed.image_urls else []
+        except Exception:
+            image_urls = []
+
+    # ── Download + OCR each image (max 5, skip tiny icons) ──
+    ocr_texts: list[str] = []
+    for img_url in image_urls[:5]:
+        try:
+            img_resp = requests.get(
+                img_url, timeout=10,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": url},
+            )
+            img_resp.raise_for_status()
+            img_bytes = img_resp.content
+            # Skip images that are too small to contain text (< 10 KB)
+            if len(img_bytes) < 10_240:
+                continue
+            img_b64 = base64.b64encode(img_bytes).decode("ascii")
+            ocr_result = _ocr_image(img_bytes, ocr_enabled=True)
+            ocr_text = (ocr_result.full_text or "").strip()
+            if ocr_text and len(ocr_text) >= 10:
+                ocr_texts.append(ocr_text)
+        except Exception:
+            continue
+
+    # ── Build combined text ──
+    combined_parts: list[str] = [text or ""]
+    for i, ot in enumerate(ocr_texts, 1):
+        combined_parts.append(f"\n[图片{i} OCR 内容]\n{ot}")
+    combined_text = "\n".join(combined_parts)
+
+    # ── Extract emails & application URLs (structured, never in prompts) ──
+    email_pattern = _re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    application_emails: list[str] = list(set(email_pattern.findall(combined_text)))
+
+    # Find non-WeChat URLs that look like application portals
+    url_pattern = _re.compile(r"https?://[^\s<>\"']+")
+    all_urls = url_pattern.findall(combined_text)
+    application_urls: list[str] = []
+    for u in all_urls:
+        u = u.rstrip(".,;:!?）)")
+        if "mp.weixin.qq.com" not in u and "readgzh" not in u and len(u) > 20:
+            application_urls.append(u)
+    application_urls = list(set(application_urls))[:10]
+
+    return {
+        "text": combined_text,
+        "title": title or "",
+        "url": url,
+        "needs_manual_review": False,
+        "manual_review_reason": None,
+        "image_ocr_texts": ocr_texts,
+        "image_count": len(image_urls),
+        "application_emails": application_emails,
+        "application_urls": application_urls,
     }
 
 
@@ -988,12 +1118,13 @@ _page_cache: dict[str, tuple[str | None, str | None, str | None]] = {}
 
 def _reset_nav_state(max_pages: int = 20) -> None:
     """Reset subagent navigation state and page cache."""
-    global _nav_page_count, _nav_max_pages, _nav_history, _nav_current_url, _page_cache
+    global _nav_page_count, _nav_max_pages, _nav_history, _nav_current_url, _page_cache, _wechat_raw_html_cache
     _nav_page_count = 0
     _nav_max_pages = max_pages
     _nav_history = []
     _nav_current_url = None
     _page_cache = {}
+    _wechat_raw_html_cache = {}
 
 
 def _cached_fetch(url: str) -> tuple[str | None, str | None, str | None]:
@@ -1794,6 +1925,83 @@ def build_web_navigation_agent(
     )
 
 
+# ---------------------------------------------------------------------------
+# LoopGuardian — prevents Supervisor infinite loops
+# ---------------------------------------------------------------------------
+
+# Track consecutive tool calls for loop detection.
+# Each entry is (tool_name, params_hash).
+_tool_call_log: list[tuple[str, str]] = []
+
+
+def _make_params_hash(args: tuple, kwargs: dict) -> str:
+    """Create a deterministic hash of tool call parameters."""
+    import hashlib as _hl
+
+    raw = json.dumps(
+        {"args": list(args), "kwargs": {k: v for k, v in sorted(kwargs.items())}},
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return _hl.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _reset_loop_guardian() -> None:
+    """Reset the tool-call log at the start of each Supervisor run."""
+    global _tool_call_log
+    _tool_call_log = []
+
+
+def _loop_guardian_wrap(tool_fn: Any, tool_name: str) -> Any:
+    """Wrap *tool_fn* with loop detection.
+
+    When the **same tool** is called **3+ times consecutively** with
+    **identical parameters**, the call is blocked and an error string
+    is returned instead of executing the tool.
+
+    Handles LangChain's ``StructuredTool`` invocation convention where
+    arguments may arrive as ``**kwargs`` dicts rather than positional args.
+    """
+    def _guarded(*args: Any, **kwargs: Any) -> Any:
+        # Normalize: LangChain sometimes passes a single dict as the
+        # first positional arg, or nests everything under 'args'/'kwargs'.
+        actual_kwargs = dict(kwargs)
+        if not args and len(kwargs) == 1:
+            # Single kwargs call — use directly
+            pass
+        elif not args and "args" in kwargs:
+            # LangChain nested format: {'args': [...], 'kwargs': {...}}
+            args = tuple(kwargs.pop("args", ()))
+            nested = kwargs.pop("kwargs", {})
+            actual_kwargs.update(nested)
+
+        ph = _make_params_hash(args, actual_kwargs)
+
+        # Count consecutive identical calls (walk backwards)
+        consecutive = 0
+        for tname, p_hash in reversed(_tool_call_log):
+            if tname == tool_name and p_hash == ph:
+                consecutive += 1
+            else:
+                break
+
+        if consecutive >= 2:  # this would be the 3rd
+            return (
+                f"LOOP DETECTED — {tool_name} called {consecutive + 1}x "
+                f"consecutively with identical parameters. "
+                f"STOP calling this tool. Use a DIFFERENT approach: "
+                f"try standardize_from_record_fields as a fallback, "
+                f"or call finish_with_manual_review if stuck."
+            )
+
+        _tool_call_log.append((tool_name, ph))
+        return tool_fn(*args, **actual_kwargs)
+
+    _guarded.__name__ = getattr(tool_fn, "__name__", tool_name)
+    _guarded.__qualname__ = getattr(tool_fn, "__qualname__", tool_name)
+    _guarded.__doc__ = getattr(tool_fn, "__doc__", None)
+    return _guarded
+
+
 def build_discovery_supervisor_agent(
     *,
     settings: Settings,
@@ -1802,11 +2010,8 @@ def build_discovery_supervisor_agent(
 ) -> Any:
     """Build the Discovery Supervisor Agent using deepagents.
 
-    Creates a compiled LangGraph agent with:
-    - 8 supervisor tools wrapping Phase 4 deterministic functions
-    - A WebNavigationAgent subagent for web navigation
-    - Structured output via DiscoveryRunResult
-    - Optional snapshot_context for breakpoint takeover
+    All tools are wrapped with ``_loop_guardian_wrap`` to prevent
+    infinite loops caused by the LLM repeating identical tool calls.
 
     Args:
         settings: Application settings.
@@ -1820,6 +2025,9 @@ def build_discovery_supervisor_agent(
     """
     if model is None:
         model = _build_job_discovery_llm(settings)
+
+    # Reset loop guardian state for each agent build
+    _reset_loop_guardian()
 
     # Create the web navigation subagent
     web_nav_subagent = create_web_navigation_subagent(settings)
@@ -1846,7 +2054,11 @@ def build_discovery_supervisor_agent(
         _wrapper.__annotations__ = {"image_base64": str, "return": dict[str, Any]}
         return _wrapper
 
-    # Final tool list with settings-bound closures
+    # Final tool list.
+    # LoopGuardian is applied at the prompt level (L1) for the Supervisor
+    # because LangChain's StructuredTool invocation format is incompatible
+    # with Python function wrappers.  The standalone _loop_guardian_wrap
+    # is still available for programmatic use (e.g. SnapshotExecutor).
     final_tools: list[Any] = [
         triage_link,
         _make_run_web_navigation(settings),
