@@ -37,11 +37,11 @@ def parse_agent_result(raw: Any) -> DiscoveryRunResult:
 
     if tool_evidence or tool_candidates:
         return DiscoveryRunResult(
-            status="succeeded" if tool_candidates else "needs_manual_review",
-            block_reason=None if tool_candidates else "parse_failed",
+            status="partial_success" if tool_candidates else "needs_manual_review",
+            block_reason="parse_failed",
             evidence=tool_evidence,
             candidates=tool_candidates,
-            summary="Recovered discovery output from tool results",
+            summary="Recovered incomplete discovery output from tool results",
         )
 
     messages = raw.get("messages", []) if isinstance(raw, dict) else []

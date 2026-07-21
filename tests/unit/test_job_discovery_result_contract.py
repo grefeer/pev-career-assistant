@@ -61,7 +61,33 @@ def test_success_requires_at_least_one_candidate() -> None:
     assert enforce_result_invariants(result).status == "failed"
 
 
-def test_assembles_tool_outputs_when_final_message_is_malformed() -> None:
+def test_candidate_only_tool_recovery_is_partial_success() -> None:
+    candidate = {
+        "title": "Software Engineer",
+        "company_name": "Example Corp",
+        "idempotency_key": "candidate-key",
+        "similarity_group_key": "group-key",
+    }
+    raw = {
+        "messages": [
+            ToolMessage(
+                content=json.dumps([candidate]),
+                name="package_candidates",
+                tool_call_id="package-call",
+            ),
+            AIMessage(content="malformed final response"),
+        ]
+    }
+
+    result = parse_agent_result(raw)
+
+    assert result.status == "partial_success"
+    assert result.block_reason == "parse_failed"
+    assert result.candidates == [candidate]
+    assert result.evidence == []
+
+
+def test_incomplete_tool_recovery_preserves_evidence_and_candidates() -> None:
     evidence = {
         "evidence_type": "page_text",
         "url": "https://example.test/jobs/1",
@@ -91,6 +117,32 @@ def test_assembles_tool_outputs_when_final_message_is_malformed() -> None:
 
     result = parse_agent_result(raw)
 
-    assert result.status == "succeeded"
+    assert result.status == "partial_success"
+    assert result.block_reason == "parse_failed"
     assert result.evidence == [evidence]
     assert result.candidates == [candidate]
+
+
+def test_evidence_only_tool_recovery_requires_manual_review() -> None:
+    evidence = {
+        "evidence_type": "page_text",
+        "url": "https://example.test/jobs/1",
+        "content_hash": "evidence-hash",
+    }
+    raw = {
+        "messages": [
+            ToolMessage(
+                content=json.dumps({"evidence_pages": [evidence]}),
+                name="run_web_navigation",
+                tool_call_id="navigation-call",
+            ),
+            AIMessage(content="malformed final response"),
+        ]
+    }
+
+    result = parse_agent_result(raw)
+
+    assert result.status == "needs_manual_review"
+    assert result.block_reason == "parse_failed"
+    assert result.evidence == [evidence]
+    assert result.candidates == []
