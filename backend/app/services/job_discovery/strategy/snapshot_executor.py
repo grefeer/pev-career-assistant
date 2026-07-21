@@ -240,6 +240,29 @@ class SnapshotExecutor:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        # Auto-generate evidence from text-producing intermediate steps
+        # when no explicit evidence was found (e.g. WeChat fetch -> extract).
+        if candidates and not evidence:
+            import hashlib as _hashlib
+            for step in completed:
+                result = step.get("result")
+                if isinstance(result, dict) and result.get("text") and not result.get("evidence_type"):
+                    text = result.get("text", "")
+                    src_url = result.get("url", "")
+                    src_title = result.get("title", "")
+                    evidence.append(PageEvidence(
+                        evidence_type="rendered_page",
+                        url=src_url,
+                        title=src_title or "",
+                        content_hash=_hashlib.sha256(text.encode()).hexdigest(),
+                        text_excerpt=text[:5000],
+                        metadata={
+                            "source": "snapshot_auto",
+                            "tool": step.get("tool", ""),
+                        },
+                    ))
+                    break  # one evidence entry suffices
+
         return DiscoveryRunResult(
             status="succeeded",
             evidence=evidence,
