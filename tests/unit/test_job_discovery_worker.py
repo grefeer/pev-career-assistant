@@ -400,7 +400,7 @@ class TestSuccessfulTask:
 
     @patch("backend.app.services.job_discovery.worker.claim_next_task")
     @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
-    def test_partial_success(
+    def test_empty_partial_success_requires_manual_review(
         self,
         mock_build_agent: MagicMock,
         mock_claim: MagicMock,
@@ -428,7 +428,8 @@ class TestSuccessfulTask:
         with Session(engine) as vs:
             t = vs.get(JobDiscoveryTask, queued_task.id)
             assert t is not None
-            assert t.status is JobDiscoveryTaskStatus.partial_success
+            assert t.status is JobDiscoveryTaskStatus.needs_manual_review
+            assert t.block_reason is DiscoveryBlockReason.parse_failed
             assert t.finished_at is not None
 
 

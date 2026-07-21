@@ -50,6 +50,11 @@ from backend.app.services.job_discovery.schemas import (
     NormalizedJobCandidate,
     PageEvidence,
 )
+from backend.app.services.job_discovery.result_contract import (
+    AgentResultParseError,
+    enforce_result_invariants,
+    parse_agent_result,
+)
 from backend.app.services.job_discovery.tools import (
     build_candidate_idempotency_key,
     build_similarity_group_key,
@@ -83,45 +88,16 @@ def _build_worker_id() -> str:
     return f"{socket.gethostname()}::{os.getpid()}"
 
 
-def _parse_agent_result(result_raw: dict[str, Any]) -> DiscoveryRunResult:
-    """Parse a ``DiscoveryRunResult`` from the agent's invocation output.
-
-    Tries, in order:
-    1. ``structured_response`` key (deepagents ``response_format`` output).
-    2. The dict itself if it carries a ``status`` key.
-    3. Last message content parsed as JSON.
-    4. Fallback to a failed result.
-    """
-    # Strategy 1 — structured_response from deepagents
-    structured = result_raw.get("structured_response")
-    if hasattr(structured, "model_dump"):
-        structured = structured.model_dump()
-    if isinstance(structured, dict) and "status" in structured:
-        return DiscoveryRunResult(**structured)
-
-    # Strategy 2 — direct dict with status key
-    if isinstance(result_raw, dict) and "status" in result_raw:
-        return DiscoveryRunResult(**result_raw)
-
-    # Strategy 3 — parse last message content as JSON
-    messages = result_raw.get("messages", [])
-    if messages:
-        last = messages[-1]
-        content: str | None = None
-        if hasattr(last, "content") and last.content:
-            content = last.content
-        if isinstance(content, str):
-            try:
-                parsed = json.loads(content)
-                if isinstance(parsed, dict) and "status" in parsed:
-                    return DiscoveryRunResult(**parsed)
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
-
-    return DiscoveryRunResult(
-        status="failed",
-        summary="Could not parse structured output from agent result",
-    )
+def _parse_agent_result(result_raw: Any) -> DiscoveryRunResult:
+    """Compatibility wrapper for the shared discovery-result parser."""
+    try:
+        return parse_agent_result(result_raw)
+    except AgentResultParseError:
+        return DiscoveryRunResult(
+            status="failed",
+            block_reason="parse_failed",
+            summary="Could not parse structured output from agent result",
+        )
 
 
 def _persist_evidence(
@@ -544,8 +520,27 @@ class JobDiscoveryWorker:
                         if "config" not in str(exc):
                             raise
                         result_raw = agent.invoke(agent_input)
-                    result = _parse_agent_result(result_raw)
-                    trajectory.record_step("supervisor_complete", "ok", {}, {"status": result.status})
+                    try:
+                        result = parse_agent_result(result_raw)
+                    except AgentResultParseError as parse_error:
+                        trajectory.record_step(
+                            "supervisor_parse_failed",
+                            "failed",
+                            {
+                                "message_types": parse_error.message_types,
+                                "message_count": parse_error.message_count,
+                            },
+                            {"stop_reason": "parse_failed"},
+                        )
+                        result = DiscoveryRunResult(
+                            status="failed",
+                            block_reason="parse_failed",
+                            summary=str(parse_error),
+                        )
+                    else:
+                        trajectory.record_step(
+                            "supervisor_complete", "ok", {}, {"status": result.status}
+                        )
                 except Exception as agent_exc:
                     agent_error = agent_exc
                     trajectory.record_step("supervisor_fatal", "failed", {}, None, error=agent_exc)
@@ -561,6 +556,7 @@ class JobDiscoveryWorker:
                 task_input=task_input,
                 settings=self.settings,
             )
+            result = enforce_result_invariants(result)
             if agent_error is not None and not result.candidates and not result.evidence:
                 raise agent_error
 
