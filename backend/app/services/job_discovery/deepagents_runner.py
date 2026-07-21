@@ -1345,122 +1345,98 @@ def extract_rendered_job_evidence(url: str) -> str:
 
 
 def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
-    """Call the Alibaba campus position search JSON API directly.
+    """Navigate the Alibaba campus SPA with Playwright and extract job data.
 
-    Extracts the batch ID and share code from the source SPA URL,
-    then POSTs to the ``/position/search`` API endpoint.  Uses a
-    ``requests.Session`` to capture cookies from the main landing page
-    first, which avoids 403 anti-bot rejections on the search endpoint.
+    Opens the URL in a headless Chromium browser, waits for the SPA to
+    fully render, then captures both XHR JSON responses and the rendered
+    DOM visible text.  Returns a dict with ``page_text``, ``payloads``,
+    and ``page_title`` so the adapter can build evidence from whichever
+    source yields usable data.
 
-    If the direct API call fails (405, 403, timeout, etc.), falls back to
-    the Playwright browser-based ``extract_rendered_job_evidence`` path,
-    which navigates the full SPA and captures XHR responses from the real
-    browser environment.
+    The old direct-POST-to-``/position/search`` path is removed — it
+    consistently returned 403 even with session-cookie warming, and the
+    wasted ~30 s ate into the per-URL time budget.
 
     Args:
-        url: The Alibaba campus SPA URL (e.g. ``https://campus-talent.alibaba.com/
-             campus/position?batchId=...&campusShareCode=...``).
+        url: The Alibaba campus SPA URL.
 
     Returns:
-        The parsed JSON response from the position search API.
+        Dict with keys ``page_text`` (str), ``page_title`` (str),
+        ``payloads`` (list[dict]), and ``url``.
 
     Raises:
-        requests.RequestException: If both direct API and browser fallback fail.
-        ValueError: If the response is not valid JSON.
+        RuntimeError: If the browser cannot be launched or the page
+            cannot be loaded at all.
     """
-    from urllib.parse import urlencode, urlparse, unquote_plus
-
-    parsed = urlparse(url)
-    api_url = f"{parsed.scheme}://{parsed.netloc}/position/search"
-    landing_url = f"{parsed.scheme}://{parsed.netloc}/campus/index"
-
-    # Extract relevant query parameters from the original URL
-    params: dict[str, str] = {}
-    if parsed.query:
-        for pair in parsed.query.split("&"):
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                params[k] = unquote_plus(v)
-
-    # Build the POST body — Alibaba's /position/search expects JSON
-    body: dict[str, object] = {"pageSize": 50, "pageNum": 1}
-    for key in ("batchId", "campusShareCode", "batchIds"):
-        if key in params:
-            body[key] = params[key]
-
-    common_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    session = requests.Session()
-
-    # ── Step 1: warm the session by visiting the landing page ──
     try:
-        landing_resp = session.get(
-            landing_url,
-            timeout=15,
-            headers={**common_headers, "Referer": url},
-        )
-        landing_resp.raise_for_status()
-    except requests.RequestException:
-        # Landing page is optional — proceed without cookies
-        pass
+        from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError("Playwright is not installed — cannot navigate Alibaba SPA")
 
-    # ── Step 2: POST to the search API ──
-    direct_error: str | None = None
+    payloads: list[dict[str, Any]] = []
+    response_urls: list[str] = []
+    page_text: str = ""
+    page_title: str = ""
+
+    def _capture_json_response(response: Any) -> None:
+        """Capture JSON responses from the SPA's XHR/fetch calls."""
+        resp_url = getattr(response, "url", "")
+        ct = (getattr(response, "headers", {}) or {}).get("content-type", "")
+        if "json" not in ct and "javascript" not in ct:
+            return
+        try:
+            payloads.append(json.loads(response.text()))
+            response_urls.append(resp_url)
+        except Exception:
+            return
+
     try:
-        resp = session.post(
-            api_url,
-            json=body,
-            timeout=30,
-            headers={
-                **common_headers,
-                "Referer": landing_url,
-                "Origin": f"{parsed.scheme}://{parsed.netloc}",
-                "Content-Type": "application/json",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        )
-        if resp.status_code == 200 and len(resp.text) > 50:
-            data = resp.json()
-            if isinstance(data, dict) and (data.get("content") or data.get("data")):
-                return data
-            # Response is valid JSON but doesn't contain expected keys;
-            # fall through to the browser path.
-            direct_error = f"API returned 200 but unrecognised shape: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}"
-        else:
-            direct_error = (
-                f"Direct POST {api_url} returned {resp.status_code}: "
-                f"{resp.text[:200]}"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125 Safari/537.36"
+                )
             )
-    except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
-        direct_error = f"Direct POST {api_url} failed: {exc}"
+            page.on("response", _capture_json_response)
 
-    # ── Step 3: fall back to Playwright browser-based extraction ──
-    try:
-        result_json = extract_rendered_job_evidence(url)
-        result = json.loads(result_json)
-        evidence_pages = result.get("evidence_pages") or []
-        if evidence_pages:
-            # Convert evidence_pages back to a search-like payload so the
-            # caller can process it with _generic_position_evidence_from_payload
-            return {
-                "content": {"datas": [
-                    _evidence_to_position_item(ev) for ev in evidence_pages
-                ]},
-            }
-        direct_error = f"{direct_error}; browser fallback found no evidence pages"
-    except Exception as browser_exc:
-        direct_error = f"{direct_error}; browser fallback also failed: {browser_exc}"
+            # Navigate and wait for SPA to finish rendering
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PlaywrightTimeoutError:
+                # SPA may have long-polling connections — give it extra time
+                page.wait_for_timeout(5_000)
 
-    raise requests.RequestException(
-        f"Alibaba position search failed: {direct_error}"
-    )
+            # Additional wait for React/Vue re-render after data fetch
+            page.wait_for_timeout(2_000)
+
+            page_title = page.title()
+            try:
+                page_text = page.inner_text("body") or ""
+            except PlaywrightError:
+                page_text = page.content() or ""
+
+            browser.close()
+    except PlaywrightTimeoutError:
+        # Page load timed out but we may still have partial data
+        pass
+    except PlaywrightError as exc:
+        raise RuntimeError(
+            f"Alibaba SPA browser navigation failed for {url}: {exc}"
+        ) from exc
+
+    return {
+        "url": url,
+        "page_text": page_text[:15000],
+        "page_title": page_title,
+        "payloads": payloads,
+        "response_urls": response_urls,
+    }
 
 
 def _evidence_to_position_item(ev: dict[str, Any]) -> dict[str, Any]:
