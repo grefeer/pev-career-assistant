@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import time
@@ -36,10 +37,12 @@ from backend.app.repositories.job_discovery import (
 )
 from backend.app.services.job_discovery.deepagents_runner import (
     build_discovery_supervisor_agent,
+    create_web_navigation_subagent,
     package_candidates,
     run_web_navigation,
     standardize_from_record_fields,
     verify_evidence,
+    _build_job_discovery_llm,
 )
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
@@ -51,6 +54,23 @@ from backend.app.services.job_discovery.tools import (
     build_candidate_idempotency_key,
     build_similarity_group_key,
 )
+from backend.app.services.job_discovery.strategy.strategy_router import StrategyRouter
+from backend.app.services.job_discovery.strategy.snapshot_executor import (
+    SnapshotExecutor,
+    SnapshotExecutionResult,
+)
+from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
+from backend.app.services.job_discovery.strategy.trajectory_store import (
+    purge_old_trajectories,
+    save_trajectory,
+    schedule_annotation,
+)
+from backend.app.services.job_discovery.strategy import strategy_store as strat_store
+from backend.app.services.job_discovery.schemas import StrategyRecord
+from backend.app.services.job_discovery.strategy import error_classifier
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +315,57 @@ def _fallback_with_record_fields_if_agent_missed_evidence(
     )
 
 
+def _extract_url_pattern(url: str) -> str | None:
+    """Derive a simple URL pattern from a URL for trajectory grouping."""
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+        host = parts.netloc
+        if not host:
+            return None
+        path_parts = parts.path.strip("/").split("/")
+        if path_parts and path_parts[0]:
+            return f"{host}/{path_parts[0]}/*"
+        return f"{host}/*"
+    except Exception:
+        return None
+
+
+def _load_adapter(adapter_path: str):
+    """Dynamically load a DomainAdapter class from a dotted path.
+
+    Example: 'backend.app.services.job_discovery.adapters.alibaba_spa.AlibabaSPAAdapter'
+    """
+    import importlib
+    module_path, class_name = adapter_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    return getattr(module, class_name)()
+
+
+def _make_run_web_navigation_wrapper(
+    settings: Settings,
+    subagent: Any,
+    model: Any,
+) -> Callable[[str], dict[str, Any]]:
+    """Create a run_web_navigation closure with pre-bound dependencies."""
+    def _wrapper(start_url: str) -> dict[str, Any]:
+        return run_web_navigation(start_url, settings=settings, subagent=subagent, model=model)
+    _wrapper.__name__ = "run_web_navigation"  # type: ignore[attr-defined]
+    _wrapper.__doc__ = run_web_navigation.__doc__
+    _wrapper.__annotations__ = {"start_url": str, "return": dict[str, Any]}  # type: ignore[attr-defined]
+    return _wrapper
+
+
+def _derive_health_check_url(url_pattern: str) -> str:
+    """Derive a health-check URL from a strategy URL pattern."""
+    clean = url_pattern.replace("*", "").rstrip("/")
+    if not clean:
+        return ""
+    if not clean.startswith("http"):
+        clean = "https://" + clean
+    return clean
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -323,6 +394,7 @@ class JobDiscoveryWorker:
         self.db_factory = db_factory
         self.settings = settings
         self.worker_id = _build_worker_id()
+        self._idle_cycles: int = 0
 
     def run_once(self) -> int:
         """Claim and process one discovery task.
@@ -364,33 +436,125 @@ class JobDiscoveryWorker:
                 record_fields=record_fields,
             )
 
-            # 4. Build and run the agent
-            agent = build_discovery_supervisor_agent(settings=self.settings)
-            agent_error: Exception | None = None
-            try:
-                agent_input = {
-                    "messages": [
-                        HumanMessage(
-                            content=json.dumps(asdict(task_input), ensure_ascii=False)
-                        )
-                    ]
+            # ── 4a. Strategy routing ──────────────────────────────────
+            strategy_record: StrategyRecord | None = None
+            trajectory: TrajectoryBuffer | None = None
+            snapshot_context: dict | None = None
+            executor_type: str = "supervisor"
+
+            # Pre-build LLM and subagent for strategy paths and supervisor
+            _llm: Any = None
+            _tool_dependencies: dict[str, Any] | None = None
+            if self.settings.job_discovery_strategy_enabled:
+                _llm = _build_job_discovery_llm(self.settings)
+                _web_nav_subagent = create_web_navigation_subagent(self.settings)
+                _tool_dependencies = {
+                    "run_web_navigation": _make_run_web_navigation_wrapper(
+                        self.settings, _web_nav_subagent, _llm
+                    ),
                 }
-                try:
-                    result_raw = agent.invoke(
-                        agent_input,
-                        config={"recursion_limit": 50},
+
+                router = StrategyRouter(db)
+                matched = router.match(task.source_url)
+                if matched is not None:
+                    strategy_record = StrategyRecord.from_orm(matched)
+                    trajectory = TrajectoryBuffer(
+                        task_id=task.id,
+                        strategy_id=strategy_record.id,
+                        executor_type=(
+                            "adapter" if strategy_record.adapter else "snapshot"
+                        ),
                     )
-                except TypeError as exc:
-                    if "config" not in str(exc):
-                        raise
-                    result_raw = agent.invoke(agent_input)
-                result = _parse_agent_result(result_raw)
-            except Exception as agent_exc:
-                agent_error = agent_exc
-                result = DiscoveryRunResult(
-                    status="failed",
-                    summary=f"Agent invocation failed: {agent_exc}",
-                )
+
+                    if strategy_record.adapter:
+                        # ── Fast lane: DomainAdapter ──
+                        executor_type = "adapter"
+                        try:
+                            adapter_instance = _load_adapter(strategy_record.adapter)
+                            result = adapter_instance.execute(
+                                task_input, strategy_record, trajectory
+                            )
+                        except Exception as adapter_exc:
+                            trajectory.record_step(
+                                strategy_record.adapter, "failed",
+                                {"url": task.source_url}, None,
+                                error=adapter_exc,
+                            )
+                            snapshot_context = trajectory.to_snapshot_context()
+                            executor_type = "supervisor"
+                            # Increment error count BEFORE clearing strategy_record
+                            strat_store.increment_error_count(db, strategy_record.id, {
+                                "tool": strategy_record.adapter,
+                                "reason": error_classifier.classify_error(str(adapter_exc)),
+                                "message": str(adapter_exc)[:500],
+                            })
+                            strategy_record = None  # Clear so supervisor outcome isn't double-counted
+                    else:
+                        # ── Fast path: SnapshotExecutor ──
+                        executor_type = "snapshot"
+                        snap = SnapshotExecutor(
+                            strategy_record, task_input, trajectory,
+                            tool_dependencies=_tool_dependencies,
+                        )
+                        snap_result = snap.execute()
+                        if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
+                            snapshot_context = snap_result.snapshot_context
+                            executor_type = "supervisor"
+                            # Increment error count BEFORE clearing strategy_record
+                            fail_idx = trajectory.failed_step_index
+                            if fail_idx is not None and trajectory.steps:
+                                failed_step = trajectory.steps[fail_idx]
+                                strat_store.increment_error_count(db, strategy_record.id, {
+                                    "tool": failed_step.get("tool", "snapshot"),
+                                    "reason": error_classifier.classify_error(failed_step.get("error", "")),
+                                    "message": str(failed_step.get("error", ""))[:500],
+                                })
+                            strategy_record = None
+                        else:
+                            result = snap_result
+
+            # ── 4b. Supervisor Agent (backup path or primary if no match) ──
+            agent_error: Exception | None = None
+            if executor_type == "supervisor":
+                if trajectory is None:
+                    trajectory = TrajectoryBuffer(
+                        task_id=task.id,
+                        strategy_id=None,
+                        executor_type="supervisor",
+                    )
+                try:
+                    agent = build_discovery_supervisor_agent(
+                        settings=self.settings,
+                        model=_llm,
+                        snapshot_context=snapshot_context,
+                    )
+                    agent_input = {
+                        "messages": [
+                            HumanMessage(
+                                content=json.dumps(asdict(task_input), ensure_ascii=False)
+                            )
+                        ]
+                    }
+                    try:
+                        if snapshot_context is not None:
+                            result_raw = agent.invoke(agent_input, config={"recursion_limit": 30})
+                        else:
+                            result_raw = agent.invoke(agent_input, config={"recursion_limit": 50})
+                    except TypeError as exc:
+                        if "config" not in str(exc):
+                            raise
+                        result_raw = agent.invoke(agent_input)
+                    result = _parse_agent_result(result_raw)
+                    trajectory.record_step("supervisor_complete", "ok", {}, {"status": result.status})
+                except Exception as agent_exc:
+                    agent_error = agent_exc
+                    trajectory.record_step("supervisor_fatal", "failed", {}, None, error=agent_exc)
+                    result = DiscoveryRunResult(
+                        status="failed",
+                        summary=f"Agent invocation failed: {agent_exc}",
+                    )
+
+            # ── 4c. Fallback recovery ──────────────────────────────────
             result = _fallback_with_record_fields_if_agent_missed_evidence(
                 result,
                 task=task,
@@ -436,6 +600,47 @@ class JobDiscoveryWorker:
                     db, task, last_error=result.summary or "Agent returned failed status"
                 )
 
+            # ── 7b. Save trajectory ────────────────────────────────────
+            try:
+                url_pattern = _extract_url_pattern(task.source_url)
+                trajectory_id = save_trajectory(
+                    db, trajectory, result,
+                    url=task.source_url,
+                    url_pattern=url_pattern,
+                )
+                # Schedule annotation for supervisor-only and fallback paths
+                if executor_type == "supervisor" or result.status == "partial_fallback":
+                    if self.settings.trajectory_annotation_enabled:
+                        schedule_annotation(db, trajectory_id)
+            except Exception:
+                pass  # trajectory save failure should not fail the task
+
+            # ── 7c. Update strategy counters ──────────────────────────
+            if strategy_record is not None:
+                try:
+                    strategy_id = strategy_record.id
+                    if trajectory.failed_step_index is not None:
+                        strat_store.increment_error_count(
+                            db, strategy_id,
+                            last_error={
+                                "tool": (trajectory.steps[trajectory.failed_step_index].get("tool")
+                                         if trajectory.steps else "unknown"),
+                                "reason": error_classifier.classify_error(
+                                    trajectory.steps[trajectory.failed_step_index].get("error", "")
+                                    if trajectory.steps else ""
+                                ),
+                                "message": (trajectory.steps[trajectory.failed_step_index].get("error", "")
+                                            if trajectory.steps else ""),
+                            },
+                        )
+                    else:
+                        strat_store.increment_success(
+                            db, strategy_id,
+                            duration_s=trajectory.elapsed_ms / 1000.0,
+                        )
+                except Exception:
+                    pass  # strategy counter updates are best-effort
+
             db.commit()
             return 1
 
@@ -462,6 +667,67 @@ class JobDiscoveryWorker:
             while True:
                 processed = self.run_once()
                 if processed == 0:
+                    self._idle_cycles += 1
+                    if self._idle_cycles % 10 == 0:
+                        self._run_health_checks()
                     time.sleep(poll_interval)
+                else:
+                    self._idle_cycles = 0
         except KeyboardInterrupt:
             pass
+
+    def _run_health_checks(self) -> None:
+        """Run periodic health checks on strategies due for checking.
+
+        Queries strategies that haven't been checked within the configured
+        interval, performs an HTTP HEAD against each derived base URL, and
+        records the result.  Failures are caught and logged via the strategy
+        store's error counter so the strategy can be automatically degraded.
+
+        Also purges old trajectories based on ``trajectory_retention_days``.
+        """
+        try:
+            db = self.db_factory()
+            try:
+                # ── Purge old trajectories ──────────────────────────────
+                if self.settings.trajectory_retention_days > 0:
+                    try:
+                        deleted = purge_old_trajectories(
+                            db, self.settings.trajectory_retention_days
+                        )
+                        if deleted > 0:
+                            logger.info("Purged %d old trajectories", deleted)
+                    except Exception:
+                        db.rollback()
+
+                # ── Health checks ───────────────────────────────────────
+                due = strat_store.get_strategies_due_for_health_check(
+                    db,
+                    interval_hours=self.settings.strategy_health_check_interval_hours,
+                )
+                import httpx
+                with httpx.Client(timeout=10.0) as client:
+                    for strategy in due:
+                        check_url = _derive_health_check_url(strategy.url_pattern)
+                        if not check_url:
+                            continue
+                        try:
+                            resp = client.head(check_url, follow_redirects=True)
+                            strat_store.record_health_check(
+                                db, strategy.id,
+                                ok=resp.is_success,
+                                detail=f"HTTP {resp.status_code}",
+                            )
+                        except Exception as hc_exc:
+                            strat_store.record_health_check(
+                                db, strategy.id,
+                                ok=False,
+                                detail=str(hc_exc),
+                            )
+                db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                db.close()
+        except Exception:
+            pass  # never crash the worker over a health check

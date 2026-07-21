@@ -1,21 +1,19 @@
 # Subagent-Driven Development Progress
 
-Plan: `docs/superpowers/plans/2026-07-18-job-discovery-agent.md`
-Branch: `worktree-job-discovery-agent`
-Baseline: `a108a78`
+Plan: `docs/superpowers/plans/2026-07-20-discovery-strategy-router-implementation.md`
+Branch: `feature/discovery-strategy-router`
+Baseline: `e24d026`
 
-Task 1: complete (commits a108a78..ced2de2, review clean)
-Task 2: complete (commits ced2de2..bcd16cc, review clean)
-Task 3: complete (commits bcd16cc..8ff654c, review clean)
-Task 4: complete (commits 8ff654c..2b2a371, review clean after 3 fixes)
-Task 5: complete (commits 2b2a371..HEAD, 55 tests pass)
-Task 5: complete (commits 2b2a371..d363080, review clean after 3 fixes)
-Task 6: complete (commit d9651b6, 15 worker tests + 193 existing pass)
-Task 6: complete (commits d363080..afcbb66, review clean — minor latent dataclass findings noted)
-Task 7: complete — admin API routes + discovery review UI. 195 backend tests + 93 frontend tests pass.
-Task 7: complete (commits afcbb66..975e0dc, review clean after mapper_version fix)
-Task 8: complete (commit c4e3a28, 10 files: 6 HTML fixtures, 11 Playwright tests, 3 docs)
-Task 8: complete (commits 975e0dc..c4e3a28, final phases 8-9 done)
-
-FINAL REVIEW: complete (commits a108a78..c4e3a28, 13 commits, 9 phases, merge approved)
-Known non-blocking gaps: OCR scaffold, no browser engine, subagent delegation fallback, dataclass-branch defaults
+Task 0: complete (commits e24d026..daca0f8, review clean)
+Task 1: complete (commits daca0f8..a4ffee4, review clean)
+Task 2: complete (commits a4ffee4..ea8f2f7, review clean after 5 fixes)
+Task 3: complete (commits ea8f2f7..f536ae8, review clean)
+Task 4: complete (commits f536ae8..fece1ad, review clean — 3 LOW obs)
+Task 5: complete (commits 498471c..92c0470, review clean)
+Task 6: complete (commits 92c0470..0ff3233, review clean after 5 fixes)
+Task 7: complete (commits 0ff3233..24be18a, review clean)
+Task 8: complete (commits fece1ad..498471c, review clean after phantom tool fix)
+Task 9: complete (commits 24be18a..de872a8, review clean after 2 fixes)
+Task 10: complete (commits de872a8..4ca4138, review clean — 5 LOW obs)
+Task 11: complete (commits 4ca4138..b73086c, review clean)
+FINAL FIX: 3 critical findings resolved (strategy counters on failure, trajectory retention, template validation)

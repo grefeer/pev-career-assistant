@@ -22,6 +22,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -1108,3 +1109,82 @@ class DiscoveredJobCandidate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     confidence: Mapped[float | None] = mapped_column(Float)
     evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
     normalization_warnings_json: Mapped[list[str] | None] = mapped_column(JSON)
+
+
+# ---------------------------------------------------------------------------
+# Strategy Router tables
+# ---------------------------------------------------------------------------
+
+
+class JobDiscoveryStrategy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "job_discovery_strategies"
+    __table_args__ = (
+        Index("ix_job_discovery_strategies_pattern", "url_pattern"),
+        Index("ix_job_discovery_strategies_status", "status"),
+    )
+    url_pattern: Mapped[str] = mapped_column(String(500), nullable=False)
+    site_type: Mapped[str] = mapped_column(
+        String(50), default="other", nullable=False, index=True
+    )
+    description: Mapped[str | None] = mapped_column(Text)
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    adapter: Mapped[str | None] = mapped_column(String(500))
+    plan_yaml: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), default="active", nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    total_runs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    success_runs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    fallback_runs: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    consecutive_ok: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error_tool: Mapped[str | None] = mapped_column(String(100))
+    last_error_reason: Mapped[str | None] = mapped_column(String(50))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    avg_duration_s: Mapped[float | None] = mapped_column(Float)
+    degradation_threshold: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
+    recovery_threshold: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    _trajectories: Mapped[list["JobDiscoveryTrajectory"]] = relationship(
+        back_populates="_strategy", lazy="raise",
+    )
+
+
+class JobDiscoveryTrajectory(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_discovery_trajectories"
+    __table_args__ = (
+        Index("ix_job_discovery_trajectories_url_pattern", "url_pattern"),
+        Index("ix_job_discovery_trajectories_created", "created_at"),
+        ForeignKeyConstraint(
+            ["task_id"], ["job_discovery_tasks.id"],
+            name="fk_job_discovery_trajectories_task_id", ondelete="SET NULL",
+        ),
+    )
+    task_id: Mapped[str | None] = mapped_column(String(36))
+    strategy_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("job_discovery_strategies.id", ondelete="SET NULL"),
+    )
+    executor_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    overall_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    failed_at_step: Mapped[int | None] = mapped_column(Integer)
+    failed_tool: Mapped[str | None] = mapped_column(String(100))
+    failed_params: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    failed_error_type: Mapped[str | None] = mapped_column(String(100))
+    failed_error_message: Mapped[str | None] = mapped_column(Text)
+    failed_error_reason: Mapped[str | None] = mapped_column(String(50))
+    completed_steps: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=list)
+    fallback_trace: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    clean_path: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    annotations: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    url: Mapped[str | None] = mapped_column(Text)
+    url_pattern: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    _strategy: Mapped["JobDiscoveryStrategy | None"] = relationship(
+        back_populates="_trajectories", lazy="raise",
+    )

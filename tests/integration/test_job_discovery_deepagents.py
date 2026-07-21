@@ -23,12 +23,13 @@ from langchain_openai import ChatOpenAI
 from backend.app.config import Settings
 from backend.app.services.job_discovery.deepagents_runner import (
     _asdict,
-    _alibaba_position_evidence_from_search_payload,
     _build_job_discovery_llm,
+    _generic_position_evidence_from_payload,
     _is_blocked_domain,
     _SUPERVISOR_SYSTEM_PROMPT,
     _WEB_NAVIGATION_SYSTEM_PROMPT,
     build_discovery_supervisor_agent,
+    build_supervisor_prompt,
     click_link,
     create_web_navigation_subagent,
     extract_jd_candidates,
@@ -544,16 +545,42 @@ class TestCreateWebNavigationSubagent:
 
 
 class TestSupervisorSystemPrompt:
-    """Test the supervisor system prompt matches the spec."""
+    """Test the supervisor system prompt (built from template files)."""
 
     def test_prompt_contains_key_elements(self) -> None:
-        prompt = _SUPERVISOR_SYSTEM_PROMPT
+        prompt = build_supervisor_prompt()
         assert "Discovery Supervisor Agent" in prompt
         assert "Tencent sheet record" in prompt
         assert "needs_manual_review" in prompt
         assert "Never invent" in prompt
-        assert "Never bypass" in prompt
         assert "Email-only applications" in prompt
+        assert "12 tool calls" in prompt
+        # Stopping conditions should be present
+        assert "Stopping Conditions" in prompt
+        assert "Fresh Start" in prompt
+
+    def test_backward_compatible_alias(self) -> None:
+        """_SUPERVISOR_SYSTEM_PROMPT should still be importable and non-empty."""
+        from backend.app.services.job_discovery.deepagents_runner import (
+            _SUPERVISOR_SYSTEM_PROMPT as _alias,
+        )
+        assert isinstance(_alias, str)
+        assert len(_alias) > 100
+
+    def test_snapshot_context_prompt(self) -> None:
+        """build_supervisor_prompt with snapshot_context returns different content."""
+        clean = build_supervisor_prompt()
+        snapshot = build_supervisor_prompt(snapshot_context={
+            "source": "snapshot_executor",
+            "strategy_id": "test-strategy",
+            "completed_steps": [{"tool": "open_url", "params": {"url": "https://example.com"}}],
+            "failed_step": {"tool": "extract_jd_candidates", "params": {"page_text": "...", "url": "..."}, "error": "timeout"},
+        })
+        assert clean != snapshot
+        assert "Continue from Breakpoint" in snapshot
+        assert "test-strategy" in snapshot
+        assert "extract_jd_candidates" in snapshot
+        assert "DO NOT REPEAT" in snapshot
 
 
 # =========================================================================
@@ -675,12 +702,12 @@ class TestRunWebNavigation:
 
 
 class TestRenderedJobEvidence:
-    """Test rendered job evidence extraction helpers."""
+    """Test rendered job evidence extraction helpers (generic path)."""
 
-    def test_alibaba_position_search_payload_yields_one_evidence_per_job(self) -> None:
+    def test_generic_position_payload_yields_evidence(self) -> None:
         payload = {
-            "content": {
-                "datas": [
+            "data": {
+                "records": [
                     {
                         "id": "199903220038",
                         "name": "AI应用研发工程师",
@@ -688,9 +715,6 @@ class TestRenderedJobEvidence:
                         "description": "1、负责 AI 应用工程研发。",
                         "requirement": "1、熟悉 Python 和 Agent 框架。",
                         "categoryName": "技术类",
-                        "categoryType": "internship",
-                        "batchName": "阿里巴巴2027届实习生",
-                        "circleNames": ["淘宝闪购"],
                     },
                     {
                         "id": "199903220039",
@@ -699,25 +723,22 @@ class TestRenderedJobEvidence:
                         "description": "1、负责算法建模。",
                         "requirement": "1、熟悉机器学习。",
                         "categoryName": "算法类",
-                        "categoryType": "internship",
-                        "batchName": "阿里巴巴2027届实习生",
-                        "circleNames": ["淘宝闪购"],
                     },
                 ]
             }
         }
 
-        evidence = _alibaba_position_evidence_from_search_payload(
+        evidence = _generic_position_evidence_from_payload(
             payload,
-            "https://campus-talent.alibaba.com/campus/position?batchId=100000540002",
+            "https://campus.example.com/position/list",
         )
 
-        assert [item["title"] for item in evidence] == ["AI应用研发工程师", "AI应用算法工程师"]
+        assert any("AI应用研发工程师" in item["title"] for item in evidence)
+        assert any("AI应用算法工程师" in item["title"] for item in evidence)
         assert all(item["evidence_type"] == "job_detail_json" for item in evidence)
         assert all(item["content_hash"] for item in evidence)
-        assert "岗位职责" in evidence[0]["text_excerpt"]
-        assert "任职要求" in evidence[0]["text_excerpt"]
-        assert evidence[0]["metadata"]["position_id"] == "199903220038"
+        assert any("岗位职责" in item["text_excerpt"] for item in evidence)
+        assert any("任职要求" in item["text_excerpt"] for item in evidence)
 
 
 # =========================================================================

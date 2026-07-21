@@ -1,34 +1,14 @@
-## Workflow (Plan → Act → Verify → Finish)
+## Execution Mode: Fresh Start
 
-### Step 1: Triage
-Call triage_link(url). Then follow the path for the returned site_type.
+You are beginning a new job discovery task from scratch. No prior steps have been executed.
 
-### Step 2: Act by URL type
+1. Start by calling `triage_link` with the task URL to classify it.
+2. Based on the triage result, plan your full tool execution sequence.
+3. Execute your plan using the available tools.
+4. Always verify and package results before finishing.
 
-**WeChat article (wechat_article / mp.weixin.qq.com):**
-1. Fetch content: call run_web_navigation(url) to get article via ReadGZH proxy.
-2. Parse: call parse_wechat_article(html, url) to get title, text, image_urls, and email instructions.
-3. OCR images (REQUIRED when image_urls not empty): call ocr_images_from_urls(json.dumps(image_urls)). JD info is often embedded in WeChat images.
-4. Combine: article text + OCR text from all images = complete content.
-5. Extract: call extract_jd_candidates(combined_text, url). If returns empty but you see JD info, manually build candidate dicts using record_fields for company/title/location hints.
-6. **Follow official recruitment links in the article text** (IMPORTANT — many WeChat articles say "点击阅读原文投递" or include a career site URL):
-   - Scan article text + OCR text for URLs like campus.xxx.com, xxx.com/careers, join.xxx.com, xxx.zhaopin.com.
-   - If a career site URL is found: call run_web_navigation(career_url) to get richer JD evidence.
-   - Extract full JD from the career site (follow the career site path below).
-   - Use the career site URL as apply_url (more trustworthy than WeChat article URL).
-   - Merge: WeChat text provides company/title/context; career site provides detailed JD/responsibilities/requirements.
-7. For email-only articles: extract email address, subject format, materials needed. Set application_channel_json to {"type":"email","email":"...","subject_hint":"..."}.
-
-**Career site / Job detail (career_site, job_detail, official_site):**
-1. Navigate: call run_web_navigation(url). Web Navigation Agent explores the site and returns evidence pages with text and job data.
-2. For each evidence page, call extract_jd_candidates(text, url).
-3. For SPA pages (Alibaba campus, etc.), evidence comes as job_detail_json with structured fields already extracted.
-4. Fallback: if no candidates but you have record_fields, call standardize_from_record_fields.
-
-**Blocked / invalid:** Call finish_with_manual_review(reason).
-
-### Step 3: Verify
-Call verify_evidence(candidates_json, evidence_json). Rejected candidates may need evidence_refs fixed and re-verified.
-
-### Step 4: Package
-Call package_candidates(verified_json, evidence_hash, source_key). Set status to "succeeded" (found candidates), "partial_success" (budget exhausted), "needs_manual_review" (blocked), or "failed".
+Remember:
+- Maximum 12 tool calls per task. If approaching the limit without results, use `standardize_from_record_fields` as a fallback.
+- If `run_web_navigation` returns no useful evidence, call `standardize_from_record_fields`.
+- If `extract_jd_candidates` returns empty twice for the same text, stop retrying.
+- After you have candidates, verify and package them. Do NOT loop back to navigation.
