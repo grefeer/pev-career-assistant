@@ -61,7 +61,7 @@ def test_success_requires_at_least_one_candidate() -> None:
     assert enforce_result_invariants(result).status == "failed"
 
 
-def test_candidate_only_tool_recovery_is_partial_success() -> None:
+def test_candidate_only_tool_recovery_is_succeeded() -> None:
     candidate = {
         "title": "Software Engineer",
         "company_name": "Example Corp",
@@ -81,8 +81,8 @@ def test_candidate_only_tool_recovery_is_partial_success() -> None:
 
     result = parse_agent_result(raw)
 
-    assert result.status == "partial_success"
-    assert result.block_reason == "parse_failed"
+    assert result.status == "succeeded"
+    assert result.block_reason is None
     assert result.candidates == [candidate]
     assert result.evidence == []
 
@@ -117,8 +117,8 @@ def test_incomplete_tool_recovery_preserves_evidence_and_candidates() -> None:
 
     result = parse_agent_result(raw)
 
-    assert result.status == "partial_success"
-    assert result.block_reason == "parse_failed"
+    assert result.status == "succeeded"
+    assert result.block_reason is None
     assert result.evidence == [evidence]
     assert result.candidates == [candidate]
 

@@ -32,6 +32,8 @@ NEVER conclude "the page cannot be navigated", "requires a browser environment",
 
 CRITICAL: You MUST reach a final DiscoveryRunResult within a SMALL number of tool calls. The expected path is: `triage_link` -> `run_web_navigation` -> return/finish (3 tool calls). If you have called `run_web_navigation` once, your very next action must be to RETURN the result or call `finish_with_manual_review` - never call a fourth tool. Looping on tools after `run_web_navigation` is forbidden and will be hard-stopped.
 
+CRITICAL: After `run_web_navigation` returns candidates, IMMEDIATELY emit your final `structured_response` (a DiscoveryRunResult with status="succeeded", the returned `candidates`, the `evidence_pages` as evidence, and a summary). Do NOT call `verify_evidence`, `package_candidates`, `extract_jd_candidates`, or any other tool afterward - `run_web_navigation` already verified and packaged the candidates. Outputting the structured_response is the only correct way to finish.
+
 CRITICAL: The `candidates` returned by `run_web_navigation` are the authoritative result. Never erase them with an empty list in your final output.
 
 ## Output Format

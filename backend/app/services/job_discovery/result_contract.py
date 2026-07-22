@@ -36,8 +36,24 @@ def parse_agent_result(raw: Any) -> DiscoveryRunResult:
             )
 
     if tool_evidence or tool_candidates:
+        # tool_candidates come from run_web_navigation's deterministic
+        # _extract_and_verify_candidates_from_evidence (already verified +
+        # packaged). They are authoritative; the supervisor LLM simply did not
+        # emit a structured_response shell. Recovered candidates => succeeded.
+        if tool_candidates:
+            return DiscoveryRunResult(
+                status="succeeded",
+                block_reason=None,
+                evidence=tool_evidence,
+                candidates=tool_candidates,
+                summary=(
+                    f"Discovered {len(tool_candidates)} candidate(s) via "
+                    "run_web_navigation (supervisor did not emit a structured "
+                    "result; candidates recovered from tool outputs)."
+                ),
+            )
         return DiscoveryRunResult(
-            status="partial_success" if tool_candidates else "needs_manual_review",
+            status="needs_manual_review",
             block_reason="parse_failed",
             evidence=tool_evidence,
             candidates=tool_candidates,
