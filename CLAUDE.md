@@ -168,7 +168,7 @@ Tencent Smartsheet → RawJobRecord → JobDiscoveryTask (queued)
 
 ### Web Navigation Agent (deepagents_runner.py)
 
-Standalone DeepAgent with 9 tools: `open_url`, `open_rendered_url`, `extract_rendered_job_evidence`, `read_dom`, `extract_links`, `click_link`, `get_visible_text`, `screenshot`, `go_back`.
+Standalone DeepAgent with 7 tools: `open_url`, `open_rendered_url`, `extract_rendered_job_evidence`, `read_dom`, `extract_links`, `click_link`, `go_back`.
 
 **ReadGZH Integration**: `open_url()` automatically routes WeChat (`mp.weixin.qq.com`) URLs through ReadGZH proxy first, with automatic fallback: ReadGZH → direct HTTP → Playwright browser → error. Set `READGZH_API_KEY` explicitly in the process environment for authenticated live runs.
 
@@ -231,7 +231,7 @@ Worker claims tasks with lease timeout. Expired leases allow re-claim.
 - Feedback idempotency: `Idempotency-Key` header → SHA-256 request fingerprint comparison
 
 ### WeChat Article Handling
-- All WeChat URLs auto-routed through ReadGZH proxy in `open_url()` and `_fetch_page()`
+- All WeChat URLs auto-routed through ReadGZH proxy in `open_url()`
 - Fallback chain: ReadGZH API → direct requests.get → Playwright browser → error
 - Verification wall detection: checks for `环境异常` + `完成验证后即可继续访问`
 - Image/video-heavy articles may require OCR or manual review; the current OCR tool only inspects inputs and returns a placeholder result

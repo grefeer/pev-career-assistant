@@ -199,92 +199,6 @@ def _is_blocked_domain(url: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# Web navigation state (per-run, module-level)
-# ---------------------------------------------------------------------------
-
-_web_nav_page_count: int = 0
-_web_nav_max_pages: int = 20
-_web_nav_history: list[str] = []
-_web_nav_current_url: str | None = None
-
-
-def _reset_web_nav_state(max_pages: int = 20) -> None:
-    """Reset the web navigation state for a new run."""
-    global _web_nav_page_count, _web_nav_max_pages, _web_nav_history, _web_nav_current_url, _wechat_raw_html_cache
-    _web_nav_page_count = 0
-    _web_nav_max_pages = max_pages
-    _web_nav_history = []
-    _web_nav_current_url = None
-    _wechat_raw_html_cache = {}
-
-
-def _check_page_budget() -> str | None:
-    """Check if page budget is exhausted. Returns error message or None."""
-    if _web_nav_page_count >= _web_nav_max_pages:
-        return (
-            f"Page budget exhausted ({_web_nav_page_count}/{_web_nav_max_pages} pages used). "
-            "Cannot open more pages."
-        )
-    return None
-
-
-def _fetch_page(url: str) -> tuple[str, str, str] | tuple[None, None, str]:
-    """Fetch a URL and return (text_content, title, error_or_none).
-
-    Returns (text, title, None) on success, (None, None, error_message) on failure.
-    """
-    global _web_nav_page_count, _web_nav_current_url, _web_nav_history
-
-    domain_err = _is_blocked_domain(url)
-    if domain_err:
-        return None, None, f"Cannot access blocked domain: {url}"
-
-    budget_err = _check_page_budget()
-    if budget_err:
-        return None, None, budget_err
-
-    # ── WeChat articles: try ReadGZH proxy first ──
-    if _is_wechat_url(url):
-        text, title, error = _fetch_wechat_via_readgzh(url)
-        if error is None:
-            _web_nav_page_count += 1
-            if _web_nav_current_url:
-                _web_nav_history.append(_web_nav_current_url)
-            _web_nav_current_url = url
-            return text, title, None
-        # ReadGZH failed; fall through to regular fetch + browser fallback
-
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "text/html" not in content_type and "text/plain" not in content_type:
-            return None, None, f"Non-text content type: {content_type}"
-
-        html = resp.text
-        # Extract title and text
-        title = _extract_page_title(html)
-        text = _extract_page_text(html)
-
-        if _needs_browser_fallback(url, text):
-            browser_text, browser_title, browser_error = _fetch_page_with_browser(url)
-            if browser_error is None:
-                text = browser_text or ""
-                title = browser_title or title
-            else:
-                return None, None, f"WeChat verification wall: {browser_error}"
-
-        _web_nav_page_count += 1
-        if _web_nav_current_url:
-            _web_nav_history.append(_web_nav_current_url)
-        _web_nav_current_url = url
-
-        return text, title, None
-    except requests.RequestException as e:
-        return None, None, f"HTTP error fetching {url}: {e}"
-
-
 # Module-level cache for raw WeChat HTML, keyed by URL.
 # Populated by _fetch_wechat_via_readgzh so that fetch_wechat_article
 # can later extract image URLs for OCR without a second HTTP round-trip.
@@ -507,7 +421,6 @@ def run_web_navigation(
     """
     max_pages = (settings.job_discovery_max_pages_per_task
                  if settings else 20)
-    _reset_web_nav_state(max_pages=max_pages)
 
     try:
         parsed = urlsplit(start_url)
@@ -622,81 +535,6 @@ def run_web_navigation(
     nav_result["candidates"] = candidates
     nav_result["evidence_hash"] = evidence_hash
     return nav_result
-
-
-def _run_via_subagent_delegation(
-    start_url: str,
-    subagent: SubAgent,
-    model: Any,
-    max_pages: int,
-) -> dict[str, Any]:
-    """Attempt to delegate web navigation to the WebNavigationAgent subagent.
-
-    Constructs a navigation prompt and invokes the subagent via
-    deepagents' create_sub_agent. If the subagent's runnable does not
-    support programmatic invocation, this raises TypeError or ValueError,
-    telling the caller to fall back to direct navigation.
-
-    Args:
-        start_url: The URL to start navigation from.
-        subagent: WebNavigationAgent subagent spec.
-        model: Model instance for subagent creation.
-        max_pages: Page budget.
-
-    Returns:
-        Dict with evidence_pages, navigation_path, and page_count.
-    """
-    from deepagents.middleware.subagents import create_sub_agent
-
-    prompt = (
-        f"Starting from {start_url}, find job listing pages "
-        f"and JD detail pages. Return the evidence pages you find. "
-        f"Page budget: {max_pages} pages."
-    )
-
-    # Inject model into subagent spec for create_sub_agent
-    spec_with_model: SubAgent = {
-        **subagent,  # type: ignore[arg-type]
-        "model": model,
-    }
-    runnable = create_sub_agent(spec_with_model)
-    result = runnable.invoke({"messages": [HumanMessage(content=prompt)]})
-
-    # Parse structured output or messages-based result
-    if isinstance(result, dict):
-        result_evidence = (
-            result.get("evidence_pages")
-            or result.get("evidence")
-            or []
-        )
-        result_path = (
-            result.get("navigation_path")
-            or result.get("path")
-            or []
-        )
-        evidence_list = (
-            list(result_evidence)
-            if not isinstance(result_evidence, list)
-            else result_evidence
-        )
-        path_list = (
-            list(result_path)
-            if not isinstance(result_path, list)
-            else result_path
-        )
-        return {
-            "evidence_pages": evidence_list,
-            "navigation_path": path_list,
-            "page_count": len(evidence_list),
-            "delegated_to": "web_navigation_agent",
-        }
-
-    return {
-        "evidence_pages": [],
-        "navigation_path": [],
-        "page_count": 0,
-        "delegated_to": "web_navigation_agent",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1195,7 +1033,7 @@ _nav_time_budget: float = 0.0
 
 # Per-run page fetch cache — avoids redundant ReadGZH / HTTP calls when
 # multiple WebNavigationAgent tools (open_url, read_dom, extract_links,
-# get_visible_text) request the same URL within a single run.
+# click_link) request the same URL within a single run.
 _page_cache: dict[str, tuple[str | None, str | None, str | None]] = {}
 # url → (raw_html_or_text, title, error_or_none)
 
@@ -1951,23 +1789,6 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
     }
 
 
-def _evidence_to_position_item(ev: dict[str, Any]) -> dict[str, Any]:
-    """Convert a single evidence dict into a position-item dict matching the
-    expected ``content.datas[]`` shape so that ``_generic_position_evidence_from_payload``
-    can process it."""
-    meta = ev.get("metadata") or {}
-    return {
-        "id": meta.get("position_id", ""),
-        "name": ev.get("title", ""),
-        "description": ev.get("text_excerpt", ""),
-        "requirement": "",
-        "workLocations": meta.get("locations") or [],
-        "circleNames": meta.get("circleNames") or [],
-        "categoryName": meta.get("categoryName", ""),
-        "batchName": meta.get("batchName", ""),
-    }
-
-
 def _generic_position_evidence_from_payload(
     payload: dict[str, Any],
     source_url: str,
@@ -2192,34 +2013,6 @@ def click_link(url: str, link_text: str) -> str:
         return f"ERROR: Could not follow link: {e}"
 
 
-def get_visible_text(url: str) -> str:
-    """Get visible text from a page (no markup).
-
-    Args:
-        url: The URL to get text from.
-
-    Returns:
-        Visible text content.
-    """
-    return open_url(url)
-
-
-def screenshot(url: str) -> str:
-    """Take a screenshot of a page (stub — returns placeholder).
-
-    Args:
-        url: The URL to screenshot.
-
-    Returns:
-        Base64 data URI placeholder (screenshot not available without browser).
-    """
-    return (
-        "data:image/png;base64,"
-        "SCREENSHOT_NOT_AVAILABLE: Real screenshot requires a browser "
-        "(Playwright/Selenium) which is not integrated in this version."
-    )
-
-
 def go_back() -> str:
     """Return to the previous page in navigation history.
 
@@ -2250,7 +2043,7 @@ Allowed actions:
 - Extract rendered job evidence from public recruitment XHR/JSON when a page is an SPA.
 - Read visible text and DOM links.
 - Follow navigation links likely related to Careers, Jobs, Join Us, Campus Recruitment, Internships, Recruiting, or Chinese equivalents.
-- Capture evidence screenshots and page text.
+- Capture evidence page text.
 
 Rules:
 - Stay within the tool-enforced page budget.
@@ -2296,8 +2089,6 @@ def create_web_navigation_subagent(
         read_dom,
         extract_links,
         click_link,
-        get_visible_text,
-        screenshot,
         go_back,
     ]
 
@@ -2305,7 +2096,7 @@ def create_web_navigation_subagent(
         "name": "web_navigation_agent",
         "description": (
             "Navigates web pages to discover job JD evidence. "
-            "Provides page text, links, and screenshots. "
+            "Provides page text, links, and rendered job evidence. "
             "Enforces page budget and domain safety."
         ),
         "system_prompt": _WEB_NAVIGATION_SYSTEM_PROMPT,
@@ -2617,8 +2408,6 @@ def build_web_navigation_agent(
             read_dom,
             extract_links,
             click_link,
-            get_visible_text,
-            screenshot,
             go_back,
         ],
         system_prompt=_WEB_NAVIGATION_SYSTEM_PROMPT,

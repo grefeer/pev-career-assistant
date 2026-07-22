@@ -26,7 +26,6 @@ from backend.app.services.job_discovery.deepagents_runner import (
     _build_job_discovery_llm,
     _generic_position_evidence_from_payload,
     _is_blocked_domain,
-    _SUPERVISOR_SYSTEM_PROMPT,
     _WEB_NAVIGATION_SYSTEM_PROMPT,
     build_discovery_supervisor_agent,
     build_supervisor_prompt,
@@ -35,7 +34,6 @@ from backend.app.services.job_discovery.deepagents_runner import (
     extract_jd_candidates,
     extract_links,
     finish_with_manual_review,
-    get_visible_text,
     go_back,
     open_url,
     package_candidates,
@@ -43,7 +41,6 @@ from backend.app.services.job_discovery.deepagents_runner import (
     read_dom,
     run_ocr,
     run_web_navigation,
-    screenshot,
     triage_link,
     verify_evidence,
 )
@@ -438,18 +435,6 @@ class TestFinishWithManualReview:
 class TestWebNavigationSubagentTools:
     """Test the web navigation subagent tool functions."""
 
-    def test_screenshot_stub(self) -> None:
-        result = screenshot("http://example.com")
-        assert result.startswith("data:image/png;base64,")
-        assert "SCREENSHOT_NOT_AVAILABLE" in result
-
-    def test_get_visible_text_delegates(self) -> None:
-        # get_visible_text delegates to open_url, which makes HTTP calls
-        # We just verify the function exists and has the right signature
-        assert callable(get_visible_text)
-        assert get_visible_text.__doc__ is not None
-        assert "url" in get_visible_text.__annotations__
-
     def test_open_url_blocked_domain(self) -> None:
         result = open_url("https://www.linkedin.com/jobs/123")
         assert "ERROR" in result
@@ -520,14 +505,14 @@ class TestCreateWebNavigationSubagent:
 
         # Should have tools
         assert "tools" in spec
-        assert len(spec["tools"]) == 9
+        assert len(spec["tools"]) == 7
 
         # Tool names
         tool_names = {t.__name__ for t in spec["tools"]}
         assert tool_names == {
             "open_url", "open_rendered_url", "extract_rendered_job_evidence",
             "read_dom", "extract_links", "click_link",
-            "get_visible_text", "screenshot", "go_back",
+            "go_back",
         }
 
     def test_subagent_system_prompt(self, settings: Settings) -> None:
@@ -631,7 +616,7 @@ class TestBuildDiscoverySupervisorAgent:
 
 
 # =========================================================================
-# Tool discovery via _fetch_page (run_web_navigation)
+# Tool discovery via run_web_navigation
 # =========================================================================
 
 
@@ -820,8 +805,6 @@ class TestMockedAgentOrchestration:
             "read_dom": read_dom,
             "extract_links": extract_links,
             "click_link": click_link,
-            "get_visible_text": get_visible_text,
-            "screenshot": screenshot,
             "go_back": go_back,
         }
         for name, tool in tools.items():
@@ -898,27 +881,11 @@ class TestAgentOrchestration:
     implementations (except HTTP which is mocked for web navigation).
     """
 
-    @pytest.fixture(autouse=True)
-    def _prevent_delegation(self) -> None:
-        """Prevent subagent delegation from consuming shared mock responses.
-
-        Patching ``_run_via_subagent_delegation`` to raise ensures the
-        delegation path in ``run_web_navigation`` falls through to direct
-        navigation without consuming supervisor response tokens.
-        """
-        with patch(
-            "backend.app.services.job_discovery.deepagents_runner._run_via_subagent_delegation",
-            side_effect=TypeError("subagent delegation not supported in test"),
-        ):
-            yield
-
     def _create_mock_model(self, responses: list[AIMessage]):
         """Create a mock ChatOpenAI with controlled response sequences.
 
         ``bind_tools`` always returns the same ``bound_mock`` (shared
-        between supervisor and delegation paths). Since the test patches
-        :func:`_run_via_subagent_delegation` to raise, the delegation path
-        fails immediately without consuming responses.
+        across the supervisor tool loop).
         """
         supervisor_responses = list(responses)
 

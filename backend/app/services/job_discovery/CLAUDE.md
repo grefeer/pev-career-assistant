@@ -188,10 +188,9 @@ latter yields *title-only* candidates flagged via `normalization_warnings`
 system never circumvents — security hard gate #2).
 
 **WebNavigationAgent subagent**: Separate DeepAgent (`build_web_navigation_agent`)
-with 9 navigation tools (`open_url`, `open_rendered_url`,
+with 7 navigation tools (`open_url`, `open_rendered_url`,
 `extract_rendered_job_evidence`, `read_dom`, `extract_links`, `click_link`,
-`get_visible_text`, `screenshot`, `go_back`) and structured output via
-`_WebNavigationResultPydantic`.
+`go_back`) and structured output via `_WebNavigationResultPydantic`.
 
 `extract_rendered_job_evidence` may dismiss privacy/cookie consent interstitials
 (see Consent Interstitial below) to read publicly-rendered JD content.
@@ -237,7 +236,7 @@ Module-level dict `{url: (content, title, error)}`. WeChat URLs route through Re
 
 ### WeChat Raw HTML Cache (`_wechat_raw_html_cache`)
 
-Separate `{url: raw_html}` cache populated by `_fetch_wechat_via_readgzh`. Used by `fetch_wechat_article` to extract `<img>` URLs for OCR without a second HTTP round-trip. Cleared by `_reset_nav_state` and `_reset_web_nav_state`.
+Separate `{url: raw_html}` cache populated by `_fetch_wechat_via_readgzh`. Used by `fetch_wechat_article` to extract `<img>` URLs for OCR without a second HTTP round-trip. Cleared by `_reset_nav_state`.
 
 ### Encoding Auto-Detection (`_fix_response_encoding`)
 
@@ -294,7 +293,7 @@ and `error`. For career sites the Supervisor should prefer it and reuse its
 
 WebNavigationAgent-only tools (not in the Supervisor's 9-tool list): `open_url`,
 `open_rendered_url`, `extract_rendered_job_evidence`, `read_dom`,
-`extract_links`, `click_link`, `get_visible_text`, `screenshot`, `go_back`.
+`extract_links`, `click_link`, `go_back`.
 
 ## Testing
 

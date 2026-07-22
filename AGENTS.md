@@ -93,21 +93,15 @@ parsed = _parse_web_navigation_agent_result(result)
 # 4. Mention in _WEB_NAVIGATION_SYSTEM_PROMPT
 ```
 
-### Module-Level State (Double Tracker Pattern)
+### Module-Level State (Single Tracker)
 
-The web navigation system uses TWO parallel state trackers:
+The web navigation system uses one state tracker, reset per run by
+`_reset_nav_state` (called from `run_web_navigation`):
 
 ```python
-# Used by _fetch_page() and run_web_navigation()
-_web_nav_page_count, _web_nav_max_pages, _web_nav_history, _web_nav_current_url
-
-# Used by open_url() and SubAgent tools
-_nav_page_count, _nav_max_pages, _nav_history, _nav_current_url
+# Used by open_url() and the other WebNavigationAgent tools
+_nav_page_count, _nav_max_pages, _nav_history, _nav_current_url, _page_cache
 ```
-
-When adding code that touches page counting, update the right tracker:
-- Supervisor path → `_web_nav_*`
-- SubAgent tool path → `_nav_*`
 
 **Always declare `global` at the TOP of any function that modifies these**, before any conditionals.
 
@@ -115,7 +109,7 @@ When adding code that touches page counting, update the right tracker:
 
 ```python
 # WeChat URLs auto-detected and routed through ReadGZH proxy
-# In _fetch_page() and open_url(), this happens transparently:
+# In open_url(), this happens transparently:
 if _is_wechat_url(url):
     text, title, error = _fetch_wechat_via_readgzh(url)
     if error is None:
