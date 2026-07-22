@@ -67,7 +67,7 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
 
     kwargs: dict[str, Any] = {
         "model": settings.job_discovery_model,
-        "temperature": 0.2,
+        "temperature": 0,
         # Bound every single LLM HTTP call and the retry backoff chain so a
         # stalled DeepSeek response cannot hang the Web Navigation Agent loop
         # indefinitely (the wall-clock budget in _nav_budget_check only fires
@@ -1513,6 +1513,141 @@ def _collect_detail_page_links(page: Any, base_url: str) -> list[str]:
     return links
 
 
+# Max list pages to paginate through in a single extract_rendered_job_evidence
+# call. Bounds the browser session so a 51-page list does not stall the run or
+# blow the per-URL time budget. Pagination stops earlier when no "next page"
+# control is found, the page content stops changing, or a login/captcha wall
+# appears.
+_MAX_LIST_PAGES = 5
+
+# CSS selectors for "next page" controls across common pagination libraries
+# (PDD rocket, Mioffice atsx, Ant Design, Element UI, rel=next). Disabled
+# controls (last page) are excluded so pagination stops cleanly.
+_NEXT_PAGE_SELECTORS = (
+    "li.rocket-pagination-next:not(.rocket-pagination-disabled)",
+    "li.atsx-pagination-next:not(.atsx-pagination-disabled)",
+    ".ant-pagination-next:not(.ant-pagination-disabled)",
+    ".el-pagination .btn-next:not(.is-disabled)",
+    "a[rel='next']",
+    "[class*='pagination-next']:not([class*='disabled'])",
+    "[class*='page-next']:not([class*='disabled'])",
+    "li[class*='next']:not([class*='disabled'])",
+    "button[class*='next']:not([class*='disabled'])",
+)
+
+# Fallback: clickable elements whose visible text marks a "next page" control.
+_NEXT_PAGE_TEXTS = ("下一页", "下页", "next", "»", "›")
+
+# Markers that a paginated page turned into a captcha/anti-bot wall. These stop
+# pagination regardless of page length (security hard gate #2: never bypass).
+_VERIFY_WALL_MARKERS = (
+    "环境异常", "完成验证后即可继续访问", "captcha", "验证码",
+    "图形验证", "安全验证", "滑块", "拼图", "人机", "robot", "bot检测",
+)
+# Markers for a dedicated login page/modal. Only checked on short bodies so a
+# normal list page that merely shows a "登录" nav link is not mistaken for a
+# wall.
+_LOGIN_WALL_MARKERS = (
+    "请先登录", "请登录", "扫码登录", "登录后查看", "登录后继续",
+    "sign in", "log in",
+)
+
+
+def _is_pagination_wall(rendered_text: str) -> bool:
+    """True if a paginated page's text looks like a login/captcha/anti-bot wall.
+
+    Security hard gate #2: never bypass login/captcha/anti-bot. When a "next
+    page" click lands on one of these, pagination must stop immediately.
+    """
+    if not rendered_text:
+        return False
+    for m in _VERIFY_WALL_MARKERS:
+        if m in rendered_text or m.lower() in rendered_text.lower():
+            return True
+    if len(rendered_text) < 2000:
+        low = rendered_text.lower()
+        for m in _LOGIN_WALL_MARKERS:
+            if m in rendered_text or m.lower() in low:
+                return True
+    return False
+
+
+def _find_next_page_element(page: Any) -> Any:
+    """Locate a visible, enabled "next page" control on a paginated list.
+
+    Returns a Playwright Locator (first visible match) or None. Tries known CSS
+    selectors first, then text matching (下一页/next/»/›). Skips disabled
+    controls so pagination stops cleanly at the last page.
+    """
+    for sel in _NEXT_PAGE_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=500):
+                return loc
+        except Exception:  # noqa: BLE001
+            continue
+    for txt in _NEXT_PAGE_TEXTS:
+        for tag in ("button", "a", "[role='button']", "li"):
+            try:
+                loc = page.locator(f"{tag}:has-text('{txt}')").first
+                if loc.count() == 0 or not loc.is_visible(timeout=400):
+                    continue
+                cls = (loc.get_attribute("class") or "").lower()
+                if loc.get_attribute("disabled") is not None or "disabled" in cls:
+                    continue
+                return loc
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
+def _capture_page_text(page: Any) -> tuple[str, str]:
+    """Return (title, rendered_body_text) for the currently-loaded page."""
+    try:
+        title = page.title() or ""
+    except Exception:  # noqa: BLE001
+        title = ""
+    try:
+        text = page.locator("body").inner_text(timeout=10_000) or ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    return title, text
+
+
+def _deep_dive_detail_pages(page: Any, browser: Any, base_url: str) -> list[tuple[str, str, str]]:
+    """Open job-detail pages linked from the currently-loaded list page.
+
+    Returns [(url, title, body_text), ...] for detail pages with non-empty
+    body. Each detail page is opened in its own tab with consent dismissal,
+    bounded by _MAX_DETAIL_PAGES so a large list cannot stall the run.
+    """
+    captures: list[tuple[str, str, str]] = []
+    for durl in _collect_detail_page_links(page, base_url)[:_MAX_DETAIL_PAGES]:
+        try:
+            dpage = browser.new_page(user_agent=_NAV_USER_AGENT)
+            dpage.goto(durl, wait_until="domcontentloaded", timeout=20_000)
+            try:
+                dpage.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:  # noqa: BLE001
+                dpage.wait_for_timeout(1_500)
+            _dismiss_consent_dialog(dpage)
+            try:
+                dtext = dpage.locator("body").inner_text(timeout=8_000) or ""
+            except Exception:  # noqa: BLE001
+                dtext = ""
+            dtitle = ""
+            try:
+                dtitle = dpage.title() or ""
+            except Exception:  # noqa: BLE001
+                pass
+            dpage.close()
+            if dtext.strip():
+                captures.append((durl, dtitle, dtext))
+        except Exception:  # noqa: BLE001 - best-effort per detail page
+            continue
+    return captures
+
+
 def extract_rendered_job_evidence(url: str) -> str:
     """Open a rendered recruitment page and extract job-detail evidence.
 
@@ -1546,6 +1681,9 @@ def extract_rendered_job_evidence(url: str) -> str:
     # (url, title, body_text) captured from deep-dived detail pages, appended
     # as evidence after the browser session closes.
     detail_captures: list[tuple[str, str, str]] = []
+    # (url, title, body_text) captured from paginated list pages (page 2..N),
+    # appended as evidence after the browser session closes.
+    list_page_captures: list[tuple[str, str, str]] = []
 
     def capture_response(response: Any) -> None:
         """Capture JSON responses from any recruitment API (not just Alibaba)."""
@@ -1592,8 +1730,7 @@ def extract_rendered_job_evidence(url: str) -> str:
                     empty_cycles += 1
                     if empty_cycles >= 2:
                         break
-            title = page.title()
-            # Capture the rendered DOM text as a fallback evidence source.
+            # ── Page 1: title + rendered DOM text + linked detail pages ──
             # Many career-site SPAs (Moka, Feishu, Mioffice, PDD) encrypt their
             # job-list XHR payloads (`{"data": "<base64>"}`) so the XHR path
             # above yields nothing, but the *rendered* DOM publicly shows job
@@ -1601,41 +1738,48 @@ def extract_rendered_job_evidence(url: str) -> str:
             # visible text (what a human user sees) is legitimate evidence that
             # the downstream extractor can fall back on. This never bypasses
             # login/captcha/anti-bot - it only reads already-rendered content.
-            try:
-                rendered_text = page.locator("body").inner_text(timeout=10_000)
-            except (PlaywrightError, PlaywrightTimeoutError):
-                rendered_text = ""
+            title, rendered_text = _capture_page_text(page)
+            detail_captures.extend(_deep_dive_detail_pages(page, browser, url))
 
-            # Deep-dive: open job-detail pages linked from this list page so
-            # their full JD body (responsibilities/requirements) is captured
-            # as separate evidence pages. Each detail page gets its own consent
-            # dismissal. Bounded by _MAX_DETAIL_PAGES + per-page timeouts so a
-            # large list cannot stall the run.
-            for durl in _collect_detail_page_links(page, url)[:_MAX_DETAIL_PAGES]:
+            # ── Paginate the list: click "next page" and re-capture each page ──
+            # PDD/Mioffice advance pages via in-DOM clicks WITHOUT changing the
+            # URL (verified: SPA state-based), so per-page URL fan-out is
+            # impossible - the only way to read page 2+ is to click through in
+            # this single browser session. Bounded by _MAX_LIST_PAGES, a
+            # no-progress content-hash check, and a login/captcha wall circuit
+            # breaker (security hard gate #2: never bypass login/captcha).
+            prev_hash = (
+                hashlib.sha256(rendered_text.encode("utf-8")).hexdigest()
+                if rendered_text.strip()
+                else ""
+            )
+            for _ in range(_MAX_LIST_PAGES - 1):
+                next_el = _find_next_page_element(page)
+                if next_el is None:
+                    break
                 try:
-                    dpage = browser.new_page(user_agent=_NAV_USER_AGENT)
-                    dpage.goto(durl, wait_until="domcontentloaded", timeout=20_000)
-                    try:
-                        dpage.wait_for_load_state("networkidle", timeout=8_000)
-                    except PlaywrightTimeoutError:
-                        dpage.wait_for_timeout(1_500)
-                    _dismiss_consent_dialog(dpage)
-                    try:
-                        dtext = dpage.locator("body").inner_text(timeout=8_000) or ""
-                    except (PlaywrightError, PlaywrightTimeoutError):
-                        dtext = ""
-                    dtitle = ""
-                    try:
-                        dtitle = dpage.title() or ""
-                    except Exception:  # noqa: BLE001
-                        pass
-                    dpage.close()
-                    if dtext.strip():
-                        detail_captures.append((durl, dtitle, dtext))
-                except (PlaywrightError, PlaywrightTimeoutError):
-                    continue
-                except Exception:  # noqa: BLE001 - best-effort per detail page
-                    continue
+                    next_el.scroll_into_view_if_needed(timeout=3_000)
+                    next_el.click(timeout=3_000)
+                except Exception:  # noqa: BLE001 - click failed / element stale
+                    break
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    page.wait_for_timeout(2_000)
+                except Exception:  # noqa: BLE001
+                    page.wait_for_timeout(2_000)
+                _dismiss_consent_dialog(page)
+                _p_title, p_text = _capture_page_text(page)
+                if not p_text.strip():
+                    break  # nothing rendered (wall/error) -> stop
+                if _is_pagination_wall(p_text):
+                    break  # login/captcha/anti-bot wall -> never bypass
+                cur_hash = hashlib.sha256(p_text.encode("utf-8")).hexdigest()
+                if cur_hash == prev_hash:
+                    break  # content unchanged -> stuck on same page
+                prev_hash = cur_hash
+                list_page_captures.append((page.url, _p_title, p_text))
+                detail_captures.extend(_deep_dive_detail_pages(page, browser, url))
             browser.close()
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
@@ -1667,6 +1811,20 @@ def extract_rendered_job_evidence(url: str) -> str:
                 "metadata": {"source": "rendered_dom", "position_id": ""},
             }
         )
+    # Paginated list pages (page 2..N). Same page_text shape as page 1 so the
+    # extractor treats each as a separate evidence source; content_hash
+    # differentiates them even when the SPA URL is unchanged across pages.
+    for p_url_i, p_title_i, p_text_i in list_page_captures:
+        evidence_pages.append(
+            {
+                "evidence_type": "page_text",
+                "url": p_url_i,
+                "title": p_title_i or "",
+                "content_hash": hashlib.sha256(p_text_i.encode("utf-8")).hexdigest(),
+                "text_excerpt": p_text_i[:8000],
+                "metadata": {"source": "list_page", "position_id": ""},
+            }
+        )
     # Append deep-dived detail-page evidence. These carry the full JD body, so
     # the strict extractor (has_detail=True) keeps them as structured
     # candidates rather than falling back to the title-only extractor.
@@ -1694,7 +1852,11 @@ def extract_rendered_job_evidence(url: str) -> str:
             "navigation_path": [{"url": url, "title": title or "", "action": "extract_rendered_job_evidence"}],
             "page_count": _nav_page_count,
             "error": None if evidence_pages else "No recognized rendered job evidence found",
-            "metadata": {"captured_response_count": len(payloads), "response_urls": response_urls[:5]},
+            "metadata": {
+                "captured_response_count": len(payloads),
+                "response_urls": response_urls[:5],
+                "list_pages": len(list_page_captures) + 1,
+            },
         },
         ensure_ascii=False,
     )
