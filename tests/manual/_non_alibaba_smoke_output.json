@@ -1,0 +1,80 @@
+[
+  {
+    "company": "柏楚电子",
+    "url": "https://mp.weixin.qq.com/s/F_ehY3q8Zi3-QV-AwoOF5g",
+    "url_type": "wechat",
+    "executor_type": "snapshot",
+    "elapsed_sec": 8.9,
+    "status": "needs_manual_review",
+    "evidence_count": 0,
+    "candidate_count": 0,
+    "summary": "WeChat article blocked by verification wall",
+    "error": null,
+    "index": 1
+  },
+  {
+    "company": "华金证券",
+    "url": "https://mp.weixin.qq.com/s/rjuqB1qQnl9sy5qX9-Xs3w",
+    "url_type": "wechat",
+    "executor_type": "snapshot",
+    "elapsed_sec": 262.0,
+    "status": "succeeded",
+    "evidence_count": 1,
+    "candidate_count": 1,
+    "summary": "SnapshotExecutor completed 3 steps, found 1 candidate(s)",
+    "error": null,
+    "index": 2
+  },
+  {
+    "company": "元戎启行",
+    "url": "https://app.mokahr.com/recommendation-apply/deeproute/6488?sharePageId=4200484&recommendCode=NTAIUtn&codeType=1&code=061yTN0w36fOd53Sqd0w3ct2UU0yTN0e&state=3#/jobs/?isCampusJob=1",
+    "url_type": "career_site",
+    "executor_type": "supervisor",
+    "elapsed_sec": 96.6,
+    "status": "partial_success",
+    "evidence_count": 3,
+    "candidate_count": 38,
+    "summary": "Recovered incomplete discovery output from tool results",
+    "error": null,
+    "index": 3
+  },
+  {
+    "company": "禾赛科技",
+    "url": "https://kwh0jtf778.jobs.feishu.cn/229043/m/?external_referral_code=GA2DJVE",
+    "url_type": "career_site",
+    "executor_type": "supervisor",
+    "elapsed_sec": 206.0,
+    "status": "partial_success",
+    "evidence_count": 2,
+    "candidate_count": 7,
+    "summary": "Recovered incomplete discovery output from tool results",
+    "error": null,
+    "index": 4
+  },
+  {
+    "company": "小米",
+    "url": "https://xiaomi.jobs.f.mioffice.cn/s/m5DjWDrhl_g",
+    "url_type": "career_site",
+    "executor_type": "supervisor",
+    "elapsed_sec": 186.0,
+    "status": "succeeded",
+    "evidence_count": 34,
+    "candidate_count": 31,
+    "summary": "Successfully discovered 10 internship positions from Xiaomi's Mioffice career page. The page is a Xiaomi internship recruitment portal listing positions across Beijing, Shanghai, and Nanjing in categories including product, operations, hardware R&D, and functional roles. All positions are campus/int",
+    "error": null,
+    "index": 5
+  },
+  {
+    "company": "拼多多",
+    "url": "https://careers.pddglobalhr.com/campus/grad?t=N5ch0DXEtA",
+    "url_type": "career_site",
+    "executor_type": "supervisor",
+    "elapsed_sec": 137.2,
+    "status": "partial_success",
+    "evidence_count": 4,
+    "candidate_count": 24,
+    "summary": "Navigated to PDD (拼多多集团) campus recruitment page. The page is a JavaScript-rendered SPA listing ~22 campus positions. The list view was captured with job titles, departments, locations, and deadlines visible, but individual JD detail pages could not be accessed (likely behind login/interstitial). Ex",
+    "error": null,
+    "index": 6
+  }
+]

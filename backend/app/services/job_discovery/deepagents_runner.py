@@ -413,13 +413,7 @@ def _fetch_page_with_browser(url: str) -> tuple[str | None, str | None, str | No
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125 Safari/537.36"
-                )
-            )
+            page = browser.new_page(user_agent=_NAV_USER_AGENT)
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_timeout(3_000)
             title = page.title()
@@ -1371,6 +1365,154 @@ def open_rendered_url(url: str) -> str:
     )
 
 
+# Privacy/cookie consent button texts we are ALLOWED to click to read public
+# job-description content. These are cookie-banner / consent-interstitial
+# buttons that any human visitor accepts to view publicly-available job
+# listings. This does NOT include login, captcha, or anti-bot challenges -
+# those are covered by ``_CONSENT_BLOCK_KEYWORDS`` and must never be clicked.
+_CONSENT_BUTTON_TEXTS = (
+    "同意并继续", "同意并接受", "全部同意", "接受全部", "全部接受",
+    "接受所有", "我同意", "我知道了", "知道了",
+    "我已阅读", "已阅读并同意", "我已知晓", "同意",
+    "Agree", "I Agree", "Accept All", "Accept all", "Accept",
+    "Got it", "Allow all", "I understand",
+)
+
+# Absolute blocklist: if the page (or a candidate button's text) contains any
+# of these, NO button is clicked. These are captcha / anti-bot / login walls
+# which the security hard gate (#2) forbids bypassing - the run must surface
+# them as needs_manual_review instead. Also keeps the WeChat verification
+# wall (``环境异常`` + ``完成验证后即可继续访问``) untouched.
+_CONSENT_BLOCK_KEYWORDS = (
+    "验证", "验证码", "图形验证", "安全验证", "滑块", "拼图", "人机",
+    "captcha", "verify", "verification", "完成验证", "环境异常",
+    "登录", "登陆", "login", "sign in", "signin", "扫码", "二维码",
+    "注册并登录", "robot", "bot检测", "bot 检测",
+)
+
+
+def _dismiss_consent_dialog(page: Any) -> bool:
+    """Click a privacy/cookie consent button so public JD content renders.
+
+    Strictly bounded to the "read JD" path: only clicks elements whose text
+    exactly matches (case-insensitive) an entry in ``_CONSENT_BUTTON_TEXTS``,
+    and only if the page body contains no ``_CONSENT_BLOCK_KEYWORDS``. Never
+    touches final-submit, login, captcha, or anti-bot elements. Returns True
+    if a consent button was clicked (caller may then re-wait for content).
+    """
+    try:
+        body_text = page.locator("body").inner_text(timeout=3_000) or ""
+    except Exception:  # noqa: BLE001 - best-effort; absence of text is fine
+        body_text = ""
+    # Anti-bot / captcha / login wall -> never click anything here.
+    if any(kw in body_text for kw in _CONSENT_BLOCK_KEYWORDS):
+        return False
+
+    buttons = page.locator(
+        "button, a, [role='button'], input[type='button'], input[type='submit']"
+    )
+    try:
+        count = buttons.count()
+    except Exception:  # noqa: BLE001
+        return False
+    lowered_allow = {s.lower() for s in _CONSENT_BUTTON_TEXTS}
+    for i in range(count):
+        el = buttons.nth(i)
+        try:
+            txt = (el.inner_text(timeout=500) or "").strip()
+            if not txt:
+                val = el.get_attribute("value")
+                txt = (val or "").strip()
+        except Exception:  # noqa: BLE001 - skip non-interactable elements
+            continue
+        if not txt or len(txt) > 12:
+            continue
+        # Exact match (case-insensitive) against the allowlist, plus a
+        # per-button blocklist re-check so a misleadingly-labelled button
+        # inside a captcha wall is never clicked.
+        if txt.lower() not in lowered_allow:
+            continue
+        if any(kw in txt for kw in _CONSENT_BLOCK_KEYWORDS):
+            continue
+        try:
+            el.click(timeout=3_000)
+            page.wait_for_timeout(1_500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=4_000)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except Exception:  # noqa: BLE001 - try the next candidate
+            continue
+    return False
+
+
+# User-Agent used for all Playwright browser sessions in this module.
+_NAV_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125 Safari/537.36"
+)
+
+# Max job-detail pages to deep-dive into from a single list page. Bounds the
+# browser session so a 100-position list does not stall the run.
+_MAX_DETAIL_PAGES = 6
+
+# Heuristic path/query fragments that mark an <a> link as a job-detail page
+# (vs navigation/footer/social). Conservative - the fragment must appear in
+# the resolved URL path or query.
+_DETAIL_LINK_HINTS = ("job", "position", "recruit", "detail", "campus")
+
+
+def _collect_detail_page_links(page: Any, base_url: str) -> list[str]:
+    """Collect same-site job-detail page URLs from a rendered list page.
+
+    Resolves relative hrefs, keeps only links on the same host whose
+    path/query contains a job-detail hint, and dedupes. Used to deep-dive
+    into detail pages (each opened with consent dismissal) so the full JD
+    body is captured, not just list-page titles.
+    """
+    try:
+        anchors = page.locator("a")
+        count = anchors.count()
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        base_host = (urlsplit(base_url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        base_host = ""
+    if not base_host:
+        return []
+    links: list[str] = []
+    seen: set[str] = set()
+    for i in range(count):
+        try:
+            href = anchors.nth(i).get_attribute("href")
+        except Exception:  # noqa: BLE001
+            continue
+        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            continue
+        try:
+            resolved = urljoin(base_url, href)
+            parsed = urlsplit(resolved)
+        except Exception:  # noqa: BLE001
+            continue
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if (parsed.hostname or "").lower() != base_host:
+            continue
+        path_q = (parsed.path + " " + parsed.query).lower()
+        if not any(h in path_q for h in _DETAIL_LINK_HINTS):
+            continue
+        if resolved == base_url or resolved in seen:
+            continue
+        seen.add(resolved)
+        links.append(resolved)
+        if len(links) >= _MAX_DETAIL_PAGES * 3:
+            break
+    return links
+
+
 def extract_rendered_job_evidence(url: str) -> str:
     """Open a rendered recruitment page and extract job-detail evidence.
 
@@ -1401,6 +1543,9 @@ def extract_rendered_job_evidence(url: str) -> str:
     response_urls: list[str] = []
     rendered_text: str = ""
     title: str = ""
+    # (url, title, body_text) captured from deep-dived detail pages, appended
+    # as evidence after the browser session closes.
+    detail_captures: list[tuple[str, str, str]] = []
 
     def capture_response(response: Any) -> None:
         """Capture JSON responses from any recruitment API (not just Alibaba)."""
@@ -1417,19 +1562,18 @@ def extract_rendered_job_evidence(url: str) -> str:
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125 Safari/537.36"
-                )
-            )
+            page = browser.new_page(user_agent=_NAV_USER_AGENT)
             page.on("response", capture_response)
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             try:
                 page.wait_for_load_state("networkidle", timeout=15_000)
             except PlaywrightTimeoutError:
                 page.wait_for_timeout(3_000)
+            # Dismiss a privacy/cookie consent interstitial so the publicly-
+            # rendered JD content (shown to the visitor after accepting) is
+            # readable. Strictly limited to consent buttons - never touches
+            # login/captcha/anti-bot (see _dismiss_consent_dialog).
+            _dismiss_consent_dialog(page)
             # Scroll to trigger lazy-loaded job XHR (infinite scroll /
             # pagination). The response callback stays armed, so each newly
             # captured batch is converted into evidence below. Stop after two
@@ -1461,6 +1605,37 @@ def extract_rendered_job_evidence(url: str) -> str:
                 rendered_text = page.locator("body").inner_text(timeout=10_000)
             except (PlaywrightError, PlaywrightTimeoutError):
                 rendered_text = ""
+
+            # Deep-dive: open job-detail pages linked from this list page so
+            # their full JD body (responsibilities/requirements) is captured
+            # as separate evidence pages. Each detail page gets its own consent
+            # dismissal. Bounded by _MAX_DETAIL_PAGES + per-page timeouts so a
+            # large list cannot stall the run.
+            for durl in _collect_detail_page_links(page, url)[:_MAX_DETAIL_PAGES]:
+                try:
+                    dpage = browser.new_page(user_agent=_NAV_USER_AGENT)
+                    dpage.goto(durl, wait_until="domcontentloaded", timeout=20_000)
+                    try:
+                        dpage.wait_for_load_state("networkidle", timeout=8_000)
+                    except PlaywrightTimeoutError:
+                        dpage.wait_for_timeout(1_500)
+                    _dismiss_consent_dialog(dpage)
+                    try:
+                        dtext = dpage.locator("body").inner_text(timeout=8_000) or ""
+                    except (PlaywrightError, PlaywrightTimeoutError):
+                        dtext = ""
+                    dtitle = ""
+                    try:
+                        dtitle = dpage.title() or ""
+                    except Exception:  # noqa: BLE001
+                        pass
+                    dpage.close()
+                    if dtext.strip():
+                        detail_captures.append((durl, dtitle, dtext))
+                except (PlaywrightError, PlaywrightTimeoutError):
+                    continue
+                except Exception:  # noqa: BLE001 - best-effort per detail page
+                    continue
             browser.close()
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
@@ -1490,6 +1665,20 @@ def extract_rendered_job_evidence(url: str) -> str:
                 "content_hash": hashlib.sha256(rendered_text.encode("utf-8")).hexdigest(),
                 "text_excerpt": rendered_text[:8000],
                 "metadata": {"source": "rendered_dom", "position_id": ""},
+            }
+        )
+    # Append deep-dived detail-page evidence. These carry the full JD body, so
+    # the strict extractor (has_detail=True) keeps them as structured
+    # candidates rather than falling back to the title-only extractor.
+    for durl_i, dtitle_i, dtext_i in detail_captures:
+        evidence_pages.append(
+            {
+                "evidence_type": "page_text",
+                "url": durl_i,
+                "title": dtitle_i,
+                "content_hash": hashlib.sha256(dtext_i.encode("utf-8")).hexdigest(),
+                "text_excerpt": dtext_i[:8000],
+                "metadata": {"source": "detail_page", "position_id": ""},
             }
         )
 
@@ -1562,13 +1751,7 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
     try:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125 Safari/537.36"
-                )
-            )
+            page = browser.new_page(user_agent=_NAV_USER_AGENT)
             page.on("response", _capture_json_response)
 
             # Navigate and wait for SPA to finish rendering
@@ -1911,6 +2094,12 @@ Rules:
 - Stay within the tool-enforced page budget.
 - Do not attempt login.
 - Do not solve captcha or anti-bot challenges.
+- You MAY let `extract_rendered_job_evidence` dismiss privacy/cookie consent
+  interstitials to read publicly-available JD content. It only clicks consent
+  buttons (同意/Accept/Agree) and never login/captcha/anti-bot. When a list
+  page shows only job titles and detail pages are gated by a consent dialog,
+  call `extract_rendered_job_evidence` on the detail-page URL to capture its
+  full JD body.
 - Return discovered JD evidence pages and discovery path.
 - Do not extract final standardized jobs; the supervisor will call extraction tools."""
 
@@ -2351,6 +2540,48 @@ def _loop_guardian_wrap(tool_fn: Any, tool_name: str) -> Any:
     _guarded.__qualname__ = getattr(tool_fn, "__qualname__", tool_name)
     _guarded.__doc__ = getattr(tool_fn, "__doc__", None)
     return _guarded
+
+
+def invoke_supervisor_agent(
+    agent: Any,
+    agent_input: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Invoke the discovery supervisor agent, degrading recursion crashes.
+
+    A GraphRecursionError (the supervisor LLM looped without reaching its
+    stop condition) is downgraded to a ``needs_manual_review`` result instead
+    of crashing the run. The supervisor prompt already mandates 3-step
+    convergence, so a recursion crash is LLM non-determinism, not a real
+    failure - the run is flagged for manual review rather than reported as a
+    hard ``failed``. Other exceptions propagate unchanged.
+
+    Detection is by exception/message name (no hard langgraph import) so the
+    guard works across langgraph versions.
+
+    Returns:
+        The raw agent result dict, or a synthetic ``needs_manual_review``
+        dict when a recursion crash was caught.
+    """
+    invoke_kwargs: dict[str, Any] = {"config": config} if config is not None else {}
+    try:
+        return agent.invoke(agent_input, **invoke_kwargs)
+    except Exception as exc:
+        name = type(exc).__name__
+        msg = str(exc)
+        if "Recursion" in name or "Recursion limit" in msg:
+            return {
+                "status": "needs_manual_review",
+                "block_reason": "recursion_limit",
+                "evidence": [],
+                "candidates": [],
+                "summary": (
+                    "Supervisor did not converge within the recursion limit "
+                    "(LLM looped without reaching a stop condition); no "
+                    "structured candidates captured. Re-run or review manually."
+                ),
+            }
+        raise
 
 
 def build_discovery_supervisor_agent(

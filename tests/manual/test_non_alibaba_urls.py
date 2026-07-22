@@ -42,6 +42,7 @@ from backend.app.db.base import Base
 from backend.app.db.models import JobDiscoveryStrategy
 from backend.app.services.job_discovery.deepagents_runner import (
     build_discovery_supervisor_agent,
+    invoke_supervisor_agent,
     _build_job_discovery_llm,
 )
 from backend.app.services.job_discovery.result_contract import (
@@ -304,9 +305,9 @@ def execute_one_url(
         t_sup = time.monotonic()
         try:
             config = {"recursion_limit": RECURSION_LIMIT}
-            raw = agent.invoke(agent_input, config=config)
+            raw = invoke_supervisor_agent(agent, agent_input, config=config)
         except TypeError:
-            raw = agent.invoke(agent_input)
+            raw = invoke_supervisor_agent(agent, agent_input)
         print(f"  Supervisor done: {time.monotonic() - t_sup:.0f}s")
 
         result = _parse_agent_result(raw)
