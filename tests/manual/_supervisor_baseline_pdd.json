@@ -1,0 +1,35 @@
+{
+  "company": "拼多多",
+  "slug": "pdd",
+  "url": "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+  "real_count": 22,
+  "real_pages": 3,
+  "status": "partial_success",
+  "raw_count": 24,
+  "unique_count": 24,
+  "duplicate_count": 0,
+  "evidence_count": 8,
+  "elapsed_sec": 189.6,
+  "apply_url_sample": [
+    "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+    "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+    "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+    "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+    "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x"
+  ],
+  "title_sample": [
+    "内容审核专员（法律专项）",
+    "用户体验运营管培（多语种优势-上海）",
+    "商家运营（多语种优势-上海）",
+    "服务端研发工程师",
+    "AI Agent研发工程师",
+    "算法工程师",
+    "客户端研发工程师",
+    "Web前端研发工程师",
+    "数据分析师",
+    "安全工程师",
+    "产品管培生（上海）",
+    "市场管培生（上海）"
+  ],
+  "summary": "Discovered 22 campus recruitment positions from PDD (拼多多集团) career site. The page is a JavaScript-rendered SPA listing all positions across 3 pages. Individual job detail pages could not be accessed (blocked by interstitial/login requirement), so only title, department, location, and recruitment typ"
+}

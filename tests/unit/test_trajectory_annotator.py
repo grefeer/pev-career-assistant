@@ -1,7 +1,6 @@
 """Unit tests for trajectory_annotator."""
 from __future__ import annotations
 
-import pytest
 from backend.app.services.job_discovery.strategy.trajectory_annotator import TrajectoryAnnotator
 
 

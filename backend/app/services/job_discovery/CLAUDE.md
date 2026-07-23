@@ -45,7 +45,7 @@ The Job Discovery subsystem is the core of the platform's automated recruitment 
 
 ```
 job_discovery/
-├── deepagents_runner.py          # ★ Core (2541 lines)
+├── deepagents_runner.py          # ★ Core (~2990 lines)
 │                                   Supervisor Agent builder, Web Nav Agent,
 │                                   all tool wrappers, _fetch_alibaba_search_api,
 │                                   fetch_wechat_article, _cached_fetch,
@@ -53,7 +53,7 @@ job_discovery/
 │                                   _dismiss_consent_dialog + consent allow/blocklists,
 │                                   _extract_and_verify_candidates_from_evidence,
 │                                   _extract_title_only_candidates,
-│                                   LoopGuardian (_loop_guardian_wrap et al)
+│                                   _is_plausible_job_title (title false-positive filter)
 │
 ├── result_contract.py            # ★ Supervisor result parsing/recovery
 │                                   parse_agent_result: parse structured output,
@@ -62,6 +62,20 @@ job_discovery/
 │                                   / package_candidates tool messages (so the final
 │                                   LLM message cannot erase collected jobs)
 │                                   enforce_result_invariants: succeeded=>needs candidates
+│                                   _dedupe_candidate_dicts: semantic dedup at both the
+│                                   tool-recovery and structured-merge paths (delegates
+│                                   to deduplication/)
+│
+├── deduplication/                 # Candidate semantic deduplication (new)
+│   └── canonical_job_deduplicator.py  # deduplicate_candidates(): _identity_key =
+│                                       ("jd", company, core_hash) for full-JD,
+│                                       ("title", normalize_title) for title-only;
+│                                       _cluster_by_title_substring (city/level variants)
+│
+├── normalization/                 # JD text normalization (new)
+│   └── jd_normalizer.py           # normalize_title/company/text + core_hash:
+│                                   NFKC fold, zero-width strip, trailing （…） strip,
+│                                   structural-punct delete (deletes 【】 chars, keeps content)
 │
 ├── schemas.py                    # Pydantic/dataclass: DiscoveryTaskInput,
 │                                   DiscoveryRunResult, PageEvidence,
@@ -105,10 +119,13 @@ job_discovery/
 │                                   PNG/JPEG dimension parsing; tall-image slicing
 │
 └── prompts/                      # Supervisor system prompt templates
-    ├── supervisor_base.txt        # Base system prompt (includes L1 Loop Prevention)
-    ├── supervisor_clean_start.txt # Instructions when no snapshot_context
-    └── supervisor_snapshot_fallback.txt  # Takeover instructions with
-                                           # {completed_steps}, {failed_step_xxx}
+    ├── supervisor_base.txt        # Base system prompt (includes prompt-level Loop Prevention)
+    └── supervisor_clean_start.txt # Instructions when no snapshot_context
+
+    Note: `build_supervisor_prompt` also calls `_load_prompt("supervisor_snapshot_fallback",
+    required=False)` on takeover, but that file does not exist - the takeover branch
+    silently falls back to base-only. Treat as dead-defensive loading; do not rely on a
+    takeover-specific template until one is authored.
 ```
 
 ## Three Execution Paths
@@ -187,6 +204,17 @@ latter yields *title-only* candidates flagged via `normalization_warnings`
 (detail-page JD bodies are behind consent/privacy interstitials that this
 system never circumvents — security hard gate #2).
 
+**`_extract_title_only_candidates`** matches lines ending in `_JOB_TITLE_SUFFIXES`
+(工程师/分析师/.../产品经理/管培生, plus 运营/制作). Each match is cleaned before the
+suffix check: leading `【...】` campaign prefix, **trailing `【...】` cohort tag**
+(e.g. ...研发工程师【2027届云弧计划】), trailing `（...）`, and trailing `-XXX`.
+
+**`_is_plausible_job_title`** post-filters false positives with three rules:
+(1) title contains `|` (banner/separator); (2) title is a bare **generic** category
+word (经理/主管/总监/负责人/运营/制作) - bare *specific* role titles like
+产品经理/工程师/管培生 are kept; (3) the title repeats across 2+ `page_text`
+captures (sidebar tab, not a job).
+
 **WebNavigationAgent subagent**: Separate DeepAgent (`build_web_navigation_agent`)
 with 7 navigation tools (`open_url`, `open_rendered_url`,
 `extract_rendered_job_evidence`, `read_dom`, `extract_links`, `click_link`,
@@ -225,10 +253,23 @@ Routing fields on both:
 
 In-memory recorder shared by all three paths. Every tool call records `{tool, status, params, result, error, error_type, timestamp}`. On failure: `to_snapshot_context()` builds `{source, strategy_id, completed_steps[], failed_step{}}`.
 
-### LoopGuardian (L1 + L2)
+### Loop Prevention (prompt-level only)
 
-- **L1** (prompt): `supervisor_base.txt` "Loop Prevention" section - tells LLM not to retry, max 12 calls, fallback at 6
-- **L2** (standalone): `_loop_guardian_wrap(tool_fn, tool_name)` - blocks the same tool+params on the 3rd consecutive identical call. Available for programmatic use but NOT auto-applied to Supervisor tools (LangChain `StructuredTool` calling convention is incompatible with Python function wrappers)
+The Supervisor relies on **prompt-level** loop prevention only: `supervisor_base.txt`
+"Loop Prevention" section tells the LLM not to retry, max 12 calls, fallback at 6.
+
+A prior programmatic guard (`_loop_guardian_wrap`, blocking the 3rd consecutive
+identical tool+params call) was **removed** - it was never applied at runtime
+(LangChain `StructuredTool` is incompatible with Python function wrappers) and
+existed only as dead code with its own test. Do not re-add a function-wrapper
+guard to Supervisor tools; rely on the prompt + `recursion_limit` instead.
+
+### Supervisor invocation (streamed)
+
+`invoke_supervisor_agent` runs the agent with `stream_mode="values"` rather than a
+blocking `invoke`. On `GraphRecursionError` (large sites like xiaomi can hit
+`recursion_limit`) it preserves the partial state already streamed instead of
+discarding everything - so collected candidates survive a recursion crash.
 
 ### Page Cache (`_page_cache` + `_cached_fetch`)
 
@@ -267,6 +308,33 @@ reconstructing `PageEvidence`: `type`→`evidence_type`, and
 dropped. This absorbs the common LLM habit of emitting `type`/`text` instead
 of the dataclass field names.
 
+### Candidate Deduplication (semantic)
+
+The Supervisor re-runs `package_candidates` on evidence `run_web_navigation` already
+packaged, producing candidates with different `idempotency_key` (byte-different) but
+identical semantics - these survive the byte-level `_unique_items` check and create
+duplicates. Semantic dedup collapses them:
+
+- **`deduplication/canonical_job_deduplicator.py`** - `deduplicate_candidates()`:
+  - Full-JD candidates (have `responsibilities`/`requirements`): identity key
+    `("jd", normalize_company, core_hash(responsibilities, requirements))`.
+  - Title-only candidates (no JD body, list-page fallback): identity key
+    `("title", normalize_title(title))` - company deliberately EXCLUDED (one company
+    per URL; `company_name` is attributed inconsistently across capture paths).
+  - Within a full-JD identity group, `_cluster_by_title_substring` partitions by
+    title overlap so a shared JD template does not merge distinct roles
+    (算法工程师 vs 算法研究员) while city/level variants do merge
+    (算法工程师 vs 算法工程师-北京).
+- **`normalization/jd_normalizer.py`** - `normalize_title`/`normalize_company`/`normalize_text`
+  + `core_hash`. NFKC fold, zero-width-char strip, **trailing （…）/(...) strip**
+  (so 产品管培生 and 产品管培生（上海） merge), structural-punctuation delete
+  (deletes 【】 bracket *characters* but keeps their content: "X【Y】" -> "XY").
+- **`result_contract._dedupe_candidate_dicts`** - applied at **both** the tool-only
+  recovery path and the structured-merge path, so neither emits duplicates regardless
+  of which produced the candidates.
+
+Result: 0 duplicates across all test sites (incl. 137-candidate xiaomi runs).
+
 ### Email Privacy
 
 `fetch_wechat_article` extracts email addresses as structured `application_emails` metadata. The deterministic `extract_jd_candidates` (regex-based, no LLM) processes them safely - no raw emails ever enter an LLM prompt.
@@ -302,11 +370,24 @@ WebNavigationAgent-only tools (not in the Supervisor's 9-tool list): `open_url`,
 # All job_discovery unit tests
 .\.venv\Scripts\python.exe -m pytest tests/unit/ -k job_discovery -v
 
-# LoopGuardian (16 scenarios, no LLM/network)
-.\.venv\Scripts\python.exe tests/unit/test_loop_guardian.py
+# New subsystem unit tests (dedup / normalization / title filter / contract)
+.\.venv\Scripts\python.exe -m pytest tests/unit/job_discovery/ -v
 
 # Evidence verifier
 .\.venv\Scripts\python.exe -m pytest tests/unit/ -k evidence_verifier -v
+```
+
+`tests/unit/job_discovery/` covers `test_canonical_job_deduplicator`,
+`test_jd_normalizer`, `test_result_contract_dedup`, and `test_title_filter`
+(title extraction + `_is_plausible_job_title` three-rule filter).
+
+### Supervisor baseline (3 real URLs, gated)
+```powershell
+# PASS = unique == real_count AND dup_count == 0.
+# deeproute 21 / pdd 22 reliably pass; xiaomi is environmentally limited
+# (intermittent anti-bot; 137/151 with 0 dups when reachable).
+$env:RUN_SUPERVISOR_BASELINE='1'
+.\.venv\Scripts\python.exe -m pytest tests/integration/job_discovery/test_supervisor_baseline_real_urls.py -v
 ```
 
 ### Live smoke tests (require DEEPSEEK_API_KEY + TENCENT_DOCS_TOKEN + READGZH_API_KEY)
@@ -340,10 +421,9 @@ WebNavigationAgent-only tools (not in the Supervisor's 9-tool list): `open_url`,
 ### When modifying Supervisor prompts
 1. Edit `prompts/supervisor_base.txt` for always-included content
 2. Edit `prompts/supervisor_clean_start.txt` for clean-start instructions
-3. Edit `prompts/supervisor_snapshot_fallback.txt` for takeover instructions
-4. Template variables in snapshot_fallback: `{source}`, `{strategy_id}`,
-   `{failed_step_count}`, `{completed_steps}`, `{failed_step_tool}`,
-   `{failed_step_params}`, `{failed_step_error}`
+   (`build_supervisor_prompt` reads these two files; the takeover-specific
+   `supervisor_snapshot_fallback.txt` is referenced in code but not present -
+   see File Structure note above.)
 
 ### Evidence format
 - `evidence_type` values emitted by the code: `"job_detail_json"` (XHR),

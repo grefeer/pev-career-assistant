@@ -7,7 +7,7 @@ hand over to the Supervisor Agent with snapshot_context injected.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import yaml

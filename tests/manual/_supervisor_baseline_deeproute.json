@@ -1,0 +1,35 @@
+{
+  "company": "元戎启行",
+  "slug": "deeproute",
+  "url": "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home",
+  "real_count": 21,
+  "real_pages": 1,
+  "status": "succeeded",
+  "raw_count": 21,
+  "unique_count": 21,
+  "duplicate_count": 0,
+  "evidence_count": 2,
+  "elapsed_sec": 74.0,
+  "apply_url_sample": [
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/home"
+  ],
+  "title_sample": [
+    "产品经理",
+    "项目经理",
+    "数据挖掘工程师",
+    "大模型算法工程师",
+    "系统评测工程师",
+    "端到端算法工程师",
+    "训练优化工程师",
+    "数据湖仓工程师",
+    "软件工程师",
+    "数据生成算法工程师",
+    "AI Infra工程师",
+    "强化学习算法工程师"
+  ],
+  "summary": "Discovered 21 candidate(s) via run_web_navigation (supervisor did not emit a structured result; candidates recovered from tool outputs)."
+}

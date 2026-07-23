@@ -151,7 +151,7 @@ def test_readgzh_direct_fetch() -> None:
     if not url:
         pytest.skip("TEST_WECHAT_URL_1 not set — provide a WeChat article URL")
 
-    print(f"\n── Testing ReadGZH direct fetch ──")
+    print("\n── Testing ReadGZH direct fetch ──")
     print(f"   URL: {url}")
 
     text, title, error = _fetch_wechat_via_readgzh(url)
@@ -245,7 +245,7 @@ def test_live_readgzh_four_url_web_navigation_smoke() -> None:
                 print(f"\n⚠ WeChat article has non-blocking error: {item['error']}")
                 # Non-verification errors are acceptable (e.g., empty article, network)
         else:
-            print(f"\n⚠ WeChat article returned 0 evidence (no error reported)")
+            print("\n⚠ WeChat article returned 0 evidence (no error reported)")
 
     print(f"\n── WeChat ReadGZH results: {wechat_success_count}/2 success ──")
 

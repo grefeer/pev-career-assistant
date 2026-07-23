@@ -1,13 +1,11 @@
 """Unit tests for SnapshotExecutor."""
 from __future__ import annotations
 
-import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from backend.app.services.job_discovery.schemas import (
     DiscoveryTaskInput,
-    DiscoveryRunResult,
     StrategyRecord,
 )
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer

@@ -7,7 +7,7 @@ existing supervisor-only behaviour.
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import Engine, create_engine
@@ -308,7 +308,6 @@ class TestWorkerStrategyStructural:
         from backend.app.services.job_discovery.strategy.snapshot_executor import (
             SnapshotExecutionResult,
         )
-        from backend.app.services.job_discovery.schemas import PageEvidence
 
         _seed_strategy(db, "career.example.com/*")
 

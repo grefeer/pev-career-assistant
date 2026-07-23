@@ -6,7 +6,7 @@ import hashlib
 import json
 
 from backend.app.services.job_discovery.adapters.base import DomainAdapter
-from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
+from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput, StrategyRecord
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
 
 
@@ -24,7 +24,7 @@ class AlibabaSPAAdapter(DomainAdapter):
     def execute(
         self,
         task: DiscoveryTaskInput,
-        strategy: "StrategyRecord",
+        strategy: StrategyRecord,
         trajectory: TrajectoryBuffer,
     ) -> DiscoveryRunResult:
         """Execute via Playwright browser navigation + deterministic pipeline."""

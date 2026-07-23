@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
+from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput, StrategyRecord
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
 
 
@@ -20,7 +20,7 @@ class DomainAdapter(ABC):
     def execute(
         self,
         task: DiscoveryTaskInput,
-        strategy: "StrategyRecord",
+        strategy: StrategyRecord,
         trajectory: TrajectoryBuffer,
     ) -> DiscoveryRunResult:
         """Execute job discovery for this domain.

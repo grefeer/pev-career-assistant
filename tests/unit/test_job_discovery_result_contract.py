@@ -8,7 +8,11 @@ from backend.app.services.job_discovery.result_contract import (
     enforce_result_invariants,
     parse_agent_result,
 )
-from backend.app.services.job_discovery.schemas import DiscoveryRunResult, PageEvidence
+from backend.app.services.job_discovery.schemas import (
+    DiscoveryRunResult,
+    NormalizedJobCandidate,
+    PageEvidence,
+)
 
 
 def test_parses_fenced_json_from_reverse_message_scan() -> None:
@@ -83,7 +87,14 @@ def test_candidate_only_tool_recovery_is_succeeded() -> None:
 
     assert result.status == "succeeded"
     assert result.block_reason is None
-    assert result.candidates == [candidate]
+    # Dedup repackages tool-recovered candidates as NormalizedJobCandidate objects
+    # (dict -> object); idempotency_key/similarity_group_key are packaging-only
+    # fields, not dataclass fields, so they are dropped (worker recomputes them).
+    assert len(result.candidates) == 1
+    cand = result.candidates[0]
+    assert isinstance(cand, NormalizedJobCandidate)
+    assert cand.title == "Software Engineer"
+    assert cand.company_name == "Example Corp"
     assert result.evidence == []
 
 
@@ -120,7 +131,11 @@ def test_incomplete_tool_recovery_preserves_evidence_and_candidates() -> None:
     assert result.status == "succeeded"
     assert result.block_reason is None
     assert result.evidence == [evidence]
-    assert result.candidates == [candidate]
+    assert len(result.candidates) == 1
+    cand = result.candidates[0]
+    assert isinstance(cand, NormalizedJobCandidate)
+    assert cand.title == "Software Engineer"
+    assert cand.company_name == "Example Corp"
 
 
 def test_evidence_only_tool_recovery_requires_manual_review() -> None:

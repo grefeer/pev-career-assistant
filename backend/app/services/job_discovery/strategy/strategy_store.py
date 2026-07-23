@@ -74,7 +74,7 @@ def get_active_strategies(db: Session) -> list[JobDiscoveryStrategy]:
         db.scalars(
             select(JobDiscoveryStrategy)
             .where(
-                JobDiscoveryStrategy.enabled == True,
+                JobDiscoveryStrategy.enabled.is_(True),
                 JobDiscoveryStrategy.status.in_(["active", "degraded"]),
             )
             .order_by(JobDiscoveryStrategy.priority.desc(), JobDiscoveryStrategy.success_count.desc())
@@ -169,7 +169,7 @@ def get_strategies_due_for_health_check(
         select(JobDiscoveryStrategy)
         .where(
             JobDiscoveryStrategy.status.in_(["active", "degraded"]),
-            JobDiscoveryStrategy.enabled == True,
+            JobDiscoveryStrategy.enabled.is_(True),
             (JobDiscoveryStrategy.last_health_check_at < cutoff)
             | (JobDiscoveryStrategy.last_health_check_at.is_(None)),
         )

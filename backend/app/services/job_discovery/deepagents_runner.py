@@ -14,6 +14,7 @@ import re
 import time
 from dataclasses import asdict, is_dataclass
 from typing import Any
+from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -25,6 +26,10 @@ from deepagents import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
 
 from backend.app.config import Settings
+from backend.app.services.job_discovery.deduplication import deduplicate_candidates
+from backend.app.services.job_discovery.normalization.jd_normalizer import (
+    normalize_title,
+)
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
     NormalizedJobCandidate,
@@ -88,8 +93,6 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
 # ---------------------------------------------------------------------------
 # Prompt loading and assembly
 # ---------------------------------------------------------------------------
-
-from pathlib import Path
 
 _PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -498,9 +501,18 @@ def run_web_navigation(
             {"messages": [HumanMessage(content=prompt)]},
             config={"recursion_limit": 30},
         )
+        nav_result = _parse_web_navigation_agent_result(result)
+        agent_evidence = nav_result.get("evidence_pages") or []
     except Exception as exc:  # noqa: BLE001 - agent/model providers raise heterogeneous errors
-        return {
-            "evidence_pages": baseline_evidence,
+        # The Web Navigation Agent failed (e.g. recursion_limit reached without
+        # converging, or a provider error). Do NOT discard the deterministic
+        # baseline evidence it captured before the failure: fall through to
+        # candidate extraction on the baseline alone so a flaky / looping agent
+        # cannot zero out jobs the baseline already captured. The error is still
+        # surfaced on the result for diagnostics.
+        agent_evidence = []
+        nav_result = {
+            "evidence_pages": [],
             "candidates": [],
             "evidence_hash": "",
             "navigation_path": [],
@@ -508,8 +520,6 @@ def run_web_navigation(
             "error": f"WebNavigationAgent failed: {exc}",
             "delegated_to": "web_navigation_agent",
         }
-    nav_result = _parse_web_navigation_agent_result(result)
-    agent_evidence = nav_result.get("evidence_pages") or []
     # Merge agent-captured evidence with the deterministic baseline, deduping
     # by content_hash so the same page captured twice is only extracted once.
     merged: dict[str, dict[str, Any]] = {}
@@ -534,6 +544,17 @@ def run_web_navigation(
         candidates, evidence_hash = [], ""
     nav_result["candidates"] = candidates
     nav_result["evidence_hash"] = evidence_hash
+    # If the deterministic baseline captured jobs despite a Web Navigation
+    # Agent failure (recursion limit / provider error), downgrade that agent
+    # failure from a hard ``error`` to a soft ``warning``. The baseline evidence
+    # is the source of truth here, and a non-empty candidate set means the crawl
+    # succeeded; surfacing the agent failure as a hard error would make the
+    # Supervisor abort to ``needs_manual_review`` and discard jobs it already
+    # captured. The hard ``error`` is preserved only when NO candidates were
+    # captured, so the Supervisor can still escalate a genuinely empty crawl.
+    if candidates and nav_result.get("error"):
+        nav_result["warnings"] = nav_result["error"]
+        nav_result["error"] = ""
     return nav_result
 
 
@@ -612,7 +633,6 @@ def fetch_wechat_article(url: str) -> dict[str, Any]:
             # Skip images that are too small to contain text (< 10 KB)
             if len(img_bytes) < 10_240:
                 continue
-            img_b64 = base64.b64encode(img_bytes).decode("ascii")
             ocr_result = _ocr_image(img_bytes, ocr_enabled=True)
             ocr_text = (ocr_result.full_text or "").strip()
             if ocr_text and len(ocr_text) >= 10:
@@ -1228,6 +1248,18 @@ _CONSENT_BLOCK_KEYWORDS = (
     "注册并登录", "robot", "bot检测", "bot 检测",
 )
 
+# Narrow wall-only subset: phrases that essentially only appear on a
+# captcha / anti-bot / verification interstitial (NOT as normal page chrome
+# like a "登录" header link or a footer "二维码"). Used for body-level wall
+# detection so a legitimate career page whose nav/footer contains "登录" /
+# "二维码" is not mistaken for a blocked wall. The full
+# ``_CONSENT_BLOCK_KEYWORDS`` is still used for per-element checks (never click
+# a control whose own text is a login/verify label).
+_CONSENT_WALL_PHRASES = (
+    "环境异常", "完成验证", "图形验证", "安全验证", "滑块", "拼图", "人机",
+    "captcha", "verification", "robot", "bot检测", "bot 检测", "注册并登录",
+)
+
 
 def _dismiss_consent_dialog(page: Any) -> bool:
     """Click a privacy/cookie consent button so public JD content renders.
@@ -1282,6 +1314,95 @@ def _dismiss_consent_dialog(page: Any) -> bool:
             return True
         except Exception:  # noqa: BLE001 - try the next candidate
             continue
+    return False
+
+
+# Clickable control texts that expand a career-site landing page's featured
+# subset into the full job list. Many career sites (e.g. Moka) show only a
+# handful of featured jobs on the landing page with a "查看更多职位" /
+# "View all positions" link to the complete list - clicking it once lets the
+# capture see every job instead of just the featured few. Generic: applies to
+# any site with this landing->full-list pattern; hardcodes no counts/pages/URLs.
+_VIEW_ALL_POSITIONS_TEXTS = (
+    "查看更多职位", "查看全部职位", "更多职位", "全部职位",
+    "所有职位", "查看更多岗位", "更多岗位", "全部岗位", "查看全部岗位",
+    "更多招聘职位", "加载更多职位", "加载更多岗位", "加载更多",
+    "View all positions", "View all jobs", "Show all jobs",
+    "More positions", "See all jobs", "All positions", "Load more jobs",
+)
+
+
+def _click_view_all_positions(page: Any) -> bool:
+    """Click a generic "view all / more positions" control so the full job list
+    (not just a landing-page featured subset) is captured.
+
+    Career sites commonly show a handful of featured jobs on the landing page
+    with a "查看更多职位" / "View all positions" link to the complete list.
+    Without clicking it, only the featured subset is captured. This clicks the
+    first such control once (Playwright ``get_by_text`` exact match across ALL
+    tags - SPAs often render these as clickable ``<div>``/``<span>`` rather
+    than ``<button>``/``<a>``; the wall blocklist is re-checked per candidate)
+    and waits for the list to render.
+
+    The click is retried after a short delay because the control is sometimes
+    not ready the instant the landing page loads (React attaches its handler
+    a beat after the text becomes visible); a single early click can be
+    intercepted/ignored even though the same click succeeds moments later.
+
+    Never bypasses login/captcha/anti-bot (security hard gate #2): the same
+    wall-keyword blocklist as consent dismissal is applied to both the page body
+    and each candidate control. Returns True if a control was clicked.
+    """
+    try:
+        body_text = page.locator("body").inner_text(timeout=3_000) or ""
+    except Exception:  # noqa: BLE001 - best-effort; absence of text is fine
+        body_text = ""
+    # Anti-bot / captcha / verification wall -> never click anything here.
+    # Uses the NARROW wall-only subset: the full ``_CONSENT_BLOCK_KEYWORDS``
+    # includes "登录"/"二维码" which appear as normal nav/footer chrome on
+    # legitimate career pages and would falsely mark them as blocked.
+    if any(kw in body_text for kw in _CONSENT_WALL_PHRASES):
+        return False
+    for pat in _VIEW_ALL_POSITIONS_TEXTS:
+        try:
+            loc = page.get_by_text(pat, exact=True).first
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            if loc.count() == 0 or not loc.is_visible(timeout=800):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            txt = (loc.inner_text(timeout=800) or "").strip()
+        except Exception:  # noqa: BLE001
+            txt = pat
+        if any(kw in txt for kw in _CONSENT_BLOCK_KEYWORDS):
+            continue
+        # Retry the click: an early attempt may be intercepted before the SPA
+        # attaches the handler; a follow-up after a short wait usually lands.
+        # ``no_wait_after`` so Playwright does not wait for the SPA route-change
+        # the click triggers - that wait can detach the control mid-action and
+        # raise a spurious "element detached" / actionability error.
+        for attempt in range(3):
+            try:
+                try:
+                    loc.scroll_into_view_if_needed(timeout=2_000)
+                except Exception:  # noqa: BLE001 - non-fatal
+                    pass
+                loc.click(timeout=3_000, no_wait_after=True)
+            except Exception:  # noqa: BLE001
+                try:
+                    loc.click(timeout=3_000, force=True, no_wait_after=True)
+                except Exception:  # noqa: BLE001
+                    page.wait_for_timeout(1_000)
+                    continue
+            page.wait_for_timeout(1_500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
     return False
 
 
@@ -1352,11 +1473,13 @@ def _collect_detail_page_links(page: Any, base_url: str) -> list[str]:
 
 
 # Max list pages to paginate through in a single extract_rendered_job_evidence
-# call. Bounds the browser session so a 51-page list does not stall the run or
+# call. Bounds the browser session so a large list does not stall the run or
 # blow the per-URL time budget. Pagination stops earlier when no "next page"
 # control is found, the page content stops changing, or a login/captcha wall
-# appears.
-_MAX_LIST_PAGES = 5
+# appears. Raised from 5 -> 20 so multi-page campus lists (e.g. a 16-page
+# 151-position site) are traversed in full instead of truncated at page 5;
+# the content-hash no-progress check and wall circuit-breaker still cap it.
+_MAX_LIST_PAGES = 20
 
 # CSS selectors for "next page" controls across common pagination libraries
 # (PDD rocket, Mioffice atsx, Ant Design, Element UI, rel=next). Disabled
@@ -1376,19 +1499,30 @@ _NEXT_PAGE_SELECTORS = (
 # Fallback: clickable elements whose visible text marks a "next page" control.
 _NEXT_PAGE_TEXTS = ("下一页", "下页", "next", "»", "›")
 
-# Markers that a paginated page turned into a captcha/anti-bot wall. These stop
-# pagination regardless of page length (security hard gate #2: never bypass).
-_VERIFY_WALL_MARKERS = (
-    "环境异常", "完成验证后即可继续访问", "captcha", "验证码",
-    "图形验证", "安全验证", "滑块", "拼图", "人机", "robot", "bot检测",
+# High-specificity phrases that essentially ONLY appear on a captcha / anti-bot
+# interstitial - never in ordinary job titles or JD text. Safe to match at any
+# body length, so a long job list is never falsely flagged as a wall.
+_WALL_INTERSTITIAL_PHRASES = (
+    "环境异常", "完成验证后即可继续访问", "完成验证", "captcha",
+    "图形验证", "安全验证", "滑块", "拼图", "bot检测", "bot 检测",
 )
-# Markers for a dedicated login page/modal. Only checked on short bodies so a
-# normal list page that merely shows a "登录" nav link is not mistaken for a
-# wall.
+# Generic verify markers that CAN appear in ordinary job text
+# (e.g. "人机交互工程师" for HCI roles, a "验证码" mention in a JD). Only treat
+# as a wall on SHORT interstitial bodies, where short + marker => a wall rather
+# than a job list.
+_WALL_GENERIC_MARKERS = ("人机", "验证码", "robot")
+# Markers for a dedicated login page/modal. Specific enough that they rarely
+# appear in a real job listing; checked on short bodies only so a normal list
+# page that merely shows a "登录" nav link is not mistaken for a wall.
 _LOGIN_WALL_MARKERS = (
     "请先登录", "请登录", "扫码登录", "登录后查看", "登录后继续",
     "sign in", "log in",
 )
+# A page shorter than this is treated as a possible interstitial (wall), where
+# generic / login markers count. Longer pages are job lists - only
+# high-specificity interstitial phrases count, so job titles like
+# "人机交互工程师" never trip a false wall.
+_WALL_SHORT_BODY_THRESHOLD = 1200
 
 
 def _is_pagination_wall(rendered_text: str) -> bool:
@@ -1396,14 +1530,24 @@ def _is_pagination_wall(rendered_text: str) -> bool:
 
     Security hard gate #2: never bypass login/captcha/anti-bot. When a "next
     page" click lands on one of these, pagination must stop immediately.
+
+    Two-tier detection so ordinary job text is not mistaken for a wall:
+    high-specificity interstitial phrases (``环境异常``, ``captcha``, ``滑块``
+    ...) count at any body length; generic markers (``人机``, ``验证码``,
+    ``robot``) and login markers count only on SHORT bodies, so a long job list
+    containing a title like "人机交互工程师" or a JD mentioning "验证码" does not
+    trip a false wall.
     """
     if not rendered_text:
         return False
-    for m in _VERIFY_WALL_MARKERS:
-        if m in rendered_text or m.lower() in rendered_text.lower():
+    low = rendered_text.lower()
+    for m in _WALL_INTERSTITIAL_PHRASES:
+        if m in rendered_text or m.lower() in low:
             return True
-    if len(rendered_text) < 2000:
-        low = rendered_text.lower()
+    if len(rendered_text) < _WALL_SHORT_BODY_THRESHOLD:
+        for m in _WALL_GENERIC_MARKERS:
+            if m in rendered_text or m.lower() in low:
+                return True
         for m in _LOGIN_WALL_MARKERS:
             if m in rendered_text or m.lower() in low:
                 return True
@@ -1450,6 +1594,72 @@ def _capture_page_text(page: Any) -> tuple[str, str]:
     except Exception:  # noqa: BLE001
         text = ""
     return title, text
+
+
+def _wait_for_list_page_change(
+    page: Any, prev_hash: str, max_wait_ms: int = 9_000
+) -> tuple[str, str, str]:
+    """Poll until the rendered list content changes from ``prev_hash``.
+
+    SPAs (Mioffice/atsx) advance pages via XHR without a URL change; the
+    post-click ``networkidle`` can fire BEFORE the page-XHR completes, so an
+    immediate capture re-reads the stale page and falsely signals "no
+    progress". This polls the rendered text until its hash differs from
+    ``prev_hash`` (the new page rendered) or ``max_wait_ms`` elapses.
+
+    Returns ``(title, body_text, content_hash)``. ``body_text`` is "" when the
+    page never changed (treated as last page / stuck by the caller); a wall
+    page that DID change is returned verbatim so the caller's wall check fires.
+    """
+    step = 500
+    elapsed = 0
+    while elapsed <= max_wait_ms:
+        try:
+            page.wait_for_load_state("networkidle", timeout=1_000)
+        except Exception:  # noqa: BLE001 - best-effort settle
+            pass
+        title, text = _capture_page_text(page)
+        if text.strip():
+            cur_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if cur_hash != prev_hash:
+                return title, text, cur_hash
+        page.wait_for_timeout(step)
+        elapsed += step
+    return "", "", ""
+
+
+def _wait_for_rendered_text_stable(page: Any, max_wait_ms: int = 8_000) -> None:
+    """Poll the rendered body text until its length stops growing.
+
+    Career-site SPAs (Moka, Mioffice, PDD) render their job lists via XHR that
+    may complete AFTER the post-scroll ``networkidle`` fires, so an immediate
+    capture can read a half-rendered page (0 job titles) and the run falsely
+    under-counts. This waits until the body text length is stable across two
+    consecutive polls (lazy-load settled) or ``max_wait_ms`` elapses, so the
+    subsequent capture sees the fully-rendered list. Generic - reads only
+    already-rendered public content, never bypasses login/captcha/anti-bot.
+    """
+    step = 500
+    elapsed = 0
+    prev_len = -1
+    stable = 0
+    while elapsed <= max_wait_ms:
+        try:
+            cur_len = int(page.evaluate(
+                "() => (document.body && document.body.innerText) ? "
+                "document.body.innerText.length : 0"
+            ))
+        except Exception:  # noqa: BLE001 - best-effort
+            cur_len = 0
+        if cur_len == prev_len:
+            stable += 1
+            if stable >= 2 and cur_len > 0:
+                return  # settled on non-empty content
+        else:
+            stable = 0
+        prev_len = cur_len
+        page.wait_for_timeout(step)
+        elapsed += step
 
 
 def _deep_dive_detail_pages(page: Any, browser: Any, base_url: str) -> list[tuple[str, str, str]]:
@@ -1550,19 +1760,53 @@ def extract_rendered_job_evidence(url: str) -> str:
             # readable. Strictly limited to consent buttons - never touches
             # login/captcha/anti-bot (see _dismiss_consent_dialog).
             _dismiss_consent_dialog(page)
+            # Many career-site landing pages show only a handful of featured
+            # jobs with a "查看更多职位" / "View all positions" link to the full
+            # list. Click it once so the capture sees every job, not just the
+            # featured subset. Generic (not site-specific); wall-guarded.
+            _click_view_all_positions(page)
             # Scroll to trigger lazy-loaded job XHR (infinite scroll /
             # pagination). The response callback stays armed, so each newly
             # captured batch is converted into evidence below. Stop after two
-            # consecutive scrolls that add no new network captures.
+            # consecutive scrolls that add no new network captures OR grow the
+            # rendered text (some SPAs render jobs inline without XHR, e.g.
+            # Mioffice, so payload-count alone would falsely signal "no
+            # progress"). Also scroll the largest scrollable *inner* container -
+            # career-site lists often live in an overflow:auto div that
+            # window.scrollTo cannot move, so a window-only scroll would never
+            # trigger their lazy-load.
             empty_cycles = 0
-            for _ in range(10):
-                before = len(payloads)
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            for _ in range(12):
+                before_payloads = len(payloads)
+                before_text_len = page.evaluate(
+                    "() => (document.body && document.body.innerText) ? "
+                    "document.body.innerText.length : 0"
+                )
+                page.evaluate(
+                    "() => {"
+                    "  window.scrollTo(0, document.body.scrollHeight);"
+                    "  const els = Array.from(document.querySelectorAll('*'));"
+                    "  let best = null, bestArea = 0;"
+                    "  for (const el of els) {"
+                    "    const st = getComputedStyle(el);"
+                    "    if ((st.overflowY === 'auto' || st.overflowY === 'scroll')"
+                    "        && el.scrollHeight > el.clientHeight + 50) {"
+                    "      const area = el.clientWidth * el.clientHeight;"
+                    "      if (area > bestArea) { bestArea = area; best = el; }"
+                    "    }"
+                    "  }"
+                    "  if (best) best.scrollTop = best.scrollHeight;"
+                    "}"
+                )
                 try:
                     page.wait_for_load_state("networkidle", timeout=4_000)
                 except PlaywrightTimeoutError:
                     page.wait_for_timeout(1_500)
-                if len(payloads) > before:
+                after_text_len = page.evaluate(
+                    "() => (document.body && document.body.innerText) ? "
+                    "document.body.innerText.length : 0"
+                )
+                if len(payloads) > before_payloads or after_text_len > before_text_len + 30:
                     empty_cycles = 0
                 else:
                     empty_cycles += 1
@@ -1576,6 +1820,12 @@ def extract_rendered_job_evidence(url: str) -> str:
             # visible text (what a human user sees) is legitimate evidence that
             # the downstream extractor can fall back on. This never bypasses
             # login/captcha/anti-bot - it only reads already-rendered content.
+            # Wait for the lazy-rendered list to settle before capturing, so a
+            # late-completing XHR (after networkidle) is not missed - without
+            # this the page-1 capture can read a half-rendered page and the run
+            # falsely under-counts (seen on Moka where the 21-job list renders
+            # ~1s after networkidle).
+            _wait_for_rendered_text_stable(page)
             title, rendered_text = _capture_page_text(page)
             detail_captures.extend(_deep_dive_detail_pages(page, browser, url))
 
@@ -1597,27 +1847,31 @@ def extract_rendered_job_evidence(url: str) -> str:
                     break
                 try:
                     next_el.scroll_into_view_if_needed(timeout=3_000)
-                    next_el.click(timeout=3_000)
+                    # ``no_wait_after``: the click triggers an in-DOM SPA page
+                    # change (no URL change) which re-renders the pager;
+                    # waiting for the resulting "navigation" to settle can detach
+                    # the control mid-action and raise a spurious click error.
+                    next_el.click(timeout=3_000, no_wait_after=True)
                 except Exception:  # noqa: BLE001 - click failed / element stale
                     break
-                try:
-                    page.wait_for_load_state("networkidle", timeout=8_000)
-                except PlaywrightTimeoutError:
-                    page.wait_for_timeout(2_000)
-                except Exception:  # noqa: BLE001
-                    page.wait_for_timeout(2_000)
                 _dismiss_consent_dialog(page)
-                _p_title, p_text = _capture_page_text(page)
+                # Wait for the list to actually update (content-hash change)
+                # rather than just networkidle, which can fire before the SPA's
+                # page-XHR completes (Mioffice) - an immediate capture would
+                # re-read the stale page and falsely signal "no progress".
+                _p_title, p_text, cur_hash = _wait_for_list_page_change(page, prev_hash)
                 if not p_text.strip():
-                    break  # nothing rendered (wall/error) -> stop
+                    break  # page never changed -> last page / stuck
                 if _is_pagination_wall(p_text):
                     break  # login/captcha/anti-bot wall -> never bypass
-                cur_hash = hashlib.sha256(p_text.encode("utf-8")).hexdigest()
-                if cur_hash == prev_hash:
-                    break  # content unchanged -> stuck on same page
                 prev_hash = cur_hash
                 list_page_captures.append((page.url, _p_title, p_text))
-                detail_captures.extend(_deep_dive_detail_pages(page, browser, url))
+                # Detail deep-dive only runs on page 1 (above). Paginated pages
+                # 2..N contribute their list-page text only - opening detail
+                # tabs for every paginated page would explode to up to
+                # _MAX_LIST_PAGES * _MAX_DETAIL_PAGES browser tabs and blow the
+                # per-URL time budget. The count objective is met by list-page
+                # titles alone.
             browser.close()
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
@@ -2177,6 +2431,40 @@ def _parse_web_navigation_agent_result(result: Any) -> dict[str, Any]:
     return normalized
 
 
+# Strong, specific job-title suffixes. Bare category words (运营/市场/产品/
+# 销售) are NOT listed here as bare words, but qualified forms that *end* in a
+# common role word are: e.g. ``商家运营`` / ``视频创意制作`` are real jobs whose
+# titles end in ``运营`` / ``制作``. The post-extraction false-positive filter
+# (``_is_plausible_job_title``) still rejects a title that is *exactly* a bare
+# suffix (``运营`` alone) or a sidebar tab repeating across pages, so listing
+# these role-word endings here surfaces qualified real titles while bare
+# category tabs stay filtered. Shared by the loose title-only extractor and
+# the post-extraction false-positive filter so a title is judged by one
+# consistent suffix set.
+_JOB_TITLE_SUFFIXES: tuple[str, ...] = (
+    "工程师", "分析师", "架构师", "设计师", "科学家", "专家",
+    "管培生", "管培", "专员", "实习生", "顾问", "助理",
+    "研究员", "产品经理", "项目经理", "运营经理", "研发经理",
+    "负责人", "总监", "主管", "经理",
+    # Role-word endings (qualified forms only survive the filter):
+    "运营", "制作",
+)
+
+# Bare-suffix words that are almost always a category / section header rather
+# than a standalone job title (``经理`` / ``主管`` / ``运营`` alone are generic
+# category labels). A bare title whose suffix is one of these is rejected. Bare
+# *specific* role titles (``产品经理``, ``工程师``, ``管培生``, ``专员`` ...) are
+# legitimate standalone jobs - e.g. deeproute lists ``【2027秋招】产品经理``
+# which strips to the bare title ``产品经理`` - so they are NOT rejected here;
+# if one is in fact a sidebar tab it is still caught by the repeats filter
+# (rule 3) on multi-page captures. The matched-suffix lookup below resolves
+# compounds (``产品经理`` matches ``产品经理``, not the shorter ``经理``), so a
+# specific compound is never misclassified as a bare generic word.
+_GENERIC_BARE_SUFFIXES: frozenset[str] = frozenset({
+    "经理", "主管", "总监", "负责人", "运营", "制作",
+})
+
+
 def _extract_title_only_candidates(
     text: str,
     page_url: str,
@@ -2202,14 +2490,7 @@ def _extract_title_only_candidates(
     Returns:
         List of title-only NormalizedJobCandidate objects (deduped by title).
     """
-    # Strong, specific suffixes - bare category words (运营/市场/产品/销售)
-    # are deliberately excluded so they are not mistaken for job titles.
-    suffixes = (
-        "工程师", "分析师", "架构师", "设计师", "科学家", "专家",
-        "管培生", "管培", "专员", "实习生", "顾问", "助理",
-        "研究员", "产品经理", "项目经理", "运营经理", "研发经理",
-        "负责人", "总监", "主管", "经理",
-    )
+    suffixes = _JOB_TITLE_SUFFIXES
     # Lines ending with these are category/section headers, not job titles.
     bad_endings = ("招聘", "类", "项目", "中心", "介绍", "说明", "详情", "更多")
     # Lines containing sentence punctuation are prose, not titles.
@@ -2230,6 +2511,11 @@ def _extract_title_only_candidates(
             line = line.replace(_ch, "")
         cleaned = re.sub(r"^[【][^】]*[】]\s*", "", line)
         cleaned = re.sub(r"（[^）]*）$", "", cleaned)
+        # Strip a TRAILING 【...】 campaign/cohort tag (e.g. "...研发工程师【2027届云弧计划】")
+        # so the suffix check sees the bare title and detects it. Mirrors the
+        # leading-prefix strip above; the tag is listing metadata, not the job
+        # title itself, so removing it is consistent with the leading-strip.
+        cleaned = re.sub(r"[【][^】]*[】]\s*$", "", cleaned)
         cleaned = re.sub(rf"[{_dash_class}][^{_dash_class}]*$", "", cleaned)
         for _ch in _zw:
             cleaned = cleaned.replace(_ch, "")
@@ -2263,6 +2549,82 @@ def _extract_title_only_candidates(
         if len(candidates) >= 80:
             break
     return candidates
+
+
+def _page_text_normalized_line_sets(
+    evidence_pages: list[dict[str, Any]],
+) -> list[set[str]]:
+    """One set of normalized lines per ``page_text`` evidence page.
+
+    Used by the sidebar-category filter: a title that appears as a whole line
+    on several paginated list-page captures is a repeating sidebar element
+    (e.g. a category tab that renders on every page), not a distinct job.
+    """
+    out: list[set[str]] = []
+    for page in evidence_pages:
+        if not isinstance(page, dict) or page.get("evidence_type") != "page_text":
+            continue
+        text = page.get("text_excerpt") or ""
+        lines: set[str] = set()
+        for raw in text.splitlines():
+            ln = raw.strip()
+            if not ln:
+                continue
+            norm = normalize_title(ln)
+            if norm:
+                lines.add(norm)
+        out.append(lines)
+    return out
+
+
+def _is_plausible_job_title(
+    candidate: NormalizedJobCandidate,
+    page_text_line_sets: list[set[str]],
+) -> bool:
+    """Reject obvious false-positive titles from rendered list pages.
+
+    Three generic, site-agnostic filters (no counts / pages / sites hardcoded):
+
+    1. Structural-separator titles (banners / news headlines containing ``|``).
+       A real job title never contains a pipe.
+    2. Bare *generic* category words - the title is exactly a generic category
+       suffix (``经理`` / ``主管`` / ``运营`` ...) with no qualifier. A section
+       header, not a listing. Bare *specific* role titles (``产品经理``,
+       ``工程师``, ``管培生`` ...) are legitimate standalone jobs and are kept;
+       a specific role that is in fact a sidebar tab is still caught by rule 3.
+    3. Sidebar category tabs - a *title-only* candidate (no JD body) whose
+       normalized title appears as a whole line on 2+ ``page_text`` captures.
+       Paginated list pages re-render the sidebar on every page, so a genuine
+       job appears on exactly one page while a sidebar element repeats across
+       all of them. Full-JD candidates are exempt (their body proves they are
+       real listings even if cross-linked from several list pages).
+    """
+    title = (getattr(candidate, "title", "") or "").strip()
+    if not title:
+        return False
+    if "|" in title:
+        return False
+    matched = max(
+        (s for s in _JOB_TITLE_SUFFIXES if title.endswith(s)),
+        key=len,
+        default="",
+    )
+    if (
+        matched
+        and not title[: -len(matched)].strip()
+        and matched in _GENERIC_BARE_SUFFIXES
+    ):
+        return False
+    has_body = bool(
+        (getattr(candidate, "responsibilities", "") or "").strip()
+        or (getattr(candidate, "requirements", "") or "").strip()
+    )
+    if has_body or len(page_text_line_sets) < 2:
+        return True
+    norm = normalize_title(title)
+    if norm and sum(1 for s in page_text_line_sets if norm in s) >= 2:
+        return False
+    return True
 
 
 def _extract_and_verify_candidates_from_evidence(
@@ -2351,7 +2713,64 @@ def _extract_and_verify_candidates_from_evidence(
                 _extract_title_only_candidates(text, page_url, ref)
             )
 
+    # Drop obvious false positives before verification: banners (pipe in
+    # title), bare category words, and sidebar tabs that repeat across
+    # paginated list-page captures. Generic (no site/count/page hardcoded);
+    # applied here so both the strict and loose extractors' output is cleaned.
+    page_text_line_sets = _page_text_normalized_line_sets(evidence_pages)
+    all_candidates = [
+        c for c in all_candidates
+        if _is_plausible_job_title(c, page_text_line_sets)
+    ]
+
     verified = _verify_evidence(all_candidates, evidence_objs)
+
+    # Collapse duplicates that arise when the same job is captured across
+    # overlapping evidence pages (the baseline extract_rendered_job_evidence
+    # call plus the Web Navigation Agent's re-capture often produce near-
+    # identical rendered text with different content hashes, so the same
+    # titles get extracted twice). Exact-identity merge only (D3): full-JD
+    # candidates dedup by (company, core_hash); title-only candidates dedup by
+    # (company, normalized_title). This is generic post-processing - it is NOT
+    # a site adapter and hardcodes no counts/pages/sites.
+    verified = deduplicate_candidates(verified)
+
+    # Cross-type subsumption: a title-only candidate (no JD body, captured from
+    # rendered list text) whose normalized title is a substring of a full-JD
+    # candidate's normalized title is almost certainly the SAME job captured
+    # twice - the list-page loose title extractor reads the bare title while
+    # the XHR / detail version carries it with a department/category suffix
+    # (e.g. list text "6g无线方案设计工程师" vs XHR "顶尖应届-6g无线方案设计工程师-
+    # 手机", both normalizing with the dept retained). The full-JD candidate is
+    # authoritative (it has the JD body), so the redundant title-only one is
+    # dropped. Substring (one-directional) keeps genuinely-new title-only jobs
+    # whose title is NOT contained in any full-JD title. Generic post-processing
+    # - not a site adapter, hardcodes no counts/pages/sites.
+    full_jd_titles = [
+        normalize_title(getattr(c, "title", "") or "")
+        for c in verified
+        if (getattr(c, "responsibilities", "") or "").strip()
+        or (getattr(c, "requirements", "") or "").strip()
+    ]
+    full_jd_titles = [t for t in full_jd_titles if len(t) >= 4]
+    if full_jd_titles:
+        kept: list[Any] = []
+        for c in verified:
+            has_body = bool(
+                (getattr(c, "responsibilities", "") or "").strip()
+                or (getattr(c, "requirements", "") or "").strip()
+            )
+            if has_body:
+                kept.append(c)
+                continue
+            t = normalize_title(getattr(c, "title", "") or "")
+            # Drop only if this title-only title is contained in a full-JD title
+            # (the full-JD version is the same job, more complete). A short
+            # generic title (len < 4) is never subsumed to avoid false drops.
+            if len(t) >= 4 and any(t in ft for ft in full_jd_titles):
+                continue
+            kept.append(c)
+        verified = kept
 
     evidence_hash = hashlib.sha256(
         json.dumps(evidence_pages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -2416,83 +2835,6 @@ def build_web_navigation_agent(
     )
 
 
-# ---------------------------------------------------------------------------
-# LoopGuardian — prevents Supervisor infinite loops
-# ---------------------------------------------------------------------------
-
-# Track consecutive tool calls for loop detection.
-# Each entry is (tool_name, params_hash).
-_tool_call_log: list[tuple[str, str]] = []
-
-
-def _make_params_hash(args: tuple, kwargs: dict) -> str:
-    """Create a deterministic hash of tool call parameters."""
-    import hashlib as _hl
-
-    raw = json.dumps(
-        {"args": list(args), "kwargs": {k: v for k, v in sorted(kwargs.items())}},
-        ensure_ascii=False, sort_keys=True, default=str,
-    )
-    return _hl.sha256(raw.encode()).hexdigest()[:16]
-
-
-def _reset_loop_guardian() -> None:
-    """Reset the tool-call log at the start of each Supervisor run."""
-    global _tool_call_log
-    _tool_call_log = []
-
-
-def _loop_guardian_wrap(tool_fn: Any, tool_name: str) -> Any:
-    """Wrap *tool_fn* with loop detection.
-
-    When the **same tool** is called **3+ times consecutively** with
-    **identical parameters**, the call is blocked and an error string
-    is returned instead of executing the tool.
-
-    Handles LangChain's ``StructuredTool`` invocation convention where
-    arguments may arrive as ``**kwargs`` dicts rather than positional args.
-    """
-    def _guarded(*args: Any, **kwargs: Any) -> Any:
-        # Normalize: LangChain sometimes passes a single dict as the
-        # first positional arg, or nests everything under 'args'/'kwargs'.
-        actual_kwargs = dict(kwargs)
-        if not args and len(kwargs) == 1:
-            # Single kwargs call — use directly
-            pass
-        elif not args and "args" in kwargs:
-            # LangChain nested format: {'args': [...], 'kwargs': {...}}
-            args = tuple(kwargs.pop("args", ()))
-            nested = kwargs.pop("kwargs", {})
-            actual_kwargs.update(nested)
-
-        ph = _make_params_hash(args, actual_kwargs)
-
-        # Count consecutive identical calls (walk backwards)
-        consecutive = 0
-        for tname, p_hash in reversed(_tool_call_log):
-            if tname == tool_name and p_hash == ph:
-                consecutive += 1
-            else:
-                break
-
-        if consecutive >= 2:  # this would be the 3rd
-            return (
-                f"LOOP DETECTED — {tool_name} called {consecutive + 1}x "
-                f"consecutively with identical parameters. "
-                f"STOP calling this tool. Use a DIFFERENT approach: "
-                f"try standardize_from_record_fields as a fallback, "
-                f"or call finish_with_manual_review if stuck."
-            )
-
-        _tool_call_log.append((tool_name, ph))
-        return tool_fn(*args, **actual_kwargs)
-
-    _guarded.__name__ = getattr(tool_fn, "__name__", tool_name)
-    _guarded.__qualname__ = getattr(tool_fn, "__qualname__", tool_name)
-    _guarded.__doc__ = getattr(tool_fn, "__doc__", None)
-    return _guarded
-
-
 def invoke_supervisor_agent(
     agent: Any,
     agent_input: dict[str, Any],
@@ -2500,27 +2842,46 @@ def invoke_supervisor_agent(
 ) -> dict[str, Any]:
     """Invoke the discovery supervisor agent, degrading recursion crashes.
 
-    A GraphRecursionError (the supervisor LLM looped without reaching its
-    stop condition) is downgraded to a ``needs_manual_review`` result instead
-    of crashing the run. The supervisor prompt already mandates 3-step
-    convergence, so a recursion crash is LLM non-determinism, not a real
-    failure - the run is flagged for manual review rather than reported as a
-    hard ``failed``. Other exceptions propagate unchanged.
+    The agent is streamed (``stream_mode="values"``) rather than invoked, so
+    that on a ``GraphRecursionError`` - the supervisor LLM looped without
+    converging - the partial state accumulated up to the crash is preserved.
+    ``run_web_navigation`` may have already captured and packaged candidates in
+    its tool-call message by the time the loop trips the recursion limit; that
+    state is returned so ``parse_agent_result`` can recover those candidates
+    via its tool-output path instead of discarding them (xiaomi: the supervisor
+    reliably calls ``run_web_navigation`` once, captures ~138 candidates, then
+    loops trying to emit the oversized structured response). Only when no
+    partial state survived do we fall back to a synthetic
+    ``needs_manual_review`` dict.
+
+    The supervisor prompt already mandates 3-step convergence, so a recursion
+    crash is LLM non-determinism, not a real failure - the recovered candidates
+    (if any) are authoritative; otherwise the run is flagged for manual review
+    rather than reported as a hard ``failed``. Other exceptions propagate.
 
     Detection is by exception/message name (no hard langgraph import) so the
     guard works across langgraph versions.
 
     Returns:
-        The raw agent result dict, or a synthetic ``needs_manual_review``
-        dict when a recursion crash was caught.
+        The final streamed agent state dict, the partial state recovered at a
+        recursion crash, or a synthetic ``needs_manual_review`` dict when no
+        state survived.
     """
     invoke_kwargs: dict[str, Any] = {"config": config} if config is not None else {}
+    last_state: dict[str, Any] | None = None
     try:
-        return agent.invoke(agent_input, **invoke_kwargs)
+        for state in agent.stream(agent_input, stream_mode="values", **invoke_kwargs):
+            if isinstance(state, dict):
+                last_state = state
     except Exception as exc:
         name = type(exc).__name__
         msg = str(exc)
         if "Recursion" in name or "Recursion limit" in msg:
+            if last_state:
+                # Preserve the partial state so parse_agent_result can recover
+                # candidates run_web_navigation already captured (status is
+                # synthesized downstream: candidates present -> succeeded).
+                return last_state
             return {
                 "status": "needs_manual_review",
                 "block_reason": "recursion_limit",
@@ -2528,11 +2889,12 @@ def invoke_supervisor_agent(
                 "candidates": [],
                 "summary": (
                     "Supervisor did not converge within the recursion limit "
-                    "(LLM looped without reaching a stop condition); no "
-                    "structured candidates captured. Re-run or review manually."
+                    "(LLM looped without reaching a stop condition) and no "
+                    "partial state was captured. Re-run or review manually."
                 ),
             }
         raise
+    return last_state if last_state is not None else {}
 
 
 def build_discovery_supervisor_agent(
@@ -2542,9 +2904,6 @@ def build_discovery_supervisor_agent(
     snapshot_context: dict | None = None,
 ) -> Any:
     """Build the Discovery Supervisor Agent using deepagents.
-
-    All tools are wrapped with ``_loop_guardian_wrap`` to prevent
-    infinite loops caused by the LLM repeating identical tool calls.
 
     Args:
         settings: Application settings.
@@ -2559,8 +2918,6 @@ def build_discovery_supervisor_agent(
     if model is None:
         model = _build_job_discovery_llm(settings)
 
-    # Reset loop guardian state for each agent build
-    _reset_loop_guardian()
 
     # Create the web navigation subagent
     web_nav_subagent = create_web_navigation_subagent(settings)
@@ -2587,11 +2944,8 @@ def build_discovery_supervisor_agent(
         _wrapper.__annotations__ = {"image_base64": str, "return": dict[str, Any]}
         return _wrapper
 
-    # Final tool list.
-    # LoopGuardian is applied at the prompt level (L1) for the Supervisor
-    # because LangChain's StructuredTool invocation format is incompatible
-    # with Python function wrappers.  The standalone _loop_guardian_wrap
-    # is still available for programmatic use (e.g. SnapshotExecutor).
+    # Final tool list. Loop prevention is prompt-level only (L1, see
+    # supervisor_base.txt); there is no programmatic tool-call guard.
     final_tools: list[Any] = [
         triage_link,
         _make_run_web_navigation(settings),

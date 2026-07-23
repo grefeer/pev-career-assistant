@@ -1,0 +1,161 @@
+"""Unit tests for canonical-job deduplication (Phase 4, D3 exact merge)."""
+
+from __future__ import annotations
+
+from backend.app.services.job_discovery.deduplication.canonical_job_deduplicator import (
+    deduplicate_candidates,
+)
+from backend.app.services.job_discovery.schemas import NormalizedJobCandidate
+
+
+def _title_only(title: str, company: str | None = None, locations=None,
+                evidence_refs=None, apply_url: str | None = None) -> NormalizedJobCandidate:
+    return NormalizedJobCandidate(
+        title=title,
+        company_name=company,
+        locations=list(locations or []),
+        apply_url=apply_url,
+        evidence_refs=list(evidence_refs or []),
+    )
+
+
+def _full_jd(title: str, company: str, responsibilities: str,
+             requirements: str, location: str | None = None) -> NormalizedJobCandidate:
+    return NormalizedJobCandidate(
+        title=title,
+        company_name=company,
+        responsibilities=responsibilities,
+        requirements=requirements,
+        locations=[location] if location else [],
+        apply_url="https://example.com/detail/1",
+    )
+
+
+class TestTitleOnlyDedup:
+    def test_same_company_title_collapses(self) -> None:
+        a = _title_only("算法工程师", "元戎启行", locations=["深圳"],
+                        evidence_refs=[{"url": "u1", "content_hash": "h1"}])
+        b = _title_only("算法工程师", "元戎启行", locations=["北京"],
+                        evidence_refs=[{"url": "u2", "content_hash": "h2"}])
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        assert set(out[0].locations) == {"深圳", "北京"}
+        assert len(out[0].evidence_refs) == 2
+
+    def test_different_title_kept(self) -> None:
+        out = deduplicate_candidates([
+            _title_only("算法工程师", "元戎启行"),
+            _title_only("系统工程师", "元戎启行"),
+        ])
+        assert len(out) == 2
+
+    def test_evidence_refs_deduped_on_merge(self) -> None:
+        ref = {"url": "u1", "content_hash": "h1", "evidence_type": "page_text"}
+        a = _title_only("算法工程师", "元戎启行", evidence_refs=[ref])
+        b = _title_only("算法工程师", "元戎启行", evidence_refs=[ref])
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        assert len(out[0].evidence_refs) == 1
+
+    def test_company_none_normalizes_consistently(self) -> None:
+        # Both None company + same title -> one candidate.
+        out = deduplicate_candidates([
+            _title_only("算法工程师", None),
+            _title_only("算法工程师", None),
+        ])
+        assert len(out) == 1
+
+
+class TestFullJdDedup:
+    def test_same_jd_different_location_merges(self) -> None:
+        # D3: location excluded -> same core_hash -> merge.
+        a = _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京")
+        b = _full_jd("算法工程师-北京", "小米", "负责A", "要求B", location="上海")
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        assert set(out[0].locations) == {"北京", "上海"}
+
+    def test_different_jd_kept(self) -> None:
+        out = deduplicate_candidates([
+            _full_jd("算法工程师", "小米", "负责A", "要求B"),
+            _full_jd("系统工程师", "小米", "负责C", "要求D"),
+        ])
+        assert len(out) == 2
+
+    def test_title_only_and_full_jd_do_not_collide(self) -> None:
+        # Different identity-tag prefix -> never merged even if title matches.
+        t = _title_only("算法工程师", "小米")
+        f = _full_jd("算法工程师", "小米", "负责A", "要求B")
+        out = deduplicate_candidates([t, f])
+        assert len(out) == 2
+
+
+class TestFullJdTitleSubstringClustering:
+    """Within a same-core_hash group, only titles with a substring relation
+    merge; genuinely different roles sharing a JD template stay separate.
+
+    This prevents a copy-paste JD template (identical responsibilities +
+    requirements) from collapsing distinct postings such as ``算法工程师`` vs
+    ``算法研究员`` (engineer vs researcher) while still merging city / level
+    variants whose titles differ only by a suffix (``算法工程师`` vs
+    ``算法工程师-北京``).
+    """
+
+    def test_same_jd_different_role_not_merged(self) -> None:
+        # 工程师 (engineer) vs 研究员 (researcher) - neither title is a
+        # substring of the other, so two distinct postings survive even though
+        # their JD body is an identical template.
+        out = deduplicate_candidates([
+            _full_jd("感知大模型算法工程师", "小米", "负责A", "要求B"),
+            _full_jd("感知大模型算法研究员", "小米", "负责A", "要求B"),
+        ])
+        assert len(out) == 2
+
+    def test_same_jd_duplicate_capture_collapses(self) -> None:
+        # Same title captured twice (e.g. across overlapping pages) -> one job.
+        out = deduplicate_candidates([
+            _full_jd("端侧大模型算法工程师", "小米", "负责A", "要求B"),
+            _full_jd("端侧大模型算法工程师", "小米", "负责A", "要求B"),
+        ])
+        assert len(out) == 1
+
+    def test_same_jd_two_distinct_city_variants_merge(self) -> None:
+        # Both city variants contain the base title -> one cluster, merged.
+        out = deduplicate_candidates([
+            _full_jd("算法工程师", "小米", "负责A", "要求B", location="深圳"),
+            _full_jd("算法工程师-北京", "小米", "负责A", "要求B", location="北京"),
+            _full_jd("算法工程师-上海", "小米", "负责A", "要求B", location="上海"),
+        ])
+        assert len(out) == 1
+        assert set(out[0].locations) >= {"北京", "上海"}
+
+    def test_same_jd_mixed_roles_and_dupes(self) -> None:
+        # 2 distinct roles x2 duplicate captures each -> 2 jobs (not 1, not 4).
+        out = deduplicate_candidates([
+            _full_jd("决策规划大模型算法工程师", "小米", "负责A", "要求B"),
+            _full_jd("决策规划大模型算法研究员", "小米", "负责A", "要求B"),
+            _full_jd("决策规划大模型算法工程师", "小米", "负责A", "要求B"),
+            _full_jd("决策规划大模型算法研究员", "小米", "负责A", "要求B"),
+        ])
+        assert len(out) == 2
+
+
+class TestEdgeCases:
+    def test_empty_list(self) -> None:
+        assert deduplicate_candidates([]) == []
+
+    def test_inputs_not_mutated(self) -> None:
+        a = _title_only("算法工程师", "小米", locations=["北京"],
+                        evidence_refs=[{"url": "u1", "content_hash": "h1"}])
+        b = _title_only("算法工程师", "小米", locations=["上海"])
+        deduplicate_candidates([a, b])
+        # Original objects unchanged.
+        assert a.locations == ["北京"]
+        assert len(a.evidence_refs) == 1
+
+    def test_apply_url_kept_from_first_non_empty(self) -> None:
+        a = _title_only("算法工程师", "小米", apply_url=None)
+        b = _title_only("算法工程师", "小米", apply_url="https://example.com/job/1")
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        assert out[0].apply_url == "https://example.com/job/1"

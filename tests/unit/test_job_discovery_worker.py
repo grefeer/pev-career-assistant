@@ -335,7 +335,11 @@ class TestSuccessfulTask:
             candidates = verify_session.query(DiscoveredJobCandidate).all()
             assert len(candidates) == 1
             assert candidates[0].title == "Software Engineer"
-            assert candidates[0].idempotency_key == "cand-1"
+            # Dedup repackages candidates as NormalizedJobCandidate objects, dropping
+            # the mock's idempotency_key (not a dataclass field); the worker recomputes
+            # it via build_candidate_idempotency_key (SHA-256 hex) on the object path.
+            assert candidates[0].idempotency_key != "cand-1"
+            assert len(candidates[0].idempotency_key) == 64
 
     @patch("backend.app.services.job_discovery.worker.claim_next_task")
     @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
