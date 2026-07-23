@@ -47,11 +47,16 @@ _CJK_PUNCT = (
 _DELETE_TABLE = str.maketrans("", "", _ASCII_PUNCT + _CJK_PUNCT)
 _WHITESPACE_RE = re.compile(r"\s+")
 
-# Trailing parenthetical group, full-width （...） or ASCII (...). Used to strip
-# location / specialization / program suffixes from titles for identity
-# comparison so the same job captured with and without its ``（上海）`` suffix
-# collapses. Content inside the group must not itself contain parens (no nesting).
-_TRAILING_PAREN_RE = re.compile(r"[（(][^（）()]*[）)]\s*$")
+# Trailing qualifier group: full-width （...）, ASCII (...), or lenticular 【...】.
+# Used to strip location / specialization / program suffixes from titles for
+# identity comparison so the same job captured with and without its ``（上海）``
+# or ``【2027届云弧计划】`` suffix collapses: the deterministic page-text
+# extractor strips these suffixes while the XHR-payload extractor preserves
+# them, so the same job surfaces once as ``AI Infra研发工程师`` and once as
+# ``AI Infra研发工程师【2027届云弧计划】``. Content inside a group must not
+# itself contain the same bracket type (no nesting); a LEADING tag
+# (``【2027秋招】算法工程师``) is NOT stripped - only trailing groups.
+_TRAILING_QUALIFIER_RE = re.compile(r"(?:[（(][^（）()]*[）)]|【[^【】]*】)\s*$")
 
 
 def normalize_text(value: str | None) -> str:
@@ -78,35 +83,41 @@ def normalize_company(name: str | None) -> str:
     return normalize_text(name)
 
 
-def _strip_trailing_parens(s: str) -> str:
-    """Repeatedly remove trailing ``（...）`` / ``(...)`` groups.
+def _strip_trailing_qualifiers(s: str) -> str:
+    """Repeatedly remove trailing ``（...）`` / ``(...)`` / ``【...】`` groups.
 
-    A title may carry several trailing qualifiers (``算法工程师（北京）（校招）``);
-    each pass peels one until none remain.
+    A title may carry several trailing qualifiers
+    (``算法工程师（北京）（校招）`` or ``AI Infra研发工程师【2027届云弧计划】``);
+    each pass peels one until none remain. Only TRAILING groups are removed - a
+    leading tag (``【2027秋招】算法工程师``) is kept (its bracket chars are later
+    deleted by ``normalize_text`` but the tag content survives).
     """
-    while _TRAILING_PAREN_RE.search(s):
-        s = _TRAILING_PAREN_RE.sub("", s).rstrip()
+    while _TRAILING_QUALIFIER_RE.search(s):
+        s = _TRAILING_QUALIFIER_RE.sub("", s).rstrip()
     return s
 
 
 def normalize_title(title: str | None) -> str:
     """Normalize a job title for identity comparison.
 
-    Like :func:`normalize_text` but first strips trailing parenthetical groups
-    (location / specialization / program tags such as ``（上海）`` or
-    ``（多语种优势-上海）``). The deterministic baseline extraction strips these
-    suffixes while the Web Navigation Agent (LLM) preserves them, so the same
-    job surfaces once as ``产品管培生`` and once as ``产品管培生（上海）``; without
-    this step they survive as duplicate candidates because ``normalize_text``
-    only deletes the bracket *characters* (keeping their content). Only the
-    comparison key is affected - the candidate's stored title is unchanged.
+    Like :func:`normalize_text` but first strips trailing parenthetical /
+    lenticular groups (location / specialization / program tags such as
+    ``（上海）``, ``（多语种优势-上海）`` or ``【2027届云弧计划】``). The
+    deterministic page-text extractor strips these suffixes while the
+    XHR-payload extractor preserves them, so the same job surfaces once as
+    ``产品管培生`` and once as ``产品管培生（上海）``, or once as
+    ``AI Infra研发工程师`` and once as ``AI Infra研发工程师【2027届云弧计划】``;
+    without this step they survive as duplicate candidates because
+    ``normalize_text`` only deletes the bracket *characters* (keeping their
+    content). Only the comparison key is affected - the candidate's stored
+    title is unchanged.
     """
     if not title:
         return ""
     s = unicodedata.normalize("NFKC", title)
     for ch in _INVISIBLE_CHARS:
         s = s.replace(ch, "")
-    s = _strip_trailing_parens(s)
+    s = _strip_trailing_qualifiers(s)
     s = s.lower()
     s = _WHITESPACE_RE.sub("", s)
     s = s.translate(_DELETE_TABLE)

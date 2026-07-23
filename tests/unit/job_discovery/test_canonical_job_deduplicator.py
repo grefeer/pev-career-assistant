@@ -32,7 +32,19 @@ def _full_jd(title: str, company: str, responsibilities: str,
 
 
 class TestTitleOnlyDedup:
-    def test_same_company_title_collapses(self) -> None:
+    def test_same_company_title_same_location_collapses(self) -> None:
+        a = _title_only("算法工程师", "元戎启行", locations=["深圳"],
+                        evidence_refs=[{"url": "u1", "content_hash": "h1"}])
+        b = _title_only("算法工程师", "元戎启行", locations=["深圳"],
+                        evidence_refs=[{"url": "u2", "content_hash": "h2"}])
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        assert set(out[0].locations) == {"深圳"}
+        assert len(out[0].evidence_refs) == 2
+
+    def test_same_company_title_different_location_merges(self) -> None:
+        # Title-only: a position advertised in several cities is ONE position
+        # the site counts once -> merged by title, locations unioned.
         a = _title_only("算法工程师", "元戎启行", locations=["深圳"],
                         evidence_refs=[{"url": "u1", "content_hash": "h1"}])
         b = _title_only("算法工程师", "元戎启行", locations=["北京"],
@@ -58,7 +70,7 @@ class TestTitleOnlyDedup:
         assert len(out[0].evidence_refs) == 1
 
     def test_company_none_normalizes_consistently(self) -> None:
-        # Both None company + same title -> one candidate.
+        # Both None company + same title + no location -> one candidate.
         out = deduplicate_candidates([
             _title_only("算法工程师", None),
             _title_only("算法工程师", None),
@@ -67,13 +79,22 @@ class TestTitleOnlyDedup:
 
 
 class TestFullJdDedup:
-    def test_same_jd_different_location_merges(self) -> None:
-        # D3: location excluded -> same core_hash -> merge.
+    def test_same_jd_same_location_merges(self) -> None:
+        # True duplicate capture (same body, same city) -> merge.
         a = _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京")
-        b = _full_jd("算法工程师-北京", "小米", "负责A", "要求B", location="上海")
+        b = _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京")
         out = deduplicate_candidates([a, b])
         assert len(out) == 1
-        assert set(out[0].locations) == {"北京", "上海"}
+
+    def test_same_jd_different_location_kept_separate(self) -> None:
+        # City variants (same role, same JD body, different city) are DISTINCT
+        # listings the site counts separately -> kept separate, NOT merged.
+        a = _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京")
+        b = _full_jd("算法工程师", "小米", "负责A", "要求B", location="上海")
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 2
+        locs = {out[0].locations[0], out[1].locations[0]}
+        assert locs == {"北京", "上海"}
 
     def test_different_jd_kept(self) -> None:
         out = deduplicate_candidates([
@@ -91,14 +112,15 @@ class TestFullJdDedup:
 
 
 class TestFullJdTitleSubstringClustering:
-    """Within a same-core_hash group, only titles with a substring relation
+    """Within a same-identity group, only titles with a substring relation
     merge; genuinely different roles sharing a JD template stay separate.
 
     This prevents a copy-paste JD template (identical responsibilities +
     requirements) from collapsing distinct postings such as ``算法工程师`` vs
-    ``算法研究员`` (engineer vs researcher) while still merging city / level
+    ``算法研究员`` (engineer vs researcher) while still merging level / suffix
     variants whose titles differ only by a suffix (``算法工程师`` vs
-    ``算法工程师-北京``).
+    ``算法工程师-应届``). City variants are already kept separate by
+    ``loc_key``, so they never reach this clustering.
     """
 
     def test_same_jd_different_role_not_merged(self) -> None:
@@ -119,18 +141,28 @@ class TestFullJdTitleSubstringClustering:
         ])
         assert len(out) == 1
 
-    def test_same_jd_two_distinct_city_variants_merge(self) -> None:
-        # Both city variants contain the base title -> one cluster, merged.
+    def test_same_jd_suffix_variant_same_city_collapses(self) -> None:
+        # Same city, title differs only by a level suffix -> one cluster, merged.
         out = deduplicate_candidates([
-            _full_jd("算法工程师", "小米", "负责A", "要求B", location="深圳"),
-            _full_jd("算法工程师-北京", "小米", "负责A", "要求B", location="北京"),
-            _full_jd("算法工程师-上海", "小米", "负责A", "要求B", location="上海"),
+            _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京"),
+            _full_jd("算法工程师-应届", "小米", "负责A", "要求B", location="北京"),
         ])
         assert len(out) == 1
-        assert set(out[0].locations) >= {"北京", "上海"}
+        assert "北京" in out[0].locations
+
+    def test_same_jd_two_distinct_city_variants_kept_separate(self) -> None:
+        # Distinct cities -> distinct loc_key -> 3 separate listings.
+        out = deduplicate_candidates([
+            _full_jd("算法工程师", "小米", "负责A", "要求B", location="深圳"),
+            _full_jd("算法工程师", "小米", "负责A", "要求B", location="北京"),
+            _full_jd("算法工程师", "小米", "负责A", "要求B", location="上海"),
+        ])
+        assert len(out) == 3
+        locs = {c.locations[0] for c in out}
+        assert locs == {"深圳", "北京", "上海"}
 
     def test_same_jd_mixed_roles_and_dupes(self) -> None:
-        # 2 distinct roles x2 duplicate captures each -> 2 jobs (not 1, not 4).
+        # 2 distinct roles x2 duplicate captures each (same city) -> 2 jobs.
         out = deduplicate_candidates([
             _full_jd("决策规划大模型算法工程师", "小米", "负责A", "要求B"),
             _full_jd("决策规划大模型算法研究员", "小米", "负责A", "要求B"),

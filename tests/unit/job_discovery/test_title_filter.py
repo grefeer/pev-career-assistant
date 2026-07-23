@@ -44,6 +44,13 @@ class TestPipeAndBareFilters:
         assert not _is_plausible_job_title(
             _cand("拼多多集团-PDD | 2027届校招提前批启动！这些岗"), [])
 
+    def test_rejects_ascii_comma_fragment(self):
+        # A leading/middle ASCII comma signals a comma-separated list fragment
+        # scraped from a rendered tag/filter row (e.g. ``", 实习生"``), not a
+        # single job title. Real Chinese campus titles use no ASCII commas.
+        assert not _is_plausible_job_title(_cand(", 实习生"), [])
+        assert not _is_plausible_job_title(_cand("应届, 实习生"), [])
+
     def test_rejects_bare_generic_category(self):
         # Bare GENERIC category words (经理/运营) with no qualifier -> a
         # section header, not a job listing.

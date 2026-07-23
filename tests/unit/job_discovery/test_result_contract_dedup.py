@@ -85,14 +85,18 @@ class TestFullJdClusteringOnDicts:
         out = _dedupe_candidate_dicts([a, b])
         assert len(out) == 1
 
-    def test_same_jd_city_variants_collapse(self) -> None:
+    def test_same_jd_city_variants_kept_separate(self) -> None:
         body = "负责算法研发\n精通Python"
         a = _packaged("算法工程师", idempotency_key="nav",
                       responsibilities=body, locations=["深圳"])
         b = _packaged("算法工程师-北京", idempotency_key="pkg",
                       responsibilities=body, locations=["北京"])
         out = _dedupe_candidate_dicts([a, b])
-        assert len(out) == 1  # title-substring clustering collapses city variant
+        # City variants (same role + JD body, different city) are DISTINCT
+        # listings the site counts separately -> kept separate, NOT merged.
+        assert len(out) == 2
+        locs = {c["locations"][0] for c in out}
+        assert locs == {"深圳", "北京"}
 
 
 class TestEdgeCases:

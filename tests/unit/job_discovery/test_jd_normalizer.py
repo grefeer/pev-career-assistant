@@ -94,3 +94,23 @@ class TestTitleTrailingParenStrip:
     def test_ascii_parens_also_stripped(self) -> None:
         assert normalize_title("SDE (Backend)") == normalize_title("SDE")
 
+    def test_strips_trailing_lenticular_program_tag(self) -> None:
+        # Same job captured with and without a trailing 【...】 campaign / program
+        # tag must collide. The XHR-payload extractor keeps ``【2027届云弧计划】``
+        # while the page-text extractor strips it, so the two captures surface
+        # as one job, not two.
+        assert normalize_title("AI Infra研发工程师【2027届云弧计划】") == \
+            normalize_title("AI Infra研发工程师")
+
+    def test_strips_mixed_paren_and_lenticular(self) -> None:
+        # A trailing （...） group followed by a trailing 【...】 group peels both.
+        assert normalize_title("算法工程师（北京）【校招】") == \
+            normalize_title("算法工程师")
+
+    def test_keeps_leading_lenticular_tag(self) -> None:
+        # Only TRAILING 【...】 groups are stripped; a leading campaign tag stays
+        # (its bracket chars are later deleted, but the tag content remains), so
+        # a leading-tag title does NOT collide with the bare title.
+        assert normalize_title("【2027秋招】算法工程师") != \
+            normalize_title("算法工程师")
+

@@ -101,22 +101,57 @@ def _setup_db() -> Session:
     return Session(engine)
 
 
-def _unique_count(candidates: list) -> int:
-    """Count unique candidates by normalized title.
+def _loc_signature(locations) -> str:
+    """Stable location signature mirroring canonical_job_deduplicator._loc_key.
 
-    Mirrors the title-only identity the production dedup uses (which excludes
-    company - see canonical_job_deduplicator._identity_key), so this is an
-    independent check that the dedup actually collapsed duplicates. Within one
-    discovery run every candidate belongs to the same company, so two
-    candidates with the same normalized title are the same posting (a
-    duplicate); company attribution (None vs the real name) must NOT keep them
-    apart.
+    A role advertised in two cities is two DISTINCT postings (a city variant),
+    so the signature includes the city. Two re-captures of the same listing
+    share the same city -> same signature. Empty/missing -> "".
     """
-    seen: set[str] = set()
+    if not locations:
+        return ""
+    norms: list[str] = []
+    for loc in locations:
+        s = str(loc or "").strip()
+        if not s:
+            continue
+        for suf in ("自治区", "省", "市"):
+            if s.endswith(suf) and len(s) > len(suf):
+                s = s[: -len(suf)]
+                break
+        norms.append(s)
+    return "|".join(sorted(set(norms)))
+
+
+def _unique_count(candidates: list) -> int:
+    """Count unique candidates, mirroring the production dedup's split identity.
+
+    Full-JD candidates (those with a responsibilities/requirements body) are
+    counted by ``(normalized_title, location_signature)`` - each (role, city) is
+    a distinct listing the site counts separately (e.g. xiaomi's 151). Title-only
+    candidates (no JD body) are counted by normalized title alone - a position
+    advertised in several cities is ONE position the site counts once (e.g.
+    PDD's 22). This is an independent check that the dedup collapsed true
+    re-captures (same title + same city for full-JD, or same title for
+    title-only) without splitting city variants the site counts as one. See
+    ``canonical_job_deduplicator._identity_key`` for the matching production
+    logic.
+    """
+    seen: set = set()
     for c in candidates:
         title = normalize_title(
             c.get("title") if isinstance(c, dict) else getattr(c, "title", None))
-        seen.add(title)
+        has_body = bool(
+            ((c.get("responsibilities") if isinstance(c, dict)
+              else getattr(c, "responsibilities", "")) or "").strip()
+            or ((c.get("requirements") if isinstance(c, dict)
+                 else getattr(c, "requirements", "")) or "").strip())
+        if has_body:
+            locs = (c.get("locations") if isinstance(c, dict)
+                    else getattr(c, "locations", None))
+            seen.add((title, _loc_signature(locs)))
+        else:
+            seen.add(title)
     return len(seen)
 
 
@@ -179,6 +214,23 @@ def test_supervisor_extracts_match_real(
     apply_urls = [c.apply_url for c in cands if getattr(c, "apply_url", None)][:5]
     title_sample = [c.title for c in cands][:12]
 
+    # Full diagnostic dump so a single live run reveals whether an over-count
+    # is true duplicates (same title twice) or genuinely distinct titles, and
+    # whether title-only vs full-JD identity splitting is the cause.
+    all_titles_with_body: list[dict] = []
+    for c in cands:
+        title = c.get("title") if isinstance(c, dict) else getattr(c, "title", None)
+        has_body = bool(
+            ((c.get("responsibilities") if isinstance(c, dict)
+              else getattr(c, "responsibilities", "")) or "").strip()
+            or ((c.get("requirements") if isinstance(c, dict)
+                 else getattr(c, "requirements", "")) or "").strip())
+        locs = (c.get("locations") if isinstance(c, dict)
+                else getattr(c, "locations", None))
+        all_titles_with_body.append(
+            {"title": title, "has_body": has_body,
+             "locations": list(locs or [])})
+
     record = {
         "company": company,
         "slug": slug,
@@ -193,6 +245,7 @@ def test_supervisor_extracts_match_real(
         "elapsed_sec": round(elapsed, 1),
         "apply_url_sample": apply_urls,
         "title_sample": title_sample,
+        "all_titles_with_body": all_titles_with_body,
         "summary": (result.summary or "")[:300],
     }
     _OUT_DIR.mkdir(parents=True, exist_ok=True)

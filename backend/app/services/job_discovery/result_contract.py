@@ -19,6 +19,17 @@ from backend.app.services.job_discovery.schemas import (
 
 _RESULT_FIELDS = {"status", "block_reason", "evidence", "candidates", "summary"}
 _FENCED_JSON_PATTERN = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+# deepagents ``FilesystemMiddleware`` replaces oversized ``ToolMessage.content``
+# with a placeholder when a tool result exceeds ``tool_token_limit_before_evict``
+# (default 20000 tokens, ~80k chars). The real payload is offloaded to the
+# filesystem state at ``raw["files"][path]`` (a ``FileData`` dict whose ``content``
+# is the original JSON string). ``run_web_navigation`` on large career sites
+# (xiaomi: ~166 evidence pages, ~422k-char result) always trips this, so its
+# evidence/candidates never reach ``_coerce_json_value`` and the supervisor falls
+# to ``parse_failed``. The placeholder path is recovered here.
+_EVICTION_PATH_PATTERN = re.compile(
+    r"saved in the filesystem at this path:\s*(\S+)"
+)
 _CANDIDATE_FIELDS = {f.name for f in dataclass_fields(NormalizedJobCandidate)}
 
 
@@ -141,6 +152,7 @@ def _known_result_fields(parsed: dict[str, Any]) -> dict[str, Any]:
 def _collect_tool_outputs(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Collect persisted result data emitted by navigation and packaging tools."""
     messages = raw.get("messages", []) if isinstance(raw, dict) else []
+    files = raw.get("files", {}) if isinstance(raw, dict) else {}
     if not isinstance(messages, list):
         return [], []
 
@@ -148,7 +160,14 @@ def _collect_tool_outputs(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str
     candidates: list[dict[str, Any]] = []
     for message in messages:
         tool_name = getattr(message, "name", None)
-        payload = _coerce_json_value(getattr(message, "content", None))
+        content = getattr(message, "content", None)
+        payload = _coerce_json_value(content)
+        # deepagents evicts oversized tool results (default > 20000 tokens) to
+        # the filesystem state and leaves a placeholder in the ToolMessage;
+        # recover the real payload so large navigation results (xiaomi: ~166
+        # evidence pages) are not silently lost to ``parse_failed``.
+        if payload is None:
+            payload = _recover_evicted_payload(content, files)
         if tool_name in {"run_web_navigation", "extract_rendered_job_evidence"}:
             if isinstance(payload, dict):
                 pages = payload.get("evidence_pages") or payload.get("evidence") or []
@@ -173,6 +192,32 @@ def _coerce_json_value(candidate: Any) -> Any:
         return json.loads(content)
     except (json.JSONDecodeError, TypeError):
         return None
+
+
+def _recover_evicted_payload(content: Any, files: Any) -> Any:
+    """Recover a tool payload deepagents evicted to the filesystem state.
+
+    deepagents' ``FilesystemMiddleware`` offloads oversized tool results to
+    ``raw["files"][path]`` and replaces ``ToolMessage.content`` with a
+    ``TOO_LARGE_TOOL_MSG`` placeholder pointing at the path. This reads the
+    offloaded file content (a ``FileData`` dict with a ``content`` str) and
+    coerces it. Returns the parsed payload (dict/list) or ``None`` when the
+    content is not an eviction placeholder or the file is missing.
+
+    The agent (and its ``read_file``/``grep`` tools) cannot reliably inspect
+    such results: they are single-line JSON of hundreds of KB, and the tools
+    truncate at ~80k chars - hiding keys near the end (e.g. ``candidates``).
+    Recovering the full payload programmatically avoids that truncation.
+    """
+    if not isinstance(content, str) or not isinstance(files, dict):
+        return None
+    match = _EVICTION_PATH_PATTERN.search(content)
+    if not match:
+        return None
+    file_data = files.get(match.group(1))
+    if not isinstance(file_data, dict):
+        return None
+    return _coerce_json_value(file_data.get("content"))
 
 
 def _merge_tool_outputs(

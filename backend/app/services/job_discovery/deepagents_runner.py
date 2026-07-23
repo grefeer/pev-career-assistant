@@ -1417,6 +1417,16 @@ _NAV_USER_AGENT = (
 # browser session so a 100-position list does not stall the run.
 _MAX_DETAIL_PAGES = 6
 
+# Max connection attempts for the initial page navigation. Anti-bot servers
+# intermittently abort the TCP/TLS handshake (``net::ERR_CONNECTION_ABORTED``);
+# a fresh Chromium session on the next attempt usually lands. After this many
+# consecutive failures the error is raised so the supervisor surfaces a
+# failed/needs_manual_review result instead of looping on empty evidence.
+# Hard gate #2 compliant: retry only opens a legitimate public page - it never
+# bypasses login/captcha/anti-bot; persistent failure becomes a manual-review
+# signal, never a circumvention attempt.
+_NAV_CONNECT_ATTEMPTS = 3
+
 # Heuristic path/query fragments that mark an <a> link as a job-detail page
 # (vs navigation/footer/social). Conservative - the fragment must appear in
 # the resolved URL path or query.
@@ -1747,14 +1757,55 @@ def extract_rendered_job_evidence(url: str) -> str:
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-            page = browser.new_page(user_agent=_NAV_USER_AGENT)
-            page.on("response", capture_response)
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
-            except PlaywrightTimeoutError:
-                page.wait_for_timeout(3_000)
+            # Connection-phase retry: anti-bot servers intermittently abort the
+            # TCP/TLS handshake (``net::ERR_CONNECTION_ABORTED``); a fresh
+            # Chromium session on the next attempt usually lands. Each attempt
+            # tears down its own browser/page before retrying so a stuck
+            # session does not leak across attempts. After
+            # ``_NAV_CONNECT_ATTEMPTS`` consecutive failures a RuntimeError is
+            # raised (caught below) so the supervisor surfaces a
+            # failed/needs_manual_review result instead of looping on empty
+            # evidence. The per-call ``timeout`` is the "certain time" bound
+            # for one attempt. Hard gate #2: retry only reopens a legitimate
+            # public page - it never bypasses login/captcha/anti-bot.
+            page = None
+            browser = None
+            last_connect_error: Exception | None = None
+            for _attempt in range(_NAV_CONNECT_ATTEMPTS):
+                try:
+                    browser = playwright.chromium.launch(headless=True)
+                    page = browser.new_page(user_agent=_NAV_USER_AGENT)
+                    page.on("response", capture_response)
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=15_000)
+                    except PlaywrightTimeoutError:
+                        page.wait_for_timeout(3_000)
+                    last_connect_error = None
+                    break
+                except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                    last_connect_error = exc
+                    if page is not None:
+                        try:
+                            page.close()
+                        except Exception:  # noqa: BLE001 - best-effort teardown
+                            pass
+                        page = None
+                    if browser is not None:
+                        try:
+                            browser.close()
+                        except Exception:  # noqa: BLE001 - best-effort teardown
+                            pass
+                        browser = None
+                    # Brief back-off so an intermittent anti-bot drop has time
+                    # to clear before the next attempt opens a fresh socket.
+                    time.sleep(1.5)
+                    continue
+            if page is None:
+                raise RuntimeError(
+                    f"connection to {url} failed after {_NAV_CONNECT_ATTEMPTS} "
+                    f"attempts: {last_connect_error}"
+                )
             # Dismiss a privacy/cookie consent interstitial so the publicly-
             # rendered JD content (shown to the visitor after accepting) is
             # readable. Strictly limited to consent buttons - never touches
@@ -1873,7 +1924,7 @@ def extract_rendered_job_evidence(url: str) -> str:
                 # per-URL time budget. The count objective is met by list-page
                 # titles alone.
             browser.close()
-    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+    except (PlaywrightError, PlaywrightTimeoutError, RuntimeError) as exc:
         return json.dumps({"evidence_pages": [], "error": f"Browser evidence extraction failed: {exc}"}, ensure_ascii=False)
 
     evidence_pages: list[dict[str, Any]] = []
@@ -2043,6 +2094,70 @@ def _fetch_alibaba_search_api(url: str) -> dict[str, Any]:
     }
 
 
+def _extract_locations_from_item(item: dict[str, Any]) -> list[str]:
+    """Extract location strings from a job record across vendor XHR shapes.
+
+    The generic keys (``workLocations``/``locations``/``location``) are tried
+    first. Mioffice (Xiaomi) does NOT use them - it exposes the work city via
+    ``city_info`` / ``city_list`` (lists of ``{"code","name"}``) and
+    ``job_post_info.address``. Without reading those, every Mioffice candidate
+    ends up with an empty ``locations`` list, and the downstream dedup (which
+    keys on company + JD-body hash) then merges distinct city-variant postings
+    of the same role (e.g. the same role posted in 上海 and 北京) into one -
+    under-counting the site's real listing count.
+
+    Returns a de-duplicated, order-preserving list of city/location strings.
+    """
+    locs: list[str] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, list):
+            for v in value:
+                _collect(v)
+        elif isinstance(value, dict):
+            name = value.get("name") or value.get("city") or value.get("text")
+            if name:
+                locs.append(str(name).strip())
+        elif isinstance(value, str) and value.strip():
+            locs.append(value.strip())
+
+    # Generic vendor keys.
+    for key in ("workLocations", "locations", "location", "workLocation"):
+        if key in item:
+            _collect(item.get(key))
+
+    # Mioffice: city_info / city_list (each a {"code","name"} dict or a list of them).
+    for key in ("city_info", "city_list", "cityInfo", "cityList", "citys"):
+        if key in item:
+            _collect(item.get(key))
+
+    # Mioffice: job_post_info.address / work_address.
+    jpi = item.get("job_post_info") or item.get("jobPostInfo")
+    if isinstance(jpi, dict):
+        addr = jpi.get("address") or jpi.get("work_address") or jpi.get("workAddress") or jpi.get("city")
+        if isinstance(addr, str) and addr.strip():
+            locs.append(addr.strip())
+        elif isinstance(addr, list):
+            _collect(addr)
+
+    # storefront_list (Mioffice) sometimes carries city names too.
+    sl = item.get("storefront_list") or item.get("storefrontList")
+    if isinstance(sl, list):
+        for s in sl:
+            if isinstance(s, dict):
+                name = s.get("city") or s.get("name") or s.get("address")
+                if name:
+                    locs.append(str(name).strip())
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in locs:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
 def _generic_position_evidence_from_payload(
     payload: dict[str, Any],
     source_url: str,
@@ -2109,11 +2224,10 @@ def _generic_position_evidence_from_payload(
         if position_id:
             seen_ids.add(position_id)
 
-        # Extract location info
-        locations = item.get("workLocations") or item.get("locations") or item.get("location") or []
-        if isinstance(locations, str):
-            locations = [locations]
-        location_str = "、".join(str(x) for x in locations if x) if isinstance(locations, list) else str(locations)
+        # Extract location info (vendor-aware: Mioffice exposes the work city via
+        # city_info / city_list / job_post_info.address, not workLocations).
+        locations = _extract_locations_from_item(item)
+        location_str = "、".join(locations)
 
         # Build the evidence text
         parts = [f"岗位名称: {title}"]
@@ -2585,8 +2699,9 @@ def _is_plausible_job_title(
 
     Three generic, site-agnostic filters (no counts / pages / sites hardcoded):
 
-    1. Structural-separator titles (banners / news headlines containing ``|``).
-       A real job title never contains a pipe.
+    1. Structural-separator titles (banners / news headlines containing ``|``,
+       or list fragments containing an ASCII comma ``,``). A real job title
+       never contains either.
     2. Bare *generic* category words - the title is exactly a generic category
        suffix (``经理`` / ``主管`` / ``运营`` ...) with no qualifier. A section
        header, not a listing. Bare *specific* role titles (``产品经理``,
@@ -2602,7 +2717,13 @@ def _is_plausible_job_title(
     title = (getattr(candidate, "title", "") or "").strip()
     if not title:
         return False
-    if "|" in title:
+    # Structural separators: a real job title never contains a pipe (banner /
+    # news headline) or an ASCII comma. An ASCII comma signals a comma-separated
+    # list fragment scraped from rendered text (e.g. ``", 实习生"`` from a tag /
+    # filter row) rather than a single job title; Chinese campus-recruitment
+    # titles use no ASCII commas. (Chinese ``，`` / ``、`` are already rejected
+    # as sentence punctuation by the loose extractor before reaching here.)
+    if "|" in title or "," in title:
         return False
     matched = max(
         (s for s in _JOB_TITLE_SUFFIXES if title.endswith(s)),

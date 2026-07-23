@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
 from backend.app.services.job_discovery.result_contract import (
+    AgentResultParseError,
     enforce_result_invariants,
     parse_agent_result,
 )
@@ -161,3 +163,83 @@ def test_evidence_only_tool_recovery_requires_manual_review() -> None:
     assert result.block_reason == "parse_failed"
     assert result.evidence == [evidence]
     assert result.candidates == []
+
+
+def test_evicted_run_web_navigation_payload_recovered_from_files() -> None:
+    """deepagents evicts oversized tool results to ``raw["files"]``; recover them.
+
+    Mirrors xiaomi: ``run_web_navigation`` returns ~166 evidence pages (~422k
+    chars) which exceeds the 20000-token eviction threshold. The ToolMessage
+    carries a placeholder pointing at the offloaded file; ``_collect_tool_outputs``
+    must read the file content and parse the real payload so the crawl is not
+    silently lost to ``parse_failed``.
+    """
+    evidence = {
+        "evidence_type": "job_detail_json",
+        "url": "https://example.test/jobs/1",
+        "content_hash": "evidence-hash",
+    }
+    candidate = {
+        "title": "Software Engineer",
+        "company_name": "Example Corp",
+        "idempotency_key": "candidate-key",
+        "similarity_group_key": "group-key",
+    }
+    real_payload = {"evidence_pages": [evidence], "candidates": [candidate]}
+    tool_call_id = "call_00_abc123"
+    file_path = f"/large_tool_results/{tool_call_id}"
+    # Placeholder text emitted by deepagents' _offload_tool_message_content
+    # (TOO_LARGE_TOOL_MSG): points at the offloaded file path.
+    placeholder = (
+        "Tool result too large, the result of this tool call "
+        f"{tool_call_id} was saved in the filesystem at this path: {file_path}"
+        "\n\nYou can read the result from the filesystem by using the read_file "
+        "tool, but make sure to only read part of the result at a time."
+    )
+    raw = {
+        "messages": [
+            ToolMessage(
+                content=placeholder,
+                name="run_web_navigation",
+                tool_call_id=tool_call_id,
+            ),
+            AIMessage(content="malformed final response"),
+        ],
+        "files": {
+            file_path: {
+                "content": json.dumps(real_payload),
+                "encoding": "utf-8",
+            }
+        },
+    }
+
+    result = parse_agent_result(raw)
+
+    assert result.status == "succeeded"
+    assert result.evidence == [evidence]
+    assert len(result.candidates) == 1
+    assert result.candidates[0].title == "Software Engineer"
+
+
+def test_evicted_placeholder_without_file_falls_to_parse_failed() -> None:
+    """When the evicted file is missing, no evidence/candidates are recovered."""
+    tool_call_id = "call_00_missing"
+    file_path = f"/large_tool_results/{tool_call_id}"
+    placeholder = (
+        "Tool result too large, the result of this tool call "
+        f"{tool_call_id} was saved in the filesystem at this path: {file_path}"
+    )
+    raw = {
+        "messages": [
+            ToolMessage(
+                content=placeholder,
+                name="run_web_navigation",
+                tool_call_id=tool_call_id,
+            ),
+            AIMessage(content="malformed final response"),
+        ],
+        "files": {},  # offloaded file is gone
+    }
+
+    with pytest.raises(AgentResultParseError):
+        parse_agent_result(raw)
