@@ -102,6 +102,19 @@ class Settings(BaseSettings):
     strategy_health_check_interval_hours: int = Field(default=24, ge=1, le=168)
     trajectory_annotation_enabled: bool = True
 
+    # Personal mode (single-user application-assistant) settings.
+    # When True: registration disabled, require_admin bypassed for the seeded
+    # single user, discovered candidates auto-promote to verified JobPostings
+    # (admin review skipped), and the student "verified only" gate is relaxed
+    # for that user. Multi-tenant logic stays intact when False.
+    personal_mode: bool = False
+    # LLM used for the cheap relevance-ranker batch (sits upstream of the
+    # expensive per-job MatchService). Defaults to the same model family.
+    relevance_model: str = "deepseek-v4-flash"
+    # Max candidates scored per single LLM batch call. Larger batches save calls
+    # but risk output truncation; 30 is a safe default for structured output.
+    relevance_batch_size: int = Field(default=30, ge=1, le=100)
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

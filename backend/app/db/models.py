@@ -50,6 +50,11 @@ from backend.app.domain.job_submissions import (
     SubmissionStatus,
 )
 
+from backend.app.domain.preferences import (
+    JobInteractionType,
+    WorkModePreference,
+)
+
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
 
@@ -1187,4 +1192,93 @@ class JobDiscoveryTrajectory(UUIDPrimaryKeyMixin, Base):
     )
     _strategy: Mapped["JobDiscoveryStrategy | None"] = relationship(
         back_populates="_trajectories", lazy="raise",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Personal memory: preferences + interactions + relevance scores
+# (personal-mode application assistant). Preferences complement the parsed
+# profile/resume facts; interactions feed the relevance feedback loop;
+# relevance scores cache the cheap ranker output keyed by profile+pref
+# version so the expensive MatchService only runs on ranked top-N.
+# ---------------------------------------------------------------------------
+
+
+class UserPreference(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "user_preferences"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_user_preferences_user"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # What the user is looking for (complements who they are, in the profile).
+    desired_roles: Mapped[list[str] | None] = mapped_column(JSON)
+    target_cities: Mapped[list[str] | None] = mapped_column(JSON)
+    salary_min: Mapped[int | None] = mapped_column(Integer)
+    salary_max: Mapped[int | None] = mapped_column(Integer)
+    excluded_companies: Mapped[list[str] | None] = mapped_column(JSON)
+    excluded_industries: Mapped[list[str] | None] = mapped_column(JSON)
+    preferred_industries: Mapped[list[str] | None] = mapped_column(JSON)
+    preferred_recruitment_types: Mapped[list[str] | None] = mapped_column(JSON)
+    work_mode: Mapped[WorkModePreference | None] = mapped_column(
+        Enum(WorkModePreference, name="work_mode_preference", **enum_kwargs)
+    )
+    is_active_search: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )
+    notes: Mapped[str | None] = mapped_column(Text)
+    # Optimistic lock; bumping this invalidates cached relevance scores.
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
+class UserJobInteraction(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "user_job_interactions"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "job_id", "interaction_type",
+            name="uq_user_job_interactions_user_job_type",
+        ),
+        Index("ix_user_job_interactions_user_created", "user_id", "created_at"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    interaction_type: Mapped[JobInteractionType] = mapped_column(
+        Enum(JobInteractionType, name="job_interaction_type", **enum_kwargs),
+        nullable=False,
+    )
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class JobRelevanceScore(UUIDPrimaryKeyMixin, Base):
+    __tablename__ = "job_relevance_scores"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "profile_version_id", "preferences_version",
+            name="uq_job_relevance_scores_job_profile_prefs",
+        ),
+        Index("ix_job_relevance_scores_user_score", "user_id", "score"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="CASCADE"), nullable=False
+    )
+    profile_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id", ondelete="SET NULL")
+    )
+    preferences_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text)
+    matched_signals_json: Mapped[list[str] | None] = mapped_column(JSON)
+    scored_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
     )
