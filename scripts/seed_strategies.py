@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base
 from backend.app.db.models import JobDiscoveryStrategy
+from backend.app.services.job_discovery.adapters.moka import MOKA_CRAWL_PLAN
 
 # Use the same engine pattern as tests
 from backend.app.config import Settings
@@ -88,6 +89,20 @@ def seed(db: Session) -> None:
             plan_yaml=ALIBABA_PLAN,
             degradation_threshold=3,
             recovery_threshold=2,
+        ),
+        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
+        # until three consecutive coverage-verified live smokes pass; enable
+        # only in a test environment by flipping this row manually.
+        JobDiscoveryStrategy(
+            url_pattern="app.mokahr.com/*",
+            site_type="career_site",
+            description="Moka 招聘 SPA -> 渲染 DOM 抽取 #/job/ 路由 -> 完整抓取",
+            priority=40,
+            adapter="backend.app.services.job_discovery.adapters.moka.MokaCrawlAdapter",
+            plan_yaml=MOKA_CRAWL_PLAN,
+            degradation_threshold=3,
+            recovery_threshold=2,
+            enabled=False,
         ),
     ]
     db.add_all(strategies)

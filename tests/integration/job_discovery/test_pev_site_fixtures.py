@@ -80,3 +80,30 @@ def test_fixture_never_contains_secret_headers() -> None:
             f"fixture text contains forbidden substring {secret!r}; "
             f"probe must strip credentials/cookies before writing"
         )
+
+
+def test_moka_fixture_carries_job_hash_route_contract() -> None:
+    """The moka contract is the input spec for ``MokaCrawlDriver.from_fixture``.
+
+    Task 4.2's driver reads ``page_url``, ``expected_listing_count``,
+    ``single_page_proof`` and ``sample_listings`` (each a ``#/job/`` hash route)
+    from this contract; the gate test pins those fields so the driver has a
+    stable, fixture-proven input.
+    """
+    fixture = load_fixture("moka")
+    assert fixture.get("data_source") == "dom_rendered"
+    assert fixture.get("obfuscated_xhr") is True
+    assert fixture.get("single_page_proof") == "single_page_mokahr_hash_jobs"
+    expected = fixture.get("expected_listing_count")
+    assert isinstance(expected, int) and expected > 0
+    samples = fixture.get("sample_listings") or []
+    assert len(samples) == expected, (
+        "moka sample_listings count must match expected_listing_count for "
+        "deterministic unit replay"
+    )
+    for sample in samples:
+        detail_url = sample.get("detail_url", "")
+        assert "#/job/" in detail_url, (
+            f"moka sample detail_url is not a job-level hash route: {detail_url}"
+        )
+        assert sample.get("title"), "moka sample listing must carry a title"
