@@ -37,6 +37,7 @@ from backend.app.repositories.job_discovery import (
     upsert_evidence,
 )
 from backend.app.services.job_discovery.deepagents_runner import (
+    build_crawl_plan_agent,
     build_discovery_supervisor_agent,
     create_web_navigation_subagent,
     package_candidates,
@@ -56,7 +57,12 @@ from backend.app.services.job_discovery.result_contract import (
     enforce_result_invariants,
     parse_agent_result,
 )
+from backend.app.services.job_discovery.planning.crawl_plan_agent import (
+    generate_crawl_plan,
+    repair_crawl_plan,
+)
 from backend.app.services.job_discovery.crawling.coverage import verify_coverage
+from backend.app.services.job_discovery.crawling.checkpoint import CrawlCheckpoint
 from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
 from backend.app.services.job_discovery.crawling.playwright_driver import (
     PlaywrightCrawlDriver,
@@ -269,6 +275,14 @@ def _fallback_with_record_fields_if_agent_missed_evidence(
     """Recover when the LLM agent gives up despite readable public evidence."""
     if not task.source_key.startswith("tencent-"):
         return result
+    if not settings.job_discovery_legacy_path_c_enabled:
+        return result
+    if result.status == "needs_manual_review":
+        return result
+    if result.execution_error:
+        classification = error_classifier.classify_execution_error(result.execution_error)
+        if classification.error_type == "blocked":
+            return result
     if result.candidates and result.evidence:
         return result
     navigation = run_web_navigation(task.source_url, settings=settings)
@@ -411,6 +425,31 @@ def _build_playwright_crawl_driver(settings: Settings) -> PlaywrightCrawlDriver:
     return PlaywrightCrawlDriver(page=page, close_callback=_close)
 
 
+def _planner_enabled(settings: Settings) -> bool:
+    """PATH C planning is opt-in only when both gray-migration flags are on."""
+    return settings.job_discovery_pev_enabled and settings.job_discovery_planner_enabled
+
+
+def _crawl_plan_yaml(plan: CrawlPlan) -> str:
+    """Serialize a validated plan for the existing deterministic PATH B API."""
+    data = asdict(plan)
+    data["plan_type"] = "crawl_plan"
+    data["pagination"]["type"] = plan.pagination.type.value
+    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+
+
+def _checkpoint_from_snapshot(snapshot_context: dict | None) -> CrawlCheckpoint | None:
+    if not snapshot_context:
+        return None
+    checkpoint = snapshot_context.get("checkpoint")
+    if not isinstance(checkpoint, dict):
+        return None
+    try:
+        return CrawlCheckpoint.from_dict(checkpoint)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -443,6 +482,149 @@ class JobDiscoveryWorker:
         self.worker_id = _build_worker_id()
         self._idle_cycles: int = 0
         self._crawl_driver_factory = crawl_driver_factory
+
+    def _execute_planned_crawl(
+        self,
+        task: DiscoveryTaskInput,
+        plan: CrawlPlan,
+        trajectory: TrajectoryBuffer,
+        snapshot_context: dict | None = None,
+    ) -> DiscoveryRunResult:
+        """Run a PATH C plan through the pre-existing deterministic PATH B."""
+        generated_strategy = StrategyRecord(
+            id=f"planner:{task.url_hash}",
+            url_pattern=task.source_url,
+            site_type="planner_generated",
+            plan_yaml=_crawl_plan_yaml(plan),
+        )
+        crawl_driver_factory = self._crawl_driver_factory or (
+            lambda _plan, _task: _build_playwright_crawl_driver(self.settings)
+        )
+        return SnapshotExecutor(
+            generated_strategy,
+            task,
+            trajectory,
+            crawl_driver_factory=crawl_driver_factory,
+            checkpoint=_checkpoint_from_snapshot(snapshot_context),
+        ).execute()
+
+    def _planner_failure_result(self, exc: Exception) -> DiscoveryRunResult | None:
+        """Keep blocked/completion outcomes out of every legacy fallback path."""
+        classification = error_classifier.classify_execution_error(str(exc))
+        if error_classifier.classify_next_action(classification.error_type) == "needs_manual_review":
+            return DiscoveryRunResult(
+                status="needs_manual_review",
+                block_reason=classification.reason,
+                summary=f"Planner requires manual review: {classification.reason}",
+            )
+        return None
+
+    def _execution_failure_context(
+        self,
+        result: DiscoveryRunResult,
+        snapshot_context: dict | None,
+    ) -> dict | None:
+        """Build one deterministic error source without inspecting result data."""
+        failed_step = (snapshot_context or {}).get("failed_step")
+        failed_step = failed_step if isinstance(failed_step, dict) else {}
+        raw_error = (
+            result.execution_error
+            or getattr(result, "error", None)
+            or result.block_reason
+            or failed_step.get("error")
+        )
+        if not isinstance(raw_error, str) or not raw_error:
+            return None
+        context = dict(snapshot_context or {})
+        context["failed_step"] = dict(failed_step)
+        context["raw_error"] = raw_error
+        return context
+
+    def _classify_execution_context(
+        self,
+        snapshot_context: dict | None,
+    ) -> error_classifier.ExecutionErrorClassification | None:
+        """Classify raw failure text before considering a declared wrapper type."""
+        context = snapshot_context or {}
+        raw_error = context.get("raw_error")
+        raw_classification = error_classifier.classify_execution_error(
+            raw_error if isinstance(raw_error, str) else ""
+        )
+        if raw_classification.reason != "unknown":
+            return raw_classification
+
+        failed_step = context.get("failed_step")
+        declared_type = (
+            failed_step.get("error_type") if isinstance(failed_step, dict) else None
+        )
+        if declared_type in {
+            "structure_error",
+            "transient",
+            "blocked",
+            "completion_unverified",
+            "data_error",
+        }:
+            return error_classifier.ExecutionErrorClassification(
+                declared_type, declared_type
+            )
+        return None
+
+    def _recover_planned_execution(
+        self,
+        task: DiscoveryTaskInput,
+        plan: CrawlPlan,
+        trajectory: TrajectoryBuffer,
+        snapshot_context: dict | None,
+        failed_result: DiscoveryRunResult | None = None,
+    ) -> DiscoveryRunResult | None:
+        """Apply the fixed PATH B/C recovery table without returning final jobs."""
+        classification = self._classify_execution_context(snapshot_context)
+        if classification is None:
+            return None
+        next_action = error_classifier.classify_next_action(classification.error_type)
+        if next_action == "needs_manual_review":
+            if failed_result is not None:
+                failed_result.status = "needs_manual_review"
+                failed_result.block_reason = classification.reason
+                failed_result.summary = f"Crawl requires manual review: {classification.reason}"
+                return failed_result
+            return DiscoveryRunResult(
+                status="needs_manual_review",
+                block_reason=classification.reason,
+                summary=f"Crawl requires manual review: {classification.reason}",
+            )
+        if next_action == "partial_success":
+            if failed_result is not None:
+                failed_result.status = "partial_success"
+                failed_result.block_reason = classification.reason
+                failed_result.summary = f"Crawl returned partial data: {classification.reason}"
+                return failed_result
+            return DiscoveryRunResult(
+                status="partial_success",
+                block_reason=classification.reason,
+                summary=f"Crawl returned partial data: {classification.reason}",
+            )
+        if next_action == "resume_path_b":
+            return self._execute_planned_crawl(task, plan, trajectory, snapshot_context)
+
+        try:
+            planner = build_crawl_plan_agent(
+                settings=self.settings,
+                snapshot_context=snapshot_context,
+            )
+            repaired_plan = repair_crawl_plan(
+                task,
+                plan,
+                snapshot_context or {},
+                planner,
+                max_inspection_pages=self.settings.job_discovery_planner_max_inspection_pages,
+                settings=self.settings,
+            )
+        except Exception as exc:
+            return self._planner_failure_result(exc)
+        return self._execute_planned_crawl(
+            task, repaired_plan, trajectory, snapshot_context
+        )
 
     def run_once(self) -> int:
         """Claim and process one discovery task.
@@ -585,20 +767,149 @@ class JobDiscoveryWorker:
                             )
                             snap_result = snap.execute()
                             if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
-                                snapshot_context = snap_result.snapshot_context
-                                executor_type = "supervisor"
-                                # Increment error count BEFORE clearing strategy_record
-                                fail_idx = trajectory.failed_step_index
-                                if fail_idx is not None and trajectory.steps:
-                                    failed_step = trajectory.steps[fail_idx]
-                                    strat_store.increment_error_count(db, strategy_record.id, {
-                                        "tool": failed_step.get("tool", "snapshot"),
-                                        "reason": error_classifier.classify_error(failed_step.get("error", "")),
-                                        "message": str(failed_step.get("error", ""))[:500],
-                                    })
-                                strategy_record = None
+                                recovered: DiscoveryRunResult | None = None
+                                if crawl_plan_declared and _planner_enabled(self.settings):
+                                    try:
+                                        failed_plan = CrawlPlan.from_yaml(strategy_record.plan_yaml)
+                                        failure_context = self._execution_failure_context(
+                                            snap_result, snap_result.snapshot_context
+                                        )
+                                        recovered = self._recover_planned_execution(
+                                            task_input,
+                                            failed_plan,
+                                            trajectory,
+                                            failure_context,
+                                        )
+                                    except (TypeError, ValueError):
+                                        recovered = None
+                                if recovered is not None:
+                                    result = recovered
+                                    executor_type = "crawl_plan"
+                                elif (
+                                    crawl_plan_declared
+                                    and _planner_enabled(self.settings)
+                                    and not self.settings.job_discovery_legacy_path_c_enabled
+                                ):
+                                    result = DiscoveryRunResult(
+                                        status="needs_manual_review",
+                                        block_reason="planner_unavailable",
+                                        summary="Planner repair failed and legacy PATH C is disabled",
+                                    )
+                                    executor_type = "crawl_plan"
+                                else:
+                                    snapshot_context = snap_result.snapshot_context
+                                    executor_type = "supervisor"
+                                    # Increment error count BEFORE clearing strategy_record
+                                    fail_idx = trajectory.failed_step_index
+                                    if fail_idx is not None and trajectory.steps:
+                                        failed_step = trajectory.steps[fail_idx]
+                                        strat_store.increment_error_count(db, strategy_record.id, {
+                                            "tool": failed_step.get("tool", "snapshot"),
+                                            "reason": error_classifier.classify_error(failed_step.get("error", "")),
+                                            "message": str(failed_step.get("error", ""))[:500],
+                                        })
+                                    strategy_record = None
                             else:
                                 result = snap_result
+                                if (
+                                    crawl_plan_declared
+                                    and _planner_enabled(self.settings)
+                                    and result.coverage is not None
+                                ):
+                                    failure_context = self._execution_failure_context(
+                                        result, None
+                                    )
+                                    if failure_context is not None:
+                                        try:
+                                            active_plan = CrawlPlan.from_yaml(
+                                                strategy_record.plan_yaml
+                                            )
+                                            recovered = self._recover_planned_execution(
+                                                task_input,
+                                                active_plan,
+                                                trajectory,
+                                                failure_context,
+                                                failed_result=result,
+                                            )
+                                        except (TypeError, ValueError):
+                                            recovered = None
+                                        if recovered is not None:
+                                            result = recovered
+
+            # ── 4aa. PATH C planning for an unknown / unstrategized site ──
+            # PEV remains fully opt-in: without both flags the legacy
+            # Supervisor path below is untouched.
+            if (
+                executor_type == "supervisor"
+                and trajectory is None
+                and _planner_enabled(self.settings)
+            ):
+                trajectory = TrajectoryBuffer(
+                    task_id=task.id,
+                    strategy_id=None,
+                    executor_type="planner",
+                )
+                try:
+                    planner = build_crawl_plan_agent(settings=self.settings, model=_llm)
+                    generated_plan = generate_crawl_plan(
+                        task_input,
+                        planner,
+                        max_inspection_pages=self.settings.job_discovery_planner_max_inspection_pages,
+                        settings=self.settings,
+                    )
+                    result = self._execute_planned_crawl(
+                        task_input, generated_plan, trajectory
+                    )
+                    executor_type = "crawl_plan"
+                    failure_context = self._execution_failure_context(result, None)
+                    if result.coverage is not None and failure_context is not None:
+                        recovered = self._recover_planned_execution(
+                            task_input,
+                            generated_plan,
+                            trajectory,
+                            failure_context,
+                            failed_result=result,
+                        )
+                        if recovered is not None:
+                            result = recovered
+                    elif (
+                        isinstance(result, SnapshotExecutionResult)
+                        and result.needs_supervisor_fallback
+                    ):
+                        failure_context = self._execution_failure_context(
+                            result, result.snapshot_context
+                        )
+                        recovered = self._recover_planned_execution(
+                            task_input,
+                            generated_plan,
+                            trajectory,
+                            failure_context,
+                        )
+                        if recovered is not None:
+                            result = recovered
+                        elif self.settings.job_discovery_legacy_path_c_enabled:
+                            snapshot_context = result.snapshot_context
+                            executor_type = "supervisor"
+                        else:
+                            result = DiscoveryRunResult(
+                                status="needs_manual_review",
+                                block_reason="planner_unavailable",
+                                summary="Planner repair failed and legacy PATH C is disabled",
+                            )
+                except Exception as exc:
+                    fallback_result = self._planner_failure_result(exc)
+                    if fallback_result is not None:
+                        result = fallback_result
+                        executor_type = "planner"
+                    elif self.settings.job_discovery_legacy_path_c_enabled:
+                        snapshot_context = {"source": "planner", "error": str(exc)}
+                    else:
+                        result = DiscoveryRunResult(
+                            status="needs_manual_review",
+                            block_reason="planner_unavailable",
+                            summary="Planner failed and legacy PATH C is disabled",
+                        )
+                        executor_type = "planner"
 
             # ── 4b. Supervisor Agent (backup path or primary if no match) ──
             agent_error: Exception | None = None
@@ -672,10 +983,24 @@ class JobDiscoveryWorker:
                 coverage_decision = None
             else:
                 coverage_decision = verify_coverage(result.coverage)
-                result.status = coverage_decision.status
-                result.block_reason = (
-                    None if coverage_decision.complete else coverage_decision.reason
+                failure_context = self._execution_failure_context(result, None)
+                classification = self._classify_execution_context(failure_context)
+                next_action = (
+                    error_classifier.classify_next_action(classification.error_type)
+                    if classification is not None
+                    else None
                 )
+                if next_action == "needs_manual_review":
+                    result.status = "needs_manual_review"
+                    result.block_reason = classification.reason
+                elif next_action == "partial_success":
+                    result.status = "partial_success"
+                    result.block_reason = classification.reason
+                else:
+                    result.status = coverage_decision.status
+                    result.block_reason = (
+                        None if coverage_decision.complete else coverage_decision.reason
+                    )
             if agent_error is not None and not result.candidates and not result.evidence:
                 raise agent_error
 

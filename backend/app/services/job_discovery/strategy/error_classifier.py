@@ -5,6 +5,80 @@ SQL-level aggregation and strategy health tracking.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+
+STRUCTURE_ERRORS = frozenset(
+    {
+        "selector_not_found",
+        "pagination_shape_changed",
+        "detail_schema_changed",
+        "unexpected_iframe",
+        "api_payload_changed",
+    }
+)
+BLOCKED_ERRORS = frozenset(
+    {
+        "captcha",
+        "slider",
+        "login_required",
+        "qr_login_required",
+        "anti_bot",
+    }
+)
+TRANSIENT_ERRORS = frozenset(
+    {
+        "network_timeout",
+        "connection_reset",
+        "rate_limited",
+        "upstream_5xx",
+    }
+)
+DATA_ERRORS = frozenset({"data_error", "malformed_candidate_payload", "empty_text"})
+
+
+@dataclass(frozen=True)
+class ExecutionErrorClassification:
+    """Immutable PATH B/C error category used for recovery routing."""
+
+    error_type: str
+    reason: str
+
+
+def classify_execution_error(message: str) -> ExecutionErrorClassification:
+    """Map a deterministic executor failure to one recovery category."""
+    normalized = (message or "").lower()
+    for reason in STRUCTURE_ERRORS:
+        if reason in normalized:
+            return ExecutionErrorClassification("structure_error", reason)
+    for reason in BLOCKED_ERRORS:
+        if reason in normalized:
+            return ExecutionErrorClassification("blocked", reason)
+    if "completion_unverified" in normalized:
+        return ExecutionErrorClassification("completion_unverified", "completion_unverified")
+    for reason in TRANSIENT_ERRORS:
+        if reason in normalized:
+            return ExecutionErrorClassification("transient", reason)
+    if "timeout" in normalized:
+        return ExecutionErrorClassification("transient", "network_timeout")
+    if "malformed candidate" in normalized or "candidate payload" in normalized:
+        return ExecutionErrorClassification("data_error", "malformed_candidate_payload")
+    for reason in DATA_ERRORS:
+        if reason in normalized:
+            return ExecutionErrorClassification("data_error", reason)
+    return ExecutionErrorClassification("data_error", "unknown")
+
+
+def classify_next_action(error_type: str) -> str:
+    """Return the only permitted recovery path for an execution category."""
+    return {
+        "structure_error": "planner_repair_then_path_b",
+        "transient": "resume_path_b",
+        "blocked": "needs_manual_review",
+        "completion_unverified": "needs_manual_review",
+        "data_error": "partial_success",
+    }.get(error_type, "partial_success")
+
 _PATTERNS: list[tuple[str, list[str]]] = [
     ("network_timeout", ["timeout", "timed out", "connectionerror", "readtimeout"]),
     ("http_blocked",    ["403", "401", "forbidden", "unauthorized"]),

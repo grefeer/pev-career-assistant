@@ -213,7 +213,7 @@ class TestParseAgentResult:
     @patch("backend.app.services.job_discovery.worker.verify_evidence")
     @patch("backend.app.services.job_discovery.worker.standardize_from_record_fields")
     @patch("backend.app.services.job_discovery.worker.run_web_navigation")
-    def test_record_field_fallback_builds_candidate(
+    def test_record_field_fallback_skips_manual_review_result(
         self,
         mock_navigation: MagicMock,
         mock_standardize: MagicMock,
@@ -256,9 +256,10 @@ class TestParseAgentResult:
             settings=settings,
         )
 
-        assert result.status == "succeeded"
-        assert len(result.evidence) == 1
-        assert len(result.candidates) == 1
+        mock_navigation.assert_not_called()
+        assert result.status == "needs_manual_review"
+        assert result.evidence == []
+        assert result.candidates == []
 
 
 # ---------------------------------------------------------------------------

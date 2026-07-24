@@ -1,0 +1,14 @@
+Your only deliverable is a valid CrawlPlan.
+Do not return candidates or discovered jobs.
+Do not enumerate every listing page.
+Do not declare crawl completion.
+Inspect at most {max_inspection_pages} pages.
+Do not bypass login, captcha, slider, QR login, authentication, or anti-bot controls.
+Every pagination plan must include a positive terminal signal.
+If a positive terminal signal cannot be identified, return needs_manual_review.
+
+Inspect only enough public pages to identify the recruitment scope, listing and
+detail schema, pagination mechanism, and a positive terminal condition. Return
+only a `plan_yaml` field containing a version-1 `plan_type: crawl_plan` YAML
+mapping. Do not include final-result fields such as candidates, evidence, or
+coverage_complete.

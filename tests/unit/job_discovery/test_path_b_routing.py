@@ -17,6 +17,10 @@ from backend.app.services.job_discovery.schemas import (
 from backend.app.services.job_discovery.strategy.snapshot_executor import SnapshotExecutor
 from backend.app.services.job_discovery.strategy.strategy_store import validate_plan_yaml
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
+from backend.app.services.job_discovery.strategy.error_classifier import (
+    classify_execution_error,
+    classify_next_action,
+)
 
 
 CRAWL_PLAN_YAML = """
@@ -198,3 +202,22 @@ def test_complete_crawl_adapter_closes_driver_when_executor_raises(monkeypatch) 
         adapter.execute(_task(), _strategy(), trajectory)
 
     assert adapter.driver.closed is True
+
+
+@pytest.mark.parametrize(
+    ("message", "error_type", "next_action"),
+    [
+        ("selector_not_found", "structure_error", "planner_repair_then_path_b"),
+        ("request timeout", "transient", "resume_path_b"),
+        ("captcha encountered", "blocked", "needs_manual_review"),
+        ("completion_unverified", "completion_unverified", "needs_manual_review"),
+        ("malformed candidate payload", "data_error", "partial_success"),
+    ],
+)
+def test_execution_error_classifier_routes_path_b_recovery(
+    message: str,
+    error_type: str,
+    next_action: str,
+) -> None:
+    assert classify_execution_error(message).error_type == error_type
+    assert classify_next_action(error_type) == next_action

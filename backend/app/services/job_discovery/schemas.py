@@ -87,6 +87,9 @@ class DiscoveryRunResult:
     # Only the post-crawl pipeline (run_post_crawl_pipeline) sets a real
     # coverage and relies on ``crawling.coverage.verify_coverage``.
     coverage: "CrawlCoverage | None" = None
+    # Set only from CrawlExecutionResult.error, whose executor contract is a
+    # sanitized type/reason code rather than page content, URLs, or secrets.
+    execution_error: str | None = None
 
 
 @dataclass

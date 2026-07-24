@@ -57,6 +57,7 @@ def run_post_crawl_pipeline(
         block_reason=None if coverage_decision.complete else coverage_decision.reason,
         evidence=evidence,
         candidates=packaged_candidates,
+        execution_error=crawl_result.error,
         coverage=crawl_result.coverage,
         summary=(
             f"Full crawl collected {len(crawl_result.raw_listings)} listing(s), "

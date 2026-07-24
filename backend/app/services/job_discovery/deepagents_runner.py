@@ -13,7 +13,7 @@ import json
 import re
 import time
 from dataclasses import asdict, is_dataclass
-from typing import Any
+from typing import Any, Literal
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -2332,6 +2332,48 @@ def extract_links(url: str) -> str:
     return json.dumps(links, ensure_ascii=False)
 
 
+def inspect_network_schema(url: str) -> str:
+    """Report only public pagination-schema hints, never network payload data.
+
+    PATH C uses this to identify a deterministic pagination plan.  The
+    response deliberately exposes field names and boolean capabilities only;
+    it must not become a backdoor for extracting listings or JD evidence.
+    """
+    global _nav_page_count, _nav_current_url, _nav_history
+    if _is_blocked_domain(url):
+        return json.dumps({"error": "blocked_domain"})
+    budget_err = _nav_budget_check()
+    if budget_err:
+        return json.dumps({"error": budget_err})
+
+    was_cached = url in _page_cache
+    content, _title, error = _cached_fetch(url)
+    if error is not None:
+        return json.dumps({"error": "network_schema_unavailable"})
+    if not was_cached:
+        _nav_page_count += 1
+        if _nav_current_url:
+            _nav_history.append(_nav_current_url)
+        _nav_current_url = url
+
+    text = content or ""
+    fields = [
+        field
+        for field in ("hasMore", "totalCount", "nextCursor", "offset", "pageNo")
+        if re.search(rf"[\"']?{field}[\"']?\s*[:=]", text, re.IGNORECASE)
+    ]
+    return json.dumps(
+        {
+            "url": urlsplit(url)._replace(query="", fragment="").geturl(),
+            "schema_fields": fields,
+            "has_positive_terminal_signal": any(
+                field in fields for field in ("hasMore", "totalCount", "nextCursor")
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
 def click_link(url: str, link_text: str) -> str:
     """Follow a link on a page by matching link text.
 
@@ -2499,6 +2541,14 @@ class _WebNavigationResultPydantic(BaseModel):
     navigation_path: list[dict[str, str]] = []
     page_count: int = 0
     error: str | None = None
+
+
+class _CrawlPlanResponsePydantic(BaseModel):
+    """The planner returns a CrawlPlan or a bounded manual-review outcome."""
+
+    status: Literal["crawl_plan", "needs_manual_review"] = "crawl_plan"
+    plan_yaml: str | None = None
+    block_reason: str | None = None
 
 
 def _parse_web_navigation_agent_result(result: Any) -> dict[str, Any]:
@@ -2953,6 +3003,40 @@ def build_web_navigation_agent(
         system_prompt=_WEB_NAVIGATION_SYSTEM_PROMPT,
         name="web_navigation_agent",
         response_format=_WebNavigationResultPydantic,
+    )
+
+
+def build_crawl_plan_agent(
+    *,
+    settings: Settings,
+    model: ChatOpenAI | None = None,
+    snapshot_context: dict | None = None,
+) -> Any:
+    """Build the bounded PATH C agent that plans or repairs a CrawlPlan only."""
+    if model is None:
+        model = _build_job_discovery_llm(settings)
+
+    max_inspection_pages = settings.job_discovery_planner_max_inspection_pages
+    prompt = _load_prompt("crawl_plan_agent", required=True).format(
+        max_inspection_pages=max_inspection_pages
+    )
+    if snapshot_context is not None:
+        prompt += "\n\nRepair context:\n" + json.dumps(
+            snapshot_context, ensure_ascii=False, sort_keys=True
+        )
+
+    return create_deep_agent(
+        model=model,
+        tools=[
+            open_rendered_url,
+            read_dom,
+            extract_links,
+            inspect_network_schema,
+            finish_with_manual_review,
+        ],
+        system_prompt=prompt,
+        name="crawl_plan_agent",
+        response_format=_CrawlPlanResponsePydantic,
     )
 
 

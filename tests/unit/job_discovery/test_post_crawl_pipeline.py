@@ -87,3 +87,12 @@ def test_complete_zero_listing_crawl_succeeds_without_candidates() -> None:
     assert result.status == "succeeded"
     assert result.candidates == []
     assert result.coverage is coverage
+
+
+def test_post_crawl_pipeline_preserves_sanitized_execution_error() -> None:
+    crawl_result = _crawl_result(complete=True)
+    crawl_result.error = "captcha"
+
+    result = run_post_crawl_pipeline(_task(), crawl_result)
+
+    assert result.execution_error == "captcha"
