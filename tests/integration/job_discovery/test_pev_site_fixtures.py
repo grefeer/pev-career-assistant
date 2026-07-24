@@ -171,3 +171,39 @@ def test_inovance_fixture_carries_jobs_hash_route_contract() -> None:
             f"inovance sample detail_url is not a job-level hash route: {detail_url}"
         )
         assert sample.get("title"), "inovance sample listing must carry a title"
+
+
+def test_xiaohongshu_fixture_carries_api_cursor_contract() -> None:
+    """The xiaohongshu contract is the input spec for ``XiaohongshuCrawlDriver.from_fixture``.
+
+    Task 5's driver reads ``page_url``, the API-cursor ``items_path`` /
+    ``total_count_path``, ``expected_listing_count`` and ``sample_listings``
+    (each carrying a real ``positionId`` with ``duty`` + ``qualification`` JD
+    body) from this contract. The probe captured a DOM terminal selector
+    (``ant_pagination_disabled``) rather than a JSON cursor path, so the
+    replay simulates cursor progression and terminates on ``next_cursor_null``.
+    """
+    fixture = load_fixture("xiaohongshu")
+    assert fixture.get("data_source") == "json_xhr"
+    assert fixture.get("items_path") == "$.data.list"
+    assert fixture.get("total_count_path") == "$.data.total"
+    total = fixture.get("total_count_value")
+    assert isinstance(total, int) and total > 0, (
+        "xiaohongshu fixture must declare the public $.data.total count"
+    )
+    expected = fixture.get("expected_listing_count")
+    assert isinstance(expected, int) and expected > 0
+    samples = fixture.get("sample_listings") or []
+    assert len(samples) == expected, (
+        "xiaohongshu sample_listings count must match expected_listing_count "
+        "for deterministic unit replay"
+    )
+    for sample in samples:
+        assert sample.get("positionId"), (
+            "xiaohongshu sample must carry a real positionId (the detail route key)"
+        )
+        assert sample.get("positionName"), "xiaohongshu sample must carry a title"
+        # Each listing's JD body comes from duty + qualification, never a blob split.
+        assert sample.get("duty") or sample.get("qualification"), (
+            "xiaohongshu sample must carry JD body fields (duty/qualification)"
+        )

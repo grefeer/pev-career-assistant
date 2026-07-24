@@ -17,6 +17,7 @@ from backend.app.db.models import JobDiscoveryStrategy
 from backend.app.services.job_discovery.adapters.moka import MOKA_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.feishu import FEISHU_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.inovance import INOVANCE_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.xiaohongshu import XHS_CRAWL_PLAN
 
 # Use the same engine pattern as tests
 from backend.app.config import Settings
@@ -130,6 +131,20 @@ def seed(db: Session) -> None:
             priority=40,
             adapter="backend.app.services.job_discovery.adapters.inovance.InovanceCrawlAdapter",
             plan_yaml=INOVANCE_CRAWL_PLAN,
+            degradation_threshold=3,
+            recovery_threshold=2,
+            enabled=False,
+        ),
+        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
+        # until three consecutive coverage-verified live smokes pass; enable
+        # only in a test environment by flipping this row manually.
+        JobDiscoveryStrategy(
+            url_pattern="job.xiaohongshu.com/*",
+            site_type="career_site",
+            description="小红书招聘 -> search XHR 跟随 cursor/total 翻页 -> /campus/position/{id} 完整抓取",
+            priority=40,
+            adapter="backend.app.services.job_discovery.adapters.xiaohongshu.XiaohongshuCrawlAdapter",
+            plan_yaml=XHS_CRAWL_PLAN,
             degradation_threshold=3,
             recovery_threshold=2,
             enabled=False,

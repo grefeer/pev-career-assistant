@@ -21,6 +21,10 @@ from backend.app.services.job_discovery.adapters.inovance import (
     INOVANCE_CRAWL_PLAN,
     InovanceCrawlDriver,
 )
+from backend.app.services.job_discovery.adapters.xiaohongshu import (
+    XHS_CRAWL_PLAN,
+    XiaohongshuCrawlDriver,
+)
 from backend.app.services.job_discovery.crawling.crawl_executor import CrawlExecutor
 from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
 from backend.app.services.job_discovery.schemas import DiscoveryTaskInput
@@ -35,6 +39,7 @@ FIXTURES = (
 _REGISTRY: dict[str, tuple[type, str]] = {
     "feishu": (FeishuCrawlDriver, FEISHU_CRAWL_PLAN),
     "inovance": (InovanceCrawlDriver, INOVANCE_CRAWL_PLAN),
+    "xiaohongshu": (XiaohongshuCrawlDriver, XHS_CRAWL_PLAN),
 }
 
 
