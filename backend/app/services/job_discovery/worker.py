@@ -16,6 +16,7 @@ import time
 from dataclasses import asdict
 from typing import Any, Callable
 
+import yaml
 from langchain_core.messages import HumanMessage
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -54,6 +55,15 @@ from backend.app.services.job_discovery.result_contract import (
     AgentResultParseError,
     enforce_result_invariants,
     parse_agent_result,
+)
+from backend.app.services.job_discovery.crawling.coverage import verify_coverage
+from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
+from backend.app.services.job_discovery.crawling.playwright_driver import (
+    PlaywrightCrawlDriver,
+)
+from backend.app.services.job_discovery.crawling.driver import CrawlDriver
+from backend.app.services.job_discovery.adapters.complete_crawl_base import (
+    CompleteCrawlAdapter,
 )
 from backend.app.services.job_discovery.tools import (
     build_candidate_idempotency_key,
@@ -342,6 +352,65 @@ def _derive_health_check_url(url_pattern: str) -> str:
     return clean
 
 
+def _snapshot_uses_runtime_navigation(plan_yaml: str) -> bool:
+    """Whether a legacy SnapshotPlan needs worker-only navigation dependencies."""
+    try:
+        raw = yaml.safe_load(plan_yaml)
+    except yaml.YAMLError:
+        return False
+    steps = raw.get("plan", raw) if isinstance(raw, dict) else raw
+    return isinstance(steps, list) and any(
+        isinstance(step, dict) and step.get("tool") == "run_web_navigation"
+        for step in steps
+    )
+
+
+def _declares_crawl_plan(plan_yaml: str) -> bool:
+    """Recognize PATH B before validating the planner-owned declaration."""
+    try:
+        raw = yaml.safe_load(plan_yaml)
+    except yaml.YAMLError:
+        return False
+    return isinstance(raw, dict) and raw.get("plan_type") == "crawl_plan"
+
+
+def _build_playwright_crawl_driver(settings: Settings) -> PlaywrightCrawlDriver:
+    """Create one real, task-scoped Playwright page and its cleanup hook."""
+    playwright: Any | None = None
+    browser: Any | None = None
+    try:
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(
+            headless=settings.job_discovery_browser_headless
+        )
+        page = browser.new_page()
+    except Exception as exc:
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
+        raise RuntimeError("playwright_crawl_initialization_failed") from exc
+
+    def _close() -> None:
+        try:
+            page.close()
+        finally:
+            try:
+                browser.close()
+            finally:
+                playwright.stop()
+
+    return PlaywrightCrawlDriver(page=page, close_callback=_close)
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -366,11 +435,14 @@ class JobDiscoveryWorker:
         self,
         db_factory: Callable[[], Session],
         settings: Settings,
+        crawl_driver_factory: Callable[[CrawlPlan, DiscoveryTaskInput], CrawlDriver]
+        | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.settings = settings
         self.worker_id = _build_worker_id()
         self._idle_cycles: int = 0
+        self._crawl_driver_factory = crawl_driver_factory
 
     def run_once(self) -> int:
         """Claim and process one discovery task.
@@ -418,18 +490,12 @@ class JobDiscoveryWorker:
             snapshot_context: dict | None = None
             executor_type: str = "supervisor"
 
-            # Pre-build LLM and subagent for strategy paths and supervisor
+            # Build the navigation dependencies only when a legacy snapshot
+            # declares that tool.  CrawlPlan execution is deterministic and
+            # must not require an LLM credential.
             _llm: Any = None
             _tool_dependencies: dict[str, Any] | None = None
             if self.settings.job_discovery_strategy_enabled:
-                _llm = _build_job_discovery_llm(self.settings)
-                _web_nav_subagent = create_web_navigation_subagent(self.settings)
-                _tool_dependencies = {
-                    "run_web_navigation": _make_run_web_navigation_wrapper(
-                        self.settings, _web_nav_subagent, _llm
-                    ),
-                }
-
                 router = StrategyRouter(db)
                 matched = router.match(task.source_url)
                 if matched is not None:
@@ -447,9 +513,20 @@ class JobDiscoveryWorker:
                         executor_type = "adapter"
                         try:
                             adapter_instance = _load_adapter(strategy_record.adapter)
-                            result = adapter_instance.execute(
-                                task_input, strategy_record, trajectory
-                            )
+                            if (
+                                isinstance(adapter_instance, CompleteCrawlAdapter)
+                                and not self.settings.job_discovery_pev_enabled
+                            ):
+                                snapshot_context = {
+                                    "source": "crawl_plan",
+                                    "block_reason": "pev_disabled",
+                                }
+                                executor_type = "supervisor"
+                                strategy_record = None
+                            else:
+                                result = adapter_instance.execute(
+                                    task_input, strategy_record, trajectory
+                                )
                         except Exception as adapter_exc:
                             trajectory.record_step(
                                 strategy_record.adapter, "failed",
@@ -467,27 +544,61 @@ class JobDiscoveryWorker:
                             strategy_record = None  # Clear so supervisor outcome isn't double-counted
                     else:
                         # ── Fast path: SnapshotExecutor ──
-                        executor_type = "snapshot"
-                        snap = SnapshotExecutor(
-                            strategy_record, task_input, trajectory,
-                            tool_dependencies=_tool_dependencies,
+                        crawl_plan_declared = _declares_crawl_plan(
+                            strategy_record.plan_yaml
                         )
-                        snap_result = snap.execute()
-                        if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
-                            snapshot_context = snap_result.snapshot_context
+
+                        if (
+                            crawl_plan_declared
+                            and not self.settings.job_discovery_pev_enabled
+                        ):
+                            snapshot_context = {
+                                "source": "crawl_plan",
+                                "block_reason": "pev_disabled",
+                            }
                             executor_type = "supervisor"
-                            # Increment error count BEFORE clearing strategy_record
-                            fail_idx = trajectory.failed_step_index
-                            if fail_idx is not None and trajectory.steps:
-                                failed_step = trajectory.steps[fail_idx]
-                                strat_store.increment_error_count(db, strategy_record.id, {
-                                    "tool": failed_step.get("tool", "snapshot"),
-                                    "reason": error_classifier.classify_error(failed_step.get("error", "")),
-                                    "message": str(failed_step.get("error", ""))[:500],
-                                })
                             strategy_record = None
                         else:
-                            result = snap_result
+                            executor_type = "crawl_plan" if crawl_plan_declared else "snapshot"
+                            if not crawl_plan_declared and _snapshot_uses_runtime_navigation(
+                                strategy_record.plan_yaml
+                            ):
+                                _llm = _build_job_discovery_llm(self.settings)
+                                _web_nav_subagent = create_web_navigation_subagent(self.settings)
+                                _tool_dependencies = {
+                                    "run_web_navigation": _make_run_web_navigation_wrapper(
+                                        self.settings, _web_nav_subagent, _llm
+                                    ),
+                                }
+                            crawl_driver_factory = (
+                                self._crawl_driver_factory
+                                or (lambda _plan, _task: _build_playwright_crawl_driver(self.settings))
+                                if crawl_plan_declared
+                                else None
+                            )
+                            snap = SnapshotExecutor(
+                                strategy_record,
+                                task_input,
+                                trajectory,
+                                tool_dependencies=_tool_dependencies,
+                                crawl_driver_factory=crawl_driver_factory,
+                            )
+                            snap_result = snap.execute()
+                            if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:
+                                snapshot_context = snap_result.snapshot_context
+                                executor_type = "supervisor"
+                                # Increment error count BEFORE clearing strategy_record
+                                fail_idx = trajectory.failed_step_index
+                                if fail_idx is not None and trajectory.steps:
+                                    failed_step = trajectory.steps[fail_idx]
+                                    strat_store.increment_error_count(db, strategy_record.id, {
+                                        "tool": failed_step.get("tool", "snapshot"),
+                                        "reason": error_classifier.classify_error(failed_step.get("error", "")),
+                                        "message": str(failed_step.get("error", ""))[:500],
+                                    })
+                                strategy_record = None
+                            else:
+                                result = snap_result
 
             # ── 4b. Supervisor Agent (backup path or primary if no match) ──
             agent_error: Exception | None = None
@@ -556,7 +667,15 @@ class JobDiscoveryWorker:
                 task_input=task_input,
                 settings=self.settings,
             )
-            result = enforce_result_invariants(result)
+            if result.coverage is None:
+                result = enforce_result_invariants(result)
+                coverage_decision = None
+            else:
+                coverage_decision = verify_coverage(result.coverage)
+                result.status = coverage_decision.status
+                result.block_reason = (
+                    None if coverage_decision.complete else coverage_decision.reason
+                )
             if agent_error is not None and not result.candidates and not result.evidence:
                 raise agent_error
 
@@ -569,6 +688,13 @@ class JobDiscoveryWorker:
                 "summary": result.summary,
                 "evidence_count": len(result.evidence),
                 "candidate_count": len(result.candidates),
+                "execution_path": (
+                    "crawl_plan" if result.coverage is not None else executor_type
+                ),
+                "coverage_verified": (
+                    coverage_decision.complete if coverage_decision is not None else False
+                ),
+                "coverage": asdict(result.coverage) if result.coverage is not None else None,
             }
 
             if result.status in ("succeeded", "partial_success"):

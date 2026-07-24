@@ -93,6 +93,12 @@ class Settings(BaseSettings):
     job_discovery_task_timeout_seconds: int = Field(default=600, ge=30, le=3600)
     job_discovery_browser_headless: bool = True
     job_discovery_ocr_enabled: bool = False
+    # Planner-Executor-Verifier (PEV) gray-migration switches.  All new
+    # execution remains opt-in until a site has a certified CrawlPlan.
+    job_discovery_pev_enabled: bool = False
+    job_discovery_planner_enabled: bool = False
+    job_discovery_legacy_path_c_enabled: bool = True
+    job_discovery_planner_max_inspection_pages: int = Field(default=3, ge=1, le=5)
 
     # Strategy Router settings
     job_discovery_strategy_enabled: bool = False

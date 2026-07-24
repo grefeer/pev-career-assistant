@@ -22,6 +22,15 @@ from backend.app.db.models import (
     JobSourceProvider,
     RawJobRecord,
 )
+from backend.app.services.job_discovery.schemas import (
+    CrawlCoverage,
+    DiscoveryRunResult,
+    PaginationType,
+)
+from backend.app.services.job_discovery.crawling.driver import ListingPage
+from backend.app.services.job_discovery.adapters.complete_crawl_base import (
+    CompleteCrawlAdapter,
+)
 from backend.app.services.job_discovery.worker import JobDiscoveryWorker
 
 
@@ -166,6 +175,47 @@ def _seed_strategy(db: Session, url_pattern: str, plan_yaml: str | None = None) 
     return s
 
 
+_CRAWL_PLAN_YAML = """
+plan_type: crawl_plan
+version: 1
+listing:
+  item_selector: .job
+  title_selector: .title
+pagination:
+  type: single_page
+detail:
+  body_selector: .detail
+completion: {}
+"""
+
+
+class _EmptyCrawlDriver:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def fetch_listing_page(self, *, plan, task, cursor):
+        return ListingPage(
+            page_key="only",
+            listings=[],
+            next_cursor=None,
+            terminal_evidence="empty_listing_terminal",
+        )
+
+    def fetch_detail(self, *, plan, listing, resource_key):
+        raise AssertionError("empty listing crawl must not fetch details")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _CompleteAdapterForGate(CompleteCrawlAdapter):
+    def build_driver(self, plan, task, trajectory):
+        return _EmptyCrawlDriver()
+
+    def validate(self, url: str) -> bool:
+        return True
+
+
 # ---------------------------------------------------------------------------
 # Structural tests — strategy routing code paths
 # ---------------------------------------------------------------------------
@@ -270,6 +320,7 @@ class TestWorkerStrategyStructural:
         mock_snap.execute.return_value = MagicMock(
             status="succeeded",
             block_reason=None,
+            coverage=None,
             evidence=[],
             candidates=[{"title": "Snapshot Engineer"}],
             summary="Snapshot executed",
@@ -400,7 +451,9 @@ class TestWorkerStrategyStructural:
         db: Session,
     ) -> None:
         """Trajectory save failure should not crash the task (best-effort)."""
-        _seed_strategy(db, "career.example.com/*")
+        # Keep this focused on the supervisor save path; SnapshotExecutor
+        # behavior is covered by the structural tests above.
+        _seed_strategy(db, "other.company.com/*")
 
         mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
         mock_agent = MagicMock()
@@ -422,6 +475,163 @@ class TestWorkerStrategyStructural:
             task = vs.get(JobDiscoveryTask, queued_task.id)
             assert task is not None
             assert task.status is JobDiscoveryTaskStatus.succeeded
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.SnapshotExecutor")
+    def test_complete_zero_listing_coverage_bypasses_legacy_invariant(
+        self,
+        mock_snapshot_executor: MagicMock,
+        mock_claim: MagicMock,
+        engine: Engine,
+        settings: Any,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+        db: Session,
+    ) -> None:
+        """A verified empty CrawlPlan is complete, not a legacy parse failure."""
+        settings.job_discovery_pev_enabled = True
+        _seed_strategy(db, "career.example.com/*", _CRAWL_PLAN_YAML)
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        coverage = CrawlCoverage(
+            pagination_type=PaginationType.SINGLE_PAGE,
+            visited_page_count=1,
+            completion_evidence=["empty_listing_terminal"],
+        )
+        mock_snapshot_executor.return_value.execute.return_value = DiscoveryRunResult(
+            status="failed", coverage=coverage, summary="empty verified crawl"
+        )
+
+        assert worker.run_once() == 1
+
+        with Session(engine) as vs:
+            task = vs.get(JobDiscoveryTask, queued_task.id)
+            assert task is not None
+            assert task.status is JobDiscoveryTaskStatus.succeeded
+            assert task.result_summary_json["coverage_verified"] is True
+            assert task.result_summary_json["coverage"]["raw_listing_count"] == 0
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    @patch("backend.app.services.job_discovery.worker.SnapshotExecutor")
+    def test_disabled_pev_crawl_plan_uses_fixed_legacy_fallback(
+        self,
+        mock_snapshot_executor: MagicMock,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        settings: Any,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+        db: Session,
+    ) -> None:
+        _seed_strategy(db, "career.example.com/*", _CRAWL_PLAN_YAML)
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        mock_build_agent.return_value.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "candidates": [{"title": "Fallback Engineer"}],
+                "summary": "legacy fallback",
+            }
+        }
+
+        assert worker.run_once() == 1
+
+        mock_snapshot_executor.assert_not_called()
+        assert (
+            mock_build_agent.call_args.kwargs["snapshot_context"]["block_reason"]
+            == "pev_disabled"
+        )
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker._build_playwright_crawl_driver")
+    def test_enabled_pev_uses_task_scoped_driver_and_releases_it(
+        self,
+        mock_build_driver: MagicMock,
+        mock_claim: MagicMock,
+        engine: Engine,
+        settings: Any,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+        db: Session,
+    ) -> None:
+        settings.job_discovery_pev_enabled = True
+        _seed_strategy(db, "career.example.com/*", _CRAWL_PLAN_YAML)
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        driver = _EmptyCrawlDriver()
+        mock_build_driver.return_value = driver
+
+        assert worker.run_once() == 1
+
+        mock_build_driver.assert_called_once_with(settings)
+        assert driver.closed is True
+        with Session(engine) as vs:
+            task = vs.get(JobDiscoveryTask, queued_task.id)
+            assert task is not None
+            assert task.status is JobDiscoveryTaskStatus.succeeded
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    def test_malformed_declared_crawl_plan_routes_to_supervisor_repair(
+        self,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        settings: Any,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+        db: Session,
+    ) -> None:
+        settings.job_discovery_pev_enabled = True
+        _seed_strategy(
+            db,
+            "career.example.com/*",
+            _CRAWL_PLAN_YAML.replace("type: single_page", "type: invalid"),
+        )
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        mock_build_agent.return_value.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "candidates": [{"title": "Recovered Engineer"}],
+            }
+        }
+
+        assert worker.run_once() == 1
+
+        context = mock_build_agent.call_args.kwargs["snapshot_context"]
+        assert context["failed_step"]["error_type"] == "structure_error"
+        assert context["checkpoint"]["plan_version"] == 1
+
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    @patch("backend.app.services.job_discovery.worker._load_adapter")
+    def test_disabled_pev_skips_complete_crawl_adapter(
+        self,
+        mock_load_adapter: MagicMock,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        settings: Any,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+        db: Session,
+    ) -> None:
+        strategy = _seed_strategy(db, "career.example.com/*", _CRAWL_PLAN_YAML)
+        strategy.adapter = "test.CompleteCrawlAdapter"
+        db.commit()
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        adapter = _CompleteAdapterForGate()
+        mock_load_adapter.return_value = adapter
+        mock_build_agent.return_value.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "candidates": [{"title": "Fallback Engineer"}],
+            }
+        }
+
+        assert worker.run_once() == 1
+
+        mock_load_adapter.assert_called_once()
+        assert (
+            mock_build_agent.call_args.kwargs["snapshot_context"]["block_reason"]
+            == "pev_disabled"
+        )
 
 
 # ---------------------------------------------------------------------------

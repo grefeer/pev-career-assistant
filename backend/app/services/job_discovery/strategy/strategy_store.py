@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.models import JobDiscoveryStrategy
 from backend.app.services.job_discovery.strategy.error_classifier import classify_error
+from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
 
 
 _ALLOWED_TEMPLATE_ROOTS = {"task", "prev"}
@@ -39,6 +40,16 @@ def validate_plan_yaml(plan_yaml: str) -> list[str]:
         plan = yaml.safe_load(plan_yaml)
     except yaml.YAMLError as exc:
         return [f"Invalid YAML: {exc}"]
+    if isinstance(plan, dict) and "plan_type" in plan:
+        plan_type = plan["plan_type"]
+        if plan_type == "crawl_plan":
+            try:
+                CrawlPlan.from_yaml(plan_yaml)
+            except (KeyError, TypeError, ValueError) as exc:
+                return [str(exc)]
+            return []
+        if plan_type != "snapshot_plan":
+            return ["unsupported plan_type"]
     steps = plan.get("plan", plan) if isinstance(plan, dict) else plan
     if not isinstance(steps, list):
         return ["plan_yaml must contain a list of steps"]

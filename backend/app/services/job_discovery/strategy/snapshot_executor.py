@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import yaml
@@ -19,6 +20,11 @@ from backend.app.services.job_discovery.schemas import (
     PageEvidence,
     StrategyRecord,
 )
+from backend.app.services.job_discovery.crawling.checkpoint import CrawlCheckpoint
+from backend.app.services.job_discovery.crawling.crawl_executor import CrawlExecutor
+from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
+from backend.app.services.job_discovery.crawling.driver import CrawlDriver
+from backend.app.services.job_discovery.post_crawl_pipeline import run_post_crawl_pipeline
 from backend.app.services.job_discovery.strategy.trajectory_buffer import TrajectoryBuffer
 
 
@@ -28,6 +34,10 @@ class SnapshotExecutionResult(DiscoveryRunResult):
 
     needs_supervisor_fallback: bool = False
     snapshot_context: dict[str, Any] | None = None
+
+
+class CrawlPlanStructureError(RuntimeError):
+    """A plan cannot be safely executed without Planner repair."""
 
 
 class SnapshotExecutor:
@@ -49,12 +59,17 @@ class SnapshotExecutor:
         task: DiscoveryTaskInput,
         trajectory: TrajectoryBuffer,
         tool_dependencies: dict[str, Any] | None = None,
+        crawl_driver_factory: Callable[[CrawlPlan, DiscoveryTaskInput], CrawlDriver]
+        | None = None,
+        checkpoint: CrawlCheckpoint | None = None,
     ) -> None:
         self.strategy = strategy
         self.task = task
         self.trajectory = trajectory
         self._context: dict[str, Any] = {"task": task, "prev": None}
         self._runtime_tools: dict[str, Any] = {}
+        self._crawl_driver_factory = crawl_driver_factory
+        self._checkpoint = checkpoint
         if tool_dependencies:
             self._inject_runtime_tools(tool_dependencies)
 
@@ -70,6 +85,14 @@ class SnapshotExecutor:
 
     def execute(self) -> DiscoveryRunResult:
         """Execute the plan. Returns SnapshotExecutionResult on any step failure."""
+        if self._declares_crawl_plan():
+            try:
+                return self._execute_crawl_plan(self._crawl_plan())
+            except (KeyError, TypeError, ValueError) as exc:
+                return self._crawl_structure_failure(
+                    exc,
+                    self._checkpoint_for_declared_crawl_plan(),
+                )
         steps = self._parse_plan()
         completed: list[dict[str, Any]] = []
 
@@ -105,6 +128,79 @@ class SnapshotExecutor:
         if isinstance(parsed, list):
             return parsed
         raise ValueError(f"Invalid plan_yaml format for strategy {self.strategy.id}")
+
+    def _declares_crawl_plan(self) -> bool:
+        try:
+            parsed = yaml.safe_load(self.strategy.plan_yaml)
+        except yaml.YAMLError:
+            return False
+        return isinstance(parsed, dict) and parsed.get("plan_type") == "crawl_plan"
+
+    def _crawl_plan(self) -> CrawlPlan:
+        return CrawlPlan.from_yaml(self.strategy.plan_yaml)
+
+    def _checkpoint_for_declared_crawl_plan(self) -> CrawlCheckpoint:
+        try:
+            parsed = yaml.safe_load(self.strategy.plan_yaml)
+        except yaml.YAMLError:
+            parsed = {}
+        version = parsed.get("version", 1) if isinstance(parsed, dict) else 1
+        try:
+            plan_version = int(version)
+        except (TypeError, ValueError):
+            plan_version = 1
+        return CrawlCheckpoint(plan_version=plan_version, source_url=self.task.source_url)
+
+    def _execute_crawl_plan(self, plan: CrawlPlan) -> DiscoveryRunResult:
+        checkpoint = self._checkpoint or CrawlCheckpoint(
+            plan_version=plan.version,
+            source_url=self.task.source_url,
+        )
+        driver: CrawlDriver | None = None
+        try:
+            if self._crawl_driver_factory is None:
+                raise CrawlPlanStructureError("crawl driver factory is unavailable")
+            driver = self._crawl_driver_factory(plan, self.task)
+            crawl_result = CrawlExecutor(driver, self.trajectory).execute(
+                plan=plan,
+                task=self.task,
+                checkpoint=checkpoint,
+            )
+            if crawl_result.error and _is_structural_crawl_error(crawl_result.error):
+                raise CrawlPlanStructureError(crawl_result.error)
+            return run_post_crawl_pipeline(self.task, crawl_result)
+        except Exception as exc:
+            return self._crawl_structure_failure(exc, checkpoint)
+        finally:
+            close = getattr(driver, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    self.trajectory.record_step("crawl_cleanup", "failed", {})
+
+    def _crawl_structure_failure(
+        self,
+        exc: Exception,
+        checkpoint: CrawlCheckpoint,
+    ) -> SnapshotExecutionResult:
+        self.trajectory.record_step(
+            "crawl_plan",
+            "failed",
+            {"plan_version": checkpoint.plan_version},
+            error=exc,
+        )
+        context = self.trajectory.to_snapshot_context()
+        failed_step = context.get("failed_step")
+        if isinstance(failed_step, dict):
+            failed_step["error_type"] = "structure_error"
+        context["checkpoint"] = checkpoint.to_dict()
+        return SnapshotExecutionResult(
+            status="failed",
+            summary=f"Crawl plan structure failed: {type(exc).__name__}",
+            needs_supervisor_fallback=True,
+            snapshot_context=context,
+        )
 
     def _resolve_template(
         self,
@@ -272,6 +368,22 @@ class SnapshotExecutor:
                 f"found {len(candidates)} candidate(s)"
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# Crawl-plan structural failure classification
+# ---------------------------------------------------------------------------
+
+
+def _is_structural_crawl_error(error: str) -> bool:
+    """Classify deterministic declaration failures that require plan repair."""
+    error_type = error.partition(":")[0]
+    return error_type in {
+        "SelectorNotFoundError",
+        "ApiPayloadChangedError",
+        "UnsafePlanExecutionError",
+        "UnsupportedPaginationError",
+    }
 
 
 # ---------------------------------------------------------------------------
