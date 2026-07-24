@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import Any, Literal
 
 
 @dataclass
@@ -79,11 +80,19 @@ class DiscoveryRunResult:
     evidence: list[PageEvidence] = field(default_factory=list)
     candidates: list[NormalizedJobCandidate] = field(default_factory=list)
     summary: str = ""
+    # Full-crawl coverage proof (Planner-Executor-Verifier migration).
+    # ``None`` = legacy PATH C path that carries no coverage; the global
+    # ``enforce_result_invariants`` keeps its pre-migration
+    # "succeeded requires candidates" behavior for that case (gray migration).
+    # Only the post-crawl pipeline (run_post_crawl_pipeline) sets a real
+    # coverage and relies on ``crawling.coverage.verify_coverage``.
+    coverage: "CrawlCoverage | None" = None
 
 
 @dataclass
 class StrategyRecord:
     """In-memory representation of a matched strategy (decoupled from ORM)."""
+
     id: str
     url_pattern: str
     site_type: str
@@ -108,3 +117,108 @@ class StrategyRecord:
             status=orm_obj.status,
             success_count=orm_obj.success_count,
         )
+
+
+# ---------------------------------------------------------------------------
+# Full-crawl domain contracts (Planner-Executor-Verifier gray migration)
+#
+# These types are additive. Existing PATH C / SnapshotExecutor production
+# paths do not set ``coverage`` and keep their pre-migration behavior. The
+# deterministic CrawlExecutor, CoverageVerifier and post-crawl pipeline
+# consume these. See:
+# docs/superpowers/specs/2026-07-22-job-discovery-complete-crawl-refactor.md
+# ---------------------------------------------------------------------------
+
+RecruitmentType = Literal["campus", "internship", "social"]
+DecisionStatus = Literal["PASS", "FAIL", "REVIEW"]
+
+
+@dataclass
+class RecruitmentScope:
+    """Target recruitment scope for a single discovery task.
+
+    One task targets exactly one ``recruitment_type``. ``social`` has no
+    cohort; ``campus``/``internship`` require a ``graduation_year``.
+    """
+
+    recruitment_type: RecruitmentType = "campus"
+    graduation_year: int | None = 2027
+
+    def __post_init__(self) -> None:
+        if self.recruitment_type == "social":
+            self.graduation_year = None
+            return
+        if self.graduation_year is None:
+            raise ValueError(
+                "graduation_year is required for campus and internship"
+            )
+
+
+class PaginationType(str, Enum):
+    PAGE_NUMBER = "page_number"
+    NEXT_BUTTON = "next_button"
+    LOAD_MORE = "load_more"
+    INFINITE_SCROLL = "infinite_scroll"
+    API_CURSOR = "api_cursor"
+    API_OFFSET = "api_offset"
+    SINGLE_PAGE = "single_page"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class CrawlCoverage:
+    """Deterministic proof of how completely a site was crawled.
+
+    ``coverage_complete`` is advisory; the authoritative verdict comes from
+    ``crawling.coverage.verify_coverage``. ``expected_*`` may be ``None`` when
+    the site offers no upfront total -- API cursor / infinite scroll rely on a
+    positive terminal signal instead.
+    """
+
+    pagination_type: PaginationType
+    expected_page_count: int | None = None
+    visited_page_count: int = 0
+    visited_page_keys: list[str] = field(default_factory=list)
+    expected_listing_count: int | None = None
+    raw_listing_count: int = 0
+    unique_listing_count: int = 0
+    total_detail_count: int = 0
+    fetched_detail_count: int = 0
+    failed_detail_count: int = 0
+    coverage_complete: bool = False
+    completion_evidence: list[str] = field(default_factory=list)
+    incomplete_reason: str | None = None
+    resumable: bool = False
+    resume_cursor: dict | None = None
+
+
+@dataclass
+class RawJobListing:
+    """A job row extracted from a listing page, before detail fetch."""
+
+    source_url: str
+    detail_url: str | None
+    company: str | None
+    title: str
+    locations: list[str] = field(default_factory=list)
+    job_code: str | None = None
+    recruitment_type_hint: str | None = None
+    graduation_year_hints: list[int] = field(default_factory=list)
+    evidence_refs: list[str] = field(default_factory=list)
+    source_record_key: str | None = None
+
+
+@dataclass
+class RawJobDetail:
+    """The fetched full-text JD for one unique detail resource."""
+
+    detail_url: str
+    full_text: str
+    title: str | None = None
+    company: str | None = None
+    locations: list[str] = field(default_factory=list)
+    job_code: str | None = None
+    structured_fields: dict = field(default_factory=dict)
+    channel_text: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    detail_resource_key: str | None = None
