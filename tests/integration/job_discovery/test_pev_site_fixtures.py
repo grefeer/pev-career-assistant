@@ -107,3 +107,39 @@ def test_moka_fixture_carries_job_hash_route_contract() -> None:
             f"moka sample detail_url is not a job-level hash route: {detail_url}"
         )
         assert sample.get("title"), "moka sample listing must carry a title"
+
+
+def test_feishu_fixture_carries_position_detail_contract() -> None:
+    """The feishu contract is the input spec for ``FeishuCrawlDriver.from_fixture``.
+
+    Task 4.3's driver reads ``page_url``, the page-number ``items_path`` /
+    ``total_count_path``, ``expected_listing_count`` and ``sample_listings`` from
+    this contract. Sample ``id`` fields are PII-redacted, so the job-level
+    ``/campus/position/{position_id}/detail`` routes are sourced from the
+    fixture's public ``detail_url_examples`` (real numeric position ids); the
+    gate pins that pairing so the driver has a stable, fixture-proven input.
+    """
+    import re
+
+    fixture = load_fixture("feishu")
+    assert fixture.get("data_source") == "json_xhr"
+    assert fixture.get("items_path") == "$.data.job_post_list"
+    assert fixture.get("total_count_path") == "$.data.count"
+    expected = fixture.get("expected_listing_count")
+    assert isinstance(expected, int) and expected > 0
+    samples = fixture.get("sample_listings") or []
+    assert len(samples) == expected, (
+        "feishu sample_listings count must match expected_listing_count for "
+        "deterministic unit replay"
+    )
+    detail_urls = fixture.get("detail_url_examples") or []
+    assert len(detail_urls) >= len(samples), (
+        "feishu detail_url_examples must cover every sample (sample ids are "
+        "PII-redacted; real position ids come from detail_url_examples)"
+    )
+    for detail_url in detail_urls[: len(samples)]:
+        assert re.search(r"/campus/position/\d+/detail", detail_url), (
+            f"feishu detail_url_example is not a position detail route: {detail_url}"
+        )
+    for sample in samples:
+        assert sample.get("title"), "feishu sample listing must carry a title"
