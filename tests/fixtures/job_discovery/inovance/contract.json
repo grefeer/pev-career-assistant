@@ -1,0 +1,46 @@
+{
+  "blocked_markers": [],
+  "data_source": "dom_rendered",
+  "detail_url_examples": [
+    "https://recruit.inovance.com/#/jobs/019f4499-b061-7d36-b09d-2612100a787c",
+    "https://recruit.inovance.com/#/jobs/019ef37e-b00d-792a-9774-cdd2aaa39299",
+    "https://recruit.inovance.com/#/jobs/019f92f8-e8d4-7e51-958e-18c0a3401e41"
+  ],
+  "expected_listing_count": 3,
+  "has_more_path": null,
+  "has_more_value": null,
+  "item_field_names": [
+    "detail_url",
+    "title"
+  ],
+  "items_path": null,
+  "next_cursor_path": null,
+  "next_cursor_value": null,
+  "obfuscated_endpoints": [],
+  "obfuscated_xhr": false,
+  "observed_total": 80,
+  "page_url": "https://recruit.inovance.com/#/jobs",
+  "response_content_type": null,
+  "response_url_pattern": null,
+  "sample_listings": [
+    {
+      "detail_url": "https://recruit.inovance.com/#/jobs/019f4499-b061-7d36-b09d-2612100a787c",
+      "title": "【27校招 - 职能】校园招聘大使校园招聘集团业务-职能全国本科2026-07-23查看详情"
+    },
+    {
+      "detail_url": "https://recruit.inovance.com/#/jobs/019ef37e-b00d-792a-9774-cdd2aaa39299",
+      "title": "高级嵌入式测试工程师社会招聘东莞市本科5-10年2026-07-24查看详情"
+    },
+    {
+      "detail_url": "https://recruit.inovance.com/#/jobs/019f92f8-e8d4-7e51-958e-18c0a3401e41",
+      "title": "linux网关开发工程师社会招聘东莞市本科5-10年2026-07-24查看详情"
+    }
+  ],
+  "single_page_proof": "single_page_inovance_hash_jobs",
+  "site": "inovance",
+  "terminal_evidence": "single_page_inovance_hash_jobs",
+  "terminal_selector": null,
+  "top_level_keys": [],
+  "total_count_path": null,
+  "total_count_value": null
+}

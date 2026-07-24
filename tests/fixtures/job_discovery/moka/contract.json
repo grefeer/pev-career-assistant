@@ -1,0 +1,50 @@
+{
+  "blocked_markers": [],
+  "data_source": "dom_rendered",
+  "detail_url_examples": [
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/a11c6084-a843-4327-9dbe-cb6febab1d99",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/0e7e90d7-5c79-4d87-aa76-7021b459cbdc",
+    "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/e449e593-7c56-4b96-82d6-0f13db10def2"
+  ],
+  "expected_listing_count": 3,
+  "has_more_path": null,
+  "has_more_value": null,
+  "item_field_names": [
+    "detail_url",
+    "title"
+  ],
+  "items_path": null,
+  "next_cursor_path": null,
+  "next_cursor_value": null,
+  "obfuscated_endpoints": [
+    "https://app.mokahr.com/api/outer/ats-apply/website/group-by-job",
+    "https://app.mokahr.com/api/outer/ats-apply/website/jobs/recent",
+    "https://app.mokahr.com/api/outer/ats-apply/website/jobs/v2"
+  ],
+  "obfuscated_xhr": true,
+  "observed_total": 20,
+  "page_url": "https://app.mokahr.com/campus-recruitment/deeproute/145894#/jobs/",
+  "response_content_type": null,
+  "response_url_pattern": null,
+  "sample_listings": [
+    {
+      "detail_url": "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/a11c6084-a843-4327-9dbe-cb6febab1d99",
+      "title": "【2027秋招】产品经理发布于 2026-07-06上海市 北京市 广东·深圳市上海市 北京市 广东·深圳市"
+    },
+    {
+      "detail_url": "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/0e7e90d7-5c79-4d87-aa76-7021b459cbdc",
+      "title": "【2027秋招】项目经理发布于 2026-07-06上海市 北京市 广东·深圳市上海市 北京市 广东·深圳市"
+    },
+    {
+      "detail_url": "https://app.mokahr.com/campus-recruitment/deeproute/145894#/job/e449e593-7c56-4b96-82d6-0f13db10def2",
+      "title": "【2027秋招】数据挖掘工程师发布于 2026-07-06上海市 广东·深圳市上海市 广东·深圳市"
+    }
+  ],
+  "single_page_proof": "single_page_mokahr_hash_jobs",
+  "site": "moka",
+  "terminal_evidence": "single_page_mokahr_hash_jobs",
+  "terminal_selector": null,
+  "top_level_keys": [],
+  "total_count_path": null,
+  "total_count_value": null
+}

@@ -1,0 +1,783 @@
+{
+  "blocked_markers": [],
+  "data_source": "json_xhr",
+  "detail_url_examples": [
+    "https://xiaopeng.jobs.feishu.cn/campus/position/7666022635733567798/detail",
+    "https://xiaopeng.jobs.feishu.cn/campus/position/7666022628973594922/detail",
+    "https://xiaopeng.jobs.feishu.cn/campus/position/7666022628973201706/detail"
+  ],
+  "expected_listing_count": 3,
+  "has_more_path": null,
+  "has_more_value": null,
+  "item_field_names": [
+    "id",
+    "title",
+    "sub_title",
+    "description",
+    "requirement",
+    "job_category",
+    "city_info",
+    "recruit_type",
+    "publish_time",
+    "job_hot_flag",
+    "job_subject",
+    "code",
+    "department_id",
+    "job_function",
+    "job_process_id",
+    "recommend_id",
+    "city_list",
+    "job_post_info",
+    "storefront_mode",
+    "storefront_list",
+    "process_type"
+  ],
+  "items_path": "$.data.job_post_list",
+  "next_cursor_path": null,
+  "next_cursor_value": null,
+  "obfuscated_endpoints": [],
+  "obfuscated_xhr": false,
+  "observed_total": 10,
+  "page_url": "https://xiaopeng.jobs.feishu.cn/campus/position/list",
+  "response_content_type": "application/json",
+  "response_url_pattern": "https://xiaopeng.jobs.feishu.cn/api/v1/search/job/posts?keyword=&limit=10&offset=0&job_category_id_list=&tag_id_list=&location_code_list=&subject_id_list=&recruitment_id_list=&portal_type=6&job_function_id_list=&storefront_id_list=&portal_entrance=1&_signature=<redacted>",
+  "sample_listings": [
+    {
+      "city_info": null,
+      "city_list": [
+        {
+          "code": "CT_128",
+          "en_name": "Shenzhen",
+          "i18n_name": "深圳",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "深圳",
+          "node_status": null,
+          "py_name": null
+        },
+        {
+          "code": "CT_45",
+          "en_name": "Guangzhou",
+          "i18n_name": "广州",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "广州",
+          "node_status": null,
+          "py_name": null
+        }
+      ],
+      "code": null,
+      "department_id": null,
+      "description": "岗位职责\n1、参与机器人数据采集链路及数据平台的产品规划与建设，覆盖采集任务下发、设备接入、数据上传、处理、管理、查询和展示等环节；\n2、深入算法、数据采集和数据运营场景，了解用户工作流程，收集并分析需求，完成产品方案、需求文档、流程设计和产品原型；\n3、参与多模态数据的产品设计，支持数据接入、组织、检索和使用；\n4、参与元数据、标签、数据质量、数据集、数据版本和数据血缘等能力建设，提升数据的可管理性、可检索性和可追溯性；\n5、参与任务管理、状态监控、异常处理、质量检查和数据看板等产品建设，持续提升数据生产效率和用户体验；\n6、协同算法、研发、测试和数据运营团队，推进需求评审、开发跟进、测试验收、上线发布和效果复盘，推动问题闭环。\n7、关注具身智能和 AI Agent 发展，探索自然语言数据查询、智能分析、异常诊断和工作流编排等产品应用。",
+      "id": "<redacted_pii>8",
+      "job_category": {
+        "children": null,
+        "depth": 3,
+        "en_name": "Product manager",
+        "i18n_name": "产品经理",
+        "id": "679<redacted_phone>53991",
+        "name": "产品经理",
+        "parent": {
+          "children": null,
+          "depth": 2,
+          "en_name": "Product / Planning / Project management",
+          "i18n_name": "产品 / 策划 / 项目",
+          "id": "679<redacted_phone>09933",
+          "name": "产品 / 策划 / 项目",
+          "parent": {
+            "children": null,
+            "depth": 1,
+            "en_name": "Internet / Electronics / Games",
+            "i18n_name": "互联网 / 电子 / 网游",
+            "id": "679<redacted_phone>24616",
+            "name": "互联网 / 电子 / 网游",
+            "parent": null
+          }
+        }
+      },
+      "job_function": null,
+      "job_hot_flag": null,
+      "job_post_info": {
+        "HighlightList": null,
+        "JobChannelPublishList": null,
+        "address": "深圳",
+        "address_id": null,
+        "address_list": [
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_128",
+              "en_name": "Shenzhen",
+              "i18n_name": "深圳",
+              "name": "深圳",
+              "py_name": "shenzhen"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "深圳",
+            "id": "7307272<redacted_phone>1",
+            "name": "深圳",
+            "state": {
+              "en_name": "Guangdong",
+              "i18n_name": "广东",
+              "name": "广东",
+              "state_code": "ST_21"
+            }
+          },
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_45",
+              "en_name": "Guangzhou",
+              "i18n_name": "广州",
+              "name": "广州",
+              "py_name": "guangzhou"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "广州",
+            "id": "<redacted_pii>2",
+            "name": "广州",
+            "state": {
+              "en_name": "Guangdong",
+              "i18n_name": "广东",
+              "name": "广东",
+              "state_code": "ST_21"
+            }
+          }
+        ],
+        "biz_create_time": null,
+        "biz_modify_time": null,
+        "city": null,
+        "city_list": null,
+        "code": null,
+        "correlation_job_list": null,
+        "crator_id": null,
+        "currency": null,
+        "department": null,
+        "department_id": null,
+        "description": null,
+        "education": null,
+        "experience": null,
+        "expiry_time": null,
+        "head_count": null,
+        "id": null,
+        "job_active_status": null,
+        "job_category": null,
+        "job_function": null,
+        "job_hot_flag": null,
+        "job_id": null,
+        "job_in_charge_user_id": null,
+        "job_level_id_list": null,
+        "job_post_object_value_map": {},
+        "job_post_process_time_list": null,
+        "job_process": null,
+        "job_process_id": null,
+        "job_process_time": null,
+        "job_process_type": null,
+        "job_storefront_mode": null,
+        "job_type": null,
+        "max_level": null,
+        "max_salary": null,
+        "min_level": null,
+        "min_salary": null,
+        "never_expiry": null,
+        "progress": null,
+        "recruitment_type": {
+          "active_status": 1,
+          "children": null,
+          "depth": 2,
+          "en_name": "Regular",
+          "i18n_name": "正式",
+          "id": "201",
+          "name": "正式",
+          "parent": {
+            "active_status": 1,
+            "children": null,
+            "depth": 1,
+            "en_name": "Campus",
+            "i18n_name": "校招",
+            "id": "2",
+            "name": "校招",
+            "parent": null,
+            "selectability": 1
+          },
+          "selectability": 1
+        },
+        "required_degree": null,
+        "requirement": null,
+        "schema": null,
+        "sequence": null,
+        "storefront_list": null,
+        "sub_title": null,
+        "subject": null,
+        "tag_list": null,
+        "target_major_list": null,
+        "title": null
+      },
+      "job_process_id": "75<redacted_phone>457703",
+      "job_subject": null,
+      "process_type": 2,
+      "publish_time": 1784884985309,
+      "recommend_id": null,
+      "recruit_type": {
+        "active_status": 1,
+        "children": null,
+        "depth": 2,
+        "en_name": "Regular",
+        "i18n_name": "正式",
+        "id": "201",
+        "name": "正式",
+        "parent": {
+          "active_status": 1,
+          "children": null,
+          "depth": 1,
+          "en_name": "Campus",
+          "i18n_name": "校招",
+          "id": "2",
+          "name": "校招",
+          "parent": null,
+          "selectability": 1
+        },
+        "selectability": 1
+      },
+      "requirement": "任职要求\n1、应届本科及以上学历，计算机、人工智能、机器人、自动化、数据科学、信息管理等相关专业优先；\n2、对具身智能、机器人和人工智能领域有浓厚兴趣，愿意深入理解数据从采集、处理到模型使用的完整流程；\n3、具备良好的逻辑分析、需求理解和产品表达能力，能够清晰梳理业务流程和用户问题；\n4、具备良好的沟通协作能力和责任心，能够与算法、研发、测试及运营团队共同推进项目；\n5、具备基本的数据分析意识，能够通过数据发现问题、验证产品效果；\n6、学习能力强，具备主动思考和问题闭环意识，愿意在复杂业务场景中持续学习。",
+      "storefront_list": null,
+      "storefront_mode": 1,
+      "sub_title": null,
+      "title": "【27届校招】具身数据产品"
+    },
+    {
+      "city_info": null,
+      "city_list": [
+        {
+          "code": "CT_128",
+          "en_name": "Shenzhen",
+          "i18n_name": "深圳",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "深圳",
+          "node_status": null,
+          "py_name": null
+        },
+        {
+          "code": "CT_125",
+          "en_name": "Shanghai",
+          "i18n_name": "上海",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "上海",
+          "node_status": null,
+          "py_name": null
+        },
+        {
+          "code": "CT_45",
+          "en_name": "Guangzhou",
+          "i18n_name": "广州",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "广州",
+          "node_status": null,
+          "py_name": null
+        }
+      ],
+      "code": null,
+      "department_id": null,
+      "description": "岗位职责（一项即可）\n1、数据 Pipeline 构建：负责具身智能多模态人类数据（如遥操作数据、第一人称视角视频、动作捕捉等）的自动化质检、清洗与标注策略设计；结合大语言模型（LLM）、多模态大模型（VLM）及规则引擎，构建高吞吐、可扩展的自动化数据处理 Pipeline。\n2、SLAM 与三维重建：负责基于视觉/多传感器的 SLAM 重建与三维场景理解算法研发，为具身智能模型提供高质量的空间几何、位姿估计与环境上下文数据支撑（如 NeRF / 3DGS 等相关技术的应用与优化）。\n3、模型工程化与优化：负责核心数据算法模块的工程化部署与性能优化，包括模型压缩、推理加速及分布式计算架构设计，保障数据处理链路的高效、稳定与低成本运行。",
+      "id": "<redacted_pii>2",
+      "job_category": {
+        "children": null,
+        "depth": 3,
+        "en_name": "Algorithm",
+        "i18n_name": "算法",
+        "id": "679<redacted_phone>08231",
+        "name": "算法",
+        "parent": {
+          "children": null,
+          "depth": 2,
+          "en_name": "R&D",
+          "i18n_name": "研发",
+          "id": "679<redacted_phone>26317",
+          "name": "研发",
+          "parent": {
+            "children": null,
+            "depth": 1,
+            "en_name": "Internet / Electronics / Games",
+            "i18n_name": "互联网 / 电子 / 网游",
+            "id": "679<redacted_phone>24616",
+            "name": "互联网 / 电子 / 网游",
+            "parent": null
+          }
+        }
+      },
+      "job_function": null,
+      "job_hot_flag": null,
+      "job_post_info": {
+        "HighlightList": null,
+        "JobChannelPublishList": null,
+        "address": "深圳",
+        "address_id": null,
+        "address_list": [
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_128",
+              "en_name": "Shenzhen",
+              "i18n_name": "深圳",
+              "name": "深圳",
+              "py_name": "shenzhen"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "深圳",
+            "id": "7307272<redacted_phone>1",
+            "name": "深圳",
+            "state": {
+              "en_name": "Guangdong",
+              "i18n_name": "广东",
+              "name": "广东",
+              "state_code": "ST_21"
+            }
+          },
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_125",
+              "en_name": "Shanghai",
+              "i18n_name": "上海",
+              "name": "上海",
+              "py_name": "shanghai"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "上海",
+            "id": "<redacted_pii>6",
+            "name": "上海",
+            "state": {
+              "en_name": "Shanghai",
+              "i18n_name": "上海",
+              "name": "上海",
+              "state_code": "ST_47"
+            }
+          },
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_45",
+              "en_name": "Guangzhou",
+              "i18n_name": "广州",
+              "name": "广州",
+              "py_name": "guangzhou"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "广州",
+            "id": "<redacted_pii>2",
+            "name": "广州",
+            "state": {
+              "en_name": "Guangdong",
+              "i18n_name": "广东",
+              "name": "广东",
+              "state_code": "ST_21"
+            }
+          }
+        ],
+        "biz_create_time": null,
+        "biz_modify_time": null,
+        "city": null,
+        "city_list": null,
+        "code": null,
+        "correlation_job_list": null,
+        "crator_id": null,
+        "currency": null,
+        "department": null,
+        "department_id": null,
+        "description": null,
+        "education": null,
+        "experience": null,
+        "expiry_time": null,
+        "head_count": null,
+        "id": null,
+        "job_active_status": null,
+        "job_category": null,
+        "job_function": null,
+        "job_hot_flag": null,
+        "job_id": null,
+        "job_in_charge_user_id": null,
+        "job_level_id_list": null,
+        "job_post_object_value_map": {},
+        "job_post_process_time_list": null,
+        "job_process": null,
+        "job_process_id": null,
+        "job_process_time": null,
+        "job_process_type": null,
+        "job_storefront_mode": null,
+        "job_type": null,
+        "max_level": null,
+        "max_salary": null,
+        "min_level": null,
+        "min_salary": null,
+        "never_expiry": null,
+        "progress": null,
+        "recruitment_type": {
+          "active_status": 1,
+          "children": null,
+          "depth": 2,
+          "en_name": "Regular",
+          "i18n_name": "正式",
+          "id": "201",
+          "name": "正式",
+          "parent": {
+            "active_status": 1,
+            "children": null,
+            "depth": 1,
+            "en_name": "Campus",
+            "i18n_name": "校招",
+            "id": "2",
+            "name": "校招",
+            "parent": null,
+            "selectability": 1
+          },
+          "selectability": 1
+        },
+        "required_degree": null,
+        "requirement": null,
+        "schema": null,
+        "sequence": null,
+        "storefront_list": null,
+        "sub_title": null,
+        "subject": null,
+        "tag_list": null,
+        "target_major_list": null,
+        "title": null
+      },
+      "job_process_id": "75<redacted_phone>457703",
+      "job_subject": null,
+      "process_type": 2,
+      "publish_time": 1784884984986,
+      "recommend_id": null,
+      "recruit_type": {
+        "active_status": 1,
+        "children": null,
+        "depth": 2,
+        "en_name": "Regular",
+        "i18n_name": "正式",
+        "id": "201",
+        "name": "正式",
+        "parent": {
+          "active_status": 1,
+          "children": null,
+          "depth": 1,
+          "en_name": "Campus",
+          "i18n_name": "校招",
+          "id": "2",
+          "name": "校招",
+          "parent": null,
+          "selectability": 1
+        },
+        "selectability": 1
+      },
+      "requirement": "任职要求\n1、学历与经验：计算机科学、人工智能、自动化、机器人或相关专业本科及以上学历，具备扎实的算法研究或数据工程实践经验。\n2、核心技术栈（满足以下至少一项即可）：\n1）深入理解自动驾驶或机器人领域的数据质检体系与数据闭环方法论，有大规模多模态数据处理经验；\n2）熟练掌握大模型微调技术（如 SFT、LoRA/QLoRA、DPO/RLHF 等），具备基于 LLM/VLM 构建自动化质检、评估或标注模型的实际落地经验；\n3）熟悉视觉 SLAM 或三维重建算法（如 ORB-SLAM、COLMAP、NeRF、3DGS 等），具备处理复杂场景空间数据的实际经验；\n4）熟悉主流深度学习框架（PyTorch 等）及模型加速技术（如 TensorRT、vLLM、ONNX 等），具备模型量化、剪枝或分布式推理优化经验。\n3、工程能力：\n1）精通 Python / C++，具备扎实的编程功底与良好的代码规范；\n2）具备较强的系统设计与工程落地能力，能独立完成从算法原型到生产级服务的开发与部署。\n4、综合素质：逻辑严谨、对数据高度敏感，具备优秀的跨团队协作与项目管理意识；对具身智能与机器人技术有强烈热情，能快速学习并掌握前沿技术。",
+      "storefront_list": null,
+      "storefront_mode": 1,
+      "sub_title": null,
+      "title": "【27届校招】具身智能数据算法工程师 - 人类数据"
+    },
+    {
+      "city_info": null,
+      "city_list": [
+        {
+          "code": "CT_128",
+          "en_name": "Shenzhen",
+          "i18n_name": "深圳",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "深圳",
+          "node_status": null,
+          "py_name": null
+        },
+        {
+          "code": "CT_125",
+          "en_name": "Shanghai",
+          "i18n_name": "上海",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "上海",
+          "node_status": null,
+          "py_name": null
+        },
+        {
+          "code": "CT_11",
+          "en_name": "Beijing",
+          "i18n_name": "北京",
+          "location_type": null,
+          "mdm_code": null,
+          "name": "北京",
+          "node_status": null,
+          "py_name": null
+        }
+      ],
+      "code": null,
+      "department_id": null,
+      "description": "职位描述（任选其一）\n1. 第一人称感知算法开发： 研发基于第一人称视角（Egocentric View）的 3D 人体重建、动作生成、手势追踪及动作捕捉建模算法，从复杂的真实场景中提取高质量的运动指令，助力数据驱动的具身智能算法研究；\n2. 高精度人体重建： 利用 SMPL / SMPL-X / MANO等参数化模型、多视角几何及神经渲染等技术，实现对人类动作行为的高精度重建，解决人体自遮挡、大范围运动等困难场景下的稳健估计问题，加速业界前沿的大规模 In-the-wild 人类数据采集和数据处理任务；\n3. 动作生成与迁移（Retargeting）： 研究人类动作到异构机器人本体（包括但不限于全尺寸人形本体、灵巧手）的语义映射与动力学对齐，构建从“人类示范”到“机器人策略”的自动化数据管线；\n4. 人类数据模型训练： 参与构建人类数据基座模型训练，将第一手模型理解与数据采集实践相结合，为 VLA / WAM 等前沿架构的具身基座模型提供大规模 Human-data 数据，提升机器人在非结构化环境下的泛化能力；\n5. 前瞻研究与落地： 跟踪 ICRA / CoRL / RSS / SIGGRAPH / CVPR / ICLR / NeurIPS 等顶级会议趋势，发表高质量论文，并负责算法在真实机器人硬件和可穿戴数据采集硬件上的工程化落地。",
+      "id": "<redacted_pii>6",
+      "job_category": {
+        "children": null,
+        "depth": 3,
+        "en_name": "Algorithm",
+        "i18n_name": "算法",
+        "id": "679<redacted_phone>08231",
+        "name": "算法",
+        "parent": {
+          "children": null,
+          "depth": 2,
+          "en_name": "R&D",
+          "i18n_name": "研发",
+          "id": "679<redacted_phone>26317",
+          "name": "研发",
+          "parent": {
+            "children": null,
+            "depth": 1,
+            "en_name": "Internet / Electronics / Games",
+            "i18n_name": "互联网 / 电子 / 网游",
+            "id": "679<redacted_phone>24616",
+            "name": "互联网 / 电子 / 网游",
+            "parent": null
+          }
+        }
+      },
+      "job_function": null,
+      "job_hot_flag": null,
+      "job_post_info": {
+        "HighlightList": null,
+        "JobChannelPublishList": null,
+        "address": "深圳",
+        "address_id": null,
+        "address_list": [
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_128",
+              "en_name": "Shenzhen",
+              "i18n_name": "深圳",
+              "name": "深圳",
+              "py_name": "shenzhen"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "深圳",
+            "id": "7307272<redacted_phone>1",
+            "name": "深圳",
+            "state": {
+              "en_name": "Guangdong",
+              "i18n_name": "广东",
+              "name": "广东",
+              "state_code": "ST_21"
+            }
+          },
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_125",
+              "en_name": "Shanghai",
+              "i18n_name": "上海",
+              "name": "上海",
+              "py_name": "shanghai"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "上海",
+            "id": "<redacted_pii>6",
+            "name": "上海",
+            "state": {
+              "en_name": "Shanghai",
+              "i18n_name": "上海",
+              "name": "上海",
+              "state_code": "ST_47"
+            }
+          },
+          {
+            "active_status": 1,
+            "city": {
+              "city_code": "CT_11",
+              "en_name": "Beijing",
+              "i18n_name": "北京",
+              "name": "北京",
+              "py_name": "beijing"
+            },
+            "country": {
+              "country_code": "CN_1",
+              "en_name": "Chinese Mainland",
+              "i18n_name": "中国大陆",
+              "name": "中国大陆"
+            },
+            "district": null,
+            "en_name": "",
+            "i18n_name": "北京",
+            "id": "730727<redacted_phone>32",
+            "name": "北京",
+            "state": {
+              "en_name": "Beijing",
+              "i18n_name": "北京",
+              "name": "北京",
+              "state_code": "ST_8"
+            }
+          }
+        ],
+        "biz_create_time": null,
+        "biz_modify_time": null,
+        "city": null,
+        "city_list": null,
+        "code": null,
+        "correlation_job_list": null,
+        "crator_id": null,
+        "currency": null,
+        "department": null,
+        "department_id": null,
+        "description": null,
+        "education": null,
+        "experience": null,
+        "expiry_time": null,
+        "head_count": null,
+        "id": null,
+        "job_active_status": null,
+        "job_category": null,
+        "job_function": null,
+        "job_hot_flag": null,
+        "job_id": null,
+        "job_in_charge_user_id": null,
+        "job_level_id_list": null,
+        "job_post_object_value_map": {},
+        "job_post_process_time_list": null,
+        "job_process": null,
+        "job_process_id": null,
+        "job_process_time": null,
+        "job_process_type": null,
+        "job_storefront_mode": null,
+        "job_type": null,
+        "max_level": null,
+        "max_salary": null,
+        "min_level": null,
+        "min_salary": null,
+        "never_expiry": null,
+        "progress": null,
+        "recruitment_type": {
+          "active_status": 1,
+          "children": null,
+          "depth": 2,
+          "en_name": "Regular",
+          "i18n_name": "正式",
+          "id": "201",
+          "name": "正式",
+          "parent": {
+            "active_status": 1,
+            "children": null,
+            "depth": 1,
+            "en_name": "Campus",
+            "i18n_name": "校招",
+            "id": "2",
+            "name": "校招",
+            "parent": null,
+            "selectability": 1
+          },
+          "selectability": 1
+        },
+        "required_degree": null,
+        "requirement": null,
+        "schema": null,
+        "sequence": null,
+        "storefront_list": null,
+        "sub_title": null,
+        "subject": null,
+        "tag_list": null,
+        "target_major_list": null,
+        "title": null
+      },
+      "job_process_id": "75<redacted_phone>457703",
+      "job_subject": null,
+      "process_type": 2,
+      "publish_time": 1784884984652,
+      "recommend_id": null,
+      "recruit_type": {
+        "active_status": 1,
+        "children": null,
+        "depth": 2,
+        "en_name": "Regular",
+        "i18n_name": "正式",
+        "id": "201",
+        "name": "正式",
+        "parent": {
+          "active_status": 1,
+          "children": null,
+          "depth": 1,
+          "en_name": "Campus",
+          "i18n_name": "校招",
+          "id": "2",
+          "name": "校招",
+          "parent": null,
+          "selectability": 1
+        },
+        "selectability": 1
+      },
+      "requirement": "职位要求\n1. 学术背景： 计算机视觉、计算机图形学、机器人学或相关专业硕士/博士学位，扎实的数学物理功底与良好的科学素养；\n2. 核心技术栈：\n  - 熟悉 3D 视觉 & 计算机图形学：多视图几何、SLAM、SfM、点云处理或神经渲染（NeRF / GS）。\n  - 精通 人体重建与估计：深入理解 人体参数化模型 / Human Mesh Recovery / Human Pose Estimation / Hand-Object Interaction / 动作捕捉技术，熟悉 动作生成（Motion Generation）算法。\n  - 了解 机器人学：运动学 / 动力学建模、强化学习（RL）或模仿学习（Imitation Learning）；\n3. 工程能力： 熟练使用 Python / C++，有良好的编程习惯和工程思维；\n4. 加分项：\n  - 在顶级会议或期刊发表过第一作者论文；\n  - 有大规模 Egocentric 数据集处理经验；\n  - 熟悉 ROS、ROS2、Isaac Sim 或 Omniverse 等仿真平台；\n  - 熟悉 机器人本体，善于学习新技术，对技术有充足热情。",
+      "storefront_list": null,
+      "storefront_mode": 1,
+      "sub_title": null,
+      "title": "【27届校招】具身智能算法研究员 - 人类数据"
+    }
+  ],
+  "single_page_proof": null,
+  "site": "feishu",
+  "terminal_evidence": null,
+  "terminal_selector": null,
+  "top_level_keys": [
+    "code",
+    "data",
+    "message",
+    "error"
+  ],
+  "total_count_path": "$.data.count",
+  "total_count_value": 441
+}
