@@ -143,3 +143,31 @@ def test_feishu_fixture_carries_position_detail_contract() -> None:
         )
     for sample in samples:
         assert sample.get("title"), "feishu sample listing must carry a title"
+
+
+def test_inovance_fixture_carries_jobs_hash_route_contract() -> None:
+    """The inovance contract is the input spec for ``InovanceCrawlDriver.from_fixture``.
+
+    Task 4.4's driver reads ``page_url``, ``single_page_proof`` and
+    ``sample_listings`` (each a ``#/jobs/<uuid>`` hash route) from this
+    contract; the gate test pins those fields so the driver has a stable,
+    fixture-proven input. The ``#/jobs`` fragment is shared by the listing
+    page and every detail route, which is why the driver leaves ``apply_url``
+    as ``None`` rather than falling back to the listing page.
+    """
+    fixture = load_fixture("inovance")
+    assert fixture.get("data_source") == "dom_rendered"
+    assert fixture.get("single_page_proof") == "single_page_inovance_hash_jobs"
+    expected = fixture.get("expected_listing_count")
+    assert isinstance(expected, int) and expected > 0
+    samples = fixture.get("sample_listings") or []
+    assert len(samples) == expected, (
+        "inovance sample_listings count must match expected_listing_count for "
+        "deterministic unit replay"
+    )
+    for sample in samples:
+        detail_url = sample.get("detail_url", "")
+        assert "#/jobs/" in detail_url, (
+            f"inovance sample detail_url is not a job-level hash route: {detail_url}"
+        )
+        assert sample.get("title"), "inovance sample listing must carry a title"
