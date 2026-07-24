@@ -430,6 +430,28 @@ def _planner_enabled(settings: Settings) -> bool:
     return settings.job_discovery_pev_enabled and settings.job_discovery_planner_enabled
 
 
+# Classifier-derived reasons that have no direct DiscoveryBlockReason enum
+# member (Task 7). ``authentication_required`` comes from the error_classifier
+# auth-wall branch; persist it as ``permission_denied`` so an authenticated
+# career-site wall is distinctly flagged instead of silently ``unknown``.
+_BLOCK_REASON_OVERRIDES: dict[str, DiscoveryBlockReason] = {
+    "authentication_required": DiscoveryBlockReason.permission_denied,
+}
+
+
+def _resolve_block_reason(reason: str | None) -> DiscoveryBlockReason:
+    """Map a result block_reason string to a persisted enum value."""
+    if reason is None:
+        return DiscoveryBlockReason.unknown
+    if reason in _BLOCK_REASON_OVERRIDES:
+        return _BLOCK_REASON_OVERRIDES[reason]
+    try:
+        return DiscoveryBlockReason(reason)
+    except ValueError:
+        return DiscoveryBlockReason.unknown
+
+
+
 def _crawl_plan_yaml(plan: CrawlPlan) -> str:
     """Serialize a validated plan for the existing deterministic PATH B API."""
     data = asdict(plan)
@@ -1047,12 +1069,7 @@ class JobDiscoveryWorker:
                         db, task, result_summary_json=summary_json
                     )
             elif result.status == "needs_manual_review":
-                block_reason = DiscoveryBlockReason.unknown
-                if result.block_reason is not None:
-                    try:
-                        block_reason = DiscoveryBlockReason(result.block_reason)
-                    except ValueError:
-                        pass
+                block_reason = _resolve_block_reason(result.block_reason)
                 mark_task_needs_manual_review(
                     db,
                     task,
