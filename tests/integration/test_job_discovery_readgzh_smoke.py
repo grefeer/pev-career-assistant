@@ -37,7 +37,9 @@ _TEST_WECHAT_URL_2 = os.environ.get("TEST_WECHAT_URL_2", "")
 _TEST_REGULAR_URL_1 = os.environ.get("TEST_REGULAR_URL_1", "")
 _TEST_REGULAR_URL_2 = os.environ.get("TEST_REGULAR_URL_2", "")
 
-pytestmark = pytest.mark.skipif(
+# Live (network + ReadGZH + Tencent docs) tests are gated individually so the
+# non-live unit assertions below still run in the default suite.
+_LIVE_SKIP = pytest.mark.skipif(
     not os.environ.get("RUN_LIVE_TENCENT_DISCOVERY"),
     reason="set RUN_LIVE_TENCENT_DISCOVERY=1 to run live ReadGZH smoke tests",
 )
@@ -144,6 +146,7 @@ def _summary(
 # ---------------------------------------------------------------------------
 
 
+@_LIVE_SKIP
 def test_readgzh_direct_fetch() -> None:
     """Verify ReadGZH API can fetch a WeChat article directly."""
     # Use env-provided URL or a known public article
@@ -176,6 +179,7 @@ def test_readgzh_direct_fetch() -> None:
 # ---------------------------------------------------------------------------
 
 
+@_LIVE_SKIP
 def test_live_readgzh_four_url_web_navigation_smoke() -> None:
     """4-URL smoke test: 2 WeChat articles + 2 regular job pages.
 
@@ -268,3 +272,66 @@ def test_live_readgzh_four_url_web_navigation_smoke() -> None:
         assert "job_detail_json" in item["evidence_types"], json.dumps(
             summaries, ensure_ascii=False, indent=2
         )
+
+
+# ---------------------------------------------------------------------------
+# Unit-level (non-live): Task 6 ReadGZH-failure -> manual review contract
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_wechat_article_returns_manual_review_on_readgzh_failure() -> None:
+    """Step 4: a ReadGZH failure surfaces as a valid manual-review result.
+
+    ``fetch_wechat_article`` must never crash or silently return empty data
+    when ReadGZH fails -- it returns ``needs_manual_review=True`` with the
+    sanitized reason, which the worker forwards as a final (non-retried)
+    manual-review outcome.
+    """
+    from unittest.mock import patch
+
+    from backend.app.services.job_discovery.deepagents_runner import (
+        fetch_wechat_article,
+    )
+
+    url = "https://mp.weixin.qq.com/s/readgzh-failure-fixture"
+    with patch(
+        "backend.app.services.job_discovery.deepagents_runner._fetch_wechat_via_readgzh",
+        return_value=(None, None, "ReadGZH fetch failed: simulated timeout"),
+    ):
+        result = fetch_wechat_article(url)
+
+    assert result["needs_manual_review"] is True
+    assert "simulated timeout" in result["manual_review_reason"]
+    assert result["url"] == url
+    assert result["image_ocr_texts"] == []
+
+
+def test_fetch_wechat_article_accepts_deadline_budget() -> None:
+    """Step 3: the deadline budget param is accepted and threads to ReadGZH.
+
+    With a generous budget the call still returns manual_review when ReadGZH
+    fails, and the ReadGZH call is invoked with a shrunk ``readgzh_timeout``
+    bounded by ``min(30, max(1.0, remaining))``.
+    """
+    from unittest.mock import patch
+
+    from backend.app.services.job_discovery.deepagents_runner import (
+        fetch_wechat_article,
+    )
+
+    url = "https://mp.weixin.qq.com/s/deadline-fixture"
+    captured: dict = {}
+
+    def _fake_readgzh(_url, readgzh_timeout=None):
+        captured["readgzh_timeout"] = readgzh_timeout
+        return (None, None, "ReadGZH fetch failed: simulated")
+
+    with patch(
+        "backend.app.services.job_discovery.deepagents_runner._fetch_wechat_via_readgzh",
+        side_effect=_fake_readgzh,
+    ):
+        result = fetch_wechat_article(url, deadline_remaining_seconds=90)
+
+    # With remaining ~90s, the ReadGZH timeout is min(30, max(1.0, ~90)) = 30.
+    assert captured["readgzh_timeout"] == 30
+    assert result["needs_manual_review"] is True

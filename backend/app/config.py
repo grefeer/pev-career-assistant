@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     job_discovery_planner_enabled: bool = False
     job_discovery_legacy_path_c_enabled: bool = True
     job_discovery_planner_max_inspection_pages: int = Field(default=3, ge=1, le=5)
+    # Hard wall-clock deadline (seconds) for a SnapshotPlan whose steps run
+    # real network fetches (WeChat ``fetch_wechat_article``). When > 0 the
+    # worker passes it to SnapshotExecutor; tools in ``hard_timeout_tools``
+    # run in a spawned subprocess that is killed at the deadline, yielding a
+    # ``needs_manual_review`` / ``task_deadline_exceeded`` result instead of
+    # an unbounded hang. 0 = disabled (no deadline enforced).
+    job_discovery_snapshot_deadline_seconds: int = Field(default=0, ge=0, le=3600)
 
     # Strategy Router settings
     job_discovery_strategy_enabled: bool = False

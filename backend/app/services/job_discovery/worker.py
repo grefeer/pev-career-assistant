@@ -758,12 +758,29 @@ class JobDiscoveryWorker:
                                 if crawl_plan_declared
                                 else None
                             )
+                            # Hard deadline for SnapshotPlans that run real
+                            # network fetches (WeChat fetch_wechat_article).
+                            # When enabled (>0), fetch_wechat_article runs in a
+                            # spawned subprocess killed at the deadline -> a
+                            # needs_manual_review / task_deadline_exceeded
+                            # result instead of an unbounded hang. Disabled
+                            # (0) by default; opt-in via env for the gray roll.
+                            _snapshot_deadline = (
+                                self.settings.job_discovery_snapshot_deadline_seconds
+                                or None
+                            )
                             snap = SnapshotExecutor(
                                 strategy_record,
                                 task_input,
                                 trajectory,
                                 tool_dependencies=_tool_dependencies,
                                 crawl_driver_factory=crawl_driver_factory,
+                                deadline_seconds=_snapshot_deadline,
+                                hard_timeout_tools=(
+                                    {"fetch_wechat_article"}
+                                    if _snapshot_deadline
+                                    else None
+                                ),
                             )
                             snap_result = snap.execute()
                             if isinstance(snap_result, SnapshotExecutionResult) and snap_result.needs_supervisor_fallback:

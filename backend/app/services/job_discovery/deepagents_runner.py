@@ -208,7 +208,10 @@ def _is_blocked_domain(url: str) -> bool:
 _wechat_raw_html_cache: dict[str, str] = {}
 
 
-def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | None]:
+def _fetch_wechat_via_readgzh(
+    url: str,
+    readgzh_timeout: float | None = None,
+) -> tuple[str | None, str | None, str | None]:
     """Fetch a WeChat article via the ReadGZH proxy service.
 
     ReadGZH (https://readgzh.site) is a server-side proxy that bypasses
@@ -256,7 +259,10 @@ def _fetch_wechat_via_readgzh(url: str) -> tuple[str | None, str | None, str | N
             headers["Authorization"] = f"Bearer {api_key}"
 
         api_url = f"https://api.readgzh.site/rd?url={url}"
-        resp = requests.get(api_url, timeout=30, headers=headers)
+        resp = requests.get(
+            api_url, timeout=readgzh_timeout if readgzh_timeout is not None else 30,
+            headers=headers,
+        )
         resp.raise_for_status()
         raw = resp.text
 
@@ -563,7 +569,10 @@ def run_web_navigation(
 # ---------------------------------------------------------------------------
 
 
-def fetch_wechat_article(url: str) -> dict[str, Any]:
+def fetch_wechat_article(
+    url: str,
+    deadline_remaining_seconds: float | None = None,
+) -> dict[str, Any]:
     """Fetch a WeChat article via ReadGZH, OCR any embedded images, and return
     structured content ready for JD extraction.
 
@@ -596,7 +605,31 @@ def fetch_wechat_article(url: str) -> dict[str, Any]:
     """
     import re as _re
 
-    text, title, error = _fetch_wechat_via_readgzh(url)
+    # Track the deadline budget across this call. The SnapshotExecutor runs
+    # ``fetch_wechat_article`` inside a spawned subprocess bounded by the
+    # same budget, so this only decides *graceful* per-call timeouts -- the
+    # subprocess kill is the real backstop. ``_remaining()`` recomputes
+    # elapsed time so a long ReadGZH fetch shrinks the OCR budget too.
+    _deadline_started = time.monotonic() if deadline_remaining_seconds else None
+
+    def _remaining() -> float | None:
+        if deadline_remaining_seconds is None or _deadline_started is None:
+            return None
+        return deadline_remaining_seconds - (time.monotonic() - _deadline_started)
+
+    def _capped_timeout(configured: float) -> float:
+        """``min(configured, max(1.0, remaining))`` per the Task 6 contract."""
+        rem = _remaining()
+        if rem is None:
+            return configured
+        return min(configured, max(1.0, rem))
+
+    _readgzh_timeout = (
+        _capped_timeout(30) if deadline_remaining_seconds is not None else None
+    )
+    text, title, error = _fetch_wechat_via_readgzh(
+        url, readgzh_timeout=_readgzh_timeout
+    )
     if error:
         return {
             "text": "",
@@ -623,9 +656,14 @@ def fetch_wechat_article(url: str) -> dict[str, Any]:
     # ── Download + OCR each image (max 5, skip tiny icons) ──
     ocr_texts: list[str] = []
     for img_url in image_urls[:5]:
+        # Honor the hard deadline: stop OCR'ing once the budget is gone.
+        _rem = _remaining()
+        if _rem is not None and _rem <= 0:
+            break
         try:
             img_resp = requests.get(
-                img_url, timeout=10,
+                img_url,
+                timeout=_capped_timeout(10),
                 headers={"User-Agent": "Mozilla/5.0", "Referer": url},
             )
             img_resp.raise_for_status()

@@ -122,6 +122,35 @@ class TestSnapshotExecutor:
         assert result.status == "succeeded"
         assert len(result.candidates) > 0
 
+    # -- Hard-deadline (Task 6) guards ----------------------------------------
+
+    @patch("backend.app.services.job_discovery.strategy.snapshot_executor._call_tool_by_name")
+    def test_hard_timeout_tools_without_deadline_use_normal_dispatch(
+        self, mock_call, strategy, task
+    ):
+        """hard_timeout_tools only spawns a subprocess when a deadline is set.
+
+        Without ``deadline_seconds`` the tool runs via the normal in-process
+        dispatch (no spawn overhead) -- the worker guarantees both are set
+        together, and the executor enforces that invariant here.
+        """
+        mock_call.side_effect = [
+            {"site_type": "other", "notes": "ok"},
+            [{"title": "Engineer", "company_name": "Acme"}],
+        ]
+
+        buf = TrajectoryBuffer(task_id="t1", strategy_id="s1", executor_type="snapshot")
+        # triage_link is listed as a hard-timeout tool but no deadline is set,
+        # so it must still go through the mocked normal dispatch.
+        executor = SnapshotExecutor(
+            strategy, task, buf, hard_timeout_tools={"triage_link"}
+        )
+        result = executor.execute()
+
+        assert result.status == "succeeded"
+        # Both steps dispatched via the normal (mocked) path, not a subprocess.
+        assert mock_call.call_count == 2
+
     # -- Tool dispatch tests (MINOR-3) ---------------------------------------
 
     def test_tool_dispatch_calls_real_function(self):

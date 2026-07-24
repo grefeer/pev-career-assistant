@@ -7,6 +7,7 @@ hand over to the Supervisor Agent with snapshot_context injected.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from collections.abc import Callable
 from typing import Any
@@ -40,6 +41,15 @@ class CrawlPlanStructureError(RuntimeError):
     """A plan cannot be safely executed without Planner repair."""
 
 
+class _HardDeadlineExceeded(RuntimeError):
+    """Internal signal: a hard-timeout tool was terminated by the deadline.
+
+    Caught by :meth:`SnapshotExecutor.execute` and converted into a
+    ``needs_manual_review`` / ``task_deadline_exceeded`` result -- never
+    escalated to the Supervisor/WebNavigationAgent.
+    """
+
+
 class SnapshotExecutor:
     """Replay a YAML plan step-by-step against real tool functions.
 
@@ -62,6 +72,8 @@ class SnapshotExecutor:
         crawl_driver_factory: Callable[[CrawlPlan, DiscoveryTaskInput], CrawlDriver]
         | None = None,
         checkpoint: CrawlCheckpoint | None = None,
+        deadline_seconds: float | None = None,
+        hard_timeout_tools: set[str] | None = None,
     ) -> None:
         self.strategy = strategy
         self.task = task
@@ -70,18 +82,30 @@ class SnapshotExecutor:
         self._runtime_tools: dict[str, Any] = {}
         self._crawl_driver_factory = crawl_driver_factory
         self._checkpoint = checkpoint
+        # Single absolute deadline (Task 6): once ``_deadline_at`` passes, every
+        # remaining step short-circuits to ``task_deadline_exceeded``. Tools in
+        # ``hard_timeout_tools`` (WeChat ``fetch_wechat_article``) additionally
+        # run in a spawned subprocess so a blocked socket is actually killed
+        # instead of leaking a thread.
+        self._deadline_at: float | None = (
+            time.monotonic() + deadline_seconds if deadline_seconds else None
+        )
+        self._hard_timeout_tools: set[str] = set(hard_timeout_tools or ())
         if tool_dependencies:
             self._inject_runtime_tools(tool_dependencies)
 
     def _inject_runtime_tools(self, deps: dict[str, Any]) -> None:
-        """Inject runtime-dependent tools (settings/model/subagent) from worker context.
+        """Inject runtime-dependent tools from worker context.
 
-        Currently wraps ``run_web_navigation`` which depends on objects
-        (settings, model, subagent) only available inside the Supervisor.
+        Tools that depend on objects only available inside the Supervisor
+        (``run_web_navigation`` needs settings/model/subagent) -- or that are
+        replaced by a hang fixture in deadline tests (``fetch_wechat_article``)
+        -- are supplied by the caller and take precedence over the static
+        registry on dispatch.
         """
-        run_web_navigation = deps.get("run_web_navigation")
-        if run_web_navigation:
-            self._runtime_tools["run_web_navigation"] = run_web_navigation
+        for name, tool in deps.items():
+            if tool is not None:
+                self._runtime_tools[name] = tool
 
     def execute(self) -> DiscoveryRunResult:
         """Execute the plan. Returns SnapshotExecutionResult on any step failure."""
@@ -100,12 +124,34 @@ class SnapshotExecutor:
             params = self._resolve_template(step.get("params", {}))
             tool_name = step["tool"]
 
-            # All step errors are terminal -- trigger Supervisor fallback
+            # ── Hard deadline: stop before this step if already exhausted ──
+            remaining = self._remaining_seconds()
+            if remaining is not None and remaining <= 0:
+                return self._deadline_exceeded(
+                    tool_name, i, params, "deadline exhausted before step"
+                )
+
+            # All step errors are terminal -- trigger Supervisor fallback.
+            # ``_HardDeadlineExceeded`` (a hard-timeout tool was killed) is
+            # caught first and converted to a manual-review deadline result
+            # rather than a Supervisor takeover.
             try:
-                result = _call_tool_by_name(tool_name, executor=self, **params)
+                if (
+                    tool_name in self._hard_timeout_tools
+                    and self._deadline_at is not None
+                ):
+                    result = self._call_with_hard_timeout(
+                        tool_name, params, remaining
+                    )
+                else:
+                    result = _call_tool_by_name(tool_name, executor=self, **params)
                 self.trajectory.record_step(tool_name, "ok", params, result)
                 self._context["prev"] = {"result": result}
                 completed.append({"tool": tool_name, "params": params, "result": result})
+            except _HardDeadlineExceeded:
+                return self._deadline_exceeded(
+                    tool_name, i, params, "subprocess deadline exceeded"
+                )
             except Exception as exc:
                 self.trajectory.record_step(tool_name, "failed", params, None, error=exc)
                 return SnapshotExecutionResult(
@@ -119,6 +165,91 @@ class SnapshotExecutor:
         return self._build_final_result(completed)
 
     # -- internal -----------------------------------------------------------
+
+    def _remaining_seconds(self) -> float | None:
+        """Wall-clock seconds left until the hard deadline, or ``None`` if unset."""
+        if self._deadline_at is None:
+            return None
+        return self._deadline_at - time.monotonic()
+
+    def _deadline_exceeded(
+        self,
+        tool_name: str,
+        step_index: int,
+        params: dict[str, Any],
+        reason: str,
+    ) -> SnapshotExecutionResult:
+        """Build the ``task_deadline_exceeded`` manual-review result.
+
+        A deadline is a per-task timeout, not a strategy/structure failure:
+        the result must NOT trigger Supervisor/WebNavigationAgent takeover
+        (``needs_supervisor_fallback=False``).
+        """
+        self.trajectory.record_step(
+            tool_name,
+            "deadline_exceeded",
+            params,
+            None,
+            error=RuntimeError(reason),
+        )
+        return SnapshotExecutionResult(
+            status="needs_manual_review",
+            block_reason="task_deadline_exceeded",
+            summary=f"Snapshot step {step_index+1} ({tool_name}) hit the hard deadline: {reason}",
+            needs_supervisor_fallback=False,
+            snapshot_context=self.trajectory.to_snapshot_context(),
+        )
+
+    def _call_with_hard_timeout(
+        self,
+        tool_name: str,
+        params: dict[str, Any],
+        remaining: float | None,
+    ) -> Any:
+        """Run a hard-timeout tool in a spawned subprocess bounded by remaining.
+
+        Forwards ``deadline_remaining_seconds`` so the tool can shrink its own
+        network timeouts below the subprocess kill bound (graceful failure vs
+        a hard kill). A timeout raises :class:`_HardDeadlineExceeded`, which
+        :meth:`execute` converts into a manual-review result.
+        """
+        from backend.app.services.job_discovery.strategy.deadline import (
+            run_with_hard_timeout,
+        )
+
+        fn = self._resolve_hard_timeout_tool(tool_name)
+        call_kwargs = dict(params)
+        if "deadline_remaining_seconds" not in call_kwargs and remaining is not None:
+            call_kwargs["deadline_remaining_seconds"] = max(0.0, remaining)
+        # Bound the subprocess just below the remaining budget so it fires
+        # before the next step's pre-check would. Keep a small floor so an
+        # already-tight budget still gets a real subprocess kill.
+        timeout = remaining if (remaining is not None and remaining > 0) else 0.05
+        result = run_with_hard_timeout(
+            fn, timeout_seconds=timeout, kwargs=call_kwargs
+        )
+        if result.timed_out:
+            raise _HardDeadlineExceeded(tool_name)
+        if result.error:
+            # Sanitized error string from the subprocess; surface as a normal
+            # step failure (Supervisor fallback may still apply).
+            raise RuntimeError(result.error)
+        return result.value
+
+    def _resolve_hard_timeout_tool(self, name: str) -> Callable[..., Any]:
+        """Resolve the actual function for a hard-timeout tool.
+
+        Runtime-injected tools (e.g. a hang fixture) take precedence; the
+        static registry is the fallback. The function must be picklable for
+        the spawn subprocess (module-level or a runtime fixture).
+        """
+        if name in self._runtime_tools:
+            return self._runtime_tools[name]
+        _ensure_tool_registry()
+        fn = _TOOL_REGISTRY.get(name)
+        if fn is None:
+            raise ValueError(f"Unknown or unavailable hard-timeout tool: {name}")
+        return fn
 
     def _parse_plan(self) -> list[dict[str, Any]]:
         """Parse the YAML plan_yaml string into step dicts."""
