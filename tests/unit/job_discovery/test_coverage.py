@@ -62,6 +62,35 @@ class TestVerifyCoverage:
         assert decision.complete is False
         assert "detail" in decision.reason.lower()
 
+    def test_unfetched_detail_blocks_success_before_pagination_checks(self) -> None:
+        coverage = CrawlCoverage(
+            pagination_type=PaginationType.PAGE_NUMBER,
+            expected_page_count=2,
+            visited_page_count=1,
+            total_detail_count=2,
+            fetched_detail_count=1,
+            completion_evidence=["visited_all_numbered_pages"],
+        )
+
+        decision = verify_coverage(coverage)
+
+        assert decision.complete is False
+        assert decision.reason == "fetched 1/2 detail resources"
+
+    def test_optional_details_do_not_block_complete_coverage(self) -> None:
+        coverage = CrawlCoverage(
+            pagination_type=PaginationType.SINGLE_PAGE,
+            total_detail_count=2,
+            fetched_detail_count=0,
+            failed_detail_count=2,
+            require_all_details=False,
+            completion_evidence=["single_page_verified"],
+        )
+
+        decision = verify_coverage(coverage)
+
+        assert decision.complete is True
+
     def test_unknown_pagination_cannot_be_proven(self) -> None:
         coverage = CrawlCoverage(
             pagination_type=PaginationType.UNKNOWN,

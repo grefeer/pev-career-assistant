@@ -185,6 +185,7 @@ class CrawlCoverage:
     total_detail_count: int = 0
     fetched_detail_count: int = 0
     failed_detail_count: int = 0
+    require_all_details: bool = True
     coverage_complete: bool = False
     completion_evidence: list[str] = field(default_factory=list)
     incomplete_reason: str | None = None
@@ -206,6 +207,7 @@ class RawJobListing:
     graduation_year_hints: list[int] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
     source_record_key: str | None = None
+    apply_url: str | None = None
 
 
 @dataclass

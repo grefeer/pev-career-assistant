@@ -39,11 +39,24 @@ def verify_coverage(coverage: CrawlCoverage) -> CoverageDecision:
         "partial_success" if coverage.resumable else "needs_manual_review"
     )
 
-    if coverage.failed_detail_count > 0:
+    if coverage.require_all_details and coverage.failed_detail_count > 0:
         return CoverageDecision(
             complete=False,
             status=incomplete_status,
             reason=f"{coverage.failed_detail_count} detail pages failed",
+        )
+
+    if (
+        coverage.require_all_details
+        and coverage.fetched_detail_count != coverage.total_detail_count
+    ):
+        return CoverageDecision(
+            complete=False,
+            status=incomplete_status,
+            reason=(
+                f"fetched {coverage.fetched_detail_count}/"
+                f"{coverage.total_detail_count} detail resources"
+            ),
         )
 
     if (

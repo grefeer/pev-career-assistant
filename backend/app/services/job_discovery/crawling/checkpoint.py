@@ -16,6 +16,12 @@ class CrawlCheckpoint:
     pending_detail_keys: list[str] = field(default_factory=list)
     completed_detail_keys: list[str] = field(default_factory=list)
     failed_detail_keys: list[str] = field(default_factory=list)
+    collected_listings: list[dict[str, Any]] = field(default_factory=list)
+    completed_details: list[dict[str, Any]] = field(default_factory=list)
+    pagination_complete: bool = False
+    completion_evidence: list[str] = field(default_factory=list)
+    expected_page_count: int | None = None
+    expected_listing_count: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
