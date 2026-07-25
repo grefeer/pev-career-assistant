@@ -41,6 +41,52 @@ The Job Discovery subsystem is the core of the platform's automated recruitment 
                    (evidence + candidates)
 ```
 
+## PEV Gray Migration (PATH A / PATH B / PATH C / Legacy)
+
+The architecture above is the **gray-migration** target. The canonical path
+definitions (see `README.md` and `docs/job-discovery-agent-workflow.md`):
+
+- **PATH A** = Certified site driver / adapter (`DomainAdapter`, e.g. Moka,
+  Feishu, Inovance, Xiaohongshu, Alibaba SPA). Coverage-verified.
+- **PATH B** = Deterministic executor replaying a `SnapshotPlan` + `CrawlPlan`
+  (`SnapshotExecutor` / `CrawlExecutor`). Coverage-verified; resumes from
+  checkpoint without re-crawling finished details.
+- **PATH C** = `CrawlPlan` generation / repair agent (the planner). Produces or
+  repairs a plan only; never produces candidates directly. Coverage-verified.
+- **Legacy PATH C** = the Supervisor Agent (LLM-in-the-loop). Coverage-
+  **unverified** compatibility fallback. Saved candidates are kept, but the
+  worker summary marks `execution_path="legacy_path_c"`,
+  `coverage_verified=False`, `legacy_fallback_reason=<reason>` so they are never
+  counted as PEV PASS.
+- **CoverageVerifier** is the sole completion authority: a run is complete only
+  when `verify_coverage` returns a positive terminal verdict.
+
+`enforce_result_invariants` is **not** changed by this migration: it still only
+transforms `succeeded`->`failed` (no candidates) and `partial_success`->
+`needs_manual_review` (no candidates). PEV completeness is enforced by
+`run_post_crawl_pipeline -> verify_coverage`, not by the global invariant.
+
+### Flags & rollout
+
+All four PEV flags default **gray** (`job_discovery_pev_enabled=False`,
+`job_discovery_planner_enabled=False`, `job_discovery_strategy_enabled=False`,
+`job_discovery_legacy_path_c_enabled=True`). Site adapters ship `enabled=False`
+in `scripts/seed_strategies.py` and are promoted one at a time in
+`GRAY_ROLLOUT_ORDER` (Moka -> Feishu -> Inovance -> Xiaohongshu) only after
+three consecutive coverage-verified live smokes
+(`tests/manual/test_pev_live_smoke.py`). Rollback is per-site
+(`GRAY_ROLLBACK_TRIGGERS`); see `README.md`.
+
+### Eval gate
+
+`tests/integration/job_discovery/test_supervisor_ten_url_eval.py` runs the
+direct supervisor across 10 public URLs and buckets results by the PEV PASS
+gate. A direct-supervisor run is PATH C, so every succeeded URL lands in the
+Legacy bucket and the PEV PASS rate from such a run is 0 - demonstrating that
+coverage-unverified results are never reported as PEV PASS. The PEV PASS
+machinery itself (`coverage_verified=True` for PATH A/B) is validated by
+`test_pev_success_is_coverage_verified` in `test_pev_worker_routing.py`.
+
 ## File Structure
 
 ```

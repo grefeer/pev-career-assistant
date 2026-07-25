@@ -23,6 +23,36 @@ from backend.app.services.job_discovery.adapters.xiaohongshu import XHS_CRAWL_PL
 from backend.app.config import Settings
 
 
+# ---------------------------------------------------------------------------
+# Gray rollout order (plan Task 8 Steps 5-6).
+#
+# Each adapter below ships ``enabled=False`` (gray) so the site continues to
+# flow through legacy PATH C until it is explicitly promoted. Promotion rules:
+#   1. The site must pass three consecutive coverage-verified live smokes
+#      (``tests/manual/test_pev_live_smoke.py``) with a stable listing count.
+#   2. Only then flip THIS site's ``JobDiscoveryStrategy.enabled`` to True.
+#   3. Promote in this order only; do not skip ahead:
+# ---------------------------------------------------------------------------
+GRAY_ROLLOUT_ORDER: tuple[str, ...] = (
+    "moka",        # 1. Moka       (app.mokahr.com/*)
+    "feishu",      # 2. 飞书       (*.jobs.feishu.cn/*)
+    "inovance",    # 3. 汇川       (recruit.inovance.com/*)
+    "xiaohongshu", # 4. 小红书     (job.xiaohongshu.com/*)
+)
+
+# Per-site rollback triggers (plan Task 8 Step 6). When ANY of these fire for a
+# promoted site, disable ONLY that site's strategy (flip ``enabled=False``);
+# do not touch other sites, the new contracts, or the global result invariant.
+GRAY_ROLLBACK_TRIGGERS: tuple[str, ...] = (
+    "expected/raw listing count drift",
+    "positive terminal signal lost (no completion_evidence)",
+    "detail failure > 0 (failed_detail_count)",
+    "listpage apply URL > 0 (count_apply_url_is_listpage)",
+    "new blocked marker (login/captcha/anti-bot/permission_denied)",
+    "listing count inconsistent across 3 consecutive runs",
+)
+
+
 WECHAT_PLAN = """plan:
   - tool: triage_link
     params:
@@ -93,9 +123,9 @@ def seed(db: Session) -> None:
             degradation_threshold=3,
             recovery_threshold=2,
         ),
-        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
-        # until three consecutive coverage-verified live smokes pass; enable
-        # only in a test environment by flipping this row manually.
+        # Gray rollout #1/4 (Moka) - PATH A driver + PATH B executor. Disabled
+        # by default until three consecutive coverage-verified live smokes pass;
+        # promote first, per GRAY_ROLLOUT_ORDER.
         JobDiscoveryStrategy(
             url_pattern="app.mokahr.com/*",
             site_type="career_site",
@@ -107,9 +137,9 @@ def seed(db: Session) -> None:
             recovery_threshold=2,
             enabled=False,
         ),
-        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
-        # until three consecutive coverage-verified live smokes pass; enable
-        # only in a test environment by flipping this row manually.
+        # Gray rollout #2/4 (飞书) - PATH A driver + PATH B executor. Disabled
+        # by default until three consecutive coverage-verified live smokes pass;
+        # promote after Moka, per GRAY_ROLLOUT_ORDER.
         JobDiscoveryStrategy(
             url_pattern="*.jobs.feishu.cn/*",
             site_type="career_site",
@@ -121,9 +151,9 @@ def seed(db: Session) -> None:
             recovery_threshold=2,
             enabled=False,
         ),
-        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
-        # until three consecutive coverage-verified live smokes pass; enable
-        # only in a test environment by flipping this row manually.
+        # Gray rollout #3/4 (汇川) - PATH A driver + PATH B executor. Disabled
+        # by default until three consecutive coverage-verified live smokes pass;
+        # promote after 飞书, per GRAY_ROLLOUT_ORDER.
         JobDiscoveryStrategy(
             url_pattern="recruit.inovance.com/*",
             site_type="career_site",
@@ -135,9 +165,9 @@ def seed(db: Session) -> None:
             recovery_threshold=2,
             enabled=False,
         ),
-        # Gray rollout (PATH A driver + PATH B executor). Disabled by default
-        # until three consecutive coverage-verified live smokes pass; enable
-        # only in a test environment by flipping this row manually.
+        # Gray rollout #4/4 (小红书) - PATH A driver + PATH B executor. Disabled
+        # by default until three consecutive coverage-verified live smokes pass;
+        # promote last, per GRAY_ROLLOUT_ORDER.
         JobDiscoveryStrategy(
             url_pattern="job.xiaohongshu.com/*",
             site_type="career_site",

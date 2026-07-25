@@ -99,3 +99,52 @@ Agent 通过 `finish_with_manual_review()` 工具返回 `needs_manual_review` �
 | `DiscoveredJobCandidate` | 标准化后的候选岗位，待管理员审核 |
 | `JobSource` | 数据源配置（智能表来源 Key、file_id、sheet_id） |
 | `RawJobRecord` | 同步后的原始记录快照 |
+
+---
+
+## 8. PEV 灰度迁移与执行路径
+
+第 1 节的流程描述的是 **Legacy PATH C**（Supervisor Agent，LLM-in-the-loop）。灰度迁移
+引入三条带完整性证明的执行路径，Legacy PATH C 降级为"覆盖率未验证"的兼容兜底：
+
+| 路径 | 含义 | 覆盖率 | 触发条件 |
+|------|------|--------|----------|
+| **PATH A** | 认证站点驱动 / adapter（`DomainAdapter`，如 Moka、飞书、汇川、小红书、阿里 SPA） | 已验证 | 匹配的 `JobDiscoveryStrategy` 带有 `adapter` 且 `enabled=True`、PEV 开启 |
+| **PATH B** | 确定性执行器回放 `SnapshotPlan` + `CrawlPlan`（`SnapshotExecutor` / `CrawlExecutor`） | 已验证 | 匹配的策略带 `plan_yaml`、PEV 开启 |
+| **PATH C** | `CrawlPlan` 生成 / 修复 Agent（planner） | 已验证 | 无策略匹配、PEV + planner 开启 |
+| **Legacy PATH C** | Supervisor Agent | **未验证** | PEV 关闭、planner 不可用、或 adapter/执行器失败兜底 |
+
+关键约束：
+
+- **CoverageVerifier 是唯一的完成权威**：只有 `verify_coverage` 给出正向终止证据
+  （`completion_evidence`）才算完成。Legacy Supervisor 无覆盖率，因此始终
+  `coverage-unverified`。
+- **Legacy 结果单列，不计入 PEV pass rate**。Worker summary 固定写入
+  `execution_path`（`path_a_adapter` / `path_b_crawl_plan` / `legacy_path_c`）、
+  `coverage_verified`（bool）、`coverage`（dict | None）、`legacy_fallback_reason`
+  （str | None），供管理端 / 评估输出区分。
+- **PEV PASS 定义**：`coverage_verified=true` 且 `coverage_complete=true` 且
+  `failed_detail_count=0` 且 `candidate_count == unique_listing_count` 且
+  `count_apply_url_is_listpage=0` 且正文覆盖率 100%（合法鉴权墙除外）。
+- `enforce_result_invariants` 全局行为**不变**：仍只把 `succeeded`（无候选）转
+  `failed`、`partial_success`（无候选）转 `needs_manual_review`。PEV 完整性由
+  `run_post_crawl_pipeline -> verify_coverage` 强制，不靠全局 invariant。
+
+### 灰度启用与回滚
+
+四个站点 adapter 在 `scripts/seed_strategies.py` 中以 `enabled=False` 发布。满足**三次
+连续 coverage-verified live smoke** 后，按 `GRAY_ROLLOUT_ORDER` 顺序逐站启用：
+
+1. Moka → 2. 飞书 → 3. 汇川 → 4. 小红书
+
+每次只把对应 `JobDiscoveryStrategy.enabled` 切为 `True`，其余站点仍走 legacy。单站出现
+计数漂移 / 正向终止字段消失 / `failed_detail_count>0` / `count_apply_url_is_listpage>0` /
+新出现 blocked marker / 三次计数不一致（`GRAY_ROLLBACK_TRIGGERS`）时，只禁用该站策略，
+不删除新契约、不改全局 invariant、不影响已稳定站点。
+
+### 相关文档
+
+- [Job Discovery Operations](job-discovery-agent-operations.md) - 启动、配置、PEV flags、live smoke 命令
+- [PEV Gray Migration Plan](../plan.md) Task 8 - 灰度发布与回滚完整步骤
+- `backend/app/services/job_discovery/README.md` - 路径定义、flags、回滚规则速查
+

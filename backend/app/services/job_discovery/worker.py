@@ -451,6 +451,25 @@ def _resolve_block_reason(reason: str | None) -> DiscoveryBlockReason:
         return DiscoveryBlockReason.unknown
 
 
+# Task 8: canonical execution-path labels for the gray-migration rollout.
+# ``executor_type`` is the internal routing variable; the persisted summary
+# exposes one of these labels so admin/eval output can separate coverage-verified
+# PEV runs (PATH A / PATH B) from coverage-unverified legacy PATH C results.
+_EXECUTION_PATH_LABELS: dict[str, str] = {
+    "adapter": "path_a_adapter",
+    "crawl_plan": "path_b_crawl_plan",
+    "planner": "path_b_crawl_plan",
+    "snapshot": "legacy_path_c",
+    "supervisor": "legacy_path_c",
+}
+
+
+def _execution_path_label(executor_type: str) -> str:
+    """Map the internal executor_type to a persisted execution-path label."""
+    return _EXECUTION_PATH_LABELS.get(executor_type, "legacy_path_c")
+
+
+
 
 def _crawl_plan_yaml(plan: CrawlPlan) -> str:
     """Serialize a validated plan for the existing deterministic PATH B API."""
@@ -693,6 +712,12 @@ class JobDiscoveryWorker:
             trajectory: TrajectoryBuffer | None = None
             snapshot_context: dict | None = None
             executor_type: str = "supervisor"
+            # Task 8: populated when the legacy Supervisor runs as a fallback
+            # (pev disabled, planner unavailable, strategy/adapter error, or
+            # snapshot fallback). None for PEV PATH A / PATH B runs. Surfaced
+            # in the persisted summary so legacy results are never confused with
+            # coverage-verified PEV PASS results.
+            legacy_fallback_reason: str | None = None
 
             # Build the navigation dependencies only when a legacy snapshot
             # declares that tool.  CrawlPlan execution is deterministic and
@@ -726,6 +751,7 @@ class JobDiscoveryWorker:
                                     "block_reason": "pev_disabled",
                                 }
                                 executor_type = "supervisor"
+                                legacy_fallback_reason = "pev_disabled"
                                 strategy_record = None
                             else:
                                 result = adapter_instance.execute(
@@ -739,6 +765,7 @@ class JobDiscoveryWorker:
                             )
                             snapshot_context = trajectory.to_snapshot_context()
                             executor_type = "supervisor"
+                            legacy_fallback_reason = "strategy_error"
                             # Increment error count BEFORE clearing strategy_record
                             strat_store.increment_error_count(db, strategy_record.id, {
                                 "tool": strategy_record.adapter,
@@ -761,6 +788,7 @@ class JobDiscoveryWorker:
                                 "block_reason": "pev_disabled",
                             }
                             executor_type = "supervisor"
+                            legacy_fallback_reason = "pev_disabled"
                             strategy_record = None
                         else:
                             executor_type = "crawl_plan" if crawl_plan_declared else "snapshot"
@@ -838,6 +866,7 @@ class JobDiscoveryWorker:
                                 else:
                                     snapshot_context = snap_result.snapshot_context
                                     executor_type = "supervisor"
+                                    legacy_fallback_reason = "snapshot_fallback"
                                     # Increment error count BEFORE clearing strategy_record
                                     fail_idx = trajectory.failed_step_index
                                     if fail_idx is not None and trajectory.steps:
@@ -929,6 +958,7 @@ class JobDiscoveryWorker:
                         elif self.settings.job_discovery_legacy_path_c_enabled:
                             snapshot_context = result.snapshot_context
                             executor_type = "supervisor"
+                            legacy_fallback_reason = "planner_unavailable"
                         else:
                             result = DiscoveryRunResult(
                                 status="needs_manual_review",
@@ -942,6 +972,7 @@ class JobDiscoveryWorker:
                         executor_type = "planner"
                     elif self.settings.job_discovery_legacy_path_c_enabled:
                         snapshot_context = {"source": "planner", "error": str(exc)}
+                        legacy_fallback_reason = "planner_unavailable"
                     else:
                         result = DiscoveryRunResult(
                             status="needs_manual_review",
@@ -1052,13 +1083,15 @@ class JobDiscoveryWorker:
                 "summary": result.summary,
                 "evidence_count": len(result.evidence),
                 "candidate_count": len(result.candidates),
-                "execution_path": (
-                    "crawl_plan" if result.coverage is not None else executor_type
-                ),
+                "execution_path": _execution_path_label(executor_type),
                 "coverage_verified": (
                     coverage_decision.complete if coverage_decision is not None else False
                 ),
                 "coverage": asdict(result.coverage) if result.coverage is not None else None,
+                # Task 8: None for PEV PATH A / PATH B runs; set when the legacy
+                # Supervisor ran as a fallback. Lets eval/admin output separate
+                # coverage-unverified legacy results from PEV PASS results.
+                "legacy_fallback_reason": legacy_fallback_reason,
             }
 
             if result.status in ("succeeded", "partial_success"):

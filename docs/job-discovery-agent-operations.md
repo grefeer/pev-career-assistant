@@ -77,6 +77,18 @@ npm run dev
 | `job_discovery_browser_headless` | `true` | 浏览器是否为无头模式（预留，暂未集成浏览器） |
 | `job_discovery_ocr_enabled` | `false` | 是否启用 OCR（需配置 OCR 服务） |
 
+PEV 灰度迁移 flags（默认全灰：PEV 关、legacy 开）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `job_discovery_strategy_enabled` | `false` | 是否查询 Strategy Router |
+| `job_discovery_pev_enabled` | `false` | 启用 PEV（PATH A / PATH B）；关闭时 `CompleteCrawlAdapter` 站点回退 legacy |
+| `job_discovery_planner_enabled` | `false` | 启用 PATH C planner agent（生成 / 修复 CrawlPlan） |
+| `job_discovery_legacy_path_c_enabled` | `true` | 允许 Legacy Supervisor 作为覆盖率未验证兜底 |
+| `job_discovery_planner_max_inspection_pages` | `3` | planner 巡检页预算（1-5） |
+
+执行路径与 PEV PASS 定义见 `backend/app/services/job_discovery/README.md`。
+
 智能表相关配置（通过 `.env` 设置）：
 
 | 变量 | 说明 |
@@ -156,3 +168,62 @@ curl -X POST "http://127.0.0.1:8000/api/admin/sync/tencent-intern-referrals" \
 ### 6.6 `JOBS_AUTOMATIC_DISCOVERY` 环境变量
 
 旧版部署依赖 `JOBS_AUTOMATIC_DISCOVERY` 环境变量。当前版本统一用 `job_discovery_enabled` 配置项。
+
+## 7. PEV 灰度发布与 live smoke
+
+### 7.1 执行路径
+
+| 路径 | 含义 | 覆盖率 |
+|------|------|--------|
+| PATH A | 认证站点 adapter（Moka / 飞书 / 汇川 / 小红书 / 阿里 SPA） | 已验证 |
+| PATH B | `SnapshotPlan` + `CrawlPlan` 确定性执行器 | 已验证 |
+| PATH C | `CrawlPlan` 生成 / 修复 agent | 已验证 |
+| Legacy PATH C | Supervisor Agent | **未验证**（兼容兜底） |
+
+CoverageVerifier 是唯一的完成权威。Legacy 结果保存候选但 `coverage-unverified`，
+worker summary 以 `execution_path` / `coverage_verified` / `legacy_fallback_reason`
+标记，**不计入 PEV pass rate**。
+
+### 7.2 单站启停（灰度）
+
+四个站点 adapter 在 `scripts/seed_strategies.py` 中 `enabled=False` 发布。按
+`GRAY_ROLLOUT_ORDER`（Moka -> 飞书 -> 汇川 -> 小红书）逐站启用，每次只切该站
+`JobDiscoveryStrategy.enabled=True`：
+
+```sql
+-- 启用 Moka（举例）；其余站点保持 enabled=false
+UPDATE job_discovery_strategies SET enabled = 1 WHERE url_pattern = 'app.mokahr.com/*';
+```
+
+回滚：单站出现计数漂移 / 正向终止字段消失 / `failed_detail_count>0` /
+`count_apply_url_is_listpage>0` / 新 blocked marker / 三次计数不一致
+（`GRAY_ROLLBACK_TRIGGERS`）时，只把该站 `enabled` 切回 0，不删契约、不改全局
+invariant、不影响其他站。
+
+### 7.3 Checkpoint 与 manual review
+
+- PATH B 的 `CrawlExecutor` 从 checkpoint 恢复，不会重复抓已完成详情。
+- 微信 snapshot 不进 CrawlPlan agent，硬 deadline 终止 hang。
+- 北森 / 会话鉴权墙（401/403 + SPA session auth）稳定返回
+  `needs_manual_review`（`permission_denied`），不进 repair / legacy 循环。
+- 永不自动点提交；最终提交始终人工控制。
+
+### 7.4 live smoke 命令
+
+```powershell
+# 10-URL 评估门禁（Step 9）：直接 supervisor 跨 10 个公开 URL，按 PEV PASS 门禁分桶。
+# 缺 gate env 或 DEEPSEEK_API_KEY 时 SKIP（绝不报为 PASS）。
+$env:RUN_TEN_URL_EVAL='1'
+$env:JOB_DISCOVERY_PEV_ENABLED='1'
+.\.venv\Scripts\python.exe tests/integration/job_discovery/test_supervisor_ten_url_eval.py -v
+
+# 单站晋升 smoke：把某灰度站走 PATH A（其策略 enabled），需连续 3 次 PASS 才晋升。
+$env:FLAGS_use_onednn='0'
+.\.venv\Scripts\python.exe tests/manual/test_pev_live_smoke.py --site moka      # 1/4
+.\.venv\Scripts\python.exe tests/manual/test_pev_live_smoke.py --site feishu    # 2/4
+.\.venv\Scripts\python.exe tests/manual/test_pev_live_smoke.py --site inovance  # 3/4
+.\.venv\Scripts\python.exe tests/manual/test_pev_live_smoke.py --site xiaohongshu # 4/4
+```
+
+结果写 `tests/manual/_ten_url_eval_*.json` 与 `_pev_live_smoke_<site>.json`。
+

@@ -31,6 +31,7 @@ from backend.app.services.job_discovery.strategy.snapshot_executor import (
     SnapshotExecutionResult,
 )
 from backend.app.services.job_discovery.worker import JobDiscoveryWorker
+from tests.conftest import settings_override
 
 
 @pytest.fixture
@@ -428,3 +429,165 @@ completion: {}
         task = db.get(JobDiscoveryTask, queued_task_id)
         assert task is not None
         assert task.status is JobDiscoveryTaskStatus.needs_manual_review
+
+
+# ---------------------------------------------------------------------------
+# Task 8: legacy PATH C results must be explicitly coverage-unverified, never
+# confused with coverage-verified PEV PASS results.
+# ---------------------------------------------------------------------------
+
+
+_CRAWL_PLAN_YAML = """
+plan_type: crawl_plan
+version: 1
+listing:
+  item_selector: .job
+  title_selector: .title
+pagination:
+  type: single_page
+detail:
+  body_selector: .detail
+completion: {}
+"""
+
+
+def _legacy_supervisor_succeeded_payload() -> dict[str, Any]:
+    """A succeeded legacy Supervisor result: candidates but no coverage."""
+    return {
+        "structured_response": {
+            "status": "succeeded",
+            "block_reason": None,
+            "evidence": [
+                {
+                    "evidence_type": "page_text",
+                    "url": "https://unknown.example.test/jobs/1",
+                    "title": "Job Page",
+                    "content_hash": "legacy-ev-hash",
+                    "text_excerpt": "Some text",
+                    "metadata": {"page_num": 1},
+                }
+            ],
+            "candidates": [
+                {
+                    "title": "Software Engineer",
+                    "company_name": "Example Corp",
+                    "locations": ["Beijing"],
+                    "recruitment_types": ["Full-time"],
+                    "confidence": 0.9,
+                }
+            ],
+            "summary": "legacy supervisor found 1 candidate",
+        }
+    }
+
+
+def run_legacy_supervisor_success(
+    engine: Engine,
+    db_session_factory: sessionmaker[Session],
+    queued_task_id: str,
+) -> tuple[DiscoveryRunResult, dict[str, Any]]:
+    """Run the legacy Supervisor (PEV off) to a succeeded, coverage-less result.
+
+    Returns the finalized result and the persisted ``result_summary_json``.
+    """
+    legacy_settings = settings_override(
+        job_discovery_enabled=True,
+        job_discovery_strategy_enabled=False,
+        job_discovery_pev_enabled=False,
+        job_discovery_planner_enabled=False,
+        job_discovery_legacy_path_c_enabled=True,
+        job_discovery_task_timeout_seconds=60,
+    )
+    with patch(
+        "backend.app.services.job_discovery.worker.claim_next_task"
+    ) as mock_claim, patch(
+        "backend.app.services.job_discovery.worker.build_discovery_supervisor_agent"
+    ) as mock_supervisor:
+        mock_claim.side_effect = lambda db, **_: db.get(
+            JobDiscoveryTask, queued_task_id
+        )
+        agent = MagicMock()
+        agent.invoke.return_value = _legacy_supervisor_succeeded_payload()
+        mock_supervisor.return_value = agent
+        JobDiscoveryWorker(db_session_factory, legacy_settings).run_once()
+    with Session(engine) as db:
+        task = db.get(JobDiscoveryTask, queued_task_id)
+        assert task is not None
+        summary = dict(task.result_summary_json or {})
+    result = DiscoveryRunResult(status="succeeded", coverage=None)
+    return result, summary
+
+
+def run_pev_success(
+    engine: Engine,
+    db_session_factory: sessionmaker[Session],
+    queued_task_id: str,
+) -> tuple[DiscoveryRunResult, dict[str, Any]]:
+    """Run a PEV PATH B crawl-plan (planner-generated) to a coverage-verified result."""
+    pev_settings = settings_override(
+        job_discovery_enabled=True,
+        job_discovery_strategy_enabled=False,
+        job_discovery_pev_enabled=True,
+        job_discovery_planner_enabled=True,
+        job_discovery_legacy_path_c_enabled=True,
+        job_discovery_planner_max_inspection_pages=3,
+        job_discovery_task_timeout_seconds=60,
+    )
+    coverage = CrawlCoverage(
+        pagination_type=PaginationType.SINGLE_PAGE,
+        visited_page_count=1,
+        completion_evidence=["single_page_terminal"],
+    )
+    with patch(
+        "backend.app.services.job_discovery.worker.claim_next_task"
+    ) as mock_claim, patch(
+        "backend.app.services.job_discovery.worker.build_discovery_supervisor_agent"
+    ), patch(
+        "backend.app.services.job_discovery.worker.SnapshotExecutor"
+    ) as mock_snapshot_executor, patch(
+        "backend.app.services.job_discovery.worker.generate_crawl_plan"
+    ) as mock_generate_plan, patch(
+        "backend.app.services.job_discovery.worker.build_crawl_plan_agent"
+    ):
+        mock_claim.side_effect = lambda db, **_: db.get(
+            JobDiscoveryTask, queued_task_id
+        )
+        mock_snapshot_executor.return_value.execute.return_value = (
+            DiscoveryRunResult(
+                status="failed", coverage=coverage, summary="verified crawl"
+            )
+        )
+        mock_generate_plan.return_value = CrawlPlan.from_yaml(_CRAWL_PLAN_YAML)
+        JobDiscoveryWorker(db_session_factory, pev_settings).run_once()
+    with Session(engine) as db:
+        task = db.get(JobDiscoveryTask, queued_task_id)
+        assert task is not None
+        summary = dict(task.result_summary_json or {})
+    result = DiscoveryRunResult(status="succeeded", coverage=coverage)
+    return result, summary
+
+
+def test_legacy_path_c_is_explicitly_coverage_unverified(
+    engine: Engine,
+    db_session_factory: sessionmaker[Session],
+    queued_task_id: str,
+) -> None:
+    result, summary = run_legacy_supervisor_success(
+        engine, db_session_factory, queued_task_id
+    )
+    assert result.coverage is None
+    assert summary["execution_path"] == "legacy_path_c"
+    assert summary["coverage_verified"] is False
+
+
+def test_pev_success_is_coverage_verified(
+    engine: Engine,
+    db_session_factory: sessionmaker[Session],
+    queued_task_id: str,
+) -> None:
+    result, summary = run_pev_success(
+        engine, db_session_factory, queued_task_id
+    )
+    assert result.coverage is not None
+    assert summary["execution_path"] in {"path_a_adapter", "path_b_crawl_plan"}
+    assert summary["coverage_verified"] is True
