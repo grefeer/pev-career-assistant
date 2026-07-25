@@ -62,14 +62,23 @@ def _loc_key(candidate: NormalizedJobCandidate) -> str:
     locations = getattr(candidate, "locations", None) or []
     norms: list[str] = []
     for loc in locations:
-        s = str(loc or "").strip()
-        if not s:
-            continue
-        for suf in ("自治区", "省", "市"):
-            if s.endswith(suf) and len(s) > len(suf):
-                s = s[: -len(suf)]
-                break
-        norms.append(s)
+        # A single location string may join multiple cities (e.g. "上海、深圳"
+        # from rendered list text vs ["上海","深圳"] from an XHR list). Split on
+        # common delimiters so both capture forms produce the same key and merge,
+        # instead of surviving as distinct (un-mergeable) loc_key values that
+        # surface as duplicate candidates (e.g. feishu multi-city postings).
+        _raw = str(loc or "")
+        for _d in ("、", "，", ",", "/", ";", "；"):
+            _raw = _raw.replace(_d, "、")
+        for part in _raw.split("、"):
+            s = part.strip()
+            if not s:
+                continue
+            for suf in ("自治区", "省", "市"):
+                if s.endswith(suf) and len(s) > len(suf):
+                    s = s[: -len(suf)]
+                    break
+            norms.append(s)
     return "|".join(sorted(set(norms)))
 
 
@@ -183,6 +192,43 @@ def _merge(dst: NormalizedJobCandidate, src: NormalizedJobCandidate) -> None:
         dst.company_name = src.company_name
 
 
+def _drop_title_only_echoes(
+    candidates: list[NormalizedJobCandidate],
+) -> list[NormalizedJobCandidate]:
+    """Drop title-only candidates that echo a kept full-JD candidate's title.
+
+    A title-only candidate (no JD body) whose normalized title matches a
+    full-JD candidate's title is a list-page echo of an already-captured real
+    posting - e.g. mokahr's ``#/home`` list-page titles re-extracted as
+    title-only while the ``#/job/<uuid>`` full JDs (with body + per-job URL)
+    are captured via XHR. It has no body and typically a list-page URL, so it
+    is not a usable posting once the full JD exists; keeping it both inflates
+    the count and leaves a same-titled pair that the eval flags as a duplicate.
+
+    Returns a new list (inputs untouched) preserving first-seen order. A no-op
+    when no full-JD candidate shares a title with a title-only one - so sites
+    whose candidates are uniformly title-only (e.g. pdd) are unaffected.
+    """
+    if not candidates:
+        return []
+    full_jd_titles: set[str] = set()
+    for c in candidates:
+        if _has_jd_body(c):
+            t = normalize_title(getattr(c, "title", "") or "")
+            if t:
+                full_jd_titles.add(t)
+    if not full_jd_titles:
+        return list(candidates)
+    out: list[NormalizedJobCandidate] = []
+    for c in candidates:
+        if not _has_jd_body(c):
+            t = normalize_title(getattr(c, "title", "") or "")
+            if t and t in full_jd_titles:
+                continue
+        out.append(c)
+    return out
+
+
 def deduplicate_candidates(
     candidates: list[NormalizedJobCandidate],
 ) -> list[NormalizedJobCandidate]:
@@ -227,4 +273,7 @@ def deduplicate_candidates(
             for src in cluster[1:]:
                 _merge(dst, src)
             out.append(dst)
-    return out
+    # Drop title-only list-page echoes of full-JD candidates (see
+    # ``_drop_title_only_echoes``). Run AFTER identity clustering so it sees
+    # the merged survivors, and so it is applied exactly once per run.
+    return _drop_title_only_echoes(out)

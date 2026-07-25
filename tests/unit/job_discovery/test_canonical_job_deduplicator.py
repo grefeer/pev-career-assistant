@@ -103,11 +103,27 @@ class TestFullJdDedup:
         ])
         assert len(out) == 2
 
-    def test_title_only_and_full_jd_do_not_collide(self) -> None:
-        # Different identity-tag prefix -> never merged even if title matches.
+    def test_title_only_echo_of_full_jd_dropped(self) -> None:
+        # A title-only candidate whose title matches a full-JD candidate's
+        # title is a list-page echo of the same posting (the list-page title
+        # re-captured while the detail-page full JD already exists). It has no
+        # body and is not actionable, so it is dropped to avoid double-counting
+        # (e.g. mokahr "#/home" list-page titles echoing "#/job/<uuid>" full
+        # JDs). The full-JD candidate survives.
         t = _title_only("算法工程师", "小米")
         f = _full_jd("算法工程师", "小米", "负责A", "要求B")
         out = deduplicate_candidates([t, f])
+        assert len(out) == 1
+        assert out[0].responsibilities == "负责A"  # the full-JD candidate won
+
+    def test_title_only_kept_when_no_full_jd_same_title(self) -> None:
+        # No-op guard: uniformly title-only runs (e.g. pdd) are unaffected -
+        # a title-only candidate is only dropped when a full-JD candidate of
+        # the SAME title exists.
+        out = deduplicate_candidates([
+            _title_only("算法工程师", "拼多多"),
+            _title_only("系统工程师", "拼多多"),
+        ])
         assert len(out) == 2
 
 

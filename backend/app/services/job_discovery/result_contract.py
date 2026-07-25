@@ -9,7 +9,11 @@ from typing import Any, Iterator
 
 from backend.app.services.job_discovery.deduplication.canonical_job_deduplicator import (
     _cluster_by_title_substring,
+    _has_jd_body,
     _identity_key,
+)
+from backend.app.services.job_discovery.normalization.jd_normalizer import (
+    normalize_title,
 )
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
@@ -231,8 +235,16 @@ def _merge_tool_outputs(
     # outputs) are dicts. Normalize to dicts, semantic-dedup, then convert back
     # to objects so ``DiscoveryRunResult.candidates`` stays ``list[NormalizedJobCandidate]``
     # regardless of which path produced it.
+    # Tool candidates (deterministically extracted + verify_evidence-verified)
+    # are authoritative per the supervisor prompt ("candidates returned by
+    # run_web_navigation are the authoritative result"). Put them FIRST so they
+    # win the canonical dedup over any LLM-emitted structured_response candidate
+    # that diverges on enum-sensitive fields (e.g. non-enum recruitment_types like
+    # ["校园招聘","全职"] instead of ["campus_recruitment","full_time"]). For a
+    # faithful relay the tool and LLM candidates are identical, so the winner is
+    # unchanged; only divergent LLM candidates are superseded.
     merged_dicts = _dedupe_candidate_dicts(
-        [*_as_candidate_dicts(result.candidates), *candidates]
+        [*candidates, *_as_candidate_dicts(result.candidates)]
     )
     return replace(
         result,
@@ -334,6 +346,8 @@ def _dedupe_candidate_dicts(candidates: list[dict[str, Any]]) -> list[dict[str, 
             bucket.append(index)
 
     out: list[dict[str, Any]] = []
+    # Collect kept (obj, dict) pairs (first per cluster) in first-seen order.
+    kept: list[tuple[NormalizedJobCandidate | None, dict[str, Any]]] = []
     for key in order:
         member_idxs = groups[key]
         member_objs = [pairs[i][0] for i in member_idxs]
@@ -348,5 +362,23 @@ def _dedupe_candidate_dicts(candidates: list[dict[str, Any]]) -> list[dict[str, 
         else:
             idx_clusters = [member_idxs]
         for cluster in idx_clusters:
-            out.append(pairs[cluster[0]][1])
+            kept.append(pairs[cluster[0]])
+
+    # Drop title-only list-page echoes of full-JD candidates (mirrors
+    # ``canonical_job_deduplicator._drop_title_only_echoes``). A title-only
+    # candidate whose normalized title matches a kept full-JD candidate's title
+    # is a redundant list-page echo (e.g. mokahr "#/home" titles echoing the
+    # "#/job/<uuid>" full JDs) and is dropped. No-op when no full-JD candidate
+    # shares a title with a title-only one.
+    full_jd_titles: set[str] = set()
+    for obj, _dict in kept:
+        if obj is not None and _has_jd_body(obj):
+            t = normalize_title(getattr(obj, "title", "") or "")
+            if t:
+                full_jd_titles.add(t)
+    for obj, d in kept:
+        if (obj is not None and not _has_jd_body(obj)
+                and normalize_title(getattr(obj, "title", "") or "") in full_jd_titles):
+            continue
+        out.append(d)
     return out
