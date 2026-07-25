@@ -17,7 +17,7 @@
 - `/jobs` and `/jobs/{id}` remain verified-only. New tables never mutate `review_version` or a `JobPosting` status.
 - Reads/writes use `current_user.id`; no DTO may expose raw payloads, cookies, tokens, or wall text.
 - Runs process existing retained shared tasks only: no URL/site/adapter/crawl-plan request fields, shared cache, scheduled refresh, query coalescing, or automatic application.
-- The canonical de-duplication module is currently dirty with user changes. Task 5 may add one isolated public identity-key hunk after preserving those changes; stage it with `git add -p` and never stage unrelated hunks. Do not modify or stage `result_contract.py`.
+- Before Task 1, create a clean isolated worktree and feature branch from this plan commit. The main worktree's user-owned changes to canonical de-duplication and `result_contract.py` must remain untouched; no implementation task stashes, commits, or stages them.
 
 ---
 
@@ -27,7 +27,7 @@
 | --- | --- |
 | `backend/app/domain/personalized_discovery.py` | Closed status/state enums, role normalization/recall, URL validation, safe display copy. |
 | `backend/app/services/job_discovery/single_source_proof.py` | Registered single-resource contract and deterministic proof verifier. |
-| `backend/app/services/job_discovery/deduplication/canonical_job_deduplicator.py` | Exposes the one canonical-key function shared by within-run and cross-task de-duplication. |
+| `backend/app/services/job_discovery/deduplication/canonical_job_deduplicator.py` | Exposes a canonical-key function with the same `_identity_key` semantics as within-run de-duplication. |
 | `backend/app/services/job_discovery/worker.py` | Persists completeness provenance in task summaries. |
 | `backend/app/db/models.py` | New preference columns and owner-scoped run/delivery/status models. |
 | `backend/app/repositories/personalized_discovery.py` | SQL-only task selection and owner-scoped upserts/listing. |
@@ -45,7 +45,13 @@
 - Produces `SourceStatusReason`, `RecommendationPresentationState`, `normalize_role_terms`, `title_matches_role_recall`, `validate_application_url`, and `source_status_copy`.
 - `validate_application_url(raw_url: str | None, allowed_hosts: set[str]) -> ValidatedApplicationUrl | UrlValidationFailure`.
 
-- [ ] **Step 1: Write failing tests.**
+- [ ] **Step 1: Create the isolated implementation worktree.**
+
+Run: `git worktree add -b codex/personalized-discovery-v1 ../personalized-discovery-v1 HEAD`
+
+Expected: a clean sibling worktree on `codex/personalized-discovery-v1`. Perform every remaining task there; do not stash, stage, or commit the main worktree's existing changes.
+
+- [ ] **Step 2: Write failing tests.**
 
 ```python
 def test_role_terms_are_trimmed_deduplicated_and_nonblank() -> None:
@@ -69,13 +75,13 @@ def test_broad_recall_keeps_synonym_but_exclusion_wins() -> None:
     assert not title_matches_role_recall("Agent Engineer", ["AI应用开发"], ["agent"], ["agent"])
 ```
 
-- [ ] **Step 2: Run the test to verify failure.**
+- [ ] **Step 3: Run the test to verify failure.**
 
 Run: `./.venv/Scripts/python.exe -m pytest tests/unit/test_personalized_discovery_domain.py -q`
 
 Expected: FAIL; module/functions do not exist.
 
-- [ ] **Step 3: Implement the minimal deterministic module.**
+- [ ] **Step 4: Implement the minimal deterministic module.**
 
 ```python
 class SourceStatusReason(StrEnum):
@@ -98,13 +104,13 @@ class RecommendationPresentationState(StrEnum):
 
 Use `urllib.parse.urlsplit` and `ipaddress.ip_address`; do not resolve DNS. `source_status_copy` maps only the enum to fixed Chinese text and fixed guidance, never accepts raw upstream text. Cap role lists at 100 terms and each term at 128 characters.
 
-- [ ] **Step 4: Verify.**
+- [ ] **Step 5: Verify.**
 
 Run: `./.venv/Scripts/python.exe -m pytest tests/unit/test_personalized_discovery_domain.py -q; ./.venv/Scripts/python.exe -m ruff check backend/app/domain/personalized_discovery.py tests/unit/test_personalized_discovery_domain.py`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit.**
+- [ ] **Step 6: Commit.**
 
 ```powershell
 git add backend/app/domain/personalized_discovery.py tests/unit/test_personalized_discovery_domain.py
@@ -216,12 +222,6 @@ def test_score_threshold_is_bounded(db_session, score: float) -> None:
     with pytest.raises(ValueError, match="0.*100"):
         set_preferences(db_session, user.id, personalized_discovery_min_score=score)
 
-def test_ranker_failure_returns_zero_score_for_every_candidate() -> None:
-    ranked = RelevanceRanker(FailingLLM()).rank([candidate], profile_summary={}, preferences={})
-    assert ranked[0].score == 0.0
-
-def test_recommendation_rank_does_not_truncate_candidates() -> None:
-    assert len(RecommendationService(FakeRanker()).rank(candidates_21, profile_summary={}, preferences={})) == 21
 ```
 
 - [ ] **Step 2: Run and confirm failure.**
@@ -234,7 +234,26 @@ Expected: FAIL; repository allowlist/summary lacks fields.
 
 Normalize lists through Task 1 before repository access. Add the three names to `_PREFERENCE_COLUMNS` and `to_summary`. A profile and `JobRelevanceScore` remain unchanged; the existing relevance ranker simply receives the augmented preferences dictionary.
 
-- [ ] **Step 4: Verify and commit.**
+- [ ] **Step 4: Add characterization tests for existing ranker behavior.**
+
+```python
+def test_ranker_failure_returns_zero_score_for_every_candidate() -> None:
+    ranked = RelevanceRanker(FailingLLM()).rank([candidate], profile_summary={}, preferences={})
+    assert ranked[0].score == 0.0
+
+
+def test_recommendation_rank_does_not_truncate_candidates() -> None:
+    ranked = RecommendationService(FakeRanker()).rank(
+        candidates_21, profile_summary={}, preferences={},
+    )
+    assert len(ranked) == 21
+```
+
+Run: `./.venv/Scripts/python.exe -m pytest tests/unit/test_relevance_ranker.py tests/unit/test_recommendation_service.py -q`
+
+Expected: PASS immediately; these characterize existing behavior and guard the later personalized service from accidentally using `filter_and_sort`.
+
+- [ ] **Step 5: Verify and commit.**
 
 Run: `./.venv/Scripts/python.exe -m pytest tests/unit/test_preferences_service.py tests/unit/test_relevance_ranker.py tests/unit/test_recommendation_service.py -q`
 
@@ -304,7 +323,7 @@ git commit -m "feat: record personalized completeness proofs"
 
 **Interfaces:**
 - `list_latest_retained_tasks(db, *, now, retention_days) -> list[JobDiscoveryTask]`
-- `upsert_recommendation(db, *, user_id, candidate_id, task_id, last_run_id, canonical_job_key, preference_version, relevance_score, relevance_reason, matched_signals, presentation_state)` and `upsert_source_status(db, *, user_id, run_id, task_id, source_key, safe_source_url, reason_code)`.
+- `upsert_recommendation(db, *, user_id, candidate_id, task_id, last_run_id, canonical_job_key, preference_version, relevance_score, relevance_reason, matched_signals, presentation_state)` updates the row's candidate/task/run/score fields on its `(user_id, canonical_job_key)` conflict; `upsert_source_status(db, *, user_id, run_id, task_id, source_key, safe_source_url, reason_code)` is idempotent per run/task/reason.
 - `list_recommendations_for_user(db, user_id, *, limit, offset)` and `list_statuses_for_user(db, user_id, *, run_id, limit, offset)`.
 - `count_runs_for_user_in_window(db, *, user_id, started_at, ended_at) -> int`.
 - `canonical_job_key(candidate: NormalizedJobCandidate) -> str` returns `v1:` plus the SHA-256 of canonical JSON for the exact private `_identity_key(candidate)` tuple. It is called only after the service rejects title-only/missing-JD candidates.
@@ -330,6 +349,23 @@ def test_delivery_upsert_reuses_user_canonical_key(db_session) -> None:
     )
     assert second.id == first.id
 
+
+def test_cross_source_conflict_repoints_delivery_to_selected_representative(db_session) -> None:
+    original = upsert_recommendation(
+        db_session, user_id=user.id, candidate_id=older_candidate.id, task_id=older_task.id,
+        last_run_id=run.id, canonical_job_key="k", preference_version=1,
+        relevance_score=80.0, relevance_reason="match", matched_signals=["AI"],
+        presentation_state=RecommendationPresentationState.NEW,
+    )
+    updated = upsert_recommendation(
+        db_session, user_id=user.id, candidate_id=newer_candidate.id, task_id=newer_task.id,
+        last_run_id=run.id, canonical_job_key="k", preference_version=1,
+        relevance_score=80.0, relevance_reason="match", matched_signals=["AI"],
+        presentation_state=RecommendationPresentationState.NEW,
+    )
+    assert updated.id == original.id
+    assert (updated.candidate_id, updated.task_id) == (newer_candidate.id, newer_task.id)
+
 def test_owner_list_excludes_another_users_records(db_session) -> None:
     assert list_recommendations_for_user(db_session, user_a.id, limit=50, offset=0) == [user_a_row]
 
@@ -352,7 +388,7 @@ Expected: FAIL; repository is absent.
 
 - [ ] **Step 3: Implement SQL only.**
 
-Select latest terminal task inside retention with `row_number() over (partition by source_id, external_record_id order by finished_at desc, created_at desc)`. Count daily runs with `started_at >= local-day UTC start AND started_at < next local-day UTC start` and the supplied `user_id`. The repository does not decide wall mapping, coverage, URL safety, relevance, or canonical-key construction. Every list/update predicate includes `user_id`.
+Select latest terminal task inside retention with `row_number() over (partition by source_id, external_record_id order by finished_at desc, created_at desc)`. Count daily runs with `started_at >= local-day UTC start AND started_at < next local-day UTC start` and the supplied `user_id`. On recommendation conflict, update candidate/task/last_run/preference version/score/reason/signals but preserve an existing `dismissed` presentation state; otherwise use the incoming presentation state. The repository does not decide the representative, wall mapping, coverage, URL safety, relevance, or canonical-key construction. Every list/update predicate includes `user_id`.
 
 Expose the identity key in the existing deduplicator rather than reproducing its private location normalization in the new service:
 
@@ -362,15 +398,14 @@ def canonical_job_key(candidate: NormalizedJobCandidate) -> str:
     return f"v1:{hashlib.sha256(payload.encode("utf-8")).hexdigest()}"
 ```
 
-Export it from `deduplication/__init__.py`. Preserve the user's current `_loc_key` and title-echo changes; add only this function/import/export/test hunk, and use `git add -p` to stage that hunk separately.
+Export it from `deduplication/__init__.py`. The isolated worktree is clean, so add the function/import/export/test as one normal focused commit. The main worktree's current `_loc_key` and title-echo edits are out of scope and remain untouched.
 
 - [ ] **Step 4: Verify and commit.**
 
 Run: `./.venv/Scripts/python.exe -m pytest tests/unit/test_personalized_discovery_repository.py -q`
 
 ```powershell
-git add backend/app/repositories/personalized_discovery.py tests/unit/test_personalized_discovery_repository.py
-git add -p backend/app/services/job_discovery/deduplication/canonical_job_deduplicator.py backend/app/services/job_discovery/deduplication/__init__.py tests/unit/job_discovery/test_canonical_job_deduplicator.py
+git add backend/app/repositories/personalized_discovery.py tests/unit/test_personalized_discovery_repository.py backend/app/services/job_discovery/deduplication/canonical_job_deduplicator.py backend/app/services/job_discovery/deduplication/__init__.py tests/unit/job_discovery/test_canonical_job_deduplicator.py
 git commit -m "feat: add personalized discovery repositories"
 ```
 
@@ -404,6 +439,13 @@ def test_ranker_failure_missing_jd_and_unsafe_url_never_deliver(db_session, fail
 def test_run_has_no_implicit_top_twenty_cap(db_session, ranker, user) -> None:
     service(ranker).run(db_session, user_id=user.id, now=NOW)
     assert len(_recommendations(db_session, user.id)) == 21
+
+
+def test_cross_source_duplicates_rank_once_and_select_newest_task_candidate(db_session, ranker, user) -> None:
+    service(ranker).run(db_session, user_id=user.id, now=NOW)
+    assert ranker.received_titles.count("AI Agent 应用开发工程师") == 1
+    row = _recommendations(db_session, user.id)[0]
+    assert (row.candidate_id, row.task_id) == (newer_candidate.id, newer_task.id)
 ```
 
 - [ ] **Step 2: Run and confirm failure.**
@@ -419,13 +461,14 @@ latest retained task per source resource
  -> terminal/wall mapping or full-coverage/registered-single-source proof
  -> require candidate JD + evidence; URL validation against proof hosts
  -> `canonical_job_key` from the existing CanonicalJobDeduplicator public API
+ -> group by canonical key; select one deterministic representative
  -> broad title/category/synonym recall (excluded role wins)
  -> RecommendationService.rank / RelevanceRanker
  -> score >= user threshold
  -> owner-scoped recommendation upsert
 ```
 
-Keep canonical de-duplication before broad recall: this is the approved gate order and ensures one canonical candidate receives one score/delivery decision. Do not call `RecommendationService.filter_and_sort` because its default is `top_n=20`. Ranker error or malformed score is `0.0`, never a positive delivery. Map actual `DiscoveryBlockReason` members as follows: `login_required -> login_required`, `captcha -> captcha`, `anti_bot -> anti_bot`, `permission_denied -> authentication_required`, `invalid_url -> url_unsafe`, `wechat_unavailable|timeout|budget_exceeded|parse_failed|unknown -> needs_manual_review`; a task without a more-specific reason and without either proof is `coverage_incomplete`. Any future non-enum worker string also maps to `needs_manual_review`.
+Keep canonical de-duplication before broad recall: this is the approved gate order and ensures one canonical candidate receives one score/delivery decision. For each key, choose the representative with the newest non-null task `finished_at`; break an equal timestamp by candidate `created_at` descending, then candidate UUID ascending. Rank only these representatives. The repository upsert receives that selected candidate/task and updates the existing delivery row to it; it is never allowed to choose a last writer independently. Do not call `RecommendationService.filter_and_sort` because its default is `top_n=20`. Ranker error or malformed score is `0.0`, never a positive delivery. Map actual `DiscoveryBlockReason` members as follows: `login_required -> login_required`, `captcha -> captcha`, `anti_bot -> anti_bot`, `permission_denied -> authentication_required`, `invalid_url -> url_unsafe`, `wechat_unavailable|timeout|budget_exceeded|parse_failed|unknown -> needs_manual_review`; a task without a more-specific reason and without either proof is `coverage_incomplete`. Any future non-enum worker string also maps to `needs_manual_review`.
 
 Before creating a running row, call `count_runs_for_user_in_window` with the caller's current China-local calendar-day UTC boundaries; reject when the count is `>= personalized_discovery_runs_per_day`. Then create a running row, rank, and finalize counts/timestamp. A failure marks only that run `failed` with a safe code and raises a typed service error.
 
@@ -550,7 +593,7 @@ git commit -m "test: verify personalized discovery safety boundaries"
 
 ## Self-review
 
-**Spec coverage:** Tasks 1/4/6 implement all gates and both approved completeness proofs. The initial source scope is intentionally the four migrated complete-crawl adapters; Task 4 provides the separately tested expansion path, but registers no single-resource source in v1. Tasks 2/5 implement separate owner records, a public shared canonical key, cross-task de-duplication, and a user/day run-count query. Task 3 reuses the current preference stack. Task 7 supplies user-only APIs without user-controlled crawling. Task 8 proves verified-job isolation, no raw wall leakage, and the retention cleanup requirement.
+**Spec coverage:** Tasks 1/4/6 implement all gates and both approved completeness proofs. The initial source scope is intentionally the four migrated complete-crawl adapters; Task 4 provides the separately tested expansion path, but registers no single-resource source in v1. Tasks 2/5/6 implement separate owner records, a public shared canonical key, deterministic cross-source representative selection before ranking, conflict repointing, and a user/day run-count query. Task 3 reuses the current preference stack. Task 7 supplies user-only APIs without user-controlled crawling. Task 8 proves verified-job isolation, no raw wall leakage, and the retention cleanup requirement.
 
 **Placeholder scan:** The Alembic revision placeholder is the generated filename only; implementation must replace it with Alembic's generated revision id. Table names, fields, constraints, interfaces, tests, and commands are fixed. The only future product expansion deliberately not enabled in v1 is registration of a source-specific `single_source_complete` contract, whose admission criteria are fixed in Task 4.
 
