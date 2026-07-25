@@ -69,3 +69,5 @@ tests/manual/_ten_url_eval_*.json
 
 .playwright-cli/
 .playwright-mcp/
+output/
+tests/manual/

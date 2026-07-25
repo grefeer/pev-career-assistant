@@ -1497,8 +1497,12 @@ def _collect_detail_page_links(page: Any, base_url: str) -> list[str]:
             href = anchors.nth(i).get_attribute("href")
         except Exception:  # noqa: BLE001
             continue
-        if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
+        if not href or href == "#" or href.startswith(("javascript:", "mailto:", "tel:")):
             continue
+        # A bare "#" is a no-op anchor and skipped above, but a hash-routed SPA
+        # detail link ("#/jobs/detail/<id>") is real navigation - keep it so the
+        # fragment hint check below can match it (resolved via urljoin, which
+        # preserves the fragment on the same host).
         try:
             resolved = urljoin(base_url, href)
             parsed = urlsplit(resolved)
@@ -1508,7 +1512,9 @@ def _collect_detail_page_links(page: Any, base_url: str) -> list[str]:
             continue
         if (parsed.hostname or "").lower() != base_host:
             continue
-        path_q = (parsed.path + " " + parsed.query).lower()
+        # Include the fragment: hash-routed SPAs (Vue/React hash mode) carry the
+        # detail route in parsed.fragment ("#/jobs/detail/<id>"), with path "/".
+        path_q = (parsed.path + " " + parsed.query + " " + parsed.fragment).lower()
         if not any(h in path_q for h in _DETAIL_LINK_HINTS):
             continue
         if resolved == base_url or resolved in seen:
@@ -1737,7 +1743,11 @@ def _deep_dive_detail_pages(page: Any, browser: Any, base_url: str) -> list[tupl
             except Exception:  # noqa: BLE001
                 pass
             dpage.close()
-            if dtext.strip():
+            # Skip walled detail pages (login/captcha/anti-bot interstitial):
+            # hard gate #2 - never bypass. A walled page's text is not a JD body;
+            # capturing it would fabricate a full-JD candidate from wall text.
+            # The candidate stays title-only with a clear signal instead.
+            if dtext.strip() and not _is_pagination_wall(dtext):
                 captures.append((durl, dtitle, dtext))
         except Exception:  # noqa: BLE001 - best-effort per detail page
             continue
@@ -2290,9 +2300,35 @@ def _generic_position_evidence_from_payload(
             json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
         # Truncate text_excerpt to avoid overflowing LLM context window.
+        # Prefer a per-position detail URL from the XHR job object over the
+        # shared source/landing URL, so a candidate links to its own detail page
+        # instead of the list. Generic field-name sweep + same-host validation
+        # (no hostname branching); relative URLs are resolved against source_url.
+        # Falls back to source_url when no usable URL field is present.
+        detail_url = source_url
+        try:
+            _src_host = (urlsplit(source_url).hostname or "").lower()
+        except Exception:  # noqa: BLE001
+            _src_host = ""
+        if _src_host:
+            for _uf in ("url", "detailUrl", "detail_url", "shareUrl",
+                        "share_url", "positionUrl", "position_url", "applyUrl",
+                        "apply_url", "jobUrl", "job_url", "link", "href",
+                        "positionLink"):
+                _uv = str(item.get(_uf) or "").strip()
+                if not _uv or _uv.startswith(("#", "javascript:", "mailto:")):
+                    continue
+                _cand = (_uv if _uv.startswith(("http://", "https://"))
+                         else urljoin(source_url, _uv))
+                try:
+                    if (urlsplit(_cand).hostname or "").lower() == _src_host:
+                        detail_url = _cand
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
         evidence.append({
             "evidence_type": "job_detail_json",
-            "url": source_url,
+            "url": detail_url,
             "title": title,
             "content_hash": content_hash,
             "text_excerpt": text[:1500],
@@ -2824,6 +2860,16 @@ def _is_plausible_job_title(
         and matched in _GENERIC_BARE_SUFFIXES
     ):
         return False
+    # Generic section/list headers ending in 职位 / 岗位 (校招职位, 社招职位,
+    # 所有职位, 找到你心仪的职位) - UI section text, never a real job title. Reject
+    # REGARDLESS of JD body: an aggregated landing blob (e.g. mobile mokahr) can
+    # attach a mashed multi-role body to such a header, so the body exemption
+    # below must not rescue it. A real role that appends 岗位 (高级工程师岗位) is
+    # kept - stripping 岗位 leaves a title ending in a real role suffix.
+    if title.endswith(("职位", "岗位")):
+        _head = title[:-2].rstrip()
+        if not any(_head.endswith(s) for s in _JOB_TITLE_SUFFIXES):
+            return False
     has_body = bool(
         (getattr(candidate, "responsibilities", "") or "").strip()
         or (getattr(candidate, "requirements", "") or "").strip()
