@@ -339,6 +339,14 @@ CRITICAL - OUTPUT DISCIPLINE:
 
 CONSTRAINTS:
 - Total tool calls <= 14. The `task` calls count but run in parallel.
+- NEVER use `edit_file`/`str_replace`/`write_file` on anything under
+  `output/candidates/` or `output/candidates_merged.json`. Candidate files
+  are written ONLY by `jd_extractor` sub-agents via `write_candidates.py`
+  (a subprocess on real disk); the virtual-FS `edit_file` cannot reach them,
+  so editing is a pure wasted step that burns your recursion budget for no
+  effect. If a candidate file looks wrong, do NOT fix it by hand - just run
+  `deduplicate`, which skips malformed files. Your only write to the candidates
+  tree is the `deduplicate`-merge.
 - Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
   normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.
@@ -395,11 +403,17 @@ STEPS (strict tool budget):
    (use the `total_in_file` from the last write_candidates result as `written`).
 
 HARD RULES - do not break these:
-- Write ONLY to the EXACT `--out` path from your task description. NEVER append a
-  suffix (`_new`, `_v2`, `_temp`, `_final`). If a write_candidates call reports
-  `status: error`, retry that SAME `--out` path ONCE with a smaller batch; do
-  NOT invent a new filename. There is no reason ever to have more than one
-  `page_NN.json` file.
+- Write ONLY to the EXACT `--out` path from your task description
+  (`output/candidates/page_NN.json`). Do NOT invent a suffixed filename
+  (`_new`, `_v2`, `_temp`, `_final`, `_batch`, `_clean`, `_test`); there is
+  never a reason to have more than one `page_NN.json` per page. If you ever do
+  write a suffixed path, write_candidates REDIRECTS it to `page_NN.json`
+  automatically (always-append + identity-dedup) so candidates are never lost -
+  but you should still write the exact path you were given.
+- If write_candidates returns `status:error`, the file is NOT corrupt - your
+  JSON INPUT was malformed/truncated. Retry the SAME `--out` path ONCE with
+  `--append` and a SMALLER batch (<=3 candidates). Do NOT invent a new
+  filename. The script dedups by identity, so `--append` never double-counts.
 - Call write_candidates at most ~4 times. If a page has >24 candidates, stop
   after 4 batches (that is already far more than the cap would have allowed).
 - Do NOT re-emit the candidates in your final message - they are on disk.
@@ -691,7 +705,7 @@ def _is_blocked(content: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _OUT_DIR = Path(__file__).resolve().parent
-RECURSION_LIMIT = 80
+RECURSION_LIMIT = 120
 _TRACE = bool(os.environ.get("SKILL_EVAL_TRACE"))
 
 

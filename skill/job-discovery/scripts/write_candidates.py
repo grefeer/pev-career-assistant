@@ -45,8 +45,6 @@ tool result instead of a crash.
 from __future__ import annotations
 
 import argparse
-import copy
-import hashlib
 import json
 import re
 import sys
@@ -59,6 +57,12 @@ _ALLOWED_ROOT = _SKILL_ROOT / "output"
 
 _INVISIBLE = "​‌‍‎‏﻿　\t"
 _WS = re.compile(r"\s+")
+# Exact page-file stem (page_01, page_12, ...). Anything else (page_03_batch,
+# page_10_new, page_06_temp2, ...) is a suffixed variant the model invented and
+# is REDIRECTED to the base page_NN.json so candidates are never lost.
+_PAGE_STEM_RE = re.compile(r"^page_\d+$")
+# Match the page_<digits> prefix of a suffixed stem (page_03_batch -> page_03).
+_PAGE_PREFIX_RE = re.compile(r"^(page_\d+)_.*$")
 
 
 def _norm_title(title: str | None) -> str:
@@ -248,6 +252,25 @@ def main() -> int:
         }, ensure_ascii=False))
         return 0
 
+    # REDIRECT any suffixed page path (page_03_batch.json, page_10_new.json,
+    # page_06_temp2.json, ...) to the base page_NN.json. v1.1 REFUSED a fixed
+    # suffix list and sub-agents lost ~10 candidates when they hit the refusal
+    # and failed to retry the exact path; the model also adapted by inventing
+    # new suffixes (_batch) the list missed. Redirecting by page_<digits> prefix
+    # catches ANY suffix, PRESERVES the candidates (they land in page_NN.json
+    # with identity-dedup), and ends the whack-a-mole. Always-append (below)
+    # makes this safe regardless of write order.
+    redirected_to: str | None = None
+    if not _PAGE_STEM_RE.match(out_p.stem):
+        pm = _PAGE_PREFIX_RE.match(out_p.stem)
+        if pm:
+            base = pm.group(1)
+            out_p = (out_p.parent / f"{base}.json").resolve()
+            try:
+                redirected_to = str(out_p.relative_to(_SKILL_ROOT)).replace("\\", "/")
+            except ValueError:
+                redirected_to = str(out_p)
+
     raw = sys.stdin.read()
     data = _lenient_extract_json(raw)
     if data is None:
@@ -255,6 +278,7 @@ def main() -> int:
             "status": "error",
             "reason": "no parseable JSON in stdin (empty or all-malformed)",
             "out": str(out_p.relative_to(_SKILL_ROOT)),
+            "redirected_to": redirected_to,
         }, ensure_ascii=False))
         return 0
 
@@ -262,9 +286,12 @@ def main() -> int:
     kept = [c for c in batch if _valid_candidate(c)]
     dropped = len(batch) - len(kept)
 
-    # Load existing (append mode) and merge by identity.
+    # ALWAYS accumulate (append semantics): load existing + identity-dedup. This
+    # makes redirects and retries safe - a re-written or re-routed batch is
+    # deduped, never double-counted, and never overwrites prior batches. The
+    # --append flag is accepted for back-compat but no longer gates this.
     existing: list[dict[str, Any]] = []
-    if args.append and out_p.exists():
+    if out_p.exists():
         try:
             prev = json.loads(out_p.read_text(encoding="utf-8"))
             if isinstance(prev, list):
@@ -288,7 +315,7 @@ def main() -> int:
         json.dumps(merged, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    print(json.dumps({
+    result: dict[str, Any] = {
         "status": "ok",
         "out": str(out_p.relative_to(_SKILL_ROOT)),
         "batch_received": len(batch),
@@ -296,8 +323,15 @@ def main() -> int:
         "batch_dropped_invalid": dropped,
         "appended": added,
         "total_in_file": len(merged),
-        "mode": "append" if args.append else "overwrite",
-    }, ensure_ascii=False))
+        "mode": "append" if existing else "overwrite",
+    }
+    if redirected_to:
+        result["redirected_to"] = redirected_to
+        result["note"] = (
+            f"suffixed --out was redirected to {redirected_to} (always-append + "
+            "identity-dedup; your candidates are safe there)."
+        )
+    print(json.dumps(result, ensure_ascii=False))
     return 0
 
 
