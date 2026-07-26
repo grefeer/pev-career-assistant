@@ -46,7 +46,9 @@ Smoke (one URL, proves the harness wires up)::
 
 Resumable: per-URL results are written to ``tests/manual/_skill_ten_url_<slug>.json``
 and reused on re-run, so a stalled URL (e.g. xiaomi) can be killed without losing
-the others. Delete those files to force a re-crawl.
+the others. ``SKILL_EVAL_ONLY=<slug>`` selects a URL but still reuses its prior
+record. A paid fresh run requires the additional, explicit
+``SKILL_EVAL_FORCE_FRESH=<same-slug>`` gate.
 """
 
 # ruff: noqa: E402  (sys.path bootstrap must precede project imports)
@@ -649,10 +651,22 @@ def _extract_candidates(content: str) -> list[dict[str, Any]]:
     """
     if not content:
         return []
-    strict = _strict_extract(content)
+    strict = _without_terminal_status_objects(_strict_extract(content))
     if strict:
         return strict
-    return _lenient_extract_objects(content)
+    return _without_terminal_status_objects(_lenient_extract_objects(content))
+
+
+def _without_terminal_status_objects(
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove workflow terminal messages mistakenly shaped like a candidate."""
+    terminal_statuses = {"blocked", "empty", "recursion", "crashed"}
+    return [
+        candidate
+        for candidate in candidates
+        if candidate.get("status") not in terminal_statuses
+    ]
 
 
 def _strict_extract(content: str) -> list[dict[str, Any]]:
@@ -1004,6 +1018,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "duplicate_count": raw_count - unique,
         "block_reason": "login/captcha/anti-bot" if blocked else None,
         "note": note or None,
+        "evaluation_mode": "fresh_live",
         "elapsed_sec": round(elapsed, 1),
         "tail": (content or "")[-400:],
     }
@@ -1055,60 +1070,120 @@ _READGZH_KEY = bool(os.environ.get("READGZH_API_KEY"))
 _LIVE_READY = _LIVE_ENABLED and _DEEPSEEK_KEY
 
 
-def _main() -> int:
-    if not _LIVE_ENABLED:
-        print("SKIP: RUN_SKILL_TEN_URL is not set (not PASS).")
-        return 0
-    if not _DEEPSEEK_KEY:
-        print("SKIP: DEEPSEEK_API_KEY is missing (not PASS).")
-        return 0
-    if not _READGZH_KEY:
-        print("NOTE: READGZH_API_KEY not set; WeChat URLs (none in this set) "
-              "would fall back to direct HTTP / Playwright.")
+def _parse_slug_set(value: str) -> set[str]:
+    return {slug.strip() for slug in value.split(",") if slug.strip()}
 
+
+def _select_eval_urls(
+    urls: list[tuple[str, str, str, int | None]],
+    *,
+    limit: int,
+    only: str,
+    force_fresh: str,
+) -> tuple[list[tuple[str, str, str, int | None]], set[str]]:
+    """Select URLs and validate the separate, explicit refresh request."""
+    selected = urls[:limit]
+    only_slugs = _parse_slug_set(only)
+    if only_slugs:
+        selected = [row for row in selected if row[0] in only_slugs]
+
+    selected_slugs = {row[0] for row in selected}
+    refresh_slugs = _parse_slug_set(force_fresh)
+    unknown = refresh_slugs - selected_slugs
+    if unknown:
+        raise ValueError(
+            "SKILL_EVAL_FORCE_FRESH must name only a selected URL; "
+            f"invalid={sorted(unknown)} selected={sorted(selected_slugs)}"
+        )
+    return selected, refresh_slugs
+
+
+def _summary_path(
+    urls: list[tuple[str, str, str, int | None]],
+) -> Path:
+    """Keep a focused replay or canary run from overwriting the suite summary."""
+    if len(urls) == len(URLS) and {row[0] for row in urls} == {row[0] for row in URLS}:
+        return _OUT_DIR / "_skill_ten_url_summary.json"
+    suffix = "_".join(row[0] for row in urls) or "none"
+    return _OUT_DIR / f"_skill_ten_url_summary_{suffix}.json"
+
+
+def _main() -> int:
     if not SKILL_DIR.exists():
         print(f"ERROR: skill dir not found: {SKILL_DIR}")
         return 1
 
     limit = int(os.environ.get("SKILL_EVAL_LIMIT", "0")) or len(URLS)
-    urls = URLS[:limit]
-    # Optional slug filter: run only the named URL (deletes its cached result
-    # first so the fresh v-architecture runs). Useful for iterating on one site.
+    # Selecting a slug is safe and cache-preserving. Deleting a record requires
+    # a second, explicit opt-in because it triggers paid model calls.
     only = os.environ.get("SKILL_EVAL_ONLY", "").strip()
+    force_fresh = os.environ.get("SKILL_EVAL_FORCE_FRESH", "").strip()
+    try:
+        urls, refresh_slugs = _select_eval_urls(
+            URLS, limit=limit, only=only, force_fresh=force_fresh,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        return 2
     if only:
-        only_slugs = {s.strip() for s in only.split(",") if s.strip()}
-        urls = [u for u in urls if u[0] in only_slugs]
-        for slug in only_slugs:
+        print(f"SKILL_EVAL_ONLY={sorted(_parse_slug_set(only))} -> {len(urls)} url(s)")
+    if refresh_slugs:
+        print(f"FRESH PAID RUN: SKILL_EVAL_FORCE_FRESH={sorted(refresh_slugs)}")
+    needs_live_run = any(
+        slug in refresh_slugs or not (_OUT_DIR / f"_skill_ten_url_{slug}.json").exists()
+        for slug, _, _, _ in urls
+    )
+    if needs_live_run and not _LIVE_ENABLED:
+        print("SKIP: RUN_SKILL_TEN_URL is not set (fresh validation not run).")
+        return 0
+    if needs_live_run and not _DEEPSEEK_KEY:
+        print("SKIP: DEEPSEEK_API_KEY is missing (fresh validation not run).")
+        return 0
+    if needs_live_run and not _READGZH_KEY:
+        print("NOTE: READGZH_API_KEY not set; WeChat URLs (none in this set) "
+              "would fall back to direct HTTP / Playwright.")
+    if not needs_live_run:
+        print("REPLAY ONLY: no model or browser calls will be made; this is not fresh validation.")
+
+    if refresh_slugs:
+        for slug in refresh_slugs:
             (_OUT_DIR / f"_skill_ten_url_{slug}.json").unlink(missing_ok=True)
-        print(f"SKILL_EVAL_ONLY={sorted(only_slugs)} -> {len(urls)} url(s)")
-    print(f"RUN_SKILL_TEN_URL=1  DEEPSEEK_API_KEY={'set' if _DEEPSEEK_KEY else 'MISSING'}  "
+    print(f"RUN_SKILL_TEN_URL={'1' if _LIVE_ENABLED else 'unset'}  "
+          f"DEEPSEEK_API_KEY={'set' if _DEEPSEEK_KEY else 'MISSING'}  "
           f"urls={len(urls)} (limit={limit})")
     print(f"SKILL_DIR={SKILL_DIR}")
 
-    settings = _build_settings()
-    # DeepSeek's default max_tokens (~4096) truncates a large single-response
-    # extraction (xiaohongshu has 346 jobs -> ~52k tokens, inherently beyond one
-    # response). 8192 is the model ceiling; the lenient parser recovers whatever
-    # fit before truncation. PATH C baseline extracts per-page so is unaffected.
-    model = _build_job_discovery_llm(settings=settings).model_copy(
-        update={"max_tokens": 8192}
-    )
-    # Sanitize empty ToolMessage content at the DeepSeek boundary (A-fix): a
-    # 0-byte tool result otherwise yields BadRequestError 400 (messages[N]:
-    # unknown) and sinks the whole run - see _install_toolmsg_sanitizer.
-    model = _install_toolmsg_sanitizer(model)
-    agent = build_skill_agent(model)
+    agent = None
+    if needs_live_run:
+        settings = _build_settings()
+        # DeepSeek's default max_tokens (~4096) truncates a large single-response
+        # extraction (xiaohongshu has 346 jobs -> ~52k tokens, inherently beyond one
+        # response). 8192 is the model ceiling; the lenient parser recovers whatever
+        # fit before truncation. PATH C baseline extracts per-page so is unaffected.
+        model = _build_job_discovery_llm(settings=settings).model_copy(
+            update={"max_tokens": 8192}
+        )
+        # Sanitize empty ToolMessage content at the DeepSeek boundary (A-fix): a
+        # 0-byte tool result otherwise yields BadRequestError 400 (messages[N]:
+        # unknown) and sinks the whole run - see _install_toolmsg_sanitizer.
+        model = _install_toolmsg_sanitizer(model)
+        agent = build_skill_agent(model)
 
     rows: list[dict[str, Any]] = []
+    summary_path = _summary_path(urls)
     for slug, company, url, real_count in urls:
         prior = _OUT_DIR / f"_skill_ten_url_{slug}.json"
         if prior.exists():  # Resumable: reuse a prior run's result.
-            print(f"  [skip] {slug} (reuse prior result)", flush=True)
-            rows.append(json.loads(prior.read_text(encoding="utf-8")))
+            print(f"  [replay] {slug} (cached result; not fresh validation)", flush=True)
+            record = json.loads(prior.read_text(encoding="utf-8"))
+            record["evaluation_mode"] = "replay"
+            rows.append(record)
         else:
-            rows.append(_run_one(slug, company, url, real_count, agent))
+            assert agent is not None
+            record = _run_one(slug, company, url, real_count, agent)
+            rows.append(record)
         _print_table(rows)
-        (_OUT_DIR / "_skill_ten_url_summary.json").write_text(
+        summary_path.write_text(
             json.dumps({"rows": rows}, ensure_ascii=False, indent=2),
             encoding="utf-8")
     _print_table(rows)
