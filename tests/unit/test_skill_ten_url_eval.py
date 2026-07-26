@@ -62,13 +62,12 @@ def test_replay_normalizes_a_stale_false_success_record() -> None:
     assert record["evaluation_mode"] == "replay"
 
 
-def test_utf8_reexec_command_enables_utf8_before_deepagents_spawns_children() -> None:
+def test_utf8_requirement_explains_how_to_start_the_eval() -> None:
     runner = _load_runner()
 
-    command = runner._utf8_reexec_command(["tests/manual/run_skill_ten_url_eval.py"])
+    message = runner._utf8_requirement_message()
 
-    assert command[1:3] == ["-X", "utf8"]
-    assert command[-1] == "tests/manual/run_skill_ten_url_eval.py"
+    assert "python -X utf8" in message
 
 
 

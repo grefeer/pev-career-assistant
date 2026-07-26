@@ -37,13 +37,13 @@ Live LLM + Playwright run. Skips (never reports PASS) unless both
 Run::
 
     $env:RUN_SKILL_TEN_URL='1'
-    .\\.venv\\Scripts\\python.exe tests/manual/run_skill_ten_url_eval.py
+    .\\.venv\\Scripts\\python.exe -X utf8 tests/manual/run_skill_ten_url_eval.py
 
 Smoke (one URL, proves the harness wires up)::
 
     $env:SKILL_EVAL_LIMIT='1'
     $env:RUN_SKILL_TEN_URL='1'
-    .\\.venv\\Scripts\\python.exe tests/manual/run_skill_ten_url_eval.py
+    .\\.venv\\Scripts\\python.exe -X utf8 tests/manual/run_skill_ten_url_eval.py
 
 Resumable: per-URL results are written to ``tests/manual/_skill_ten_url_<slug>.json``
 and reused on re-run, so a stalled URL (e.g. xiaomi) can be killed without losing
@@ -72,9 +72,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-def _utf8_reexec_command(argv: list[str]) -> list[str]:
-    """Build an interpreter command that fixes Windows child-process decoding."""
-    return [sys.executable, "-X", "utf8", *argv]
+def _utf8_requirement_message() -> str:
+    return (
+        "SKIP: start this Windows eval with `python -X utf8 "
+        "tests/manual/run_skill_ten_url_eval.py` to prevent GBK decoding."
+    )
 
 # Force UTF-8 stdout/stderr on Windows so trace printing of message content
 # containing the Unicode replacement char (�, from garbled browse text)
@@ -1230,10 +1232,10 @@ if __name__ == "__main__":
     # `deepagents` may spawn helper subprocesses with `text=True` but no
     # explicit encoding. On Windows that otherwise falls back to GBK and can
     # turn valid UTF-8 tool output into `None` / a downstream splitlines error.
-    # Re-exec before importing the agent graph so every descendant inherits
-    # UTF-8 mode. The marker prevents an accidental loop on exotic interpreters.
-    if not sys.flags.utf8_mode and not os.environ.get("SKILL_EVAL_UTF8_REEXEC"):
-        os.environ["SKILL_EVAL_UTF8_REEXEC"] = "1"
-        os.environ["PYTHONUTF8"] = "1"
-        os.execv(sys.executable, _utf8_reexec_command(sys.argv))
+    # Require an explicit interpreter flag rather than re-execing on Windows:
+    # `os.execv` can detach the calling terminal's output pipe there, making a
+    # paid eval appear to finish silently.
+    if not sys.flags.utf8_mode:
+        print(_utf8_requirement_message())
+        sys.exit(2)
     sys.exit(_main())
