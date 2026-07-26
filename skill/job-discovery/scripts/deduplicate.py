@@ -469,17 +469,63 @@ def process(
 # CLI
 # ============================================================================
 
+def _expand_files(file_args: list[str]) -> list[str]:
+    """Expand shell-style globs in file args (run_skill_script uses no shell, so
+    ``output/candidates/*.json`` would otherwise be a literal nonexistent path).
+
+    Args containing ``*``/``?``/``[`` are globbed relative to the cwd (the skill
+    dir); literal args are kept as-is. Result is de-duplicated and sorted. If a
+    glob matches nothing it is silently dropped (the caller's ``process`` reports
+    an empty status if NO files resolve at all).
+    """
+    import glob
+
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for a in file_args:
+        if any(ch in a for ch in "*?["):
+            matches = sorted(glob.glob(a, recursive=True))
+            for m in matches:
+                if m not in seen:
+                    seen.add(m)
+                    expanded.append(m)
+        else:
+            if a not in seen:
+                seen.add(a)
+                expanded.append(a)
+    return expanded
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Normalize, deduplicate, package, and verify candidate JSONs"
     )
-    parser.add_argument("files", nargs="+", help="One or more candidate JSON files")
+    parser.add_argument("files", nargs="+", help="One or more candidate JSON files "
+                        "(shell globs like output/candidates/*.json are expanded)")
     parser.add_argument("--out", default=None, help="Output file (merged JSON)")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip evidence quality checks")
     args = parser.parse_args()
 
-    result = process(args.files, verify=not args.no_verify)
+    files = _expand_files(args.files)
+    if not files:
+        # Nothing to merge - emit an empty-but-valid result so the caller (and the
+        # harness reading candidates_merged.json) gets a clean empty array, not a
+        # missing file.
+        if args.out:
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text("[]", encoding="utf-8")
+        print(json.dumps({
+            "status": "empty",
+            "stats": {"input_count": 0, "output_count": 0, "duplicates_removed": 0},
+            "load_errors": [],
+            "verify_warnings_count": 0,
+            "output_file": str(Path(args.out).resolve()) if args.out else None,
+        }, ensure_ascii=False))
+        return
+
+    result = process(files, verify=not args.no_verify)
 
     if args.out:
         out_path = Path(args.out)

@@ -265,6 +265,32 @@ def _save_evidence(text: str, out_dir: Path) -> tuple[str, Path, Path]:
     return short_hash, text_path, screenshot_path
 
 
+def _save_page_files(all_texts: list[str], out_dir: Path) -> list[str]:
+    """Stash each collected page's text as its own numbered file.
+
+    Writes ``page_01.txt`` ... ``page_NN.txt`` under ``<out_dir>/pages/``. Each
+    file holds one page's body text (no ``--- PAGE BREAK ---`` separators), so a
+    downstream extractor sub-agent can read a single small file and pull JDs
+    from just that page instead of re-reading the whole concatenated blob. This
+    is the on-disk backing for per-page progressive disclosure + parallel
+    per-page extraction.
+
+    ``all_texts`` already contains only changed pages (identical pages are
+    skipped by the pagination loops), so each numbered file is unique content.
+    Returns the list of written file paths (strings), in page order.
+    """
+    if not all_texts:
+        return []
+    pages_dir = out_dir / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for idx, text in enumerate(all_texts, start=1):
+        p = pages_dir / f"page_{idx:02d}.txt"
+        p.write_text(text, encoding="utf-8")
+        paths.append(str(p))
+    return paths
+
+
 def _save_screenshot(page: Any, path: Path) -> None:
     try:
         page.screenshot(path=str(path), full_page=True)
@@ -294,7 +320,7 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
             next_btn.click(timeout=5000)
             page.wait_for_timeout(wait_ms)
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
+                page.wait_for_load_state("networkidle", timeout=4000)
             except Exception:
                 pass
             if page.url == old_url:
@@ -310,6 +336,7 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
             break
 
     full_text = "\n\n--- PAGE BREAK ---\n\n".join(all_texts)
+    page_files = _save_page_files(all_texts, out_dir)
     short_hash, text_path, screenshot_path = _save_evidence(full_text, out_dir)
     _save_screenshot(page, screenshot_path)
 
@@ -322,6 +349,8 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
         "screenshot_path": str(screenshot_path),
         "text_length": len(full_text),
         "pagination": {"pages_collected": page_num, "max_allowed": max_pages},
+        "page_count": len(all_texts),
+        "page_files": page_files,
     }
 
 
@@ -456,6 +485,7 @@ def browse_click_mode(
             break
 
     full_text = "\n\n--- PAGE BREAK ---\n\n".join(all_texts)
+    page_files = _save_page_files(all_texts, out_dir)
     short_hash, text_path, screenshot_path = _save_evidence(full_text, out_dir)
     _save_screenshot(page, screenshot_path)
 
@@ -476,6 +506,8 @@ def browse_click_mode(
         "pages_collected": len(all_texts),
         "end_reached": clicks_effective < click_count,
         "end_reason": end_reason,
+        "page_count": len(all_texts),
+        "page_files": page_files,
     }
 
 
@@ -828,7 +860,7 @@ def browse_search_mode(
             next_btn.click(timeout=5000)
             page.wait_for_timeout(wait_ms)
             try:
-                page.wait_for_load_state("networkidle", timeout=10000)
+                page.wait_for_load_state("networkidle", timeout=4000)
             except Exception:
                 pass
             if page.url == old_url:

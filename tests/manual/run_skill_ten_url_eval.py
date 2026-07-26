@@ -57,6 +57,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -72,6 +73,7 @@ from langchain_core.tools import tool
 from deepagents import create_deep_agent
 from deepagents.backends.filesystem import FilesystemBackend
 from deepagents.middleware.filesystem import FilesystemPermission
+from deepagents.middleware.subagents import SubAgent
 
 from backend.app.config import Settings
 from backend.app.services.job_discovery.deepagents_runner import _build_job_discovery_llm
@@ -89,7 +91,8 @@ SKILL_DIR = Path(__file__).resolve().parents[2] / "skill" / "job-discovery"
 SKILL_PARENT = SKILL_DIR.parent
 # The six helper scripts the skill ships. run_skill_script refuses anything else
 # so an agent can never coax it into running arbitrary code.
-_SKILL_SCRIPTS = ("browse", "validate", "normalize", "deduplicate", "ocr_image", "state")
+_SKILL_SCRIPTS = ("browse", "validate", "normalize", "deduplicate", "ocr_image", "state",
+                  "read_evidence", "write_candidates")
 # Browse.py can take minutes on a 16-page site (xiaomi). Per-call ceiling.
 _SCRIPT_TIMEOUT_SEC = 900
 # Cap the inlined page text so a huge list cannot blow the model context. Raised
@@ -100,7 +103,7 @@ _MAX_PAGE_TEXT_CHARS = 60_000
 
 
 @tool
-def run_skill_script(script: str, cli_args: str = "") -> str:
+def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
     """Run one of the job-discovery skill's helper scripts.
 
     The skill (read /job-discovery/SKILL.md for full instructions) orchestrates
@@ -108,10 +111,15 @@ def run_skill_script(script: str, cli_args: str = "") -> str:
     execute them - the built-in ``execute`` tool is disabled on this backend.
 
     Args:
-        script: One of: browse, validate, normalize, deduplicate, ocr_image, state.
+        script: One of: browse, validate, normalize, deduplicate, ocr_image,
+            state, read_evidence, write_candidates.
         cli_args: Command-line arguments as a single string, e.g.
             ``"--mode list --out output/evidence <url>"``. Use the same argument
             syntax the SKILL.md documents.
+        stdin: Optional string piped to the script's stdin. Used by
+            ``write_candidates`` (which reads a candidate JSON document from
+            stdin to avoid the Windows ~32k command-line length limit). Pass the
+            full JSON document here; do NOT put large JSON in ``cli_args``.
 
     Returns:
         The script's stdout. For ``browse`` the rendered page text is appended
@@ -140,6 +148,7 @@ def run_skill_script(script: str, cli_args: str = "") -> str:
             timeout=_SCRIPT_TIMEOUT_SEC,
             encoding="utf-8",
             errors="replace",
+            input=stdin if stdin else None,
         )
     except subprocess.TimeoutExpired:
         return f"ERROR: {script} timed out after {_SCRIPT_TIMEOUT_SEC}s"
@@ -278,71 +287,126 @@ def _unique_count(candidates: list[dict[str, Any]]) -> int:
 # ---------------------------------------------------------------------------
 
 _SKILL_SYSTEM_PROMPT = """\
-You are a job-discovery agent that uses the `job-discovery` skill's helper scripts
-to extract structured job postings from a career-site URL. You orchestrate; the
-scripts do the mechanical Playwright rendering.
+You are a job-discovery PLANNER/VERIFIER for a single career-site URL. You
+orchestrate per-page extraction; the scripts do the rendering and a
+`jd_extractor` sub-agent does the per-page JD extraction. You do NOT extract
+JDs yourself and you do NOT emit the candidate list - that is what avoids the
+LLM output-cap loss on large sites (151 jobs / 16 pages).
 
-WORKFLOW (follow exactly - do NOT deviate):
-1. Read the output schema ONCE:
-   `read_file(file_path="/job-discovery/references/schema.md", limit=1000)`
-   Do NOT read SKILL.md - it documents the SmartSheet workflow (not needed here)
-   and is large. The workflow below is all you need.
-2. Render the page to text:
-   `run_skill_script(script="browse", cli_args="<URL> --mode list --max-pages 3 --out output/evidence")`
-   - The tool output ends with the rendered page text under a `[PAGE_TEXT]` marker.
-   - Do NOT separately read_file the evidence path - the text is already inline.
-   - If [PAGE_TEXT] is missing or < ~500 chars (common on Moka/feishu/zhiye SPAs),
-     retry ONCE: `run_skill_script(script="browse", cli_args="<URL> --mode search-interact --out output/evidence")`.
-   - If [PAGE_TEXT] says `(empty - the page rendered NO visible job text ...)` the
-     page is an SPA shell that did not load job data, or a dead URL (404/blank).
-     Retry browse ONCE with `--mode search-interact`; if STILL empty, output
-     `{"status":"blocked","reason":"page did not render job content"}` and stop.
-     NEVER respond to an empty [PAGE_TEXT] by calling `read_file`/`ls`/`glob` on
-     the evidence path - the cached file is 0 bytes and reading it corrupts the
-     request. The text you need is ONLY ever under [PAGE_TEXT].
-   - Do NOT call `execute` - it is disabled. Use `run_skill_script` only.
-2b. PAGINATE if the page has more jobs than [PAGE_TEXT] shows. Signals: a total
-    count in the text (共151 / (151) / 151 职位 / 151 results) that exceeds the
-    jobs you can see, OR a paginator control (下一页 / 加载更多 / page numbers
-    1 2 3 ... 16 / a next arrow). To load the rest:
-    `run_skill_script(script="browse", cli_args="<URL> --mode click --click-auto --click-count 15 --out output/evidence")`
-    - `--click-auto` lets browse re-detect the next-page arrow each click (use for
-      icon-only arrows, e.g. Mioffice/atsx sites like xiaomi). If the paginator is
-      a text button instead, use `--click-text "下一页"` or `--click-text "加载更多"`
-      in place of `--click-auto`.
-    - Returns the CUMULATIVE text of all loaded pages under [PAGE_TEXT] (pages
-      joined by `--- PAGE BREAK ---`). Set `--click-count` high (e.g. 15) - it
-      stops early when the paginator is exhausted (`end_reached: true`).
-    - Skip 2b if [PAGE_TEXT] already shows all the jobs (no paginator visible and
-      no "total" larger than what you see), or if step 2 already used search-interact.
-3. Extract EVERY visible job posting from the [PAGE_TEXT] as a JSON array of
-   NormalizedJobCandidate objects (per schema.md). One object per distinct job.
-   Each must include title, company_name, responsibilities, requirements,
-   locations, recruitment_types. Do not invent jobs not on the page.
-4. Your FINAL message must contain ONLY the JSON array (no prose, no code fence).
-   If the page is a login/captcha/anti-bot wall, output instead:
-   `{"status":"blocked","reason":"<one short line>"}` and stop.
+WORKFLOW - load it first, then follow it exactly:
+1. Read the workflow doc ONCE:
+   `read_file(file_path="/job-discovery/references/single-url-extraction.md", limit=1200)`
+   It documents the full planner -> executor -> verifier flow. Do NOT read
+   SKILL.md - it documents the SmartSheet batch workflow (not needed here) and
+   is large.
+2. Follow that doc: read schema.md, browse (list), click-paginate if a paginator
+   or total-count signal is present, then fan out ONE `jd_extractor` task per
+   page file in a SINGLE message (parallel), then `deduplicate`-merge.
+
+KEY POINTS (also in the workflow doc - repeated because they are the common
+failure modes):
+- After browse, the result JSON carries `page_files` (paths to
+  `output/evidence/pages/page_NN.txt`) and `page_count`. Use `page_files` to
+  dispatch one `jd_extractor` per page. Each task description must give the
+  sub-agent its page file path AND its output path
+  (`output/candidates/page_NN.json`) AND the company name.
+- Dispatch ALL page tasks in ONE assistant message (multiple `task` tool calls)
+  so they run in parallel. One task per page file.
+- The `jd_extractor` reads its own page file via `read_evidence` - do NOT pass
+  the page text in the task description (keep your context lean).
+- After all sub-agents return, run:
+  `run_skill_script(script="deduplicate", cli_args="output/candidates/*.json --out output/candidates_merged.json")`
+- If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
+  `--mode search-interact`; if still empty, emit
+  `{"status":"blocked","reason":"page did not render job content"}` and stop.
+- HARD LIMITS: at most ONE list browse, ONE click-paginate, and ONE
+  search-interact retry. If click-paginate does not grow the page text, STOP
+  paginating and dispatch `jd_extractor` on whatever pages you have - do NOT
+  loop on browse variants. NEVER `read_file`/`ls`/`glob` anything under
+  `output/evidence/` (especially `.png` screenshots) - that returns empty/image
+  bytes which crash the run. Page text is ONLY under `[PAGE_TEXT]` or via
+  `read_evidence` on a `output/evidence/pages/page_NN.txt` path.
 
 CRITICAL - OUTPUT DISCIPLINE:
-- After your last browse/click call, your VERY NEXT message MUST be the JSON array
-  itself. Do NOT emit a prose "planning" message ("Let me extract...", "I'll now
-  parse..."). The agent loop ENDS on any non-tool message, so a prose message
-  means you output nothing and lose every job. Go straight to the JSON array.
-- If the page has more jobs than fit in one response, output as many COMPLETE
-  objects as fit, starting from the top of the list - do NOT abandon the whole
-  list. The harness's lenient parser recovers every complete object you emit, so
-  a truncated array still yields real candidates. Emitting zero is the only
-  failure.
+- Your FINAL message must be ONLY a small JSON summary, e.g.
+  `{"status":"done","pages":16,"candidates_file":"output/candidates_merged.json","merged_count":151}`
+  The harness reads `output/candidates_merged.json` off disk. Do NOT emit the
+  candidates themselves - that re-hits the output cap this design avoids. Do
+  NOT emit a prose "planning" message either: the agent loop ENDS on any
+  non-tool message, so a prose message means you output nothing.
+- If the page is a login/captcha/anti-bot wall, emit instead
+  `{"status":"blocked","reason":"<one short line>"}` and stop.
 
 CONSTRAINTS:
-- Total tool calls <= 9. Be decisive: one schema read, one browse (list), one
-  click pagination if needed, then output the JSON. Do not loop or re-read files.
-- Run helper scripts ONLY via `run_skill_script`. Allowed scripts: browse,
-  validate, normalize, deduplicate, ocr_image, state.
+- Total tool calls <= 14. The `task` calls count but run in parallel.
+- Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
+  normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.
 - Use the company name you are given for `company_name`.
 - Campus / 提前批 / 校招 is the default recruitment_type unless the page says
   otherwise (社招 / 实习).
+"""
+
+
+_JD_EXTRACTOR_PROMPT = """\
+You are a JD EXTRACTOR sub-agent. You extract structured job postings from ONE
+page-text file and persist them to disk. You handle exactly ONE page - do NOT
+browse, do NOT paginate, do NOT dispatch further sub-agents (you are depth-2).
+
+INPUT: your `task` description gives you (a) the page file path to read, e.g.
+`output/evidence/pages/page_03.txt`, (b) the output path to write, e.g.
+`output/candidates/page_03.json`, and (c) the company name to use.
+
+SCHEMA ( condensed - produce one JSON object per distinct job on the page ):
+{
+  "title": "<required, job title>",
+  "company_name": "<required, the company name from your task description>",
+  "department": "<optional>",
+  "description_text": "<short summary of the role>",
+  "responsibilities": "<职责, full text from the page>",
+  "requirements": "<任职要求, full text from the page>",
+  "locations": ["<city>"],
+  "recruitment_types": ["校园招聘"],
+  "apply_url": "<optional, if on the page>",
+  "evidence_refs": [{"content_hash": "", "evidence_type": "browsed_list_page_text"}]
+}
+- Default recruitment_types to ["校园招聘"] (campus) unless the page says 社招 / 实习.
+- For full field details you MAY `read_file("/job-discovery/references/schema.md")`
+  on demand, but the condensed schema above is enough for most pages - skip the
+  read to save a round-trip when the fields are clear.
+
+STEPS (strict tool budget):
+1. Read your page text ONCE:
+   `run_skill_script(script="read_evidence", cli_args="output/evidence/pages/page_03.txt")`
+   If the `[READ_SUMMARY]` says `status: error`, your final message must be
+   `{"status":"error","page":"page_03","reason":"<the reason>"}` - do NOT call
+   write_candidates.
+2. WRITE the extracted candidates to your assigned output path. To stay under
+   the generation cap, write in BATCHES of <=6 candidates per call, using
+   `--append` on every call after the first:
+   - 1st batch:  `run_skill_script(script="write_candidates", cli_args="--out output/candidates/page_03.json", stdin="<JSON array of up to 6 candidates>")`
+   - 2nd+ batch: `run_skill_script(script="write_candidates", cli_args="--out output/candidates/page_03.json --append", stdin="<next up to 6>")`
+   - Continue until all candidates on the page are written.
+   PASS ONLY THE JSON ARRAY ON `stdin` - no prose, no code fence, no
+   "here are the candidates" prefix. The script leniently recovers complete
+   objects even if a batch is truncated mid-object.
+3. Your FINAL message must be ONLY a short JSON summary, e.g.
+   `{"status":"ok","page":"page_03","written":12,"file":"output/candidates/page_03.json"}`
+   (use the `total_in_file` from the last write_candidates result as `written`).
+
+HARD RULES - do not break these:
+- Write ONLY to the EXACT `--out` path from your task description. NEVER append a
+  suffix (`_new`, `_v2`, `_temp`, `_final`). If a write_candidates call reports
+  `status: error`, retry that SAME `--out` path ONCE with a smaller batch; do
+  NOT invent a new filename. There is no reason ever to have more than one
+  `page_NN.json` file.
+- Call write_candidates at most ~4 times. If a page has >24 candidates, stop
+  after 4 batches (that is already far more than the cap would have allowed).
+- Do NOT re-emit the candidates in your final message - they are on disk.
+- Do NOT emit a prose planning message; the loop ENDS on any non-tool message.
+- If the page is a login/captcha/anti-bot wall (no JDs), still call
+  write_candidates once with `stdin="[]"` and report `{"status":"blocked",...}`.
+- Never bypass login / captcha / anti-bot. You are depth-2: do NOT call `task`.
 """
 
 
@@ -360,12 +424,17 @@ def _build_settings() -> Settings:
 
 
 def build_skill_agent(model: Any) -> Any:
-    """Build the skill-orchestrated DeepAgent.
+    """Build the skill-orchestrated DeepAgent (planner/verifier + jd_extractor).
 
     - FilesystemBackend (virtual_mode=True) confines file access to the skills
-      tree and lets ``read_file``/``ls`` reach the skill files.
+      tree and lets ``read_file``/``ls`` reach the skill files (progressive
+      disclosure: the agent loads ``references/single-url-extraction.md`` and
+      ``references/schema.md`` on demand instead of carrying them in the prompt).
     - ``skills=["/"]`` makes SkillsMiddleware load job-discovery/SKILL.md.
     - ``tools=[run_skill_script]`` is the bounded bash/py execution path.
+    - ``subagents=[jd_extractor]``: the planner fans out ONE jd_extractor per
+      page file (parallel via multiple ``task`` calls in one message). The
+      sub-agent has no ``subagents`` of its own -> max depth 2 (no sub-sub-agents).
     """
     backend = FilesystemBackend(root_dir=str(SKILL_PARENT), virtual_mode=True)
     permissions = [
@@ -374,6 +443,17 @@ def build_skill_agent(model: Any) -> Any:
             paths=["/job-discovery/**"],
         ),
     ]
+    jd_extractor: SubAgent = {
+        "name": "jd_extractor",
+        "description": (
+            "Extract structured JDs from ONE page-text file (output/evidence/"
+            "pages/page_NN.txt) and persist them to output/candidates/page_NN.json. "
+            "Dispatch one per page; the sub-agent reads its own page file."
+        ),
+        "system_prompt": _JD_EXTRACTOR_PROMPT,
+        # tools omitted -> inherits [run_skill_script] from the parent.
+        # No 'subagents' key -> this sub-agent cannot dispatch sub-sub-agents.
+    }
     return create_deep_agent(
         model=model,
         tools=[run_skill_script],
@@ -381,6 +461,7 @@ def build_skill_agent(model: Any) -> Any:
         skills=["/"],
         permissions=permissions,
         system_prompt=_SKILL_SYSTEM_PROMPT,
+        subagents=[jd_extractor],
         name="skill_job_discovery",
     )
 
@@ -406,14 +487,27 @@ def _install_toolmsg_sanitizer(model: Any) -> Any:
         for m in messages:
             if isinstance(m, ToolMessage):
                 c = m.content
-                empty = (
-                    c is None
-                    or (isinstance(c, str) and not c.strip())
-                    or (isinstance(c, list) and len(c) == 0)
-                )
-                if empty:
+                # Empty: None, empty/whitespace string, or empty list.
+                empty_str = isinstance(c, str) and not c.strip()
+                empty_list = isinstance(c, list) and len(c) == 0
+                # Non-text list: a list whose blocks have no usable text. DeepSeek
+                # rejects image/multimodal blocks inside a tool result with the
+                # same "messages[N]: unknown" 400 as an empty tool result, so a
+                # tool that returns an image (e.g. read_file on a .png) must also
+                # be replaced with a plain-text placeholder.
+                non_text_list = False
+                if isinstance(c, list) and c:
+                    texts = [
+                        str(b.get("text", "")) for b in c
+                        if isinstance(b, dict) and "text" in b
+                    ]
+                    non_text_list = not any(t.strip() for t in texts)
+                if c is None or empty_str or empty_list or non_text_list:
+                    if _TRACE:
+                        print(f"  [trace] SANITIZED empty/non-text ToolMessage "
+                              f"({getattr(m, 'name', '?')})", flush=True)
                     m = m.model_copy(
-                        update={"content": "(tool returned empty output)"}
+                        update={"content": "(tool returned empty or non-text output)"}
                     )
             out.append(m)
         return out
@@ -598,6 +692,32 @@ def _is_blocked(content: str) -> bool:
 
 _OUT_DIR = Path(__file__).resolve().parent
 RECURSION_LIMIT = 80
+_TRACE = bool(os.environ.get("SKILL_EVAL_TRACE"))
+
+
+def _trace_msg(msg: Any) -> None:
+    """Print a compact per-message trace so a looping/under-extracting agent is
+    diagnosable without re-reading the full transcript. One line per message:
+    AI tool calls, AI text (first 120 chars), or tool result (first 120 chars).
+    """
+    mt = type(msg).__name__
+    # AIMessage: tool_calls + optional content
+    tool_calls = getattr(msg, "tool_calls", None)
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        content = "".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    if tool_calls:
+        calls = ", ".join(
+            f"{tc.get('name')}({str(tc.get('args',''))[:80]!r})"
+            for tc in tool_calls
+        )
+        print(f"  [trace] AI->tools: {calls}", flush=True)
+        if content:
+            print(f"  [trace] AI text: {str(content)[:120]!r}", flush=True)
+    elif mt == "ToolMessage":
+        print(f"  [trace] TOOL[{getattr(msg,'name','?')}]: {str(content)[:120]!r}", flush=True)
+    elif content:
+        print(f"  [trace] AI text: {str(content)[:120]!r}", flush=True)
 
 
 def _invoke_agent(agent: Any, prompt: str) -> tuple[str, str]:
@@ -619,6 +739,9 @@ def _invoke_agent(agent: Any, prompt: str) -> tuple[str, str]:
             msgs = chunk.get("messages", []) if isinstance(chunk, dict) else []
             if not msgs:
                 continue
+            if _TRACE:
+                for m in msgs[-2:]:
+                    _trace_msg(m)
             content = msgs[-1].content
             if isinstance(content, list):  # multimodal content blocks
                 content = "".join(
@@ -635,15 +758,120 @@ def _invoke_agent(agent: Any, prompt: str) -> tuple[str, str]:
     return last_content, note
 
 
+def _clean_persisted() -> None:
+    """Clear per-URL persisted artifacts so a previous URL's candidates/pages
+    cannot pollute the next URL's run.
+
+    Clears ``output/candidates/`` (per-page JD files written by jd_extractor
+    sub-agents), ``output/candidates_merged.json`` (the deduplicate output), and
+    ``output/evidence/pages/`` (the per-page text stash from browse click/list
+    mode - a shorter page would otherwise leave the longer prior run's
+    ``page_NN.txt`` files in place). The content-addressed
+    ``output/evidence/sha256_*.txt`` browse cache is KEPT so list-mode caching
+    behaves consistently across runs (a different URL hashes to a different
+    file, so there is no cross-URL collision).
+    """
+    for target in (
+        SKILL_DIR / "output" / "candidates",
+        SKILL_DIR / "output" / "evidence" / "pages",
+    ):
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+    (SKILL_DIR / "output" / "candidates_merged.json").unlink(missing_ok=True)
+
+
+def _load_persisted_candidates() -> list[dict[str, Any]]:
+    """Load candidate JDs the sub-agents persisted to disk.
+
+    Preference order:
+      1. ``output/candidates_merged.json`` (the agent-run ``deduplicate`` output -
+         already normalized, deduped, and packaged).
+      2. ``output/candidates/*.json`` (per-page files written by jd_extractor
+         sub-agents) - flattened; cross-page duplicates are removed by
+         ``_unique_count`` / ``deduplicate`` semantics downstream.
+      3. empty list (caller falls back to parsing the agent's final message).
+
+    Never raises - a malformed file is skipped so one bad page file cannot sink
+    the whole URL's result.
+    """
+    merged = SKILL_DIR / "output" / "candidates_merged.json"
+    if merged.exists():
+        try:
+            data = json.loads(merged.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [c for c in data if isinstance(c, dict)]
+            if isinstance(data, dict):
+                return [data]
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    out: list[dict[str, Any]] = []
+    cand_dir = SKILL_DIR / "output" / "candidates"
+    if not cand_dir.exists():
+        return out
+    for f in sorted(cand_dir.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, list):
+            out.extend(c for c in data if isinstance(c, dict))
+        elif isinstance(data, dict):
+            out.append(data)
+    return out
+
+
+def _preserve_merged(slug: str) -> str | None:
+    """Copy this run's merged candidates to the record dir so candidate
+    QUALITY (detailed JDs) can be inspected post-run even if the working
+    ``output/`` tree is later cleared by the next URL's ``_clean_persisted``.
+
+    Preference order mirrors ``_load_persisted_candidates``: the merged file
+    first, then a flattened per-page fallback. Returns the destination path
+    or None. Never raises - preservation is best-effort, not on the critical
+    path of the measurement.
+    """
+    dst = _OUT_DIR / f"_skill_ten_url_{slug}_merged.json"
+    merged = SKILL_DIR / "output" / "candidates_merged.json"
+    try:
+        if merged.exists():
+            shutil.copy2(merged, dst)
+            return str(dst)
+        cand_dir = SKILL_DIR / "output" / "candidates"
+        out: list[dict[str, Any]] = []
+        if cand_dir.exists():
+            for f in sorted(cand_dir.glob("*.json")):
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                if isinstance(data, list):
+                    out.extend(c for c in data if isinstance(c, dict))
+                elif isinstance(data, dict):
+                    out.append(data)
+        if out:
+            dst.write_text(
+                json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+            return str(dst)
+    except OSError:
+        pass
+    return None
+
+
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
           flush=True)
+    # Fresh per-URL persisted state so prior candidates/pages don't leak in.
+    _clean_persisted()
     prompt = (
-        f"Extract ALL campus job postings from this URL as a NormalizedJobCandidate "
-        f"JSON array.\n\nURL: {url}\nCompany: {company}\n\n"
-        f"Follow the skill workflow: read schema.md, browse the URL, then output "
-        f"the JSON array. Output ONLY the final JSON array in your last message."
+        f"Extract ALL campus job postings from this URL as NormalizedJobCandidate "
+        f"JSON objects, persisted to disk via the workflow.\n\n"
+        f"URL: {url}\nCompany: {company}\n\n"
+        f"Follow the single-url-extraction workflow: read it + schema.md, browse "
+        f"the URL, paginate if needed, dispatch one jd_extractor per page, "
+        f"deduplicate-merge to output/candidates_merged.json, then emit the "
+        f"short summary JSON as your final message."
     )
     t0 = time.monotonic()
     content, note = _invoke_agent(agent, prompt)
@@ -652,8 +880,20 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     elapsed = time.monotonic() - t0
 
     blocked = _is_blocked(content)
-    cands = _extract_candidates(content)
+    # Prefer candidates persisted to disk by the sub-agents; fall back to
+    # parsing the agent's final message for backward compatibility (older
+    # single-pass behavior / blocked responses).
+    persisted = _load_persisted_candidates()
+    if persisted:
+        cands = persisted
+        source = "disk"
+    else:
+        cands = _extract_candidates(content)
+        source = "message"
     raw_count = len(cands)
+    # Snapshot the merged candidates into the record dir so JD quality can be
+    # inspected later (the working output/ tree is cleared per-URL).
+    merged_preserved = _preserve_merged(slug)
     unique = _unique_count(cands)
     if note == "recursion_limit" and cands:
         status = "partial"  # did not converge but produced candidates
@@ -671,6 +911,8 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "url": url,
         "real_count": real_count,
         "status": status,
+        "candidate_source": source,
+        "merged_preserved": merged_preserved,
         "candidate_count": raw_count,
         "unique_listing_count": unique,
         "duplicate_count": raw_count - unique,
@@ -682,7 +924,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     (_OUT_DIR / f"_skill_ten_url_{slug}.json").write_text(
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"  -> status={status} raw={raw_count} unique={unique} "
+        f"  -> status={status} src={source} raw={raw_count} unique={unique} "
         f"dups={record['duplicate_count']} elapsed={record['elapsed_sec']}s"
         + (f" note={note}" if note else ""),
         flush=True)
@@ -744,6 +986,15 @@ def _main() -> int:
 
     limit = int(os.environ.get("SKILL_EVAL_LIMIT", "0")) or len(URLS)
     urls = URLS[:limit]
+    # Optional slug filter: run only the named URL (deletes its cached result
+    # first so the fresh v-architecture runs). Useful for iterating on one site.
+    only = os.environ.get("SKILL_EVAL_ONLY", "").strip()
+    if only:
+        only_slugs = {s.strip() for s in only.split(",") if s.strip()}
+        urls = [u for u in urls if u[0] in only_slugs]
+        for slug in only_slugs:
+            (_OUT_DIR / f"_skill_ten_url_{slug}.json").unlink(missing_ok=True)
+        print(f"SKILL_EVAL_ONLY={sorted(only_slugs)} -> {len(urls)} url(s)")
     print(f"RUN_SKILL_TEN_URL=1  DEEPSEEK_API_KEY={'set' if _DEEPSEEK_KEY else 'MISSING'}  "
           f"urls={len(urls)} (limit={limit})")
     print(f"SKILL_DIR={SKILL_DIR}")
