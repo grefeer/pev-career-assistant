@@ -70,4 +70,8 @@ tests/manual/_ten_url_eval_*.json
 .playwright-cli/
 .playwright-mcp/
 output/
-tests/manual/
+# tests/manual/ holds scratch/debug scripts + eval artifacts; track ONLY the
+# 10-URL eval harness itself (the rest stays local). `tests/manual/*` excludes
+# the dir *contents* (not the dir) so the negation below can re-include one file.
+tests/manual/*
+!tests/manual/run_skill_ten_url_eval.py

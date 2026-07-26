@@ -1,0 +1,26 @@
+{
+  "skill_name": "job-discovery",
+  "evals": [
+    {
+      "id": 1,
+      "name": "feishu-listing-extraction",
+      "prompt": "从 https://xiaopeng.jobs.feishu.cn/s/Pycfxid-fok 这个URL提取所有可见的岗位JD，按NormalizedJobCandidate格式输出JSON。公司是小鹏集团。这是校园招聘提前批。",
+      "expected_output": "至少输出5个岗位，每个含title/company_name/responsibilities/requirements/recruitment_types",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "moka-listing-extraction",
+      "prompt": "帮我抓取深信服的校招岗位：https://app.mokahr.com/campus-recruitment/sangfor/27944 请先浏览页面，然后把看到的岗位全部提取成结构化JSON，包含岗位名、部门、职责、要求、地点。",
+      "expected_output": "包含多个岗位的结构化JSON数组",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "zhiye-classify-then-extract",
+      "prompt": "这是一个招聘页面 https://norincogroupzhaopin.zhiye.com/campus/jobs 先判断这是什么类型的站点，然后决定用什么方式提取所有博士提前批的岗位。输出每个岗位的完整JD。",
+      "expected_output": "先分类站点类型为zhiye，然后提取岗位列表，包含完整JD",
+      "files": []
+    }
+  ]
+}
