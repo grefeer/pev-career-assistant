@@ -327,7 +327,16 @@ failure modes):
   so they run in parallel. One task per page file.
 - The `jd_extractor` reads its own page file via `read_evidence` - do NOT pass
   the page text in the task description (keep your context lean).
-- After all sub-agents return, run:
+- VERIFY-RETRY (the verifier step - recovers pages whose first extraction
+  failed): after the jd_extractor tasks return, INSPECT each task's final
+  JSON summary. A page is FAILED if its summary is not
+  `{"status":"ok",...}` with `written` > 0 (i.e. status is "error" or
+  "blocked", OR `written` is 0/missing, OR the page file was never created).
+  For every FAILED page, RE-DISPATCH ONE `jd_extractor` task for that page
+  in a SINGLE assistant message (parallel) - the evidence file
+  `output/evidence/pages/page_NN.txt` still exists, so the retry sub-agent can
+  re-read it. Do at most ONE retry round. Then run deduplicate.
+- After verify-retry (or if no pages failed), run:
   `run_skill_script(script="deduplicate", cli_args="output/candidates/*.json --out output/candidates_merged.json")`
 - If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
   `--mode search-interact`; if still empty, emit
@@ -425,6 +434,20 @@ HARD RULES - do not break these:
   `python -c`, etc.) to write candidate JSON - it bypasses the dedup/redirect
   logic and pollutes the skill. The ONLY write call you make is
   `run_skill_script(script="write_candidates", ...)`.
+- NO TEST/PLACEHOLDER DATA. NEVER write dummy candidates (title like `test`,
+  `test1`, `job1`, `placeholder`, `test123`, `test_clear`, `测试`, `算法组`,
+  `算法组` alone, a bare category label, etc.). If the page has NO real job
+  postings (login/captcha/anti-bot wall, empty list, no JD text), call
+  write_candidates ONCE with `stdin="[]"` and your final message is
+  `{"status":"blocked","page":"page_NN","reason":"<one line>"}`. Writing fake
+  candidates to look busy is the worst failure mode - it poisons the dataset.
+- ORIGINAL LANGUAGE ONLY. Keep `title`, `company_name`, `department` in the
+  EXACT language they appear in on the page (Chinese for 小米/xiaomi, etc.).
+  Do NOT translate to English and do NOT romanize to pinyin (e.g. write
+  `鼎尖英杰`, never `Dingjian Yingjie`; write `AI编译器工程师`, never
+  `AI Compiler Engineer` unless the page itself uses the English form).
+  `description_text`/`responsibilities`/`requirements` are quoted from the
+  page verbatim - same rule.
 - Write ONLY to the EXACT `--out` path from your task description
   (`output/candidates/page_NN.json`). Do NOT invent a suffixed filename
   (`_new`, `_v2`, `_temp`, `_final`, `_batch`, `_clean`, `_test`); there is
@@ -743,7 +766,12 @@ def _is_blocked(content: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _OUT_DIR = Path(__file__).resolve().parent
-RECURSION_LIMIT = 120
+# v1.4 bumped 120 -> 150: the verify-retry round re-dispatches jd_extractor
+# sub-agents for failed pages (page_03/08/10 in v1.3), adding ~3-5 sub-agent
+# subgraphs on top of the 16-page first round. Each sub-agent's internal
+# steps count toward the parent's recursion budget, so the retry round needs
+# headroom to avoid a recursion_limit partial on otherwise-recoverable runs.
+RECURSION_LIMIT = 150
 _TRACE = bool(os.environ.get("SKILL_EVAL_TRACE"))
 
 
