@@ -71,6 +71,11 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+
+def _utf8_reexec_command(argv: list[str]) -> list[str]:
+    """Build an interpreter command that fixes Windows child-process decoding."""
+    return [sys.executable, "-X", "utf8", *argv]
+
 # Force UTF-8 stdout/stderr on Windows so trace printing of message content
 # containing the Unicode replacement char (�, from garbled browse text)
 # or CJK does not crash with ``UnicodeEncodeError: 'gbk' codec can't encode``.
@@ -155,6 +160,11 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
     except ValueError as exc:  # noqa: BLE001 - malformed quoting
         return f"ERROR: could not parse cli_args {cli_args!r}: {exc}"
     cmd = [sys.executable, str(script_path), *parts]
+    child_env = {
+        **os.environ,
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+    }
     try:
         proc = subprocess.run(
             cmd,
@@ -165,6 +175,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
             encoding="utf-8",
             errors="replace",
             input=stdin if stdin else None,
+            env=child_env,
         )
     except subprocess.TimeoutExpired:
         return f"ERROR: {script} timed out after {_SCRIPT_TIMEOUT_SEC}s"
@@ -412,8 +423,9 @@ SCHEMA ( condensed - produce one JSON object per distinct job on the page ):
   "evidence_refs": [{"content_hash": "", "evidence_type": "browsed_list_page_text"}]
 }
 - Default recruitment_types to ["校园招聘"] (campus) unless the page says 社招 / 实习.
-- The bounded script tool is your only tool. The condensed schema above is the
-  complete contract for this page-level task; do not attempt filesystem tools.
+- For full field details you MAY `read_file("/job-discovery/references/schema.md")`
+  on demand, but the condensed schema above is enough for most pages - skip the
+  read to save a round-trip when the fields are clear.
 
 STEPS (strict tool budget):
 1. Read your page text ONCE:
@@ -490,20 +502,6 @@ def _build_settings() -> Settings:
     )
 
 
-def _build_jd_extractor_subagent() -> SubAgent:
-    """Build a depth-2 extractor with no inherited filesystem tool surface."""
-    return {
-        "name": "jd_extractor",
-        "description": (
-            "Extract structured JDs from ONE page-text file (output/evidence/"
-            "pages/page_NN.txt) and persist them to output/candidates/page_NN.json. "
-            "Dispatch one per page; the sub-agent reads its own page file."
-        ),
-        "system_prompt": _JD_EXTRACTOR_PROMPT,
-        "tools": [run_skill_script],
-    }
-
-
 def build_skill_agent(model: Any) -> Any:
     """Build the skill-orchestrated DeepAgent (planner/verifier + jd_extractor).
 
@@ -540,7 +538,17 @@ def build_skill_agent(model: Any) -> Any:
             mode="deny",
         ),
     ]
-    jd_extractor = _build_jd_extractor_subagent()
+    jd_extractor: SubAgent = {
+        "name": "jd_extractor",
+        "description": (
+            "Extract structured JDs from ONE page-text file (output/evidence/"
+            "pages/page_NN.txt) and persist them to output/candidates/page_NN.json. "
+            "Dispatch one per page; the sub-agent reads its own page file."
+        ),
+        "system_prompt": _JD_EXTRACTOR_PROMPT,
+        # tools omitted -> inherits [run_skill_script] from the parent.
+        # No 'subagents' key -> this sub-agent cannot dispatch sub-sub-agents.
+    }
     return create_deep_agent(
         model=model,
         tools=[run_skill_script],
@@ -1219,4 +1227,13 @@ def _main() -> int:
 
 
 if __name__ == "__main__":
+    # `deepagents` may spawn helper subprocesses with `text=True` but no
+    # explicit encoding. On Windows that otherwise falls back to GBK and can
+    # turn valid UTF-8 tool output into `None` / a downstream splitlines error.
+    # Re-exec before importing the agent graph so every descendant inherits
+    # UTF-8 mode. The marker prevents an accidental loop on exotic interpreters.
+    if not sys.flags.utf8_mode and not os.environ.get("SKILL_EVAL_UTF8_REEXEC"):
+        os.environ["SKILL_EVAL_UTF8_REEXEC"] = "1"
+        os.environ["PYTHONUTF8"] = "1"
+        os.execv(sys.executable, _utf8_reexec_command(sys.argv))
     sys.exit(_main())

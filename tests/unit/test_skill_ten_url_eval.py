@@ -62,12 +62,15 @@ def test_replay_normalizes_a_stale_false_success_record() -> None:
     assert record["evaluation_mode"] == "replay"
 
 
-def test_jd_extractor_uses_only_the_bounded_skill_script_tool() -> None:
+def test_utf8_reexec_command_enables_utf8_before_deepagents_spawns_children() -> None:
     runner = _load_runner()
 
-    spec = runner._build_jd_extractor_subagent()
+    command = runner._utf8_reexec_command(["tests/manual/run_skill_ten_url_eval.py"])
 
-    assert spec["tools"] == [runner.run_skill_script]
+    assert command[1:3] == ["-X", "utf8"]
+    assert command[-1] == "tests/manual/run_skill_ten_url_eval.py"
+
+
 
 
 def test_slug_filter_reuses_cache_unless_force_fresh_is_explicit() -> None:
