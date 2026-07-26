@@ -28,7 +28,6 @@ import copy
 import hashlib
 import json
 import re
-import sys
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -145,6 +144,109 @@ _JD_KEYWORDS = [
     "\u5c97\u4f4d", "\u804c\u4f4d", "\u62db\u8058", "\u8981\u6c42", "\u804c\u8d23",
     "job", "position", "requirement", "responsibility", "qualification",
 ]
+
+# ============================================================================
+# Garbage / placeholder filtering (deterministic, prompt-independent)
+# ============================================================================
+# v1.5: the LLM occasionally emits placeholder/test candidates (title like
+# `test`, `job1`, `placeholder`, `\u6d4b\u8bd5`, a bare category label `\u7b97\u6cd5\u7ec4`, etc.)
+# despite prompt bans. These are NEVER real JDs - drop them deterministically
+# so quality does not depend on the model obeying instructions. This is a
+# GENERAL rule (same regex for every site), not a per-URL adapter.
+#
+# Anchored exact-match after normalization: a real title like "Test Engineer"
+# or "QA Tester" is NOT matched because the normalized form ("testengineer" /
+# "qatester") is not exactly "test". Only bare placeholder tokens are dropped.
+_GARBAGE_TITLE_RE = re.compile(
+    r"^(?:test\d*|test_clear|job\d*|placeholder|demo\d*|sample\d*|example\d*|"
+    r"tmp\d*|foo\d*|bar\d*|"
+    r"\u6d4b\u8bd5\d*|\u5360\u4f4d\u7b26|\u793a\u4f8b|"
+    r"\u7b97\u6cd5\u7ec4|\u7b97\u6cd5\u7ec4\u7ec4\u957f|\u5f00\u53d1\u7ec4|"
+    # bare single CJK category labels with no role
+    r"\u5b9e\u4e60\u5c97|\u6821\u62db\u5c97)$"
+)
+# Placeholder BODY tokens: a candidate whose every text field (desc/resp/req)
+# is empty or one of these tokens has no real JD content - drop it. Catches
+# candidates whose title looked real but whose body is bare "test" data.
+_GARBAGE_BODY_RE = re.compile(
+    r"^(?:test\d*|test_clear|placeholder|demo\d*|sample\d*|tmp\d*|"
+    r"\u6d4b\u8bd5|\u5360\u4f4d\u7b26|tbd|todo|n/?a|none|null|\.\.\.)$"
+)
+
+# Romanization leak detector. v1.5: a pure-ASCII title with no recognized
+# English job word is almost always pinyin the model emitted instead of the
+# original Chinese title (e.g. "dingjian" for \u9f0e\u5c16, "Guanggao Suanfa
+# Gongchengshi" for \u5e7f\u544a\u7b97\u6cd5\u5de5\u7a0b\u5e08). These are REAL jobs with
+# mistranslated titles - we FLAG them (not drop, to preserve completeness) so
+# they can be re-extracted or reviewed. Recognized English job words exempt a
+# title (e.g. "AI Engineer", "Python Developer" are legitimate).
+_ASCII_TITLE_RE = re.compile(r"^[A-Za-z0-9\s\-\.\,\(\)/&+]+$")
+# After lowercasing, pinyin is one or more bare alphabetic words separated by
+# whitespace/hyphens (no digits, no other punctuation). Matches "dingjian",
+# "duan", "guanggao suanfa gongchengshi - hulianwang".
+_PINYIN_HINT_RE = re.compile(r"^[a-z]+(?:[\s\-]+[a-z]+)*$")
+_ENGLISH_JOB_WORDS = {
+    "engineer", "developer", "manager", "intern", "analyst", "architect",
+    "scientist", "specialist", "consultant", "lead", "senior", "junior",
+    "director", "officer", "designer", "product", "program", "software",
+    "data", "ai", "ml", "qa", "test", "fullstack", "frontend", "backend",
+    "platform", "solution", "solutions", "security", "cloud", "devops", "sre",
+    "ios", "android", "web", "ui", "ux", "marketing", "operation",
+    "operations", "finance", "hr", "legal", "support", "researcher",
+    "trader", "accountant", "auditor", "engineer", "head", "vp", "ceo",
+    "cto", "coo", "cfo", "partner", "associate", "assistant", "secretary",
+}
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _is_garbage_title(title: str | None) -> bool:
+    if not title:
+        return False
+    return bool(_GARBAGE_TITLE_RE.match(_normalize_title(title)))
+
+
+def _is_garbage_body(c: dict[str, Any]) -> bool:
+    """True if the candidate has SOME body text but ALL of it is placeholder.
+
+    All-empty bodies are NOT garbage here (they may be legitimate title-only
+    listings on some sites; Pass 2 / verify handle them as warnings). We only
+    drop when the model emitted explicit placeholder tokens ("test"/"tbd"/etc.)
+    - a real JD never has every field be a bare placeholder.
+    """
+    fields = [
+        str(c.get("description_text") or "").strip(),
+        str(c.get("responsibilities") or "").strip(),
+        str(c.get("requirements") or "").strip(),
+    ]
+    non_empty = [f for f in fields if f]
+    if not non_empty:
+        return False
+    return all(_GARBAGE_BODY_RE.match(f.lower()) for f in non_empty)
+
+
+def _romanization_warning(c: dict[str, Any]) -> str | None:
+    """Return a warning string if the title looks like pinyin romanization."""
+    title = c.get("title") or ""
+    if not title or not _ASCII_TITLE_RE.match(title):
+        return None
+    # Exempt titles containing a recognized English job word (any case).
+    words = set(re.findall(r"[A-Za-z]+", title.lower()))
+    if words & _ENGLISH_JOB_WORDS:
+        return None
+    # Flag any pinyin-shaped title (lowercased: bare alphabetic words). A real
+    # English title almost always contains a job word (exempted above); a bare
+    # pinyin string like "dingjian"/"guanggao suanfa gongchengshi" is a
+    # romanization leak. WARNING only - does not drop (preserves completeness).
+    if _PINYIN_HINT_RE.match(title.strip().lower()):
+        body_has_cjk = bool(_CJK_RE.search(" ".join(
+            str(c.get(k) or "") for k in ("description_text", "responsibilities", "requirements")
+        )))
+        kind = "JD body is CJK" if body_has_cjk else "JD body is English-translated"
+        return (
+            "ROMANIZED_TITLE_SUSPECTED: title is ASCII pinyin but " + kind
+            + "; re-extract in original language"
+        )
+    return None
 
 
 def _check_stale(desc: str) -> bool:
@@ -332,8 +434,9 @@ def _merge(dst: dict[str, Any], src: dict[str, Any]) -> None:
 def process(
     candidate_files: list[str],
     verify: bool = True,
+    keep_garbage: bool = False,
 ) -> dict[str, Any]:
-    """Load, normalize, deduplicate, package, verify — return merged result."""
+    """Load, normalize, deduplicate, package, verify - return merged result."""
 
     # --- Load all candidates ---
     raw_candidates: list[dict[str, Any]] = []
@@ -356,11 +459,36 @@ def process(
         return {
             "status": "empty",
             "candidates": [],
-            "stats": {"input_count": 0, "output_count": 0, "duplicates_removed": 0},
+            "stats": {
+                "input_count": 0,
+                "garbage_dropped": 0,
+                "garbage_titles": [],
+                "output_count": 0,
+                "duplicates_removed": 0,
+            },
             "load_errors": load_errors,
         }
 
     input_count = len(raw_candidates)
+
+    # --- Pass 0: Drop garbage/placeholder candidates (deterministic) ---
+    # v1.5: removes (a) test/job1/placeholder/测试/算法组-style TITLES and
+    # (b) candidates whose body is all placeholder tokens ("test"/"tbd"/etc.)
+    # - both are NEVER real JDs. Runs BEFORE identity-dedup so garbage cannot
+    # pollute identity keys or merge into real candidates. GENERAL rule (same
+    # regexes for every site), not a per-URL adapter.
+    garbage_dropped: list[str] = []
+    if not keep_garbage:
+        filtered: list[dict[str, Any]] = []
+        for c in raw_candidates:
+            if _is_garbage_title(c.get("title")) or _is_garbage_body(c):
+                garbage_dropped.append(
+                    f"{c.get('title')!r}"
+                    + (" (body=placeholder)" if not _is_garbage_title(c.get("title")) else "")
+                )
+                continue
+            filtered.append(c)
+        raw_candidates = filtered
 
     # --- Pass 1: Deduplicate by canonical identity ---
     groups: dict[tuple, list[int]] = {}
@@ -440,6 +568,10 @@ def process(
         for i, c in enumerate(deduped):
             title = c.get("title", f"candidate_{i}")
             warns = _verify_candidate(c)
+            # v1.5: romanization flag (does not drop - preserves completeness)
+            rw = _romanization_warning(c)
+            if rw:
+                warns.append(rw)
             if warns:
                 verify_warnings[title] = warns
                 existing = c.get("normalization_warnings") or []
@@ -457,6 +589,8 @@ def process(
         "candidates": deduped,
         "stats": {
             "input_count": input_count,
+            "garbage_dropped": len(garbage_dropped),
+            "garbage_titles": garbage_dropped,
             "output_count": len(deduped),
             "duplicates_removed": duplicates_removed,
         },
@@ -505,6 +639,8 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="Output file (merged JSON)")
     parser.add_argument("--no-verify", action="store_true",
                         help="Skip evidence quality checks")
+    parser.add_argument("--keep-garbage", action="store_true",
+                        help="Do NOT drop placeholder/test titles (default: drop them)")
     args = parser.parse_args()
 
     files = _expand_files(args.files)
@@ -525,7 +661,7 @@ def main() -> None:
         }, ensure_ascii=False))
         return
 
-    result = process(files, verify=not args.no_verify)
+    result = process(files, verify=not args.no_verify, keep_garbage=args.keep_garbage)
 
     if args.out:
         out_path = Path(args.out)
