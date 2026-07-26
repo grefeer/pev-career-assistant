@@ -2,7 +2,7 @@
 """browse.py — Render a career site URL to plain text via Playwright.
 
 Usage:
-  browse.py <url> [--mode list|detail|interact|search|search-interact] [--out <dir>]
+  browse.py <url> [--mode list|detail|interact|search|search-interact|click|parallel-fetch] [--out <dir>]
               [--max-pages N] [--max-cards N] [--wait MS]
               [--cache-mode use|revalidate|off] [--ignore-cache]
               [--search-terms TERMS] [--search-strategy first_match|each|broad]
@@ -18,6 +18,14 @@ Modes:
              if search is unavailable or produces zero results (with --fallback full).
              Use --search-terms for comma-separated keywords, --search-strategy
              to control how multiple terms are tried.
+  click          - Agent-driven pagination: click a target (--click-text /
+                   --click-selector / --click-auto) up to --click-count times.
+  parallel-fetch - v1.6 fast path: detect URL-keyed pagination (click next -> read URL
+                   -> click prev -> read URL -> diff to find page/size params), pre-compute
+                   all page URLs, fetch concurrently via a thread pool (--concurrency),
+                   write page_01..NN.txt. Auto-falls back to click mode when URL-keyed
+                   pagination is not detectable or a fetch errors (3 retries / timeout).
+                   Returns status=blocked (not fallback) on a captcha/anti-bot wall.
 
 Cache modes:
   use         — Return cached result if URL+hash match (default, fastest).
@@ -35,10 +43,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +240,39 @@ def _find_next_page_button(page: Any) -> Any | None:
                 # Generic fallbacks
                 "[class*='pagination-next']:not([class*='prev'])",
                 "li[class*='page-next']"]:
+        try:
+            el = page.locator(sel).first
+            if el.is_visible():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+_PREV_PAGE_TEXTS = ["Prev", "Previous", "Previous Page", "<", "«", "上一页", "上一頁", "上页"]
+
+
+def _find_prev_page_button(page: Any) -> Any | None:
+    """Mirror of ``_find_next_page_button`` for the previous-page control.
+
+    Used by the v1.6 pagination-detection flow to click back to page 1 after
+    probing page 2. Falls back to ``page.go_back()`` in the caller if no prev
+    control is found (browser back button reliably returns to the prior URL for
+    URL-keyed pagination).
+    """
+    for text in _PREV_PAGE_TEXTS:
+        try:
+            btn = page.get_by_text(text, exact=True).first
+            if btn.is_visible():
+                return btn
+        except Exception:
+            continue
+    for sel in [".prev", ".pagination-prev", "[aria-label='Previous']", "[aria-label='previous']",
+                "a[rel='prev']", "button.prev-page", ".ant-pagination-prev",
+                ".el-pagination button:first-child", ".t-pagination__btn-prev",
+                ".atsx-pagination-prev", ".atsx-pagination-prev a",
+                "[class*='pagination-prev']:not([class*='next'])",
+                "li[class*='page-prev']"]:
         try:
             el = page.locator(sel).first
             if el.is_visible():
@@ -508,6 +554,538 @@ def browse_click_mode(
         "end_reason": end_reason,
         "page_count": len(all_texts),
         "page_files": page_files,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Parallel URL fetch (v1.6) - detect URL-keyed pagination, pre-compute all
+# page URLs, fetch concurrently via a thread pool, auto-fallback to click mode.
+# ---------------------------------------------------------------------------
+
+# Shared browser profile (used by the main launch path and the pool workers).
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+class _Blocked(Exception):
+    """Raised when a fetched page contains a captcha / anti-bot / login wall.
+
+    Per the security hard gates the mode must NOT retry or fall back through a
+    wall - it surfaces as status=blocked so the agent stops.
+    """
+
+
+# Phrases that unambiguously indicate a verification / anti-bot wall in fetched
+# page TEXT. Deliberately NARROW: ``_CLICK_BLOCK_KEYWORDS`` (used for click
+# targets) also lists ``登录`` / ``扫码`` / ``robot`` / ``验证码``, but those
+# appear in ordinary page headers / job descriptions (a "Login" nav link, a JD
+# mentioning SMS 验证码) and would false-positive if scanned against full page
+# text. Only the specific WeChat-style wall phrases block a parallel fetch.
+_PAGE_BLOCK_PHRASES = [
+    "环境异常",
+    "完成验证后即可继续访问",
+    "请在微信客户端打开",
+    "请长按识别二维码",
+]
+
+# Default --search-terms value (shared by the argparse default and the
+# parallel-fetch dispatch, so the mode can tell "agent explicitly asked to search"
+# from "the argparse default leaked in" and avoid an unintended keyword search).
+_DEFAULT_SEARCH_TERMS = "AI,人工智能,Agent,大模型,算法"
+
+
+def _parse_total_pages(text: str | None) -> int | None:
+    """Extract an explicit page-count (e.g. '16 页', '1/16', '16 pages')."""
+    if not text:
+        return None
+    m = re.search(r"(\d+)\s*(?:页|pages?|/pages?)", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*/\s*(\d+)", text)  # "1 / 16" -> 16
+    if m:
+        return int(m.group(2))
+    return None
+
+
+def _parse_total_items(text: str | None) -> int | None:
+    """Best-effort item-count from a result-count line ('共 151 个职位' -> 151)."""
+    if not text:
+        return None
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    if not nums:
+        return None
+    return max(nums)  # the total is usually the largest number on the line
+
+
+def _compute_total_pages(count_text: str | None, size_val: int | None, max_pages: int) -> int:
+    """Decide how many pages to fetch. Prefers an explicit page count, then
+    item-count / page-size, else caps at ``max_pages`` (dedup drops the tail)."""
+    pages = _parse_total_pages(count_text)
+    if pages:
+        return min(max_pages, max(1, pages))
+    if size_val:
+        items = _parse_total_items(count_text)
+        if items:
+            return min(max_pages, max(1, math.ceil(items / size_val)))
+    return max_pages
+
+
+def _scan_body_count(body: str | None) -> str | None:
+    """Scan rendered body text for a total-jobs count when the result-count
+    selectors miss it (e.g. xiaomi renders '开启新的工作（151）' in full-width
+    parens, with no '个职位' substring for the selectors to anchor on).
+
+    Returns the matched digit string (caller parses via ``_parse_total_items``),
+    or None. Patterns tried in priority order: a 2-4 digit number in full/half
+    width parens, 'N 个职位' / 'N 职位', 'N results', '共 N'.
+    """
+    if not body:
+        return None
+    for pat in (
+        r"[（(]\s*(\d{2,4})\s*[）)]",        # （151）  /  (151)
+        r"(\d{2,4})\s*个?职位",               # 151 个职位 / 151 职位
+        r"(\d{2,4})\s*results?",              # 151 results
+        r"共\s*(\d{2,4})",                    # 共 151
+    ):
+        m = re.search(pat, body)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _detect_pagination(page: Any, retries: int) -> dict[str, Any] | None:
+    """Probe URL-keyed pagination by clicking next, reading the URL, going back,
+    and diffing the two URLs to find the page-number / page-size query params.
+
+    Returns ``None`` when URL-keyed pagination is not detectable (no paginator,
+    no URL change on click = 'load more' style, or path/opaque pagination) so
+    the caller can fall back to serial click mode. Returns a dict with
+    ``page_param`` / ``size_param`` / ``size_val`` / ``base_url`` on success.
+    """
+    url_1 = page.url
+    url_2: str | None = None
+    for _ in range(max(1, retries)):
+        # Re-find each attempt: the paginator may re-render after a click.
+        next_btn = _find_next_page_button(page)
+        if next_btn is None:
+            return None  # no paginator -> single page; caller handles
+        try:
+            next_btn.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        try:
+            next_btn.click(timeout=5000)
+            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+        except Exception:
+            continue  # click itself failed -> retry
+        if page.url == url_1:
+            # Click succeeded but URL unchanged -> 'load more' / no-op style.
+            # Not URL-keyed; fall back fast instead of burning the retry budget.
+            return None
+        url_2 = page.url
+        break
+    if url_2 is None:
+        return None  # exhausted retries without a successful advancing click
+    # Return to page 1 so the (eventual) click-fallback path starts clean.
+    prev = _find_prev_page_button(page)
+    if prev is not None:
+        try:
+            prev.click(timeout=5000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            try:
+                page.go_back(timeout=5000)
+            except Exception:
+                pass
+    else:
+        try:
+            page.go_back(timeout=5000)
+        except Exception:
+            pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+
+    q1 = dict(parse_qsl(urlparse(url_1).query, keep_blank_values=True))
+    q2 = dict(parse_qsl(urlparse(url_2).query, keep_blank_values=True))
+    page_param = None
+    for k, v2 in q2.items():
+        v1 = q1.get(k, "")
+        if v1 == v2:
+            continue  # unchanged between pages
+        # Param changed (or newly appeared) - is it a numeric page increment?
+        try:
+            n2 = int(v2)
+        except ValueError:
+            continue  # non-numeric change (token, slug) - not the page param
+        if v1 == "":
+            # Param absent on page 1, appears on page 2 (xiaomi: page-1 URL is a
+            # bare share_token; current/limit only show up from page 2). Accept
+            # it as the page param when page 2's value is 2.
+            if n2 == 2:
+                page_param = k
+                break
+            continue
+        try:
+            n1 = int(v1)
+        except ValueError:
+            continue
+        if n2 == n1 + 1:
+            page_param = k
+            break
+    if page_param is None:
+        return None  # path-based / opaque pagination -> fall back to click
+
+    # Size param: scan q2 (page 2 carries the full param set, including limit,
+    # even when page 1's URL omits it). base_url = url_2 for the same reason -
+    # building page URLs from url_2 preserves limit + every other param.
+    size_param = None
+    size_val = None
+    for cand in ("limit", "pageSize", "page_size", "size", "perPage",
+                 "per_page", "count", "rows", "rowCount"):
+        if cand in q2:
+            size_param = cand
+            try:
+                size_val = int(q2[cand])
+            except ValueError:
+                size_val = None
+            break
+    return {
+        "page_param": page_param,
+        "size_param": size_param,
+        "size_val": size_val,
+        "base_url": url_2,  # page-2 URL: full param set, page_param reset per page
+    }
+
+
+def _substitute_page_param(base_url: str, page_param: str, page_no: int) -> str:
+    """Return ``base_url`` with its ``page_param`` query value set to ``page_no``."""
+    p = urlparse(base_url)
+    qsl = parse_qsl(p.query, keep_blank_values=True)
+    found = False
+    new_q: list[tuple[str, str]] = []
+    for k, v in qsl:
+        if k == page_param:
+            new_q.append((k, str(page_no)))
+            found = True
+        else:
+            new_q.append((k, v))
+    if not found:
+        new_q.append((page_param, str(page_no)))
+    return urlunparse(p._replace(query=urlencode(new_q)))
+
+
+def _dedup_adjacent(texts: list[str | None]) -> list[str]:
+    """Drop None and exact-adjacent-duplicate page texts.
+
+    Out-of-range pages on some sites echo the page-1 (or last valid) body; the
+    downstream ``deduplicate.py`` handles cross-page content dedup, but dropping
+    adjacent identical blobs here keeps page files honest and avoids feeding
+    the extractors stale echoes.
+    """
+    out: list[str] = []
+    for t in texts:
+        if not t:
+            continue
+        if out and t.strip() == out[-1].strip():
+            continue
+        out.append(t)
+    return out
+
+
+# Per-worker persistent browser (Java-thread-pool analog: N worker threads, each
+# with one long-lived browser, pulling URLs from the queue). Amortizes browser
+# launch to ``concurrency`` instead of one per page.
+_THREAD_LOCAL = threading.local()
+_CREATED: list[tuple[Any, Any]] = []  # (playwright, browser) pairs for teardown
+_CREATED_LOCK = threading.Lock()
+
+
+def _worker_init() -> None:
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch(headless=True)
+    _THREAD_LOCAL.pw = pw
+    _THREAD_LOCAL.browser = browser
+    with _CREATED_LOCK:
+        _CREATED.append((pw, browser))
+
+
+def _worker_shutdown() -> None:
+    with _CREATED_LOCK:
+        pairs = list(_CREATED)
+        _CREATED.clear()
+    for pw, browser in pairs:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
+def _fetch_one(url: str, wait_ms: int) -> str:
+    browser = getattr(_THREAD_LOCAL, "browser", None)
+    if browser is None:
+        raise RuntimeError("worker browser not initialized")
+    context = browser.new_context(
+        user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
+    )
+    page = context.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(wait_ms)
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        _scroll_to_load(page, wait_ms)
+        for _ in range(3):
+            _dismiss_consent(page)
+        text = _extract_body_text(page)
+        low = text.lower()
+        for kw in _PAGE_BLOCK_PHRASES:
+            if kw.lower() in low:
+                raise _Blocked(f"anti-bot/captcha wall on {url}: {kw!r}")
+        return text
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+
+
+def _fetch_one_with_retry(url: str, wait_ms: int, retries: int) -> str:
+    last_exc: Exception | None = None
+    for _ in range(max(1, retries)):
+        try:
+            return _fetch_one(url, wait_ms)
+        except _Blocked:
+            raise  # walls are not retried (security gate)
+        except Exception as exc:
+            last_exc = exc
+    assert last_exc is not None
+    raise last_exc
+
+
+def _parallel_fetch(urls: list[str], wait_ms: int, concurrency: int, retries: int) -> list[str]:
+    """Fetch all page URLs concurrently via a thread pool. Raises ``_Blocked`` if
+    any page hit a captcha/anti-bot wall, or ``RuntimeError`` on a non-wall error
+    after all retries (so the caller can fall back to serial click mode)."""
+    texts: list[str | None] = [None] * len(urls)
+    block_reason: str | None = None
+    error_reason: str | None = None
+    try:
+        # NOTE: ThreadPoolExecutor has no `finalizer` kwarg (unlike
+        # multiprocessing.Pool); worker browsers are torn down manually below via
+        # the module-level _CREATED registry.
+        with ThreadPoolExecutor(
+            max_workers=max(1, concurrency),
+            initializer=_worker_init,
+        ) as ex:
+            fut_to_idx = {
+                ex.submit(_fetch_one_with_retry, u, wait_ms, retries): i
+                for i, u in enumerate(urls)
+            }
+            for fut in as_completed(fut_to_idx):
+                i = fut_to_idx[fut]
+                try:
+                    texts[i] = fut.result()
+                except _Blocked as b:
+                    if block_reason is None:
+                        block_reason = str(b)
+                except Exception as exc:  # noqa: BLE001 - surface for fallback
+                    if error_reason is None:
+                        error_reason = str(exc)
+    finally:
+        _worker_shutdown()  # close every worker's persistent browser + playwright
+    if block_reason is not None:
+        raise _Blocked(block_reason)
+    if error_reason is not None:
+        raise RuntimeError(error_reason)
+    return texts  # type: ignore[return-value]
+
+
+def browse_parallel_fetch_mode(
+    url: str,
+    out_dir: Path,
+    max_pages: int,
+    wait_ms: int,
+    search_terms: list[str] | None = None,
+    concurrency: int = 4,
+    detect_retries: int = 3,
+) -> dict[str, Any]:
+    """v1.6 fast path: detect URL-keyed pagination, pre-compute all page URLs,
+    fetch them concurrently via a thread pool, write ``page_01..NN.txt``.
+
+    Self-contained: owns its browser lifecycle (does not reuse a caller-opened
+    page). On any failure that makes URL pre-computation impossible (no paginator,
+    no URL change = 'load more', opaque path/POST pagination) OR a non-wall error
+    during parallel fetch, it transparently falls back to serial ``click`` mode
+    (v1.5 path) so completeness never regresses. A captcha/anti-bot wall is NOT
+    fallen back through - it surfaces as ``status=blocked`` (security gate).
+
+    Optional ``search_terms``: if the page exposes a search box, search the
+    keywords first (user step 2), then detect pagination on the filtered
+    results URL. Search is best-effort; if no box is found the flow proceeds
+    unfiltered.
+    """
+    from playwright.sync_api import sync_playwright
+
+    # ---- Phase 1: detect (sync, own browser) ----
+    detect: dict[str, Any] | None = None
+    count_text: str | None = None
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
+        )
+        page = context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(wait_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            _scroll_to_load(page, wait_ms)
+            for _ in range(3):
+                _dismiss_consent(page)
+
+            if search_terms:
+                # Best-effort search (user step 2). Failure does not abort.
+                try:
+                    from_cur = _perform_search(page, search_terms[0], _SEARCH_WAIT_MS)
+                    _searched = from_cur[0]
+                except Exception:
+                    _searched = False
+                # After a search, settle the page before reading totals / paginating.
+                _scroll_to_load(page, wait_ms)
+                for _ in range(3):
+                    _dismiss_consent(page)
+
+            body_1 = _extract_body_text(page)
+            # SPA-shell fast-fail: mokahr / feishu card-SPAs render <500 chars
+            # under a plain load (they need search-interact card click-through,
+            # not pagination). Don't waste time on detect+click - return page 1
+            # only so the agent's existing thin-result retry triggers
+            # search-interact. Matches the list-mode threshold in
+            # single-url-extraction.md ("If [PAGE_TEXT] < ~500 chars ... retry
+            # ONCE with --mode search-interact").
+            if len(body_1.strip()) < 500:
+                page_files = _save_page_files([body_1], out_dir)
+                short_hash, text_path, screenshot_path = _save_evidence(body_1, out_dir)
+                _save_screenshot(page, screenshot_path)
+                browser.close()
+                return {
+                    "status": "ok",
+                    "url": url,
+                    "mode": "parallel-fetch",
+                    "used_path": "spa_shell_no_pagination",
+                    "title": page.title(),
+                    "content_hash": short_hash,
+                    "text_path": str(text_path),
+                    "screenshot_path": str(screenshot_path),
+                    "text_length": len(body_1),
+                    "page_count": 1,
+                    "page_files": page_files,
+                }
+            count_text = _read_result_count_text(page) or _scan_body_count(body_1)
+            detect = _detect_pagination(page, detect_retries)
+
+            if detect is None:
+                # FALLBACK A: page rendered real content but no URL-keyed
+                # pagination (load-more / next-page button style) -> serial
+                # click on this page (user step 4).
+                result = browse_click_mode(
+                    page, url, out_dir, None, None, max_pages, wait_ms, click_auto=True
+                )
+                result["used_path"] = "click_fallback_no_detect"
+                browser.close()
+                return result
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    # ---- Compute page URLs ----
+    total_pages = _compute_total_pages(count_text, detect.get("size_val"), max_pages)
+    page_param = detect["page_param"]
+    urls = [
+        _substitute_page_param(detect["base_url"], page_param, i)
+        for i in range(1, total_pages + 1)
+    ]
+
+    # ---- Phase 2: parallel fetch ----
+    try:
+        texts = _parallel_fetch(urls, wait_ms, concurrency, detect_retries)
+    except _Blocked as b:
+        return {
+            "status": "blocked",
+            "url": url,
+            "mode": "parallel-fetch",
+            "reason": str(b),
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback path
+        # FALLBACK B: parallel fetch errored -> re-open and serial-click.
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
+            )
+            page = context.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(wait_ms)
+                _scroll_to_load(page, wait_ms)
+                for _ in range(3):
+                    _dismiss_consent(page)
+                result = browse_click_mode(
+                    page, url, out_dir, None, None, total_pages, wait_ms, click_auto=True
+                )
+                result["used_path"] = f"click_fallback_fetch_error ({exc})"
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            return result
+
+    texts = _dedup_adjacent(texts)
+    page_files = _save_page_files(texts, out_dir)
+    full_text = "\n\n--- PAGE BREAK ---\n\n".join(texts)
+    short_hash, text_path, screenshot_path = _save_evidence(full_text, out_dir)
+
+    return {
+        "status": "ok",
+        "url": url,
+        "mode": "parallel-fetch",
+        "used_path": "parallel",
+        "title": "",  # title not retained across the pool workers; harmless
+        "content_hash": short_hash,
+        "text_path": str(text_path),
+        "screenshot_path": str(screenshot_path),
+        "text_length": len(full_text),
+        "page_count": len(texts),
+        "page_files": page_files,
+        "pagination": {
+            "pages_collected": len(texts),
+            "total_pages": total_pages,
+            "page_param": page_param,
+            "size_param": detect.get("size_param"),
+            "size_val": detect.get("size_val"),
+            "concurrency": concurrency,
+        },
     }
 
 
@@ -1480,12 +2058,16 @@ def browse_interact_mode(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render career site to plain text via Playwright")
     parser.add_argument("url", help="Career site URL to browse")
-    parser.add_argument("--mode", choices=["list", "detail", "interact", "search", "search-interact", "click"],
+    parser.add_argument("--mode", choices=["list", "detail", "interact", "search", "search-interact",
+                                            "click", "parallel-fetch"],
                         default="list",
                         help="Page type: list, detail, interact (click-through cards), "
                              "search (keyword filter first), search-interact "
-                             "(search + click-through filtered cards), or click "
-                             "(agent-driven pagination: click a target N times)")
+                             "(search + click-through filtered cards), click "
+                             "(agent-driven pagination: click a target N times), "
+                             "or parallel-fetch (v1.6: detect URL-keyed pagination, "
+                             "pre-compute all page URLs, fetch concurrently via a "
+                             "thread pool, auto-fallback to click mode)")
     parser.add_argument("--out", default="output/evidence",
                         help="Output directory for evidence files (default: output/evidence)")
     parser.add_argument("--max-pages", type=int, default=5,
@@ -1501,7 +2083,7 @@ def main() -> None:
                         help="Cache strategy: use (return cached if exists), "
                              "revalidate (always re-browse but skip LLM if hash matches), "
                              "off (never cache, always re-browse). Default: use")
-    parser.add_argument("--search-terms", default="AI,人工智能,Agent,大模型,算法",
+    parser.add_argument("--search-terms", default=_DEFAULT_SEARCH_TERMS,
                         help="Comma-separated keywords for search/search-interact mode "
                              "(default: AI,人工智能,Agent,大模型,算法)")
     parser.add_argument("--search-strategy", choices=["first_match", "each", "broad"],
@@ -1523,6 +2105,14 @@ def main() -> None:
                              "(uses the same selector set as list-mode pagination). "
                              "Use when the paginator is an icon-only arrow with no "
                              "clickable text (e.g. Mioffice/atsx sites).")
+    parser.add_argument("--concurrency", type=int, default=4,
+                        help="parallel-fetch mode: max concurrent page workers "
+                             "(default: 4). Each worker holds one persistent headless "
+                             "browser; the Java-thread-pool analog.")
+    parser.add_argument("--detect-retries", type=int, default=3,
+                        help="parallel-fetch mode: retries for the detect probe and "
+                             "per-page fetch (default: 3). After exhausting retries on "
+                             "a non-wall error the mode falls back to serial click.")
 
     args = parser.parse_args()
     url = args.url
@@ -1537,8 +2127,9 @@ def main() -> None:
     # click mode content depends on the click target + count, not just the URL,
     # so the URL-keyed cache must be bypassed for both reads and writes (a cached
     # list-mode result for the same URL would be wrong, and writing back would
-    # corrupt the list-mode entry).
-    if args.mode == "click":
+    # corrupt the list-mode entry). parallel-fetch is likewise param-dependent
+    # (concurrency / max-pages / search terms) and self-contained.
+    if args.mode in ("click", "parallel-fetch"):
         cache_mode = "off"
 
     # ---- Cache check (before browser launch) ----
@@ -1571,6 +2162,29 @@ def main() -> None:
         }
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(1)
+
+    # parallel-fetch is self-contained (owns its browser lifecycle, may fan out
+    # to a thread pool of browsers), so dispatch it before main's single-browser
+    # block and exit without touching the URL-keyed cache.
+    if args.mode == "parallel-fetch":
+        # Only search when the agent EXPLICITLY passed --search-terms; the
+        # argparse default (_DEFAULT_SEARCH_TERMS) must not trigger an
+        # unintended keyword filter on the parallel path.
+        pf_search_terms = (
+            search_terms if args.search_terms != _DEFAULT_SEARCH_TERMS else None
+        )
+        result = browse_parallel_fetch_mode(
+            url, out_dir, args.max_pages, args.wait,
+            pf_search_terms, args.concurrency, args.detect_retries,
+        )
+        try:
+            json_bytes = json.dumps(result, ensure_ascii=False).encode("utf-8")
+            sys.stdout.buffer.write(json_bytes + b"\n")
+            sys.stdout.buffer.flush()
+        except (OSError, AttributeError):
+            sys.stdout.reconfigure(encoding="utf-8")
+            print(json.dumps(result, ensure_ascii=False))
+        sys.exit(0)
 
     try:
         with sync_playwright() as pw:

@@ -37,36 +37,42 @@ Do NOT read `SKILL.md` - it is large and documents the SmartSheet flow.
 
 ### 2. Render + paginate (planner)
 ```
-run_skill_script(script="browse", cli_args="<URL> --mode list --max-pages 3 --out output/evidence")
+run_skill_script(script="browse", cli_args="<URL> --mode parallel-fetch --max-pages 20 --concurrency 4 --out output/evidence")
 ```
-The result JSON now carries **`page_files`** (a list of `output/evidence/pages/page_NN.txt`
-paths) and **`page_count`**, in addition to the inlined `[PAGE_TEXT]`.
+`parallel-fetch` (v1.6) is the default first call. It detects URL-keyed
+pagination (click next -> read URL -> click prev -> read URL -> diff to find the
+`current`/`limit` params), pre-computes every page URL, and fetches them
+**concurrently** via a thread pool (`--concurrency 4` = 4 worker browsers, the
+Java-thread-pool analog). The result JSON carries **`page_files`** (paths to
+`output/evidence/pages/page_NN.txt`), **`page_count`**, and **`used_path`**.
+
+`used_path` tells you which path it took:
+- `"parallel"` - URL-keyed site, pages fetched concurrently. Proceed to step 3.
+- `"click_fallback_no_detect"` / `"click_fallback_fetch_error"` - not URL-keyed
+  (load-more / next-button style); it fell back to serial `click` internally.
+  If `page_count > 1`, the click fallback paginated successfully - proceed to
+  step 3 with those page files. If `page_count == 1` and `[PAGE_TEXT]` is thin,
+  treat as the SPA case below.
+- `"spa_shell_no_pagination"` - the page rendered < 500 chars (mokahr / feishu
+  card-SPA shell). Retry ONCE with `--mode search-interact` (below).
 
 - If `[PAGE_TEXT]` is missing / `< ~500 chars` (common on Moka/feishu/zhiye
-  SPAs), retry ONCE with `--mode search-interact`. If still empty, the page is
-  an SPA shell / dead URL - emit `{"status":"blocked","reason":"page did not
-  render job content"}` and stop.
-- **Paginate** if the text signals more jobs than one page holds: a total count
-  (`共151` / `(151)` / `151 职位` / `151 results`) larger than what you see, OR
-  a paginator control (`下一页` / `加载更多` / `查看更多` / page numbers
-  `1 2 3 ... 16` / a next arrow):
+  SPAs, or when `used_path` is `spa_shell_no_pagination`), retry ONCE with:
   ```
-  run_skill_script(script="browse", cli_args="<URL> --mode click --click-auto --click-count 15 --out output/evidence")
+  run_skill_script(script="browse", cli_args="<URL> --mode search-interact --max-pages 3 --out output/evidence")
   ```
-  `--click-auto` re-detects the next-page arrow each click (icon-only arrows on
-  Mioffice/atsx sites like xiaomi). If the paginator is a text button use
-  `--click-text "下一页"` / `--click-text "加载更多"` / `--click-text "查看更多"`
-  instead. Set `--click-count` high (e.g. 15); it stops early when exhausted
-  (`end_reached: true`). Skip pagination if `[PAGE_TEXT]` already shows all the
-  jobs and no paginator/total-larger-than-visible is present.
+  If still empty, the page is an SPA shell / dead URL - emit
+  `{"status":"blocked","reason":"page did not render job content"}` and stop.
+- Skip pagination entirely only if `parallel-fetch` already returned all the
+  jobs and `used_path` is `parallel`/`click_fallback_*` with `page_count` >= 1.
 
 **HARD LIMITS - do not flail:**
-- At most ONE list browse, ONE click-paginate, and ONE search-interact retry per
-  URL. If a click-paginate does not grow the page text (`pages_collected` stays
-  1, or `[PAGE_TEXT]` is unchanged), the SPA's load-more is not something
-  browse can drive. STOP paginating and proceed to step 3 with whatever pages
-  you have - extracting the visible jobs correctly is far better than retrying
-  browse until the run crashes. Do NOT loop on browse variants.
+- At most ONE `parallel-fetch` call and ONE `search-interact` retry per URL.
+  (`parallel-fetch` internally already covers the `list` + `click` paths and
+  their fallbacks - do NOT also issue separate `--mode list` or `--mode click`
+  calls.) If `parallel-fetch` returns `page_count == 1` with thin text and
+  `search-interact` is also empty, STOP and proceed to step 3 with whatever
+  (if any) pages you have, or emit the blocked JSON. Do NOT loop on browse variants.
 - NEVER `read_file` / `ls` / `glob` anything under `output/evidence/` - and
   especially never read a `.png`/`.jpg` screenshot. The evidence dir holds the
   content-addressed cache (often 0-byte text files or PNG screenshots); reading
@@ -119,8 +125,9 @@ avoid. If the page was a login/captcha/anti-bot wall, emit instead
 `{"status":"blocked","reason":"<one short line>"}` and stop.
 
 ## Constraints
-- Tool budget <= 14 (schema read + browse + maybe click + N task calls + 1
-  deduplicate). The `task` calls count toward budget but run in parallel.
+- Tool budget <= 14 (schema read + parallel-fetch browse + maybe search-interact
+  retry + N task calls + 1 deduplicate). The `task` calls count toward budget
+  but run in parallel.
 - Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
   normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.

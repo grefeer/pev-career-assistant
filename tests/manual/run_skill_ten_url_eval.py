@@ -312,9 +312,13 @@ WORKFLOW - load it first, then follow it exactly:
    It documents the full planner -> executor -> verifier flow. Do NOT read
    SKILL.md - it documents the SmartSheet batch workflow (not needed here) and
    is large.
-2. Follow that doc: read schema.md, browse (list), click-paginate if a paginator
-   or total-count signal is present, then fan out ONE `jd_extractor` task per
-   page file in a SINGLE message (parallel), then `deduplicate`-merge.
+2. Follow that doc: read schema.md, browse with `--mode parallel-fetch` (v1.6:
+   detects URL-keyed pagination and fetches all pages concurrently via a thread
+   pool; auto-falls back to serial click for load-more sites, and returns a thin
+   `spa_shell_no_pagination` result for card-SPAs), retry ONCE with
+   `--mode search-interact` if `[PAGE_TEXT]` is < ~500 chars, then fan out ONE
+   `jd_extractor` task per page file in a SINGLE message (parallel), then
+   `deduplicate`-merge.
 
 KEY POINTS (also in the workflow doc - repeated because they are the common
 failure modes):
@@ -341,10 +345,12 @@ failure modes):
 - If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
   `--mode search-interact`; if still empty, emit
   `{"status":"blocked","reason":"page did not render job content"}` and stop.
-- HARD LIMITS: at most ONE list browse, ONE click-paginate, and ONE
-  search-interact retry. If click-paginate does not grow the page text, STOP
-  paginating and dispatch `jd_extractor` on whatever pages you have - do NOT
-  loop on browse variants. NEVER `read_file`/`ls`/`glob` anything under
+- HARD LIMITS: at most ONE `parallel-fetch` browse and ONE search-interact
+  retry. (`parallel-fetch` already covers the list + click paths internally -
+  do NOT also issue separate `--mode list` or `--mode click` calls.) If
+  `parallel-fetch` returns `page_count == 1` with thin text and search-interact
+  is also empty, STOP and dispatch `jd_extractor` on whatever pages you have -
+  do NOT loop on browse variants. NEVER `read_file`/`ls`/`glob` anything under
   `output/evidence/` (especially `.png` screenshots) - that returns empty/image
   bytes which crash the run. Page text is ONLY under `[PAGE_TEXT]` or via
   `read_evidence` on a `output/evidence/pages/page_NN.txt` path.
