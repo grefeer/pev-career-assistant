@@ -68,6 +68,19 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+# Force UTF-8 stdout/stderr on Windows so trace printing of message content
+# containing the Unicode replacement char (�, from garbled browse text)
+# or CJK does not crash with ``UnicodeEncodeError: 'gbk' codec can't encode``.
+# v1.3 xiaomi hit this mid-stream, leaving candidates on disk but marking the
+# run with an error note. Reconfigure with errors='replace' so printing is
+# always safe; the on-disk candidate files are already written as UTF-8 by
+# write_candidates.py and are unaffected.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+except (AttributeError, OSError):
+    pass
+
 from langchain_core.messages import HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from deepagents import create_deep_agent
@@ -339,14 +352,16 @@ CRITICAL - OUTPUT DISCIPLINE:
 
 CONSTRAINTS:
 - Total tool calls <= 14. The `task` calls count but run in parallel.
-- NEVER use `edit_file`/`str_replace`/`write_file` on anything under
-  `output/candidates/` or `output/candidates_merged.json`. Candidate files
-  are written ONLY by `jd_extractor` sub-agents via `write_candidates.py`
-  (a subprocess on real disk); the virtual-FS `edit_file` cannot reach them,
-  so editing is a pure wasted step that burns your recursion budget for no
-  effect. If a candidate file looks wrong, do NOT fix it by hand - just run
-  `deduplicate`, which skips malformed files. Your only write to the candidates
-  tree is the `deduplicate`-merge.
+- The virtual filesystem is READ-ONLY: `write_file`/`edit_file`/`str_replace`
+  are DENIED everywhere under /job-discovery/** (they return a
+  permission-denied error). Do NOT attempt them and do NOT invent or run
+  your own writer scripts (`write_jobs.py`, `write_pageNN.py`, etc.) - they
+  pollute the skill and will not run. Candidate files are written ONLY by
+  `jd_extractor` sub-agents via `write_candidates.py` (a `run_skill_script`
+  subprocess on real disk, which the FS permissions do not gate). If a
+  candidate file looks wrong, do NOT fix it by hand - just run
+  `deduplicate`, which skips malformed files. Your only write to the
+  candidates tree is the `deduplicate`-merge.
 - Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
   normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.
@@ -403,6 +418,13 @@ STEPS (strict tool budget):
    (use the `total_in_file` from the last write_candidates result as `written`).
 
 HARD RULES - do not break these:
+- The virtual filesystem is READ-ONLY. `write_file`/`edit_file`/`str_replace`
+  are DENIED (they return permission-denied). Persist candidates ONLY via
+  `write_candidates.py` (`run_skill_script`). NEVER invent, `write_file`, or
+  run your own writer script (`write_jobs.py`, `write_pageNN.py`, an inline
+  `python -c`, etc.) to write candidate JSON - it bypasses the dedup/redirect
+  logic and pollutes the skill. The ONLY write call you make is
+  `run_skill_script(script="write_candidates", ...)`.
 - Write ONLY to the EXACT `--out` path from your task description
   (`output/candidates/page_NN.json`). Do NOT invent a suffixed filename
   (`_new`, `_v2`, `_temp`, `_final`, `_batch`, `_clean`, `_test`); there is
@@ -451,10 +473,26 @@ def build_skill_agent(model: Any) -> Any:
       sub-agent has no ``subagents`` of its own -> max depth 2 (no sub-sub-agents).
     """
     backend = FilesystemBackend(root_dir=str(SKILL_PARENT), virtual_mode=True)
+    # READ-ONLY filesystem (v1.3): allow read on the skill tree so the agent
+    # can load references/schema/evidence on demand (progressive disclosure),
+    # but EXPLICITLY DENY write. deepagents permissions are DEFAULT-ALLOW, so a
+    # bare operations=["read"] rule would NOT block writes - the explicit deny
+    # rule is required. This forces EVERY candidate write through
+    # write_candidates.py (a run_skill_script subprocess on real disk, which the
+    # virtual-FS permissions do not gate), so the suffix-redirect logic always
+    # applies and sub-agents can no longer invent writer scripts (write_jobs.py,
+    # write_pageNN.py) or write_file candidate JSON directly - both were observed
+    # in v1.2 and bypassed the redirect. All legitimate writes (browse stash,
+    # write_candidates, deduplicate-merge) are subprocesses unaffected here.
     permissions = [
         FilesystemPermission(
-            operations=["read", "write"],
+            operations=["read"],
             paths=["/job-discovery/**"],
+        ),
+        FilesystemPermission(
+            operations=["write"],
+            paths=["/job-discovery/**"],
+            mode="deny",
         ),
     ]
     jd_extractor: SubAgent = {
