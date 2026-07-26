@@ -30,6 +30,46 @@ def test_extract_candidates_ignores_terminal_blocked_message() -> None:
     assert runner._extract_candidates('{"status":"blocked","reason":"captcha"}') == []
 
 
+def test_llm_key_gate_accepts_the_project_openai_compatible_key(monkeypatch) -> None:
+    runner = _load_runner()
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    assert runner._has_llm_key()
+
+
+def test_non_recursion_agent_error_with_candidates_is_partial_not_success() -> None:
+    runner = _load_runner()
+
+    assert runner._classify_run_status(
+        note="AttributeError: tool result was None",
+        blocked=False,
+        candidates=[{"title": "岗位"}],
+    ) == "partial"
+
+
+def test_replay_normalizes_a_stale_false_success_record() -> None:
+    runner = _load_runner()
+
+    record = runner._normalize_replayed_record({
+        "status": "succeeded",
+        "candidate_count": 102,
+        "note": "AttributeError: tool result was None",
+        "block_reason": None,
+    })
+
+    assert record["status"] == "partial"
+    assert record["evaluation_mode"] == "replay"
+
+
+def test_jd_extractor_uses_only_the_bounded_skill_script_tool() -> None:
+    runner = _load_runner()
+
+    spec = runner._build_jd_extractor_subagent()
+
+    assert spec["tools"] == [runner.run_skill_script]
+
+
 def test_slug_filter_reuses_cache_unless_force_fresh_is_explicit() -> None:
     runner = _load_runner()
 

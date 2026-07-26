@@ -31,7 +31,8 @@ Architecture
 Gating
 ------
 Live LLM + Playwright run. Skips (never reports PASS) unless both
-``RUN_SKILL_TEN_URL=1`` and ``DEEPSEEK_API_KEY`` are set.
+``RUN_SKILL_TEN_URL=1`` and an OpenAI-compatible API key
+(``DEEPSEEK_API_KEY`` or ``OPENAI_API_KEY``) are set.
 
 Run::
 
@@ -411,9 +412,8 @@ SCHEMA ( condensed - produce one JSON object per distinct job on the page ):
   "evidence_refs": [{"content_hash": "", "evidence_type": "browsed_list_page_text"}]
 }
 - Default recruitment_types to ["校园招聘"] (campus) unless the page says 社招 / 实习.
-- For full field details you MAY `read_file("/job-discovery/references/schema.md")`
-  on demand, but the condensed schema above is enough for most pages - skip the
-  read to save a round-trip when the fields are clear.
+- The bounded script tool is your only tool. The condensed schema above is the
+  complete contract for this page-level task; do not attempt filesystem tools.
 
 STEPS (strict tool budget):
 1. Read your page text ONCE:
@@ -490,6 +490,20 @@ def _build_settings() -> Settings:
     )
 
 
+def _build_jd_extractor_subagent() -> SubAgent:
+    """Build a depth-2 extractor with no inherited filesystem tool surface."""
+    return {
+        "name": "jd_extractor",
+        "description": (
+            "Extract structured JDs from ONE page-text file (output/evidence/"
+            "pages/page_NN.txt) and persist them to output/candidates/page_NN.json. "
+            "Dispatch one per page; the sub-agent reads its own page file."
+        ),
+        "system_prompt": _JD_EXTRACTOR_PROMPT,
+        "tools": [run_skill_script],
+    }
+
+
 def build_skill_agent(model: Any) -> Any:
     """Build the skill-orchestrated DeepAgent (planner/verifier + jd_extractor).
 
@@ -526,17 +540,7 @@ def build_skill_agent(model: Any) -> Any:
             mode="deny",
         ),
     ]
-    jd_extractor: SubAgent = {
-        "name": "jd_extractor",
-        "description": (
-            "Extract structured JDs from ONE page-text file (output/evidence/"
-            "pages/page_NN.txt) and persist them to output/candidates/page_NN.json. "
-            "Dispatch one per page; the sub-agent reads its own page file."
-        ),
-        "system_prompt": _JD_EXTRACTOR_PROMPT,
-        # tools omitted -> inherits [run_skill_script] from the parent.
-        # No 'subagents' key -> this sub-agent cannot dispatch sub-sub-agents.
-    }
+    jd_extractor = _build_jd_extractor_subagent()
     return create_deep_agent(
         model=model,
         tools=[run_skill_script],
@@ -958,6 +962,35 @@ def _preserve_merged(slug: str) -> str | None:
     return None
 
 
+def _classify_run_status(
+    *,
+    note: str,
+    blocked: bool,
+    candidates: list[dict[str, Any]],
+) -> str:
+    """Classify a run without treating an interrupted workflow as a success."""
+    if note == "recursion_limit":
+        return "partial" if candidates else "recursion"
+    if note:
+        return "partial" if candidates else "crashed"
+    if blocked:
+        return "blocked"
+    return "succeeded" if candidates else "empty"
+
+
+def _normalize_replayed_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Apply current status semantics to a cached result without re-running it."""
+    normalized = dict(record)
+    candidate_count = int(normalized.get("candidate_count", 0) or 0)
+    normalized["status"] = _classify_run_status(
+        note=str(normalized.get("note") or ""),
+        blocked=bool(normalized.get("block_reason")),
+        candidates=[{}] if candidate_count else [],
+    )
+    normalized["evaluation_mode"] = "replay"
+    return normalized
+
+
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
@@ -995,16 +1028,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     # inspected later (the working output/ tree is cleared per-URL).
     merged_preserved = _preserve_merged(slug)
     unique = _unique_count(cands)
-    if note == "recursion_limit" and cands:
-        status = "partial"  # did not converge but produced candidates
-    elif note == "recursion_limit":
-        status = "recursion"
-    elif blocked:
-        status = "blocked"
-    elif cands:
-        status = "succeeded"
-    else:
-        status = "empty"
+    status = _classify_run_status(note=note, blocked=blocked, candidates=cands)
     record: dict[str, Any] = {
         "slug": slug,
         "company": company,
@@ -1065,9 +1089,12 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 
 _LIVE_ENABLED = bool(os.environ.get("RUN_SKILL_TEN_URL"))
-_DEEPSEEK_KEY = bool(os.environ.get("DEEPSEEK_API_KEY"))
 _READGZH_KEY = bool(os.environ.get("READGZH_API_KEY"))
-_LIVE_READY = _LIVE_ENABLED and _DEEPSEEK_KEY
+
+
+def _has_llm_key() -> bool:
+    """Match the job-discovery LLM factory's OpenAI-compatible key lookup."""
+    return bool(os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("OPENAI_API_KEY"))
 
 
 def _parse_slug_set(value: str) -> set[str]:
@@ -1136,8 +1163,8 @@ def _main() -> int:
     if needs_live_run and not _LIVE_ENABLED:
         print("SKIP: RUN_SKILL_TEN_URL is not set (fresh validation not run).")
         return 0
-    if needs_live_run and not _DEEPSEEK_KEY:
-        print("SKIP: DEEPSEEK_API_KEY is missing (fresh validation not run).")
+    if needs_live_run and not _has_llm_key():
+        print("SKIP: an OpenAI-compatible API key is missing (fresh validation not run).")
         return 0
     if needs_live_run and not _READGZH_KEY:
         print("NOTE: READGZH_API_KEY not set; WeChat URLs (none in this set) "
@@ -1149,7 +1176,7 @@ def _main() -> int:
         for slug in refresh_slugs:
             (_OUT_DIR / f"_skill_ten_url_{slug}.json").unlink(missing_ok=True)
     print(f"RUN_SKILL_TEN_URL={'1' if _LIVE_ENABLED else 'unset'}  "
-          f"DEEPSEEK_API_KEY={'set' if _DEEPSEEK_KEY else 'MISSING'}  "
+          f"LLM_API_KEY={'set' if _has_llm_key() else 'MISSING'}  "
           f"urls={len(urls)} (limit={limit})")
     print(f"SKILL_DIR={SKILL_DIR}")
 
@@ -1175,8 +1202,9 @@ def _main() -> int:
         prior = _OUT_DIR / f"_skill_ten_url_{slug}.json"
         if prior.exists():  # Resumable: reuse a prior run's result.
             print(f"  [replay] {slug} (cached result; not fresh validation)", flush=True)
-            record = json.loads(prior.read_text(encoding="utf-8"))
-            record["evaluation_mode"] = "replay"
+            record = _normalize_replayed_record(
+                json.loads(prior.read_text(encoding="utf-8"))
+            )
             rows.append(record)
         else:
             assert agent is not None
