@@ -180,6 +180,25 @@ def _loc_signature(locations) -> str:
     return "|".join(sorted(set(norms)))
 
 
+def _has_body(c: Any) -> bool:
+    """A candidate counts as full-JD when it carries a resp/req body.
+
+    Accepts either a dict candidate (LLM / JSON record) or a
+    NormalizedJobCandidate dataclass (live result), mirroring
+    ``test_supervisor_ten_url_quality._has_body``.
+    """
+    resp = (c.get("responsibilities") if isinstance(c, dict)
+            else getattr(c, "responsibilities", "")) or ""
+    req = (c.get("requirements") if isinstance(c, dict)
+           else getattr(c, "requirements", "")) or ""
+    return bool(resp.strip() or req.strip())
+
+
+def _body_count(candidates: list) -> int:
+    """Number of candidates carrying a JD body (the LLM-extractor signal)."""
+    return sum(1 for c in candidates if _has_body(c))
+
+
 def _unique_count(candidates: list) -> int:
     """Count unique candidates, mirroring the production dedup's split identity.
 
@@ -191,12 +210,7 @@ def _unique_count(candidates: list) -> int:
     for c in candidates:
         title = normalize_title(
             c.get("title") if isinstance(c, dict) else getattr(c, "title", None))
-        has_body = bool(
-            ((c.get("responsibilities") if isinstance(c, dict)
-              else getattr(c, "responsibilities", "")) or "").strip()
-            or ((c.get("requirements") if isinstance(c, dict)
-                 else getattr(c, "requirements", "")) or "").strip())
-        if has_body:
+        if _has_body(c):
             locs = (c.get("locations") if isinstance(c, dict)
                     else getattr(c, "locations", None))
             seen.add((title, _loc_signature(locs)))
@@ -330,7 +344,8 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
             "slug": slug, "company": company, "url": url, "real_count": real_count,
             "status": "crashed", "bucket": "failed", "execution_path": "legacy_path_c",
             "coverage_verified": False, "candidate_count": 0,
-            "unique_listing_count": 0, "duplicate_count": 0, "block_reason": None,
+            "unique_listing_count": 0, "with_body": 0,
+            "duplicate_count": 0, "block_reason": None,
             "elapsed_sec": round(time.monotonic() - t0, 1),
             "error": str(exc)[:200],
         }
@@ -341,6 +356,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     unique = summary["unique_listing_count"]
     bucket = _classify(summary, result)
 
+    with_body = _body_count(cands)
     record: dict[str, Any] = {
         "slug": slug,
         "company": company,
@@ -352,6 +368,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "coverage_verified": summary["coverage_verified"],
         "candidate_count": raw_count,
         "unique_listing_count": unique,
+        "with_body": with_body,
         "duplicate_count": raw_count - unique,
         "block_reason": summary["block_reason"],
         "elapsed_sec": round(elapsed, 1),
@@ -362,7 +379,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
         f"  -> bucket={bucket} status={result.status} raw={raw_count} "
-        f"unique={unique} dups={record['duplicate_count']} "
+        f"unique={unique} body={with_body} dups={record['duplicate_count']} "
         f"cov_verified={record['coverage_verified']} elapsed={record['elapsed_sec']}s",
         flush=True)
     return record
@@ -495,11 +512,11 @@ def _main() -> int:
     print("  10-URL EVAL BREAKDOWN")
     print("=" * 70)
     print(f"  {'slug':<16} {'bucket':<10} {'status':<20} "
-          f"{'raw':>4} {'uniq':>5} {'dups':>4} {'cov':>5}")
+          f"{'raw':>4} {'uniq':>5} {'body':>4} {'dups':>4} {'cov':>5}")
     for r in rows:
         print(f"  {r['slug']:<16} {r['bucket']:<10} {r['status']:<20} "
               f"{r['candidate_count']:>4} {r['unique_listing_count']:>5} "
-              f"{r['duplicate_count']:>4} "
+              f"{r['with_body']:>4} {r['duplicate_count']:>4} "
               f"{'Y' if r['coverage_verified'] else 'N':>5}")
     print("\n  Buckets: " + json.dumps(breakdown["buckets"], ensure_ascii=False))
     print(f"  PEV PASS rate: {breakdown['pev_pass_rate']:.0%} "

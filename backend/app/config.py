@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     job_discovery_pev_enabled: bool = False
     job_discovery_planner_enabled: bool = False
     job_discovery_legacy_path_c_enabled: bool = True
+    # LLM JD-body extractor (PATH C quality port from skill/job-discovery).
+    # When on, the Legacy Supervisor asks a structured-output LLM to read each
+    # rendered list-page's text and emit full-JD candidates instead of falling
+    # back to the loose title-only extractor. Default off - the deterministic
+    # path is unchanged. Affects PATH C only; PATH A/B Executor stays LLM-free.
+    job_discovery_llm_extraction_enabled: bool = False
     job_discovery_planner_max_inspection_pages: int = Field(default=3, ge=1, le=5)
     # Hard wall-clock deadline (seconds) for a SnapshotPlan whose steps run
     # real network fetches (WeChat ``fetch_wechat_article``). When > 0 the

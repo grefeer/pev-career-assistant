@@ -45,6 +45,9 @@ from backend.app.services.job_discovery.tools import (
     build_candidate_idempotency_key,
     build_similarity_group_key,
 )
+from backend.app.services.job_discovery.extraction.llm_jd_extractor import (
+    extract_jd_candidates_llm as _extract_jd_candidates_llm,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -544,7 +547,7 @@ def run_web_navigation(
     # page is extracted independently, yielding one candidate per job-detail page.
     try:
         candidates, evidence_hash = _extract_and_verify_candidates_from_evidence(
-            evidence_pages, start_url
+            evidence_pages, start_url, settings=settings, model=model
         )
     except Exception:  # noqa: BLE001 - degrade gracefully; evidence_pages remain
         candidates, evidence_hash = [], ""
@@ -2885,6 +2888,9 @@ def _is_plausible_job_title(
 def _extract_and_verify_candidates_from_evidence(
     evidence_pages: list[dict[str, Any]],
     source_url: str,
+    *,
+    settings: Settings | None = None,
+    model: Any | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Deterministically extract and verify candidates from captured evidence.
 
@@ -2964,9 +2970,32 @@ def _extract_and_verify_candidates_from_evidence(
                 cand.evidence_refs = [ref]
                 all_candidates.append(cand)
         if is_page_text and not has_detail:
-            all_candidates.extend(
-                _extract_title_only_candidates(text, page_url, ref)
-            )
+            # When the LLM JD-body extractor is enabled, ask it to read the
+            # rendered list-page text first: it can surface full-JD candidates
+            # (responsibilities/requirements) that the deterministic loose
+            # title extractor cannot. Only an LLM result carrying at least one
+            # JD body is trusted; otherwise fall through to the proven
+            # title-only extractor so behavior is unchanged when the flag is off
+            # or the LLM returns nothing usable. This is a PATH C quality port
+            # (richer JD bodies); PATH A/B Executor stays LLM-free.
+            llm_used = False
+            if settings is not None and getattr(
+                settings, "job_discovery_llm_extraction_enabled", False
+            ):
+                llm_cands = _extract_jd_candidates_llm(
+                    text, page_url, settings=settings, model=model, ref=ref
+                )
+                if llm_cands and any(
+                    (getattr(c, "responsibilities", "") or "").strip()
+                    or (getattr(c, "requirements", "") or "").strip()
+                    for c in llm_cands
+                ):
+                    all_candidates.extend(llm_cands)
+                    llm_used = True
+            if not llm_used:
+                all_candidates.extend(
+                    _extract_title_only_candidates(text, page_url, ref)
+                )
 
     # Drop obvious false positives before verification: banners (pipe in
     # title), bare category words, and sidebar tabs that repeat across
