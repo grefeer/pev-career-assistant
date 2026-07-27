@@ -496,7 +496,12 @@ def _main() -> int:
             # a long live run be killed and resumed, and lets a stalled URL
             # (e.g. xiaomi) be skipped without losing the others' results.
             print(f"  [skip] {slug} (reuse prior result)", flush=True)
-            rows.append(json.loads(prior.read_text(encoding="utf-8")))
+            rec = json.loads(prior.read_text(encoding="utf-8"))
+            # Back-compat: records cached before the with_body field existed
+            # (e.g. a stale xiaomi baseline reused to skip a 70min re-crawl)
+            # default to 0 body so the summary print does not KeyError.
+            rec.setdefault("with_body", 0)
+            rows.append(rec)
         else:
             rows.append(
                 _run_one(slug, company, url, real_count, settings, db, llm_model))
