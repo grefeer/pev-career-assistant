@@ -2,8 +2,9 @@
 
 Covers the lenient JSON parser, flag gating, graceful degradation, field
 coercion, and the integration fork in ``_extract_and_verify_candidates_from_evidence``
-(flag ON -> LLM body candidates; flag OFF -> deterministic title-only, LLM never
-called). All LLM calls are mocked - no network, no DeepSeek key required.
+(v2 merge: flag ON -> deterministic title-only + LLM body candidates union,
+cross-type subsumption dedups the overlap; flag OFF -> deterministic title-only
+only, LLM never called). All LLM calls are mocked - no network, no DeepSeek key.
 """
 # ruff: noqa: E402  (sys.path bootstrap must precede project imports)
 
@@ -230,17 +231,43 @@ def _page_text_evidence(text: str, url: str = _URL) -> list[dict]:
 
 def test_extract_and_verify_uses_llm_body_when_flag_on() -> None:
     text = "在招职位\n算法工程师\n前端开发工程师\n"
-    llm = _FakeLLM([_BODY_JSON])
+    llm = _FakeLLM([_BODY_JSON])  # LLM returns a body only for 算法工程师
     cands, _ = _extract_and_verify_candidates_from_evidence(
         _page_text_evidence(text), _URL, settings=_settings(True), model=llm
     )
     assert llm.calls == 1
     titles = [c["title"] for c in cands]
-    assert "算法工程师" in titles
     # LLM body candidate survives with its responsibilities/requirements body.
     body = [c for c in cands if c["title"] == "算法工程师"][0]
     assert body["responsibilities"]
     assert body["requirements"]
+    # v2 merge: the deterministic title-only extractor also runs, so a job the
+    # LLM did NOT classify (前端开发工程师) is still surfaced as title-only -
+    # strict-Pareto over the flag-off path (count >= title-only, body >= LLM).
+    assert "前端开发工程师" in titles
+    # The duplicate title-only 算法工程师 is subsumed by the full-JD candidate
+    # (same title), so only one 算法工程师 survives.
+    assert titles.count("算法工程师") == 1
+
+
+def test_extract_and_verify_v2_merge_keeps_titles_llm_missed() -> None:
+    """v2 merge completeness guarantee: titles the LLM skipped are not lost.
+
+    The LLM returns a body for ONE job (算法工程师); a second job title in the
+    same page text (前端开发工程师) is absent from the LLM output. The
+    deterministic title-only extractor still surfaces it - this is the
+    strict-Pareto guarantee over the flag-off path (the merge can never yield
+    fewer candidates than title-only alone, and never fewer bodies than the LLM).
+    """
+    text = "在招职位\n算法工程师\n前端开发工程师\n"
+    llm = _FakeLLM([_BODY_JSON])
+    cands, _ = _extract_and_verify_candidates_from_evidence(
+        _page_text_evidence(text), _URL, settings=_settings(True), model=llm
+    )
+    titles = {c["title"] for c in cands}
+    assert "前端开发工程师" in titles  # recovered by title-only, not dropped
+    body = [c for c in cands if c["title"] == "算法工程师"]
+    assert body and body[0]["responsibilities"]  # LLM body still present
 
 
 def test_extract_and_verify_falls_back_to_title_only_when_flag_off() -> None:

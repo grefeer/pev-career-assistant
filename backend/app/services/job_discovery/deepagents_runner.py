@@ -2970,32 +2970,24 @@ def _extract_and_verify_candidates_from_evidence(
                 cand.evidence_refs = [ref]
                 all_candidates.append(cand)
         if is_page_text and not has_detail:
-            # When the LLM JD-body extractor is enabled, ask it to read the
-            # rendered list-page text first: it can surface full-JD candidates
-            # (responsibilities/requirements) that the deterministic loose
-            # title extractor cannot. Only an LLM result carrying at least one
-            # JD body is trusted; otherwise fall through to the proven
-            # title-only extractor so behavior is unchanged when the flag is off
-            # or the LLM returns nothing usable. This is a PATH C quality port
-            # (richer JD bodies); PATH A/B Executor stays LLM-free.
-            llm_used = False
+            # v2 merge (strict-Pareto over the flag-off path): always run the
+            # proven deterministic title-only extractor so no publicly-rendered
+            # job title is lost, and ADD the LLM full-JD candidates on top when
+            # the flag is on. Downstream cross-type subsumption
+            # (deduplicate_candidates + the substring pass below) drops any
+            # title-only candidate already covered by a full-JD candidate, so
+            # the union is dedup-aware: count >= title-only, body >= LLM. This
+            # is a PATH C quality port (richer JD bodies + completeness);
+            # PATH A/B Executor stays LLM-free.
+            all_candidates.extend(_extract_title_only_candidates(text, page_url, ref))
             if settings is not None and getattr(
                 settings, "job_discovery_llm_extraction_enabled", False
             ):
                 llm_cands = _extract_jd_candidates_llm(
                     text, page_url, settings=settings, model=model, ref=ref
                 )
-                if llm_cands and any(
-                    (getattr(c, "responsibilities", "") or "").strip()
-                    or (getattr(c, "requirements", "") or "").strip()
-                    for c in llm_cands
-                ):
+                if llm_cands:
                     all_candidates.extend(llm_cands)
-                    llm_used = True
-            if not llm_used:
-                all_candidates.extend(
-                    _extract_title_only_candidates(text, page_url, ref)
-                )
 
     # Drop obvious false positives before verification: banners (pipe in
     # title), bare category words, and sidebar tabs that repeat across
