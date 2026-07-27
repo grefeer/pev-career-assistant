@@ -75,3 +75,8 @@ output/
 # the dir *contents* (not the dir) so the negation below can re-include one file.
 tests/manual/*
 !tests/manual/run_skill_ten_url_eval.py
+
+# Skill runtime artifacts (deepagents conversation history + temp output)
+skill/conversation_history/
+skill/tmp/
+nul
