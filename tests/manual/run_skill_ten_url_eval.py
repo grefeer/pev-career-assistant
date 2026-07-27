@@ -844,6 +844,7 @@ def _invoke_agent(agent: Any, prompt: str) -> tuple[str, str]:
     """
     last_content = ""
     note = ""
+    _traced = 0  # messages already traced (values stream replays the full list each yield)
     try:
         for chunk in agent.stream(
             {"messages": [HumanMessage(content=prompt)]},
@@ -854,8 +855,16 @@ def _invoke_agent(agent: Any, prompt: str) -> tuple[str, str]:
             if not msgs:
                 continue
             if _TRACE:
-                for m in msgs[-2:]:
-                    _trace_msg(m)
+                # Trace only NEW messages since the last yield. The values
+                # stream replays the entire message list every step, so the
+                # old `msgs[-2:]` window re-traced the previous message each
+                # time -> a misleading 2x in the log that looked like the agent
+                # double-calling (it does not - actual execution is single-pass).
+                # Skip HumanMessage (the prompt) - it is not an agent action.
+                for m in msgs[_traced:]:
+                    if type(m).__name__ != "HumanMessage":
+                        _trace_msg(m)
+                _traced = len(msgs)
             content = msgs[-1].content
             if isinstance(content, list):  # multimodal content blocks
                 content = "".join(
