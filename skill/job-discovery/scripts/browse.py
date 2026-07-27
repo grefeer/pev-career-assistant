@@ -163,6 +163,19 @@ def _dismiss_consent(page: Any) -> bool:
 
 _NEXT_PAGE_TEXTS = ["Next", "Next Page", ">", "»", "下一页", "下一頁", "下页"]
 
+# Load-more / view-more buttons: content-appending pagination common on SPAs
+# that have NO 'next page' control (the page grows in place, URL unchanged).
+# e.g. mokahr '查看更多职位' (deeproute) exposes the full list with one click.
+# Tried LAST in _find_next_page_button (after next-page texts AND CSS selectors)
+# so a real next-page match always wins; only sites with neither fall through.
+# exact=False so trailing chevrons / counts like '查看更多职位>>' or '加载更多(10)'
+# still match the long phrase.
+_LOAD_MORE_TEXTS = [
+    "查看更多职位", "查看更多岗位", "查看更多职位信息", "查看全部职位", "查看全部岗位",
+    "加载更多", "加载更多职位", "更多职位", "更多岗位", "展开更多", "展开全部",
+    "View more positions", "View more jobs", "Load more", "Show more", "See more jobs",
+]
+
 
 # ---------------------------------------------------------------------------
 # Search mode — keyword filtering via search boxes
@@ -244,6 +257,16 @@ def _find_next_page_button(page: Any) -> Any | None:
             el = page.locator(sel).first
             if el.is_visible():
                 return el
+        except Exception:
+            continue
+    # Load-more / view-more buttons (content-appending SPAs with no next-page
+    # control). Tried LAST so a real next-page text/CSS match always wins; only
+    # sites with neither (e.g. mokahr '查看更多职位') fall through to here.
+    for text in _LOAD_MORE_TEXTS:
+        try:
+            btn = page.get_by_text(text, exact=False).first
+            if btn.is_visible():
+                return btn
         except Exception:
             continue
     return None
