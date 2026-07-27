@@ -62,6 +62,11 @@ from backend.app.services.job_discovery.planning.crawl_plan_agent import (
     repair_crawl_plan,
 )
 from backend.app.services.job_discovery.crawling.coverage import verify_coverage
+from backend.app.services.job_discovery.single_source_proof import (
+    PRODUCTION_REGISTRY,
+    SingleSourceProofRegistry,
+    evaluate_single_source_proof,
+)
 from backend.app.services.job_discovery.crawling.checkpoint import CrawlCheckpoint
 from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
 from backend.app.services.job_discovery.crawling.playwright_driver import (
@@ -523,6 +528,13 @@ class JobDiscoveryWorker:
         self.worker_id = _build_worker_id()
         self._idle_cycles: int = 0
         self._crawl_driver_factory = crawl_driver_factory
+        # Personalized discovery v1: registry of single-source completeness
+        # contracts. The production registry is empty; tests inject a fixture
+        # registry to exercise the admission mechanism without enabling a
+        # production source.
+        self.single_source_proof_registry: SingleSourceProofRegistry = (
+            PRODUCTION_REGISTRY
+        )
 
     def _execute_planned_crawl(
         self,
@@ -1007,7 +1019,12 @@ class JobDiscoveryWorker:
                         if snapshot_context is not None:
                             result_raw = agent.invoke(agent_input, config={"recursion_limit": 30})
                         else:
-                            result_raw = agent.invoke(agent_input, config={"recursion_limit": 50})
+                            # Site-wide discovery on large SPAs (e.g. mioffice
+                            # with 100+ listings) can need far more than 50 graph
+                            # steps; 50 caused a spurious ``recursion_limit
+                            # reached`` failure on xiaomi. 200 keeps the
+                            # supervisor bounded while letting large sites finish.
+                            result_raw = agent.invoke(agent_input, config={"recursion_limit": 200})
                     except TypeError as exc:
                         if "config" not in str(exc):
                             raise
@@ -1079,6 +1096,12 @@ class JobDiscoveryWorker:
             _persist_candidates(db, task, result.candidates)
 
             # 7. Mark task according to status
+            single_source_proof = evaluate_single_source_proof(
+                task,
+                result,
+                executor_type,
+                registry=self.single_source_proof_registry,
+            )
             summary_json: dict[str, Any] = {
                 "summary": result.summary,
                 "evidence_count": len(result.evidence),
@@ -1088,6 +1111,12 @@ class JobDiscoveryWorker:
                     coverage_decision.complete if coverage_decision is not None else False
                 ),
                 "coverage": asdict(result.coverage) if result.coverage is not None else None,
+                # Personalized discovery v1: single-source completeness proof.
+                # ``None`` for legacy PATH C / supervisor runs (never complete by
+                # implication) and when no contract is registered for the source.
+                "single_source_complete": (
+                    single_source_proof.to_dict() if single_source_proof else None
+                ),
                 # Task 8: None for PEV PATH A / PATH B runs; set when the legacy
                 # Supervisor ran as a fallback. Lets eval/admin output separate
                 # coverage-unverified legacy results from PEV PASS results.

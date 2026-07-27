@@ -4,8 +4,11 @@ import os
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
 from backend.app.config import Settings
+from backend.app.db.base import Base
 from tests.integration.job_sync_gate_safety import (
     DESTRUCTIVE_MYSQL_OPT_IN_ENV,
     MYSQL_TEST_URL_ENV,
@@ -13,7 +16,40 @@ from tests.integration.job_sync_gate_safety import (
 )
 
 
+@pytest.fixture()
+def db_session() -> Session:
+    """Fresh in-memory SQLite session with all ORM tables created.
+
+    Used by personalized-discovery model / repository / service unit tests.
+    ``Base.metadata.create_all`` mirrors the models without needing Alembic.
+    """
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        # SQLite's defaults are too lax for the unique/RESTRICT semantics the
+        # personalized-discovery tests assert; enable foreign keys + a modern
+        # isolation so IntegrityError surfaces on a real constraint violation.
+        connect_args={"check_same_thread": False},
+    )
+
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_fk(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA foreign_keys=ON")
+        cur.close()
+
+    Base.metadata.create_all(engine)
+    session = Session(engine)
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
 @pytest.fixture(scope="session")
+
 def destructive_mysql_url() -> str:
     """Load a destructive-test URL only after explicit, fail-closed opt-in."""
     if DESTRUCTIVE_MYSQL_OPT_IN_ENV not in os.environ:

@@ -32,6 +32,8 @@ title / company / description fields.
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 
 from backend.app.services.job_discovery.normalization.jd_normalizer import (
     core_hash,
@@ -114,6 +116,29 @@ def _identity_key(candidate: NormalizedJobCandidate) -> tuple[str, ...]:
                 core_hash(candidate.responsibilities, candidate.requirements),
                 _loc_key(candidate))
     return ("title", normalize_title(candidate.title))
+
+
+def canonical_job_key(candidate: NormalizedJobCandidate) -> str:
+    """Stable cross-run string key for one canonical job.
+
+    This is the personalized-discovery identity used to upsert a
+    recommendation: two candidates that ``deduplicate_candidates`` would merge
+    (same ``_identity_key``) MUST produce the same ``canonical_job_key`` so the
+    recommendation row is replaced rather than duplicated across discovery
+    runs. The ``v1:`` prefix pins the hashing scheme so a future identity
+    change can bump the version without colliding with historical rows.
+
+    The key is a SHA-256 of the JSON-encoded identity tuple (deterministic
+    field order, ASCII-disabled so CJK titles/companies hash identically
+    across runs). It carries no business data - only the digest leaks.
+    """
+    payload = json.dumps(
+        _identity_key(candidate),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"v1:{digest}"
 
 
 def _dedupe_preserve(items: list | None) -> list:

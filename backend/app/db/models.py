@@ -54,6 +54,10 @@ from backend.app.domain.preferences import (
     JobInteractionType,
     WorkModePreference,
 )
+from backend.app.domain.personalized_discovery import (
+    RecommendationPresentationState,
+    SourceStatusReason,
+)
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -1228,6 +1232,12 @@ class UserPreference(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, default=True, nullable=False
     )
     notes: Mapped[str | None] = mapped_column(Text)
+    # Personalized discovery v1: synonyms broaden title recall (e.g. "agent" /
+    # "Agent开发" map to the AI-application role); excluded roles always win.
+    role_synonyms: Mapped[list[str] | None] = mapped_column(JSON)
+    excluded_roles: Mapped[list[str] | None] = mapped_column(JSON)
+    # User-controlled relevance threshold (0..100) for personalized delivery.
+    personalized_discovery_min_score: Mapped[float | None] = mapped_column(Float)
     # Optimistic lock; bumping this invalidates cached relevance scores.
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -1282,3 +1292,107 @@ class JobRelevanceScore(UUIDPrimaryKeyMixin, Base):
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+# ---------------------------------------------------------------------------
+# Personalized discovery v1 - owner-scoped pre-review delivery.
+#
+# A user receives recommendations built from retained SHARED discovery tasks
+# (already-completed JobDiscoveryTask rows + their DiscoveredJobCandidate
+# evidence). These tables never mutate JobPosting / review_version / the
+# verified-only /jobs path; they are a separate user-scoped delivery channel.
+# Recommendation candidate/task FKs are RESTRICT so a delivered recommendation
+# retains its evidence trace while it exists - retention cleanup deletes these
+# rows before deleting the source task/candidate.
+# ---------------------------------------------------------------------------
+
+
+class PersonalizedDiscoveryRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "personalized_discovery_runs"
+    __table_args__ = (
+        Index("ix_pdr_user_started", "user_id", "started_at"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    preference_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+
+
+class PersonalizedDiscoveryRecommendation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "personalized_discovery_recommendations"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "canonical_job_key",
+            name="uq_pdr_user_canonical_job_key",
+        ),
+        Index("ix_pdr_rec_user_score", "user_id", "relevance_score"),
+        Index("ix_pdr_rec_user_state", "user_id", "presentation_state"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("discovered_job_candidates.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("job_discovery_tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    last_run_id: Mapped[str] = mapped_column(
+        ForeignKey("personalized_discovery_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    canonical_job_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    preference_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    relevance_score: Mapped[float] = mapped_column(Float, nullable=False)
+    relevance_reason: Mapped[str | None] = mapped_column(Text)
+    matched_signals_json: Mapped[list[str] | None] = mapped_column(JSON)
+    presentation_state: Mapped[RecommendationPresentationState] = mapped_column(
+        Enum(
+            RecommendationPresentationState,
+            name="recommendation_presentation_state",
+            **enum_kwargs,
+        ),
+        default=RecommendationPresentationState.NEW,
+        nullable=False,
+    )
+
+
+class UserDiscoverySourceStatus(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "user_discovery_source_statuses"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "run_id",
+            "task_id",
+            "reason_code",
+            name="uq_udss_user_run_task_reason",
+        ),
+        Index("ix_udss_user_run", "user_id", "run_id"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("personalized_discovery_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("job_discovery_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    source_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    safe_source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    reason_code: Mapped[SourceStatusReason] = mapped_column(
+        Enum(SourceStatusReason, name="source_status_reason", **enum_kwargs),
+        nullable=False,
+    )
+    display_text: Mapped[str] = mapped_column(Text, nullable=False)
+    retry_guidance: Mapped[str] = mapped_column(Text, nullable=False)
+

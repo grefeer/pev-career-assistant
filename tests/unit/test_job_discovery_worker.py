@@ -34,6 +34,7 @@ from backend.app.services.job_discovery.worker import (
     _parse_agent_result,
 )
 from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
+from backend.app.services.job_discovery.single_source_proof import SingleSourceProof
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +326,11 @@ class TestSuccessfulTask:
             assert task.finished_at is not None
             assert task.result_summary_json is not None
             assert task.result_summary_json["candidate_count"] == 1
+            # Personalized discovery v1: the supervisor path is a legacy
+            # executor, so ``single_source_complete`` must serialize as None
+            # (never proven by implication). The key must always be present.
+            assert "single_source_complete" in task.result_summary_json
+            assert task.result_summary_json["single_source_complete"] is None
 
             # Evidence should be persisted
             evidence = verify_session.query(JobDiscoveryEvidence).all()
@@ -436,6 +442,137 @@ class TestSuccessfulTask:
             assert t.status is JobDiscoveryTaskStatus.needs_manual_review
             assert t.block_reason is DiscoveryBlockReason.parse_failed
             assert t.finished_at is not None
+
+
+# ---------------------------------------------------------------------------
+# Single-source proof serialization (personalized discovery v1)
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSourceProofSerialization:
+    """The worker must serialize ``single_source_complete`` into the task
+    summary JSON, round-tripping the proof dict when the evaluator returns one
+    and emitting ``None`` when it does not."""
+
+    @patch("backend.app.services.job_discovery.worker.evaluate_single_source_proof")
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    def test_proof_serialized_into_summary_json(
+        self,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        mock_evaluate: MagicMock,
+        engine: Engine,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+    ) -> None:
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "block_reason": None,
+                "evidence": [
+                    {
+                        "evidence_type": "page_text",
+                        "url": "https://example.com/jobs/1",
+                        "title": "Job Page",
+                        "content_hash": "ev-hash-1",
+                        "text_excerpt": "Some text",
+                        "metadata": {"page_num": 1},
+                    }
+                ],
+                "candidates": [
+                    {
+                        "title": "Software Engineer",
+                        "company_name": "Example Corp",
+                        "locations": ["Beijing"],
+                        "recruitment_types": ["Full-time"],
+                        "confidence": 0.95,
+                    }
+                ],
+                "summary": "Found 1 candidate",
+            }
+        }
+        mock_build_agent.return_value = mock_agent
+
+        fixture_proof = SingleSourceProof(
+            contract_id="test-contract",
+            evidence_hash="ev-hash-1",
+            terminal_signal="job_list_complete",
+            application_hosts=["app.example.com"],
+        )
+        mock_evaluate.return_value = fixture_proof
+
+        result = worker.run_once()
+        assert result == 1
+
+        with Session(engine) as verify_session:
+            task = verify_session.get(JobDiscoveryTask, queued_task.id)
+            assert task is not None
+            assert task.result_summary_json is not None
+            payload = task.result_summary_json["single_source_complete"]
+            assert payload is not None
+            assert payload["contract_id"] == "test-contract"
+            assert payload["evidence_hash"] == "ev-hash-1"
+            assert payload["terminal_signal"] == "job_list_complete"
+            assert payload["application_hosts"] == ["app.example.com"]
+            # The evaluator is invoked with the worker's wired registry.
+            assert mock_evaluate.call_count == 1
+            _, kwargs = mock_evaluate.call_args
+            assert kwargs["registry"] is worker.single_source_proof_registry
+
+    @patch("backend.app.services.job_discovery.worker.evaluate_single_source_proof")
+    @patch("backend.app.services.job_discovery.worker.claim_next_task")
+    @patch("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent")
+    def test_proof_none_serializes_as_none(
+        self,
+        mock_build_agent: MagicMock,
+        mock_claim: MagicMock,
+        mock_evaluate: MagicMock,
+        engine: Engine,
+        worker: JobDiscoveryWorker,
+        queued_task: JobDiscoveryTask,
+    ) -> None:
+        mock_claim.side_effect = lambda db, **kw: db.merge(queued_task)
+        mock_agent = MagicMock()
+        mock_agent.invoke.return_value = {
+            "structured_response": {
+                "status": "succeeded",
+                "block_reason": None,
+                "evidence": [
+                    {
+                        "evidence_type": "page_text",
+                        "url": "https://example.com/jobs/1",
+                        "title": "Job Page",
+                        "content_hash": "ev-hash-1",
+                        "text_excerpt": "Some text",
+                        "metadata": {"page_num": 1},
+                    }
+                ],
+                "candidates": [
+                    {
+                        "title": "Software Engineer",
+                        "company_name": "Example Corp",
+                        "locations": ["Beijing"],
+                        "recruitment_types": ["Full-time"],
+                        "confidence": 0.95,
+                    }
+                ],
+                "summary": "Found 1 candidate",
+            }
+        }
+        mock_build_agent.return_value = mock_agent
+        mock_evaluate.return_value = None
+
+        result = worker.run_once()
+        assert result == 1
+
+        with Session(engine) as verify_session:
+            task = verify_session.get(JobDiscoveryTask, queued_task.id)
+            assert task is not None
+            assert task.result_summary_json is not None
+            assert task.result_summary_json["single_source_complete"] is None
 
 
 # ---------------------------------------------------------------------------

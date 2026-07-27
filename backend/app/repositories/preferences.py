@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import UserPreference
+
 
 # Columns callers may set via ``upsert(..., **changes)``. Keeps the surface
 # explicit so a typo doesn't silently land in the JSON payload.
@@ -28,6 +29,10 @@ _PREFERENCE_COLUMNS = (
     "work_mode",
     "is_active_search",
     "notes",
+    # Personalized discovery v1 additions (Task 3).
+    "role_synonyms",
+    "excluded_roles",
+    "personalized_discovery_min_score",
 )
 
 
@@ -82,6 +87,9 @@ def to_summary(pref: UserPreference | None) -> dict[str, Any]:
             "work_mode": None,
             "is_active_search": True,
             "notes": None,
+            "role_synonyms": [],
+            "excluded_roles": [],
+            "personalized_discovery_min_score": None,
             "version": 0,
         }
     return {
@@ -96,5 +104,22 @@ def to_summary(pref: UserPreference | None) -> dict[str, Any]:
         "work_mode": pref.work_mode.value if pref.work_mode else None,
         "is_active_search": pref.is_active_search,
         "notes": pref.notes,
+        "role_synonyms": pref.role_synonyms or [],
+        "excluded_roles": pref.excluded_roles or [],
+        "personalized_discovery_min_score": pref.personalized_discovery_min_score,
         "version": pref.version,
     }
+
+
+def delete_for_user(db: Session, user_id: str) -> bool:
+    """Delete the preference row for ``user_id``. Returns True if a row was removed.
+
+    On the next read ``get_for_user`` returns ``None`` and the caller sees the
+    default (empty) preference view. This is the only write that removes the row;
+    ``upsert`` always keeps exactly one row per user.
+    """
+    result = db.execute(
+        delete(UserPreference).where(UserPreference.user_id == user_id)
+    )
+    db.flush()
+    return (result.rowcount or 0) > 0

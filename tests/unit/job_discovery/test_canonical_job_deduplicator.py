@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from backend.app.services.job_discovery.deduplication.canonical_job_deduplicator import (
+    canonical_job_key,
     deduplicate_candidates,
 )
 from backend.app.services.job_discovery.schemas import NormalizedJobCandidate
@@ -207,3 +208,53 @@ class TestEdgeCases:
         out = deduplicate_candidates([a, b])
         assert len(out) == 1
         assert out[0].apply_url == "https://example.com/job/1"
+
+
+class TestCanonicalJobKey:
+    """``canonical_job_key`` must agree with ``deduplicate_candidates``:
+
+    two candidates that the deduper would merge (same identity) must produce
+    the same key so personalized-discovery upserts replace rather than duplicate.
+    """
+
+    def test_full_jd_same_body_different_city_order_matches(self) -> None:
+        a = _full_jd("AI工程师", "某公司", "职责", "要求", "上海、深圳")
+        b = _full_jd("AI工程师", "某公司", "职责", "要求", "深圳、上海")
+        assert canonical_job_key(a) == canonical_job_key(b)
+
+    def test_full_jd_different_body_differs(self) -> None:
+        a = _full_jd("AI工程师", "某公司", "职责A", "要求", "上海")
+        b = _full_jd("AI工程师", "某公司", "职责B", "要求", "上海")
+        assert canonical_job_key(a) != canonical_job_key(b)
+
+    def test_full_jd_different_city_differs(self) -> None:
+        # A city variant is a DISTINCT posting -> distinct canonical key.
+        a = _full_jd("AI工程师", "某公司", "职责", "要求", "上海")
+        b = _full_jd("AI工程师", "某公司", "职责", "要求", "深圳")
+        assert canonical_job_key(a) != canonical_job_key(b)
+
+    def test_title_only_matches_when_deduper_merges(self) -> None:
+        # Deduper merges title-only candidates by normalized title (company/
+        # location excluded). The canonical key must follow the same rule.
+        a = _title_only("算法工程师", "小米", locations=["北京"])
+        b = _title_only("算法工程师", None, locations=["上海"])
+        assert canonical_job_key(a) == canonical_job_key(b)
+
+    def test_key_is_versioned_sha256_hex(self) -> None:
+        a = _full_jd("AI工程师", "某公司", "职责", "要求", "上海")
+        key = canonical_job_key(a)
+        assert key.startswith("v1:")
+        assert len(key) == 3 + 64
+        int(key[3:], 16)  # valid hex
+
+    def test_merged_candidate_key_matches_original_identity(self) -> None:
+        """End-to-end: after dedupe, the survivor's key equals the pre-dedupe
+        identity key of every member it merged (so an upsert keyed on the
+        survivor would have matched any of its duplicates)."""
+        a = _full_jd("AI工程师", "某公司", "职责", "要求", "上海、深圳")
+        b = _full_jd("AI工程师-应届", "某公司", "职责", "要求", "深圳、上海")
+        out = deduplicate_candidates([a, b])
+        assert len(out) == 1
+        survivor_key = canonical_job_key(out[0])
+        assert survivor_key == canonical_job_key(a)
+        assert survivor_key == canonical_job_key(b)

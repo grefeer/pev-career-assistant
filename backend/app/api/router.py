@@ -12,6 +12,7 @@ from backend.app.api.routes import (
     jobs,
     matches,
     metrics,
+    personalized_discovery,
     profiles,
     resume_drafts,
     sessions,
@@ -34,4 +35,5 @@ api_router.include_router(matches.router)
 api_router.include_router(resume_drafts.router)
 api_router.include_router(application_snapshots.router)
 api_router.include_router(job_discovery.router)
+api_router.include_router(personalized_discovery.router)
 api_router.include_router(site_adapters.router)

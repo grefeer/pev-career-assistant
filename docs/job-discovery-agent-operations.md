@@ -227,3 +227,73 @@ $env:FLAGS_use_onednn='0'
 
 结果写 `tests/manual/_ten_url_eval_*.json` 与 `_pev_live_smoke_<site>.json`。
 
+
+---
+
+## 8. 个性化发现（Personalized Discovery v1）
+
+个性化发现是 **预审核（pre-review）** 通道：把 worker 已完成的共享 `JobDiscoveryTask` 中「证据核验 + 覆盖完整 + URL 安全 + 去重 + 相关性达标」的候选，以 owner-scoped 推荐的形式直接送达单个用户，跳过管理员审核。它**独立于** verified-only 的 `/api/jobs` 路径，绝不修改 `JobPosting`、`JobRelevanceScore` 或 `review_version`。推荐卡片固定标注「自动发现，建议自行确认」。
+
+### 8.1 初始覆盖范围（v1）
+
+- 仅 **4 个已迁移的完整抓取 adapter** 可作为自动推荐来源：Moka、Feishu、Inovance、Xiaohongshu。
+- **初始不注册任何 `single_source_complete` 契约**；WeChat 文章、PDD、SnapshotExecutor、Alibaba SPA 以及所有 legacy / PATH C 结果，在保留窗口内只产出 owner-scoped 状态（不推荐）。
+- 来源池只读 **retained shared tasks**（终端态 + `finished_at` 在 `personalized_discovery_retention_days`（默认 30 天）窗口内 + 同 `(source_id, external_record_id)` 最新一条）。不触发任何 URL / site / adapter / crawl-plan 请求。
+
+### 8.2 两道完整性证明（任一即可放行 task）
+
+1. `coverage_verified`（PEV 全量覆盖已确认）。
+2. 注册的 `single_source_complete` 契约（`single_source_proof.py` 中的 `SingleSourceProofRegistry`）。
+
+候选级另有三道门：**JD body 非空**（`responsibilities` 或 `requirements`）+ **证据存在**（`evidence_refs` 或 task 有 `JobDiscoveryEvidence.content_hash`）+ **apply URL 安全校验**。
+
+### 8.3 单来源契约注册清单
+
+注册一个新 `SingleSourceContract` 前，逐项确认：
+
+- [ ] 有 fixture 测试覆盖该 adapter 的终端抓取。
+- [ ] 记录一个稳定的 `evidence_hash`（首个非空证据 content_hash）。
+- [ ] 终端信号 `terminal_signal` 精确（如 `job_list_complete`），不能是泛化文案。
+- [ ] `application_hosts` 为 ATS 申请域 allowlist（apply URL 必须 exact-match 其中之一或 source host）。
+
+### 8.4 状态码（closed enum）
+
+`SourceStatusReason` 是闭合枚举，状态行只存来源标识 + 枚举 + 固定文案，**绝不**存原始 wall 文本 / cookie / token / anti-bot 细节：
+
+| reason_code | 触发 |
+|---|---|
+| `login_required` / `captcha` / `anti_bot` | 对应墙 |
+| `authentication_required` | `permission_denied`（401/403 + SPA session auth） |
+| `coverage_incomplete` | 终端但无 coverage 证明且无单来源契约 |
+| `url_unsafe` | `invalid_url` |
+| `needs_manual_review` | 其余（`wechat_unavailable` / `timeout` / `budget_exceeded` / `parse_failed` / `unknown`） |
+
+用户可自行访问被拦截来源人工查看，但 **worker 永不绕过任何墙**。
+
+### 8.5 用户级限额与回滚
+
+- 每用户每日（中国自然日，按 UTC 边界核算）最多 `personalized_discovery_runs_per_day`（默认 **5**）次 run；超限 `POST /runs` 返回 **429**。
+- 用户相关性阈值 `personalized_discovery_min_score`（0..100）；低于阈值的候选不送达。
+- **回滚**：如需停用，关闭个性化发现端点（feature flag）即可——不会影响 verified `/jobs` 与 worker 抓取。
+
+### 8.6 RESTRICT 保留顺序（删数据时）
+
+`personalized_discovery_recommendations.candidate_id` / `task_id` 为 `ON DELETE RESTRICT`。清理时**必须先删个性化送达行，再删 candidate / task**：
+
+```
+DELETE personalized_discovery_recommendations  -- 先
+DELETE discovered_job_candidates              -- 后
+DELETE job_discovery_tasks                     -- 后
+```
+
+反向删除会被 RESTRICT 阻断（`UserDiscoverySourceStatus.task_id` 为 CASCADE，无需单独处理）。
+
+### 8.7 API 端点
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET/PATCH/DELETE | `/api/personalized-discovery/preferences` | 角色 prefs（`desired_roles` / `role_synonyms` / `excluded_roles` / `personalized_discovery_min_score`），PATCH 提供→替换，DELETE 清空 |
+| POST | `/api/personalized-discovery/runs` | 触发一次 run（空 body，`extra="forbid"` 拒绝 `url` 等爬虫输入） |
+| GET | `/api/personalized-discovery/recommendations?limit=&offset=` | 推荐卡片（标题/公司/地点/安全 apply URL/分值/原因/信号/证据链接/固定 label/状态/时间戳） |
+| GET | `/api/personalized-discovery/source-statuses?run_id=&limit=&offset=` | 来源状态（闭合 reason + 固定文案） |
+| POST | `/api/personalized-discovery/recommendations/{id}/interactions` | 交互：`viewed` / `saved` / `dismissed` / `apply_clicked`（非属主 → 404） |

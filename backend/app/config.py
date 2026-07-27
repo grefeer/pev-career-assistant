@@ -127,6 +127,19 @@ class Settings(BaseSettings):
     # Max candidates scored per single LLM batch call. Larger batches save calls
     # but risk output truncation; 30 is a safe default for structured output.
     relevance_batch_size: int = Field(default=30, ge=1, le=100)
+    # Personalized discovery v1: how far back to look for retained shared
+    # discovery tasks, and how many user-scoped runs may start per local day.
+    personalized_discovery_retention_days: int = Field(default=30, ge=1, le=365)
+    personalized_discovery_runs_per_day: int = Field(default=5, ge=1, le=50)
+    # v1.1 provisional tier: when True, a task without coverage-verified proof
+    # is still admitted as a *provisional* recommendation set (clearly labeled
+    # "覆盖未核验，建议自行确认") instead of being hard-blocked as
+    # ``coverage_incomplete``. Blocked tasks (login/captcha/anti-bot) are still
+    # blocked regardless. Default False preserves the strict v1 gate; the
+    # deliverable harness opts in because coverage verification (adapter/planner
+    # paths) is not operational in this environment, so provisional is the only
+    # way to surface the supervisor's evidence-backed candidates.
+    personalized_discovery_allow_provisional: bool = Field(default=False)
 
     @property
     def is_production(self) -> bool:
