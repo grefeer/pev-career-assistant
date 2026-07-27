@@ -497,10 +497,20 @@ def _main() -> int:
             # (e.g. xiaomi) be skipped without losing the others' results.
             print(f"  [skip] {slug} (reuse prior result)", flush=True)
             rec = json.loads(prior.read_text(encoding="utf-8"))
-            # Back-compat: records cached before the with_body field existed
-            # (e.g. a stale xiaomi baseline reused to skip a 70min re-crawl)
-            # default to 0 body so the summary print does not KeyError.
-            rec.setdefault("with_body", 0)
+            # Back-compat: records cached under an older eval schema (e.g. the
+            # 2026-07-23 xiaomi baseline, which used count_with_body/raw_count/
+            # unique_count and lacked bucket/candidate_count/unique_listing_count/
+            # with_body/coverage_verified) would KeyError the breakdown/summary
+            # print. Map the old field names onto the current ones (without
+            # clobbering fresh records that already have them) so a stale cache
+            # can still be reused to skip a long re-crawl without crashing.
+            rec.setdefault("bucket", "legacy")
+            rec.setdefault("execution_path", "legacy")
+            rec.setdefault("coverage_verified", False)
+            rec.setdefault("candidate_count", rec.get("raw_count", 0))
+            rec.setdefault("unique_listing_count", rec.get("unique_count", 0))
+            rec.setdefault("with_body", rec.get("count_with_body", 0))
+            rec.setdefault("duplicate_count", rec.get("duplicate_count", 0))
             rows.append(rec)
         else:
             rows.append(
