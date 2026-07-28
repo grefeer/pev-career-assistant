@@ -1869,29 +1869,28 @@ def _find_clickable_cards(page: Any, max_cards: int) -> list[Any]:
         except Exception:
             continue
 
-    # If CSS selectors found nothing, try JS-based discovery and convert to locators
-    if not candidates:
-        js_cards = _find_clickable_cards_js(page, max_cards * 2)
-        for card_info in js_cards:
-            try:
-                # Try by text first (most reliable for SPA components)
-                el = page.get_by_text(card_info["text"], exact=True).first
+    # CSS is fast but some virtualized SPAs expose only the first visible card
+    # through those selectors. Always supplement it with the DOM-wide JS scan
+    # so the remaining job links are not silently missed.
+    js_cards = _find_clickable_cards_js(page, max_cards * 2)
+    for card_info in js_cards:
+        try:
+            # Try by text first (most reliable for SPA components)
+            el = page.get_by_text(card_info["text"], exact=True).first
+            if el.is_visible():
+                candidates.append(el)
+                continue
+        except Exception:
+            pass
+        try:
+            # Try by selector
+            sel = card_info.get("selector", "")
+            if sel:
+                el = page.locator(sel).first
                 if el.is_visible():
                     candidates.append(el)
-                    continue
-            except Exception:
-                pass
-            try:
-                # Try by selector
-                sel = card_info.get("selector", "")
-                if sel:
-                    el = page.locator(sel).first
-                    if el.is_visible():
-                        candidates.append(el)
-            except Exception:
-                continue
-            if len(candidates) >= max_cards:
-                break
+        except Exception:
+            continue
 
     # Deduplicate by bounding box (roughly)
     unique: list[Any] = []
@@ -2070,6 +2069,28 @@ def browse_interact_mode(
         page, url, url, out_dir, max_cards, wait_ms, label_prefix="JOB"
     )
 
+    # A career homepage often exposes exactly one "view all jobs" card. That
+    # first interaction navigates to the real listing but is not a JD itself.
+    # Follow it once, then interact with the actual job cards on the listing.
+    # This is bounded navigation (one transition, then <= max_cards details),
+    # not a site-specific adapter or an unbounded agent loop.
+    list_url = _navigated_list_url(start_url=url, interact_text=interact_text, cards_found=found)
+    if list_url:
+        try:
+            page.goto(list_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(wait_ms)
+            _scroll_to_load(page, wait_ms)
+            list_text = _extract_body_text(page)
+            second_text, second_clicked, second_found, second_failed = _interact_on_cards(
+                page, list_url, list_url, out_dir, max_cards, wait_ms, label_prefix="DETAIL"
+            )
+            interact_text = second_text
+            clicked += second_clicked
+            found += second_found
+            failed += second_failed
+        except Exception:
+            pass
+
     if found == 0:
         short_hash, text_path, screenshot_path = _save_evidence(list_text, out_dir)
         _save_screenshot(page, screenshot_path)
@@ -2105,6 +2126,20 @@ def browse_interact_mode(
         "cards_failed": failed,
         "categories_expanded": cats_clicked,
     }
+
+
+def _navigated_list_url(*, start_url: str, interact_text: str, cards_found: int) -> str | None:
+    """Extract one homepage-to-list navigation URL captured by interaction."""
+    if cards_found < 1:
+        return None
+    for match in re.finditer(r"=== JOB \d+ \(([^)]+)\)", interact_text):
+        candidate = match.group(1).strip()
+        # Moka and many SPA career homepages use a plural /jobs route for the
+        # listing and a singular /job route for a detail. Follow only the
+        # listing transition; a detail card is already captured as evidence.
+        if candidate and candidate != start_url and "#/jobs/" in candidate:
+            return candidate
+    return None
 
 
 # ---------------------------------------------------------------------------
