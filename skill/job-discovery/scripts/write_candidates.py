@@ -34,9 +34,10 @@ The script reads a JSON document from stdin. Accepted shapes:
   - a JSON object wrapping one candidate: {"title": "...", ...}
   - a JSON object with a "candidates" array: {"candidates": [...], ...}
 
-It validates the minimum shape (each candidate must have a non-empty title OR
-company_name), drops items that are not JSON objects, and (in --append) dedups
-against the existing file by (company, normalized title, location). Output
+It validates the minimum publishable JD shape (non-empty title, company name,
+and at least one responsibilities/requirements body), drops items that are not
+JSON objects, and (in --append) dedups against the existing file by (company,
+normalized title, location). Output
 (stdout): a JSON summary with status / written-so-far count / out path. Never
 raises - malformed input is reported as a status JSON so the agent gets a clean
 tool result instead of a crash.
@@ -215,10 +216,24 @@ def _normalize(data: Any) -> list[dict[str, Any]]:
 
 
 def _valid_candidate(c: dict[str, Any]) -> bool:
-    """A candidate is valid if it has a non-empty title OR company_name."""
+    """Accept only a publishable JD, never a title-only listing echo.
+
+    The caller is collecting structured job descriptions, not merely vacancy
+    titles. A title-only row can remain in raw browser evidence, but must not
+    enter the persisted candidate set: it could otherwise hide a failed detail
+    extraction and make a count look complete while JD coverage is not.
+    """
     title = (c.get("title") or "").strip() if isinstance(c.get("title"), str) else ""
     company = (c.get("company_name") or "").strip() if isinstance(c.get("company_name"), str) else ""
-    return bool(title or company)
+    responsibilities = (
+        (c.get("responsibilities") or "").strip()
+        if isinstance(c.get("responsibilities"), str) else ""
+    )
+    requirements = (
+        (c.get("requirements") or "").strip()
+        if isinstance(c.get("requirements"), str) else ""
+    )
+    return bool(title and company and (responsibilities or requirements))
 
 
 def main() -> int:

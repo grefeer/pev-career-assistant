@@ -398,7 +398,25 @@ def _coverage_for_run(
         arguments.extend(["--terminal-evidence", terminal_evidence])
     if expected_count is not None:
         arguments.extend(["--expected-count", str(expected_count)])
-    output = run_skill_script("coverage_gate", " ".join(shlex.quote(arg) for arg in arguments))
+    # ``@tool`` wraps run_skill_script as a StructuredTool for the DeepAgent;
+    # internal harness code must invoke that wrapper instead of calling it as a
+    # plain function.
+    try:
+        output = run_skill_script.invoke({
+            "script": "coverage_gate",
+            "cli_args": " ".join(shlex.quote(arg) for arg in arguments),
+        })
+    except Exception as exc:  # A completed paid run must still be recorded.
+        return {
+            "coverage_verified": False,
+            "page_count": len(page_files),
+            "candidate_count": len(candidates),
+            "body_candidate_count": 0,
+            "unique_listing_count": 0,
+            "expected_count": expected_count,
+            "terminal_evidence": terminal_evidence,
+            "reasons": [f"coverage_gate_execution_error:{type(exc).__name__}"],
+        }
     try:
         parsed = json.loads(output.strip().splitlines()[0])
     except (IndexError, json.JSONDecodeError):
@@ -577,6 +595,10 @@ HARD RULES - do not break these:
   write_candidates ONCE with `stdin="[]"` and your final message is
   `{"status":"blocked","page":"page_NN","reason":"<one line>"}`. Writing fake
   candidates to look busy is the worst failure mode - it poisons the dataset.
+- JD BODY REQUIRED. Every object passed to `write_candidates` must contain a
+  non-empty `responsibilities` OR `requirements` quoted from this page. The
+  writer rejects title-only rows, because they demonstrate incomplete detail
+  extraction rather than a publishable job description.
 - ORIGINAL LANGUAGE ONLY. Keep `title`, `company_name`, `department` in the
   EXACT language they appear in on the page (Chinese for 小米/xiaomi, etc.).
   Do NOT translate to English and do NOT romanize to pinyin (e.g. write
