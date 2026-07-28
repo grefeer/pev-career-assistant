@@ -115,7 +115,7 @@ SKILL_PARENT = SKILL_DIR.parent
 # The six helper scripts the skill ships. run_skill_script refuses anything else
 # so an agent can never coax it into running arbitrary code.
 _SKILL_SCRIPTS = ("browse", "validate", "normalize", "deduplicate", "ocr_image", "state",
-                  "read_evidence", "write_candidates")
+                  "read_evidence", "write_candidates", "coverage_gate")
 # Browse.py can take minutes on a 16-page site (xiaomi). Per-call ceiling.
 _SCRIPT_TIMEOUT_SEC = 900
 # Cap the inlined page text so a huge list cannot blow the model context. Raised
@@ -135,7 +135,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
 
     Args:
         script: One of: browse, validate, normalize, deduplicate, ocr_image,
-            state, read_evidence, write_candidates.
+            state, read_evidence, write_candidates, coverage_gate.
         cli_args: Command-line arguments as a single string, e.g.
             ``"--mode list --out output/evidence <url>"``. Use the same argument
             syntax the SKILL.md documents.
@@ -358,6 +358,9 @@ failure modes):
   re-read it. Do at most ONE retry round. Then run deduplicate.
 - After verify-retry (or if no pages failed), run:
   `run_skill_script(script="deduplicate", cli_args="output/candidates/*.json --out output/candidates_merged.json")`
+- Then call `coverage_gate` on the merged candidates and every `page_files`
+  path. Supply a positive terminal marker only when browse explicitly observed
+  one. Never claim coverage-verified in the final JSON without a passing gate.
 - If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
   `--mode search-interact`; if still empty, emit
   `{"status":"blocked","reason":"page did not render job content"}` and stop.
@@ -394,7 +397,8 @@ CONSTRAINTS:
   `deduplicate`, which skips malformed files. Your only write to the
   candidates tree is the `deduplicate`-merge.
 - Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
-  normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
+  normalize, deduplicate, ocr_image, state, read_evidence, write_candidates,
+  coverage_gate.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.
 - Use the company name you are given for `company_name`.
 - Campus / 提前批 / 校招 is the default recruitment_type unless the page says
