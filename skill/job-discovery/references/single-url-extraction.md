@@ -45,6 +45,9 @@ pagination (click next -> read URL -> click prev -> read URL -> diff to find the
 **concurrently** via a thread pool (`--concurrency 4` = 4 worker browsers, the
 Java-thread-pool analog). The result JSON carries **`page_files`** (paths to
 `output/evidence/pages/page_NN.txt`), **`page_count`**, and **`used_path`**.
+Process every returned page file. If a site reaches the configured
+`--max-pages` safety ceiling before browse reports a positive terminal marker,
+the run is incomplete and must be marked `needs_manual_review`, not complete.
 
 `used_path` tells you which path it took:
 - `"parallel"` - URL-keyed site, pages fetched concurrently. Proceed to step 3.
@@ -114,10 +117,25 @@ run_skill_script(script="deduplicate",
 idempotency/similarity keys, and runs evidence-quality checks. Its stdout
 summary reports `input_count` / `output_count` / `duplicates_removed`.
 
-### 5. Final message (short - do NOT re-emit the candidates)
+### 5. Coverage gate + final message (short - do NOT re-emit the candidates)
+
+Run the deterministic gate after deduplication. Pass every returned page file
+and a terminal marker **only if browse actually observed it** (disabled next
+button, exhausted finite page range, or an equivalent positive end marker):
+
+```
+run_skill_script(script="coverage_gate",
+                 cli_args="output/candidates_merged.json --pages <all page_files> --terminal-evidence <observed marker>")
+```
+
+If the gate rejects the output, preserve the candidates but report
+`"status":"needs_manual_review"` with its reasons; do not call the run
+complete. A missing terminal marker is therefore an explicit quality failure,
+not permission to guess that pagination ended.
+
 Your final message must be ONLY a small JSON summary, e.g.:
 ```
-{"status":"done","pages":16,"candidates_file":"output/candidates_merged.json","merged_count":151}
+{"status":"done","pages":16,"candidates_file":"output/candidates_merged.json","merged_count":151,"terminal_evidence":"last_page_disabled","coverage_verified":true}
 ```
 The harness reads `output/candidates_merged.json` off disk - re-emitting the
 candidates here would just re-hit the output cap that this design exists to

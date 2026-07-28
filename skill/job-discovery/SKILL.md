@@ -48,7 +48,9 @@ Use `scripts/adapter_supervisor.py` as the outer Supervisor when a backend
 Before reporting a complete run, call `scripts/coverage_gate.py` on the merged
 candidates and page files. Only call a run coverage-verified when it has page
 evidence, a positive terminal signal, a body for every candidate, no duplicate
-`(title, apply_url)` identity, and (when public total is known) an exact count.
+public apply URL identity (or, when URLs are unavailable, duplicate
+title/department/location identity), and (when public total is known) an exact
+count.
 
 The fallback still uses `parallel-fetch` first, makes only one
 `search-interact` retry for a thin SPA, fans out one extraction sub-agent per
@@ -162,7 +164,7 @@ Review `merged_final.json` and update `state.json`. Full details in
 |-----------|--------|
 | URL returns 403 / login wall | Skip, record in `output/errors.jsonl` |
 | Page renders but has no job listings | Mark as `empty`, record screenshot path |
-| Page has >100 positions (estimate) | Process first 3 pages only, note in summary |
+| Page has >100 positions (estimate) | Process every discovered page concurrently in bounded batches; checkpoint each page result. A configured `--max-pages` ceiling is a safety stop, not proof of completion: report `needs_manual_review` unless a positive terminal marker proves the final page was reached. |
 | LLM extraction produces invalid JSON | Re-read the text and try again with stricter prompt |
 | Playwright times out (30s+) | Retry once with `--wait 5000`, then skip |
 | WeChat article has images (any) | ALWAYS attempt OCR - see `references/wechat-image-handling.md` for the full decision tree (6 levels) |

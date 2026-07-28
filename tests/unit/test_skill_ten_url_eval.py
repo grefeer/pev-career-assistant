@@ -94,6 +94,15 @@ def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path
     assert verdict["reasons"] == ["no_page_evidence"]
 
 
+def test_skill_does_not_instruct_large_site_truncation() -> None:
+    skill = (Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Process first 3 pages only" not in skill
+    assert "Process every discovered page" in skill
+
+
 
 
 def test_slug_filter_reuses_cache_unless_force_fresh_is_explicit() -> None:
