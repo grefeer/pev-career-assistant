@@ -382,7 +382,10 @@ failure modes):
 
 CRITICAL - OUTPUT DISCIPLINE:
 - Your FINAL message must be ONLY a small JSON summary, e.g.
-  `{"status":"done","pages":16,"candidates_file":"output/candidates_merged.json","merged_count":151}`
+  `{"status":"done","pages":16,"candidates_file":"output/candidates_merged.json","merged_count":151,"terminal_evidence":"last_page_disabled"}`.
+  Set `terminal_evidence` only when browse explicitly observed a disabled next
+  page, an exhausted finite page range, or another positive end marker; use
+  `null` when the site does not expose one.
   The harness reads `output/candidates_merged.json` off disk. Do NOT emit the
   candidates themselves - that re-hits the output cap this design avoids. Do
   NOT emit a prose "planning" message either: the agent loop ENDS on any
