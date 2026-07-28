@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "scripts" / "adapter_supervisor.py"
@@ -86,3 +87,14 @@ def test_build_skill_deep_agent_uses_create_deep_agent(monkeypatch) -> None:
     assert calls == {
         "model": "model", "tools": ["browse"], "system_prompt": "skill workflow"
     }
+
+
+def test_load_adapter_uses_validation_before_execution(monkeypatch) -> None:
+    class Adapter:
+        def validate(self, url):
+            return url.endswith("/campus")
+
+    monkeypatch.setattr(_MODULE, "import_module", lambda name: SimpleNamespace(Adapter=Adapter))
+
+    assert _MODULE.load_adapter("example.Adapter", "https://jobs.example/campus") is not None
+    assert _MODULE.load_adapter("example.Adapter", "https://jobs.example/social") is None

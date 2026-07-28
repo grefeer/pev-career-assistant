@@ -11,6 +11,7 @@ auditable context.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from importlib import import_module
 from typing import Any, Callable
 
 
@@ -28,6 +29,20 @@ def build_skill_deep_agent(*, model: Any, tools: list[Any], system_prompt: str) 
     from deepagents import create_deep_agent
 
     return create_deep_agent(model=model, tools=tools, system_prompt=system_prompt)
+
+
+def load_adapter(adapter_path: str | None, source_url: str) -> Any | None:
+    """Load a configured backend adapter only when it accepts the public URL."""
+    if not adapter_path:
+        return None
+    module_name, _, class_name = adapter_path.rpartition(".")
+    if not module_name or not class_name:
+        raise ValueError("adapter_path must be a dotted class path")
+    adapter = getattr(import_module(module_name), class_name)()
+    validate = getattr(adapter, "validate", None)
+    if not callable(validate):
+        raise TypeError("configured adapter has no validate(url) method")
+    return adapter if validate(source_url) else None
 
 
 def run_with_adapter_fallback(
