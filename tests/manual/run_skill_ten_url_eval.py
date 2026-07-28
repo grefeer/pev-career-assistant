@@ -123,6 +123,10 @@ _SCRIPT_TIMEOUT_SEC = 900
 # more text than a single page); the lenient parser recovers whatever the
 # 8192-token output cap can emit.
 _MAX_PAGE_TEXT_CHARS = 60_000
+# Per-URL, deterministic metadata from the actual browse tool result.  This is
+# intentionally separate from the model's final prose/JSON: coverage must be
+# based on an observed browser terminal signal, not a hallucinated restatement.
+_last_browse_metadata: dict[str, Any] | None = None
 
 
 @tool
@@ -149,6 +153,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         under a ``[PAGE_TEXT]`` marker so the caller can extract JDs directly
         without resolving evidence file paths.
     """
+    global _last_browse_metadata
     if script not in _SKILL_SCRIPTS:
         return (
             f"ERROR: unknown script {script!r}. "
@@ -192,6 +197,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
     # virtual filesystem backend - that path mapping is fragile and would cost a
     # second tool round-trip per page.
     if script == "browse":
+        _last_browse_metadata = _browse_metadata_from_output(out)
         text = _read_browse_text(out)
         if text:
             out += "\n[PAGE_TEXT]\n" + text[:_MAX_PAGE_TEXT_CHARS]
@@ -213,6 +219,23 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
                 'content\"} and stop immediately.)'
             )
     return out
+
+
+def _browse_metadata_from_output(output: str) -> dict[str, Any] | None:
+    """Parse the browse result before its large ``[PAGE_TEXT]`` suffix."""
+    prefix = output.split("\n[PAGE_TEXT]", maxsplit=1)[0]
+    decoder = json.JSONDecoder()
+    last: dict[str, Any] | None = None
+    for index, char in enumerate(prefix):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(prefix[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and "status" in value:
+            last = value
+    return last
 
 
 def _read_browse_text(browse_stdout: str) -> str:
@@ -337,7 +360,11 @@ def _coverage_for_run(
     page_dir = SKILL_DIR / "output" / "evidence" / "pages"
     page_files = sorted(str(path.relative_to(SKILL_DIR)) for path in page_dir.glob("*.txt")) \
         if page_dir.exists() else []
-    terminal_evidence = _terminal_evidence_from_content(content)
+    observed_terminal = (
+        str((_last_browse_metadata or {}).get("terminal_evidence") or "").strip()
+        or None
+    )
+    terminal_evidence = observed_terminal or _terminal_evidence_from_content(content)
     arguments = ["output/candidates_merged.json"]
     # The model may have returned final-message candidates without persisting a
     # merged file.  In that case the gate cannot certify the run, rather than
@@ -1099,6 +1126,7 @@ def _normalize_replayed_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
+    global _last_browse_metadata
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
           flush=True)
     # Fresh per-URL persisted state so prior candidates/pages don't leak in.
@@ -1113,6 +1141,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         f"short summary JSON as your final message."
     )
     t0 = time.monotonic()
+    _last_browse_metadata = None
     content, note = _invoke_agent(agent, prompt)
     if note and note != "recursion_limit":
         print(f"  !! INVOKE ERROR: {note}", flush=True)
@@ -1156,6 +1185,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "duplicate_count": raw_count - unique,
         "coverage": coverage,
         "coverage_verified": bool(coverage.get("coverage_verified")),
+        "browse_metadata": _last_browse_metadata,
         "block_reason": "login/captcha/anti-bot" if blocked else None,
         "note": note or None,
         "evaluation_mode": "fresh_live",

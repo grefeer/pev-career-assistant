@@ -77,6 +77,17 @@ def test_terminal_evidence_requires_the_explicit_final_json_field() -> None:
     assert runner._terminal_evidence_from_content('{"status":"done"}') is None
 
 
+def test_browse_metadata_reads_the_deterministic_tool_result_before_page_text() -> None:
+    runner = _load_runner()
+
+    metadata = runner._browse_metadata_from_output(
+        '{"status":"ok","terminal_evidence":"finite_page_range_exhausted"}'
+        '\n[PAGE_TEXT]\n岗位列表 {not json}'
+    )
+
+    assert metadata == {"status": "ok", "terminal_evidence": "finite_page_range_exhausted"}
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"

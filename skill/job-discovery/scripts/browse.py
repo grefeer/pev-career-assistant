@@ -374,6 +374,7 @@ def _save_screenshot(page: Any, path: Path) -> None:
 def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms: int) -> dict[str, Any]:
     all_texts: list[str] = []
     page_num = 1
+    terminal_evidence: str | None = None
 
     _scroll_to_load(page, wait_ms)
     for _ in range(3):
@@ -383,6 +384,7 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
     while page_num < max_pages:
         next_btn = _find_next_page_button(page)
         if next_btn is None:
+            terminal_evidence = "next_control_absent"
             break
         try:
             old_url = page.url
@@ -395,6 +397,7 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
             if page.url == old_url:
                 new_text = _extract_body_text(page)
                 if new_text == all_texts[-1]:
+                    terminal_evidence = "page_content_repeated"
                     break
                 all_texts.append(new_text)
             else:
@@ -418,6 +421,8 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
         "screenshot_path": str(screenshot_path),
         "text_length": len(full_text),
         "pagination": {"pages_collected": page_num, "max_allowed": max_pages},
+        "terminal_evidence": terminal_evidence,
+        "truncated_by_max_pages": terminal_evidence is None and page_num >= max_pages,
         "page_count": len(all_texts),
         "page_files": page_files,
     }
@@ -575,6 +580,15 @@ def browse_click_mode(
         "pages_collected": len(all_texts),
         "end_reached": clicks_effective < click_count,
         "end_reason": end_reason,
+        # A missing auto-detected paginator or a no-change click is an observed
+        # terminal signal.  A selector/text chosen by an agent can be wrong, so
+        # its absence is deliberately NOT treated as proof of completion.
+        "terminal_evidence": (
+            "next_control_absent" if click_auto and "target not found" in end_reason
+            else "page_content_repeated" if "did not change" in end_reason
+            else None
+        ),
+        "truncated_by_max_pages": not end_reason and clicks_effective >= click_count,
         "page_count": len(all_texts),
         "page_files": page_files,
     }
@@ -642,17 +656,21 @@ def _parse_total_items(text: str | None) -> int | None:
     return max(nums)  # the total is usually the largest number on the line
 
 
-def _compute_total_pages(count_text: str | None, size_val: int | None, max_pages: int) -> int:
+def _compute_total_pages(
+    count_text: str | None, size_val: int | None, max_pages: int,
+) -> tuple[int, int | None]:
     """Decide how many pages to fetch. Prefers an explicit page count, then
     item-count / page-size, else caps at ``max_pages`` (dedup drops the tail)."""
     pages = _parse_total_pages(count_text)
     if pages:
-        return min(max_pages, max(1, pages))
+        pages = max(1, pages)
+        return min(max_pages, pages), pages
     if size_val:
         items = _parse_total_items(count_text)
         if items:
-            return min(max_pages, max(1, math.ceil(items / size_val)))
-    return max_pages
+            pages = max(1, math.ceil(items / size_val))
+            return min(max_pages, pages), pages
+    return max_pages, None
 
 
 def _scan_body_count(body: str | None) -> str | None:
@@ -1042,7 +1060,9 @@ def browse_parallel_fetch_mode(
                 pass
 
     # ---- Compute page URLs ----
-    total_pages = _compute_total_pages(count_text, detect.get("size_val"), max_pages)
+    total_pages, declared_total_pages = _compute_total_pages(
+        count_text, detect.get("size_val"), max_pages,
+    )
     page_param = detect["page_param"]
     urls = [
         _substitute_page_param(detect["base_url"], page_param, i)
@@ -1104,11 +1124,20 @@ def browse_parallel_fetch_mode(
         "pagination": {
             "pages_collected": len(texts),
             "total_pages": total_pages,
+            "declared_total_pages": declared_total_pages,
             "page_param": page_param,
             "size_param": detect.get("size_param"),
             "size_val": detect.get("size_val"),
             "concurrency": concurrency,
         },
+        "terminal_evidence": (
+            "finite_page_range_exhausted"
+            if declared_total_pages is not None and total_pages == declared_total_pages
+            else None
+        ),
+        "truncated_by_max_pages": (
+            declared_total_pages is not None and declared_total_pages > max_pages
+        ),
     }
 
 
