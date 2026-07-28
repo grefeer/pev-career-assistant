@@ -96,6 +96,22 @@ def _repair_candidate_metadata(
     evidence: PageEvidence,
 ) -> NormalizedJobCandidate:
     """Prefer the associated listing's authoritative display metadata."""
+    raw_detail_text = detail.full_text.strip()
+    title_placeholder = (listing.title if listing is not None else detail.title) or ""
+    responsibilities = candidate.responsibilities
+    requirements = candidate.requirements
+    # A certified detail resource is already evidence-backed and job-scoped.
+    # Some portals provide an unlabelled responsibility paragraph, which the
+    # generic section parser intentionally cannot classify. Preserve it rather
+    # than silently downgrading a full JD to title-only. Do not promote the
+    # driver's title fallback (used only when no detail text exists).
+    if (
+        not responsibilities
+        and not requirements
+        and raw_detail_text
+        and raw_detail_text != title_placeholder.strip()
+    ):
+        responsibilities = raw_detail_text
     return NormalizedJobCandidate(
         title=(listing.title if listing is not None else None) or candidate.title or detail.title,
         company_name=(listing.company if listing is not None else None)
@@ -103,8 +119,8 @@ def _repair_candidate_metadata(
         or detail.company,
         department=candidate.department,
         description_text=candidate.description_text,
-        responsibilities=candidate.responsibilities,
-        requirements=candidate.requirements,
+        responsibilities=responsibilities,
+        requirements=requirements,
         locations=(list(listing.locations) if listing is not None and listing.locations else list(candidate.locations or detail.locations)),
         recruitment_types=list(candidate.recruitment_types),
         industries=list(candidate.industries),

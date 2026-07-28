@@ -18,7 +18,7 @@ import fnmatch
 import json
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 from backend.app.services.job_discovery.adapters.complete_crawl_base import (
     CompleteCrawlAdapter,
@@ -53,16 +53,49 @@ completion:
 
 TERMINAL_PROOF = "total_count_reached"
 _SEARCH_API_MARKER = "/api/v1/search/job/posts"
-_NEXT_PAGE_SELECTOR = ".ant-pagination-next"
+# The current Feishu portal uses a component-library-neutral accessible label;
+# the historical Ant Design class is absent on the live Xiaopeng portal.
+_NEXT_PAGE_SELECTOR = "text=下一页"
 _BLOCKED_MARKERS = (
     "captcha",
     "验证码",
-    "login",
-    "登录",
+    "请先登录",
+    "登录后继续",
     "扫码登录",
     "环境异常",
     "完成验证后即可继续访问",
 )
+
+
+def _is_successful_search_response(response: Any) -> bool:
+    """Match only the usable search payload, not the pre-CSRF 405 retry.
+
+    The live portal first POSTs the search endpoint before it has a CSRF token;
+    that request can return 405, after which the portal obtains a token and
+    retries with a 200 JSON payload.  Waiting for the first path match loses
+    the real listing response and incorrectly certifies an empty crawl.
+    """
+    request = getattr(response, "request", None)
+    return (
+        _SEARCH_API_MARKER in getattr(response, "url", "")
+        and getattr(request, "method", "").upper() == "POST"
+        and getattr(response, "status", None) == 200
+    )
+
+
+def _with_search_offset(
+    request_url: str, request_payload: dict[str, Any], offset: int
+) -> tuple[str, dict[str, Any]]:
+    """Return a copy of a captured same-origin search request at ``offset``."""
+    parts = urlparse(request_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["offset"] = str(offset)
+    payload = dict(request_payload)
+    payload["offset"] = offset
+    return (
+        urlunparse(parts._replace(query=urlencode(query))),
+        payload,
+    )
 
 
 class FeishuBlockedError(RuntimeError):
@@ -106,6 +139,13 @@ class FeishuCrawlDriver:
         self._replay_index = 0
         self._replay_emitted = 0
         self._live_total: int | None = None
+        self._search_url: str | None = None
+        self._search_payload: dict[str, Any] | None = None
+        self._search_headers: dict[str, str] = {}
+        # The public search payload already contains the JD body. Keep it
+        # task-scoped and deterministic instead of serially reopening every
+        # detail URL solely to retrieve duplicated content.
+        self._live_detail_text_by_url: dict[str, str] = {}
 
     @classmethod
     def from_fixture(cls, fixture_dir: str | Path) -> "FeishuCrawlDriver":
@@ -208,23 +248,21 @@ class FeishuCrawlDriver:
         if page_number == 1:
             payload = self._capture_search(page, task.source_url)
         else:
-            next_button = page.locator(_NEXT_PAGE_SELECTOR)
-            if not next_button.is_visible():
-                return ListingPage(
-                    page_key=str(page_number),
-                    listings=[],
-                    next_cursor=None,
-                    terminal_evidence=TERMINAL_PROOF,
-                    expected_listing_count=self._live_total,
-                )
-            payload = self._capture_search(page, task.source_url, click_next=next_button)
+            payload = self._fetch_search_offset(page, offset=self._replay_emitted)
         items_path = plan.pagination.items_path
         total_path = plan.pagination.total_count_path
         items = _resolve_path(payload, items_path) or []
         total = _resolve_path(payload, total_path)
         if isinstance(total, int):
             self._live_total = total
-        listings = [_listing_from_api_item(item, task.source_url) for item in items]
+        listings = []
+        for item in items:
+            listing = _listing_from_api_item(item, task.source_url)
+            listings.append(listing)
+            if listing.detail_url:
+                full_text = _sample_full_text(item if isinstance(item, dict) else None)
+                if full_text:
+                    self._live_detail_text_by_url[listing.detail_url] = full_text
         accumulated = self._replay_emitted + len(listings)
         self._replay_emitted = accumulated
         reached = self._live_total is not None and accumulated >= self._live_total
@@ -240,20 +278,59 @@ class FeishuCrawlDriver:
         self,
         page: Any,
         source_url: str,
-        *,
-        click_next: Any | None = None,
     ) -> dict[str, Any]:
-        def _is_search(response: Any) -> bool:
-            return _SEARCH_API_MARKER in getattr(response, "url", "")
-
-        if click_next is not None:
-            with page.expect_response(_is_search) as captured:
-                click_next.click()
-        else:
-            with page.expect_response(_is_search) as captured:
-                page.goto(source_url)
+        with page.expect_response(_is_successful_search_response) as captured:
+            page.goto(source_url)
         self._raise_if_blocked(page)
-        return captured.value.json()
+        response = captured.value
+        payload = response.json()
+        request = response.request
+        request_payload = request.post_data_json
+        if not isinstance(request_payload, dict):
+            raise RuntimeError("Feishu search request did not carry a JSON object")
+        self._search_url = response.url
+        self._search_payload = request_payload
+        # Keep only browser-set application headers; forbidden headers such as
+        # User-Agent must be supplied by the browser itself during fetch().
+        headers = request.headers
+        self._search_headers = {
+            key: value for key, value in headers.items()
+            if key.lower() in {
+                "content-type", "x-csrf-token", "website-path",
+                "portal-channel", "portal-platform",
+            }
+        }
+        # The XHR resolves slightly before the pagination component commits to
+        # the SPA DOM.  Give the committed response a short deterministic UI
+        # settle window before the next crawl iteration looks for "下一页".
+        page.wait_for_timeout(250)
+        return payload
+
+    def _fetch_search_offset(self, page: Any, *, offset: int) -> dict[str, Any]:
+        if self._search_url is None or self._search_payload is None:
+            raise RuntimeError("Feishu search request template is unavailable")
+        url, payload = _with_search_offset(self._search_url, self._search_payload, offset)
+        response = page.evaluate(
+            """async ({url, headers, payload}) => {
+                const result = await fetch(url, {
+                    method: 'POST', credentials: 'same-origin', headers,
+                    body: JSON.stringify(payload),
+                });
+                const text = await result.text();
+                return {status: result.status, text};
+            }""",
+            {"url": url, "headers": self._search_headers, "payload": payload},
+        )
+        if not isinstance(response, dict) or response.get("status") != 200:
+            raise RuntimeError("Feishu paged search returned a non-200 response")
+        try:
+            parsed = json.loads(str(response.get("text") or ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Feishu paged search returned invalid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Feishu paged search returned a non-object payload")
+        self._raise_if_blocked(page)
+        return parsed
 
     def _get_page(self) -> Any:
         if self._page is None:
@@ -276,6 +353,9 @@ class FeishuCrawlDriver:
         """
         if not listing.detail_url:
             return ""
+        cached = self._live_detail_text_by_url.get(listing.detail_url)
+        if cached:
+            return cached
         page = self._get_page()
         page.goto(listing.detail_url)
         page.wait_for_load_state("networkidle")
@@ -291,7 +371,13 @@ class FeishuCrawlDriver:
 
     @staticmethod
     def _raise_if_blocked(page: Any) -> None:
-        content = str(page.content()).lower() if hasattr(page, "content") else ""
+        content = ""
+        try:
+            body = page.locator("body") if hasattr(page, "locator") else None
+            if body is not None and hasattr(body, "inner_text"):
+                content = str(body.inner_text() or "").lower()
+        except Exception:
+            content = ""
         if any(marker.lower() in content for marker in _BLOCKED_MARKERS):
             raise FeishuBlockedError("Feishu presented a login/QR/anti-bot wall")
 

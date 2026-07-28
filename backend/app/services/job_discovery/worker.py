@@ -1106,6 +1106,10 @@ class JobDiscoveryWorker:
                 "summary": result.summary,
                 "evidence_count": len(result.evidence),
                 "candidate_count": len(result.candidates),
+                "body_candidate_count": sum(
+                    bool((candidate.responsibilities or "").strip() or (candidate.requirements or "").strip())
+                    for candidate in result.candidates
+                ),
                 "execution_path": _execution_path_label(executor_type),
                 "coverage_verified": (
                     coverage_decision.complete if coverage_decision is not None else False

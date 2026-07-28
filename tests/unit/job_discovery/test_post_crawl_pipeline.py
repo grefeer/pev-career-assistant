@@ -96,3 +96,12 @@ def test_post_crawl_pipeline_preserves_sanitized_execution_error() -> None:
     result = run_post_crawl_pipeline(_task(), crawl_result)
 
     assert result.execution_error == "captcha"
+
+
+def test_complete_detail_text_without_known_heading_is_preserved_as_body() -> None:
+    crawl_result = _crawl_result(complete=True)
+    crawl_result.raw_details[0].full_text = "1、构建可靠服务。2、参与系统设计与持续优化。"
+
+    result = run_post_crawl_pipeline(_task(), crawl_result)
+
+    assert result.candidates[0].responsibilities == crawl_result.raw_details[0].full_text

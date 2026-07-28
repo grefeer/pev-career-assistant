@@ -22,8 +22,11 @@ Usage::
     .\\.venv\\Scripts\\python.exe tests/manual/test_pev_live_smoke.py --site inovance
     .\\.venv\\Scripts\\python.exe tests/manual/test_pev_live_smoke.py --site xiaohongshu
 
-Skips (never reports PASS) when ``DEEPSEEK_API_KEY`` is missing. Exits 0 on
-PASS, 1 on FAIL/SKIP so a wrapper can require three consecutive 0-exit runs.
+The certified PEV adapter path is deterministic and does not require an LLM
+key. If an adapter falls back to Legacy PATH C, a missing key is surfaced as a
+failure in the recorded result rather than hiding the routing regression.
+Exits 0 on PASS, 1 on FAIL so a wrapper can require three consecutive 0-exit
+runs.
 """
 # ruff: noqa: E402  (sys.path bootstrap must precede project imports)
 
@@ -58,6 +61,9 @@ from backend.app.db.models import (
 from backend.app.services.job_discovery.adapters.feishu import FEISHU_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.inovance import INOVANCE_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.moka import MOKA_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.pdd import PDD_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.mioffice import MIOFFICE_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.bytedance import BYTEDANCE_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.xiaohongshu import XHS_CRAWL_PLAN
 from backend.app.services.job_discovery.worker import JobDiscoveryWorker
 
@@ -90,6 +96,27 @@ SITES: dict[str, dict[str, Any]] = {
         "adapter": "backend.app.services.job_discovery.adapters.xiaohongshu.XiaohongshuCrawlAdapter",
         "plan_yaml": XHS_CRAWL_PLAN,
         "url": "https://job.xiaohongshu.com/campus/position",
+    },
+    "pdd": {
+        "label": "拼多多 (careers.pddglobalhr.com)",
+        "url_pattern": "careers.pddglobalhr.com/*",
+        "adapter": "backend.app.services.job_discovery.adapters.pdd.PddCrawlAdapter",
+        "plan_yaml": PDD_CRAWL_PLAN,
+        "url": "https://careers.pddglobalhr.com/campus/grad?t=AOT9z6aa0x",
+    },
+    "xiaomi": {
+        "label": "小米 Mioffice (*.jobs.f.mioffice.cn)",
+        "url_pattern": "*.jobs.f.mioffice.cn/*",
+        "adapter": "backend.app.services.job_discovery.adapters.mioffice.MiofficeCrawlAdapter",
+        "plan_yaml": MIOFFICE_CRAWL_PLAN,
+        "url": "https://xiaomi.jobs.f.mioffice.cn/s/kJVnd58xtWY",
+    },
+    "bytedance": {
+        "label": "字节跳动 (jobs.bytedance.com)",
+        "url_pattern": "jobs.bytedance.com/*",
+        "adapter": "backend.app.services.job_discovery.adapters.bytedance.ByteDanceCrawlAdapter",
+        "plan_yaml": BYTEDANCE_CRAWL_PLAN,
+        "url": "https://jobs.bytedance.com/campus/position",
     },
 }
 
@@ -181,6 +208,7 @@ def _passes_pev_gate(summary: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     coverage_complete = coverage_verified  # CoverageVerifier terminal verdict
     failed_detail = int(coverage.get("failed_detail_count", 0) or 0)
     candidate_count = int(summary.get("candidate_count", 0) or 0)
+    body_candidate_count = int(summary.get("body_candidate_count", 0) or 0)
     unique = int(summary.get("unique_listing_count", candidate_count) or 0)
     no_dups = candidate_count == unique
     # count_apply_url_is_listpage is not persisted on the summary; recompute is
@@ -192,6 +220,7 @@ def _passes_pev_gate(summary: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         "coverage_complete": coverage_complete,
         "failed_detail_count": failed_detail,
         "candidate_count": candidate_count,
+        "body_candidate_count": body_candidate_count,
         "unique_listing_count": unique,
         "duplicate_count": candidate_count - unique,
         "count_apply_url_is_listpage": listpage_apply,
@@ -202,6 +231,7 @@ def _passes_pev_gate(summary: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         coverage_verified
         and coverage_complete
         and failed_detail == 0
+        and body_candidate_count == candidate_count
         and no_dups
         and listpage_apply == 0
     )
@@ -214,9 +244,6 @@ def main() -> int:
     parser.add_argument("--url", default=None, help="override the listing URL")
     args = parser.parse_args()
 
-    if not os.environ.get("DEEPSEEK_API_KEY"):
-        print("SKIP: DEEPSEEK_API_KEY is missing (not PASS).")
-        return 1
     if not os.environ.get("READGZH_API_KEY"):
         print("NOTE: READGZH_API_KEY not set (only needed for WeChat URLs).")
 
@@ -225,7 +252,10 @@ def main() -> int:
         site_cfg["url"] = args.url
     print(f"PEV live smoke: {site_cfg['label']}")
     print(f"  URL: {site_cfg['url']}")
-    print(f"  DEEPSEEK_API_KEY={'set' if os.environ.get('DEEPSEEK_API_KEY') else 'MISSING'}")
+    print(
+        "  DEEPSEEK_API_KEY="
+        f"{'set' if os.environ.get('DEEPSEEK_API_KEY') else 'MISSING (PEV does not need it)'}"
+    )
 
     settings = _settings()
     factory, task_id = _setup_db(site_cfg)
@@ -238,7 +268,7 @@ def main() -> int:
     elapsed = time.monotonic() - t0
     print(f"  claimed={claimed} elapsed={elapsed:.0f}s")
 
-    with Session(factory.bind) as db:
+    with factory() as db:
         task = db.get(JobDiscoveryTask, task_id)
         summary = dict(task.result_summary_json or {}) if task else {}
 

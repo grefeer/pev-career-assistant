@@ -17,8 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from backend.app.services.job_discovery.adapters.xiaohongshu import (
+    _SEARCH_API_MARKER,
     XHS_CRAWL_PLAN,
+    XiaohongshuBlockedError,
     XiaohongshuCrawlDriver,
 )
 from backend.app.services.job_discovery.crawling.crawl_executor import CrawlExecutor
@@ -167,6 +171,76 @@ def test_xhs_crawl_plan_yaml_parses_as_api_cursor() -> None:
     assert plan.pagination.items_path == "$.data.list"
     assert plan.pagination.total_count_path == "$.data.total"
     assert plan.completion.require_all_details is True
+
+
+def test_xhs_live_response_marker_matches_captured_public_contract() -> None:
+    """The live driver must await the same public XHR captured in the contract.
+
+    A stale marker silently makes ``expect_response`` time out and forces a
+    Legacy-Supervisor fallback, so keep this production routing detail pinned.
+    """
+    assert _SEARCH_API_MARKER == "/websiterecruit/position/pageQueryPosition"
+
+
+def test_xhs_reuses_public_listing_jd_body_before_opening_detail_page() -> None:
+    """A list response that carries duty/qualification needs no detail revisit."""
+    detail_url = "https://job.xiaohongshu.com/campus/position/42"
+    driver = XiaohongshuCrawlDriver(source_url=SOURCE_URL, page=object())
+    driver._live_detail_text_by_url[detail_url] = "岗位职责\n任职要求"
+    listing = RawJobListing(
+        source_url=SOURCE_URL,
+        detail_url=detail_url,
+        apply_url=detail_url,
+        company=None,
+        title="缓存职位",
+    )
+
+    assert driver._live_detail_text(xhs_plan(), listing) == "岗位职责\n任职要求"
+
+
+def test_xhs_block_detection_ignores_captcha_text_in_nonvisible_assets() -> None:
+    """Bundled script text is not evidence that the user saw an anti-bot wall."""
+
+    class _Body:
+        def inner_text(self) -> str:
+            return ""
+
+    class _Page:
+        def content(self) -> str:
+            return "<script>const captchaLibrary = true;</script>"
+
+        def locator(self, selector: str) -> _Body:
+            assert selector == "body"
+            return _Body()
+
+    XiaohongshuCrawlDriver._raise_if_blocked(_Page())
+
+
+def test_xhs_block_detection_ignores_a_normal_navigation_login_link() -> None:
+    class _Body:
+        def inner_text(self) -> str:
+            return "首页\n职位\n登录\n搜索"
+
+    class _Page:
+        def locator(self, selector: str) -> _Body:
+            assert selector == "body"
+            return _Body()
+
+    XiaohongshuCrawlDriver._raise_if_blocked(_Page())
+
+
+def test_xhs_block_detection_rejects_visible_login_wall() -> None:
+    class _Body:
+        def inner_text(self) -> str:
+            return "请先登录后继续访问"
+
+    class _Page:
+        def locator(self, selector: str) -> _Body:
+            assert selector == "body"
+            return _Body()
+
+    with pytest.raises(XiaohongshuBlockedError):
+        XiaohongshuCrawlDriver._raise_if_blocked(_Page())
 
 
 def test_xhs_emits_one_listing_per_position_id_no_blob_split() -> None:

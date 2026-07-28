@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
@@ -50,7 +51,7 @@ listing:
 pagination:
   type: single_page
 detail:
-  body_selector: "main"
+  body_selector: "body"
 completion:
   require_all_pages: true
   require_all_details: true
@@ -59,14 +60,15 @@ completion:
 #: The fragment that identifies a job-level (not a listing-level) Moka route.
 JOB_ROUTE_MARKER = "#/job/"
 TERMINAL_PROOF = "single_page_mokahr_hash_jobs"
+_LISTING_TOTAL_PATTERN = re.compile(r"(\d+)\s*结果")
 
 #: Markers that mean the page presented a login/captcha/anti-bot wall. The
 #: driver must stop and surface a blocked error -- never attempt to bypass.
 _BLOCKED_MARKERS = (
     "captcha",
     "验证码",
-    "login",
-    "登录",
+    "请先登录",
+    "登录后继续",
     "环境异常",
     "完成验证后即可继续访问",
 )
@@ -150,11 +152,15 @@ class MokaCrawlDriver:
         cursor: dict[str, Any] | None,
     ) -> ListingPage:
         listings = self._collect_listings(plan, task.source_url)
+        complete = (
+            self._expected_listing_count is not None
+            and len(listings) >= self._expected_listing_count
+        )
         return ListingPage(
             page_key="1",
             listings=listings,
             next_cursor=None,
-            terminal_evidence=self._terminal_proof,
+            terminal_evidence=self._terminal_proof if complete else None,
             expected_listing_count=self._expected_listing_count,
         )
 
@@ -192,9 +198,22 @@ class MokaCrawlDriver:
         if self._listings:
             return list(self._listings)
         page = self._get_page()
-        page.goto(source_url)
+        listing_url = f"{source_url.split('#', 1)[0]}#/jobs/"
+        page.goto(listing_url, wait_until="domcontentloaded", timeout=10_000)
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(500)
         self._raise_if_blocked(page)
+        self._expected_listing_count = self._visible_listing_total(page)
         return self._extract_dom_listings(page, plan, source_url)
+
+    @staticmethod
+    def _visible_listing_total(page: Any) -> int | None:
+        try:
+            text = str(page.locator("body").inner_text(timeout=5_000) or "")
+        except Exception:
+            return None
+        match = _LISTING_TOTAL_PATTERN.search(text)
+        return int(match.group(1)) if match else None
 
     def _extract_dom_listings(
         self,
@@ -233,14 +252,19 @@ class MokaCrawlDriver:
         if self._page is None and self._page_factory is None:
             return None
         page = self._get_page()
-        page.goto(detail_url)
+        # Moka keeps long-lived connections open, so ``networkidle`` can hang
+        # indefinitely even after the hash-route detail is rendered.
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=10_000)
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(250)
         self._raise_if_blocked(page)
         body_selector = plan.detail.body_selector
         if not body_selector:
             return None
         body = page.locator(body_selector)
-        if hasattr(body, "inner_text"):
-            return str(body.inner_text()).strip() or None
+        first = body.first if hasattr(body, "first") else body
+        if hasattr(first, "inner_text"):
+            return str(first.inner_text(timeout=5_000)).strip() or None
         return None
 
     def _get_page(self) -> Any:
@@ -254,7 +278,13 @@ class MokaCrawlDriver:
 
     @staticmethod
     def _raise_if_blocked(page: Any) -> None:
-        content = str(page.content()).lower() if hasattr(page, "content") else ""
+        content = ""
+        try:
+            body = page.locator("body") if hasattr(page, "locator") else None
+            if body is not None and hasattr(body, "inner_text"):
+                content = str(body.inner_text(timeout=5_000) or "").lower()
+        except Exception:
+            content = ""
         if any(marker.lower() in content for marker in _BLOCKED_MARKERS):
             raise MokaBlockedError("Moka presented a login/captcha/anti-bot wall")
 

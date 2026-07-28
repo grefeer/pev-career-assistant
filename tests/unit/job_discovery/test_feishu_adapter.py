@@ -16,6 +16,8 @@ from pathlib import Path
 from backend.app.services.job_discovery.adapters.feishu import (
     FEISHU_CRAWL_PLAN,
     FeishuCrawlDriver,
+    _is_successful_search_response,
+    _with_search_offset,
 )
 from backend.app.services.job_discovery.crawling.crawl_plan import CrawlPlan
 from backend.app.services.job_discovery.schemas import (
@@ -76,3 +78,49 @@ def test_feishu_apply_url_is_job_level_not_listing_page() -> None:
     for item in result.raw_listings:
         assert item.apply_url != item.source_url
         assert "/campus/position/list" not in (item.apply_url or "")
+
+
+def test_feishu_reuses_public_listing_jd_body_before_opening_detail_page() -> None:
+    detail_url = "https://xiaopeng.jobs.feishu.cn/campus/position/42/detail"
+    driver = FeishuCrawlDriver(
+        source_url="https://xiaopeng.jobs.feishu.cn/campus/position/list",
+        page=object(),
+    )
+    driver._live_detail_text_by_url[detail_url] = "岗位职责\n任职要求"
+    listing = RawJobListing(
+        source_url=driver.source_url,
+        detail_url=detail_url,
+        apply_url=detail_url,
+        company=None,
+        title="缓存职位",
+    )
+
+    assert driver._live_detail_text(feishu_plan(), listing) == "岗位职责\n任职要求"
+
+
+def test_feishu_ignores_pre_csrf_search_405_until_successful_post() -> None:
+    class Request:
+        method = "POST"
+
+    class Response:
+        url = "https://xiaopeng.jobs.feishu.cn/api/v1/search/job/posts?offset=0"
+        request = Request()
+
+        def __init__(self, status: int) -> None:
+            self.status = status
+
+    assert not _is_successful_search_response(Response(405))
+    assert _is_successful_search_response(Response(200))
+
+
+def test_feishu_next_search_request_updates_only_offset() -> None:
+    url, payload = _with_search_offset(
+        "https://xiaopeng.jobs.feishu.cn/api/v1/search/job/posts?limit=10&offset=0&_signature=x",
+        {"limit": 10, "offset": 0, "portal_type": 6},
+        30,
+    )
+
+    assert "limit=10" in url
+    assert "offset=30" in url
+    assert "_signature=x" in url
+    assert payload == {"limit": 10, "offset": 30, "portal_type": 6}

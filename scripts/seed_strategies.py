@@ -18,6 +18,9 @@ from backend.app.services.job_discovery.adapters.moka import MOKA_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.feishu import FEISHU_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.inovance import INOVANCE_CRAWL_PLAN
 from backend.app.services.job_discovery.adapters.xiaohongshu import XHS_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.pdd import PDD_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.mioffice import MIOFFICE_CRAWL_PLAN
+from backend.app.services.job_discovery.adapters.bytedance import BYTEDANCE_CRAWL_PLAN
 
 # Use the same engine pattern as tests
 from backend.app.config import Settings
@@ -38,6 +41,9 @@ GRAY_ROLLOUT_ORDER: tuple[str, ...] = (
     "feishu",      # 2. 飞书       (*.jobs.feishu.cn/*)
     "inovance",    # 3. 汇川       (recruit.inovance.com/*)
     "xiaohongshu", # 4. 小红书     (job.xiaohongshu.com/*)
+    "pdd",         # 5. 拼多多     (careers.pddglobalhr.com/*)
+    "mioffice",    # 6. Mioffice  (*.jobs.f.mioffice.cn/*)
+    "bytedance",   # 7. ByteDance (jobs.bytedance.com/*)
 )
 
 # Per-site rollback triggers (plan Task 8 Step 6). When ANY of these fire for a
@@ -133,6 +139,41 @@ def seed(db: Session) -> None:
             priority=40,
             adapter="backend.app.services.job_discovery.adapters.moka.MokaCrawlAdapter",
             plan_yaml=MOKA_CRAWL_PLAN,
+            degradation_threshold=3,
+            recovery_threshold=2,
+            enabled=False,
+        ),
+        JobDiscoveryStrategy(
+            url_pattern="jobs.bytedance.com/*",
+            site_type="career_site",
+            description="字节跳动校园招聘 -> shared search API total 分页 -> 内联 JD 完整抓取",
+            priority=40,
+            adapter="backend.app.services.job_discovery.adapters.bytedance.ByteDanceCrawlAdapter",
+            plan_yaml=BYTEDANCE_CRAWL_PLAN,
+            degradation_threshold=3,
+            recovery_threshold=2,
+            enabled=False,
+        ),
+        # Gray rollout #6/6 (Mioffice/Xiaomi) - shared public search API.
+        JobDiscoveryStrategy(
+            url_pattern="*.jobs.f.mioffice.cn/*",
+            site_type="career_site",
+            description="Mioffice 招聘 -> shared search API total 分页 -> 内联 JD 完整抓取",
+            priority=40,
+            adapter="backend.app.services.job_discovery.adapters.mioffice.MiofficeCrawlAdapter",
+            plan_yaml=MIOFFICE_CRAWL_PLAN,
+            degradation_threshold=3,
+            recovery_threshold=2,
+            enabled=False,
+        ),
+        # Gray rollout #5/5 (PDD) - public position/list API includes full JD.
+        JobDiscoveryStrategy(
+            url_pattern="careers.pddglobalhr.com/*",
+            site_type="career_site",
+            description="拼多多校园招聘 -> public position/list API total 分页 -> 内联 JD 完整抓取",
+            priority=40,
+            adapter="backend.app.services.job_discovery.adapters.pdd.PddCrawlAdapter",
+            plan_yaml=PDD_CRAWL_PLAN,
             degradation_threshold=3,
             recovery_threshold=2,
             enabled=False,

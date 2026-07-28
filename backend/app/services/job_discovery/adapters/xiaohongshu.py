@@ -63,14 +63,16 @@ completion:
 """
 
 TERMINAL_PROOF = "next_cursor_null"
-_SEARCH_API_MARKER = "/api/v1/search/job/posts"
+# Captured public listing response.  This differs from Feishu's endpoint even
+# though both sites expose a similarly shaped listing payload.
+_SEARCH_API_MARKER = "/websiterecruit/position/pageQueryPosition"
 _NEXT_PAGE_SELECTOR = ".ant-pagination-next"
 _NEXT_PAGE_DISABLED_SELECTOR = ".ant-pagination-next.ant-pagination-disabled"
 _BLOCKED_MARKERS = (
     "captcha",
     "验证码",
-    "login",
-    "登录",
+    "请先登录",
+    "登录后继续",
     "扫码登录",
     "环境异常",
     "完成验证后即可继续访问",
@@ -120,6 +122,11 @@ class XiaohongshuCrawlDriver:
         self._replay_emitted = 0
         self._page_count = 0
         self._live_total: int | None = None
+        # The public listing response already carries ``duty`` and
+        # ``qualification`` for each position.  Keep that task-scoped evidence
+        # so the deterministic executor does not serially re-open hundreds of
+        # detail pages merely to retrieve the same JD body.
+        self._live_detail_text_by_url: dict[str, str] = {}
 
     @classmethod
     def from_fixture(cls, fixture_dir: str | Path) -> "XiaohongshuCrawlDriver":
@@ -236,7 +243,14 @@ class XiaohongshuCrawlDriver:
         total = _resolve_path(payload, total_path)
         if isinstance(total, int):
             self._live_total = total
-        listings = [_listing_from_api_item(item, task.source_url) for item in items]
+        listings = []
+        for item in items:
+            listing = _listing_from_api_item(item, task.source_url)
+            listings.append(listing)
+            if listing.detail_url:
+                full_text = _sample_full_text(item if isinstance(item, dict) else None)
+                if full_text:
+                    self._live_detail_text_by_url[listing.detail_url] = full_text
         accumulated = self._replay_emitted + len(listings)
         self._replay_emitted = accumulated
         cursor_null = self._is_next_disabled(page) or (
@@ -279,6 +293,9 @@ class XiaohongshuCrawlDriver:
     def _live_detail_text(self, plan: CrawlPlan, listing: RawJobListing) -> str:
         if not listing.detail_url:
             return ""
+        cached = self._live_detail_text_by_url.get(listing.detail_url)
+        if cached:
+            return cached
         page = self._get_page()
         page.goto(listing.detail_url)
         page.wait_for_load_state("networkidle")
@@ -303,7 +320,18 @@ class XiaohongshuCrawlDriver:
 
     @staticmethod
     def _raise_if_blocked(page: Any) -> None:
-        content = str(page.content()).lower() if hasattr(page, "content") else ""
+        # Inspect rendered, user-visible text only.  The raw HTML routinely
+        # contains bundled captcha/login library identifiers, which are not an
+        # anti-bot wall and must not force a false blocked result.
+        content = ""
+        try:
+            body = page.locator("body") if hasattr(page, "locator") else None
+            if body is not None and hasattr(body, "inner_text"):
+                content = str(body.inner_text() or "").lower()
+        except Exception:
+            # A missing/unreadable body is not proof of a wall. The subsequent
+            # navigation/response operation will surface its own failure.
+            content = ""
         if any(marker.lower() in content for marker in _BLOCKED_MARKERS):
             raise XiaohongshuBlockedError(
                 "Xiaohongshu presented a login/QR/anti-bot wall"

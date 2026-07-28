@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
@@ -64,14 +65,16 @@ completion:
 #: Plural ``jobs`` distinguishes Inovance from Moka's singular ``#/job/``.
 JOB_ROUTE_MARKER = "#/jobs/"
 TERMINAL_PROOF = "single_page_inovance_hash_jobs"
+_LISTING_TOTAL_PATTERN = re.compile(r"共有\s*(\d+)\s*个在招职位")
+_MAX_LAZY_LOAD_SCROLLS = 30
 
 #: Markers that mean the page presented a login/captcha/anti-bot wall. The
 #: driver must stop and surface a blocked error -- never attempt to bypass.
 _BLOCKED_MARKERS = (
     "captcha",
     "验证码",
-    "login",
-    "登录",
+    "请先登录",
+    "登录后继续",
     "环境异常",
     "完成验证后即可继续访问",
 )
@@ -155,11 +158,15 @@ class InovanceCrawlDriver:
         cursor: dict[str, Any] | None,
     ) -> ListingPage:
         listings = self._collect_listings(plan, task.source_url)
+        complete = (
+            self._expected_listing_count is not None
+            and len(listings) >= self._expected_listing_count
+        )
         return ListingPage(
             page_key="1",
             listings=listings,
             next_cursor=None,
-            terminal_evidence=self._terminal_proof,
+            terminal_evidence=self._terminal_proof if complete else None,
             expected_listing_count=self._expected_listing_count,
         )
 
@@ -171,7 +178,17 @@ class InovanceCrawlDriver:
         resource_key: str,
     ) -> RawJobDetail:
         detail_url = listing.detail_url or ""
-        full_text = self._fetch_detail_text(plan, detail_url) or listing.title or ""
+        full_text: str | None = None
+        for attempt in range(2):
+            try:
+                full_text = self._fetch_detail_text(plan, detail_url)
+                break
+            except Exception:
+                if attempt:
+                    raise
+                if self._page is not None and hasattr(self._page, "wait_for_timeout"):
+                    self._page.wait_for_timeout(300)
+        full_text = full_text or listing.title or ""
         return RawJobDetail(
             detail_url=detail_url,
             full_text=full_text,
@@ -200,7 +217,35 @@ class InovanceCrawlDriver:
         page.goto(source_url)
         page.wait_for_load_state("networkidle")
         self._raise_if_blocked(page)
+        selector = plan.listing.item_selector or f"a[href*='{JOB_ROUTE_MARKER}']"
+        self._expand_lazy_listings(page, selector)
+        self._expected_listing_count = self._visible_listing_total(page)
         return self._extract_dom_listings(page, plan, source_url)
+
+    @staticmethod
+    def _expand_lazy_listings(page: Any, selector: str) -> None:
+        """Scroll a public lazy list until its rendered job-link count stabilizes."""
+        previous = -1
+        for _ in range(_MAX_LAZY_LOAD_SCROLLS):
+            locator = page.locator(selector)
+            count = int(locator.count()) if hasattr(locator, "count") else 0
+            if count == previous:
+                return
+            previous = count
+            if hasattr(page, "evaluate"):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            if hasattr(page, "wait_for_timeout"):
+                page.wait_for_timeout(300)
+
+    @staticmethod
+    def _visible_listing_total(page: Any) -> int | None:
+        try:
+            body = page.locator("body")
+            text = str(body.inner_text() or "")
+        except Exception:
+            return None
+        match = _LISTING_TOTAL_PATTERN.search(text)
+        return int(match.group(1)) if match else None
 
     def _extract_dom_listings(
         self,
@@ -244,11 +289,24 @@ class InovanceCrawlDriver:
         page = self._get_page()
         page.goto(detail_url)
         page.wait_for_load_state("networkidle")
+        # A hash-route navigation can become network-idle before the SPA has
+        # committed its detail component.  Give the rendered route one bounded
+        # frame window before inspecting its main regions.
+        if hasattr(page, "wait_for_timeout"):
+            page.wait_for_timeout(250)
         self._raise_if_blocked(page)
         body_selector = plan.detail.body_selector
         if not body_selector:
             return None
         body = page.locator(body_selector)
+        if hasattr(body, "all_inner_texts"):
+            try:
+                texts = [str(text).strip() for text in body.all_inner_texts()]
+                merged = "\n".join(text for text in texts if text)
+                if merged:
+                    return merged
+            except Exception:
+                pass
         if hasattr(body, "inner_text"):
             return str(body.inner_text()).strip() or None
         return None
@@ -264,7 +322,16 @@ class InovanceCrawlDriver:
 
     @staticmethod
     def _raise_if_blocked(page: Any) -> None:
-        content = str(page.content()).lower() if hasattr(page, "content") else ""
+        # A public careers page legitimately has a login/register navigation
+        # link. Treat only visible, explicit wall text as a block; bundled HTML
+        # and ordinary navigation labels are not proof of an anti-bot wall.
+        content = ""
+        try:
+            body = page.locator("body") if hasattr(page, "locator") else None
+            if body is not None and hasattr(body, "inner_text"):
+                content = str(body.inner_text() or "").lower()
+        except Exception:
+            content = ""
         if any(marker.lower() in content for marker in _BLOCKED_MARKERS):
             raise InovanceBlockedError("Inovance presented a login/captcha/anti-bot wall")
 
