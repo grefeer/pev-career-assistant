@@ -187,6 +187,7 @@ def test_coverage_gate_uses_structured_tool_invocation(tmp_path: Path, monkeypat
     monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
     monkeypatch.setattr(runner, "run_skill_script", FakeTool())
     monkeypatch.setattr(runner, "_last_browse_metadata", {"terminal_evidence": "finite_page_range_exhausted"})
+    monkeypatch.setattr(runner, "_COVERAGE_GATE_RESULT_FILE", skill_dir / "output" / "evidence" / "coverage_gate_result.json")
 
     verdict = runner._coverage_for_run(
         candidates=[{"title": "算法", "apply_url": "https://jobs.example/a", "responsibilities": "开发"}],
@@ -213,6 +214,7 @@ def test_coverage_tool_exception_is_recorded_not_raised(tmp_path: Path, monkeypa
     monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
     monkeypatch.setattr(runner, "run_skill_script", BrokenTool())
     monkeypatch.setattr(runner, "_last_browse_metadata", {"terminal_evidence": "next_control_absent"})
+    monkeypatch.setattr(runner, "_COVERAGE_GATE_RESULT_FILE", skill_dir / "output" / "evidence" / "coverage_gate_result.json")
 
     verdict = runner._coverage_for_run(candidates=[], content="", expected_count=None)
 

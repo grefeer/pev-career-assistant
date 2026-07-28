@@ -220,8 +220,14 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         # A cache hit may omit terminal/pagination fields. Retain the richer
         # first observed browse result instead of allowing a later cache hit to
         # erase a valid completion proof.
+        current_pages = int((_last_browse_metadata or {}).get("page_count", 0) or 0)
+        new_pages = int((metadata or {}).get("page_count", 0) or 0)
+        current_terminal = bool((_last_browse_metadata or {}).get("terminal_evidence"))
+        new_terminal = bool((metadata or {}).get("terminal_evidence"))
         if metadata is not None and (
-            _last_browse_metadata is None or metadata.get("terminal_evidence")
+            _last_browse_metadata is None
+            or new_pages > current_pages
+            or (new_terminal and not current_terminal)
         ):
             _last_browse_metadata = metadata
             _persist_browse_metadata(metadata)
