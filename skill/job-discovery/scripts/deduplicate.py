@@ -351,7 +351,17 @@ def _cluster_by_title_substring(members: list[dict[str, Any]]) -> list[list[dict
         t = _normalize_title(m.get("title"))
         placed = False
         for c in clusters:
-            if any(t and ct and (t == ct or t in ct or ct in t) for ct in c[0]):
+            # A shared JD template is common in campus recruiting.  It is only
+            # safe to merge title variants when their concrete apply routes do
+            # not contradict each other; otherwise distinct openings with the
+            # same template disappear during deduplication.
+            cluster_urls = {
+                str(item.get("apply_url") or "").strip()
+                for item in c[1] if str(item.get("apply_url") or "").strip()
+            }
+            candidate_url = str(m.get("apply_url") or "").strip()
+            routes_compatible = not cluster_urls or not candidate_url or candidate_url in cluster_urls
+            if routes_compatible and any(t and ct and (t == ct or t in ct or ct in t) for ct in c[0]):
                 c[0].add(t)
                 c[1].append(m)
                 placed = True
