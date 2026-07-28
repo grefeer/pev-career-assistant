@@ -492,7 +492,12 @@ failure modes):
   `run_skill_script(script="deduplicate", cli_args="output/candidates/*.json --out output/candidates_merged.json")`
 - Then call `coverage_gate` on the merged candidates and every `page_files`
   path. Supply a positive terminal marker only when browse explicitly observed
-  one. Never claim coverage-verified in the final JSON without a passing gate.
+  one. Call the gate exactly ONCE. It is a terminal decision, not a new
+  planning loop: if it rejects, preserve the artifacts and immediately emit
+  `{"status":"needs_manual_review","coverage_verified":false,"reasons":[...]}`.
+  Do NOT browse, redispatch extraction tasks, or call coverage_gate again after
+  its verdict. Never claim coverage-verified in the final JSON without a
+  passing gate.
 - If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
   `--mode search-interact`; if still empty, emit
   `{"status":"blocked","reason":"page did not render job content"}` and stop.

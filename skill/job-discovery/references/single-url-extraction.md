@@ -146,7 +146,9 @@ run_skill_script(script="coverage_gate",
 If the gate rejects the output, preserve the candidates but report
 `"status":"needs_manual_review"` with its reasons; do not call the run
 complete. A missing terminal marker is therefore an explicit quality failure,
-not permission to guess that pagination ended.
+not permission to guess that pagination ended. Call the gate only once: its
+verdict is terminal for this run. Do not browse or re-dispatch extraction after
+it, because that creates an unbounded cost loop without new evidence.
 
 Your final message must be ONLY a small JSON summary, e.g.:
 ```

@@ -174,6 +174,13 @@ def test_planner_requires_exact_per_page_count_when_browse_proves_page_size() ->
     assert "Do not cap page tasks with a fixed total-tool budget" in runner._SKILL_SYSTEM_PROMPT
 
 
+def test_planner_treats_coverage_rejection_as_terminal_not_a_cost_loop() -> None:
+    runner = _load_runner()
+
+    assert "Call the gate exactly ONCE" in runner._SKILL_SYSTEM_PROMPT
+    assert "It is a terminal decision, not a new\n  planning loop" in runner._SKILL_SYSTEM_PROMPT
+
+
 
 
 def test_slug_filter_reuses_cache_unless_force_fresh_is_explicit() -> None:
