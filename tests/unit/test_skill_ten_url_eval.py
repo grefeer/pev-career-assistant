@@ -88,6 +88,27 @@ def test_browse_metadata_reads_the_deterministic_tool_result_before_page_text() 
     assert metadata == {"status": "ok", "terminal_evidence": "finite_page_range_exhausted"}
 
 
+def test_coverage_rejects_model_terminal_claim_without_browse_metadata(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_runner()
+    skill_dir = tmp_path / "job-discovery"
+    page_dir = skill_dir / "output" / "evidence" / "pages"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page_01.txt").write_text("岗位列表", encoding="utf-8")
+    (skill_dir / "output" / "candidates_merged.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(runner, "_BROWSE_METADATA_FILE", skill_dir / "output" / "evidence" / "browse_metadata.json")
+    monkeypatch.setattr(runner, "_last_browse_metadata", None)
+
+    verdict = runner._coverage_for_run(
+        candidates=[],
+        content='{"terminal_evidence":"invented_by_model"}',
+        expected_count=None,
+    )
+
+    assert verdict["coverage_verified"] is False
+    assert verdict["reasons"] == ["missing_observed_terminal_evidence"]
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"
@@ -150,6 +171,7 @@ def test_coverage_tool_exception_is_recorded_not_raised(tmp_path: Path, monkeypa
 
     monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
     monkeypatch.setattr(runner, "run_skill_script", BrokenTool())
+    monkeypatch.setattr(runner, "_last_browse_metadata", {"terminal_evidence": "next_control_absent"})
 
     verdict = runner._coverage_for_run(candidates=[], content="", expected_count=None)
 

@@ -285,6 +285,13 @@ def main() -> int:
                 redirected_to = str(out_p.relative_to(_SKILL_ROOT)).replace("\\", "/")
             except ValueError:
                 redirected_to = str(out_p)
+        else:
+            print(json.dumps({
+                "status": "error",
+                "reason": "refused: --out must be output/candidates/page_NN.json",
+                "out": str(out_p.relative_to(_SKILL_ROOT)),
+            }, ensure_ascii=False))
+            return 0
 
     raw = sys.stdin.read()
     data = _lenient_extract_json(raw)

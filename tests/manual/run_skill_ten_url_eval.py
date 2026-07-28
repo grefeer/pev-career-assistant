@@ -127,6 +127,7 @@ _MAX_PAGE_TEXT_CHARS = 60_000
 # intentionally separate from the model's final prose/JSON: coverage must be
 # based on an observed browser terminal signal, not a hallucinated restatement.
 _last_browse_metadata: dict[str, Any] | None = None
+_BROWSE_METADATA_FILE = SKILL_DIR / "output" / "evidence" / "browse_metadata.json"
 
 
 @tool
@@ -198,6 +199,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
     # second tool round-trip per page.
     if script == "browse":
         _last_browse_metadata = _browse_metadata_from_output(out)
+        _persist_browse_metadata(_last_browse_metadata)
         text = _read_browse_text(out)
         if text:
             out += "\n[PAGE_TEXT]\n" + text[:_MAX_PAGE_TEXT_CHARS]
@@ -236,6 +238,32 @@ def _browse_metadata_from_output(output: str) -> dict[str, Any] | None:
         if isinstance(value, dict) and "status" in value:
             last = value
     return last
+
+
+def _persist_browse_metadata(metadata: dict[str, Any] | None) -> None:
+    """Persist the actual browse result for the outer quality gate.
+
+    DeepAgent tool execution can cross an async/sub-agent boundary, so a module
+    global alone is not an audit boundary.  This tiny run-scoped file is written
+    only by the allowlisted browse wrapper and read after the agent returns.
+    """
+    if metadata is None:
+        return
+    try:
+        _BROWSE_METADATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _BROWSE_METADATA_FILE.write_text(
+            json.dumps(metadata, ensure_ascii=False), encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _load_browse_metadata() -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(_BROWSE_METADATA_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _read_browse_text(browse_stdout: str) -> str:
@@ -360,11 +388,8 @@ def _coverage_for_run(
     page_dir = SKILL_DIR / "output" / "evidence" / "pages"
     page_files = sorted(str(path.relative_to(SKILL_DIR)) for path in page_dir.glob("*.txt")) \
         if page_dir.exists() else []
-    observed_terminal = (
-        str((_last_browse_metadata or {}).get("terminal_evidence") or "").strip()
-        or None
-    )
-    terminal_evidence = observed_terminal or _terminal_evidence_from_content(content)
+    metadata = _last_browse_metadata or _load_browse_metadata()
+    terminal_evidence = str((metadata or {}).get("terminal_evidence") or "").strip() or None
     arguments = ["output/candidates_merged.json"]
     # The model may have returned final-message candidates without persisting a
     # merged file.  In that case the gate cannot certify the run, rather than
@@ -392,6 +417,19 @@ def _coverage_for_run(
             "expected_count": expected_count,
             "terminal_evidence": terminal_evidence,
             "reasons": ["no_page_evidence"],
+        }
+    if not terminal_evidence:
+        return {
+            "coverage_verified": False,
+            "page_count": len(page_files),
+            "candidate_count": len(candidates),
+            "body_candidate_count": sum(bool((candidate.get("responsibilities") or "").strip()
+                                               or (candidate.get("requirements") or "").strip())
+                                        for candidate in candidates),
+            "unique_listing_count": _unique_count(candidates),
+            "expected_count": expected_count,
+            "terminal_evidence": None,
+            "reasons": ["missing_observed_terminal_evidence"],
         }
     arguments.extend(["--pages", *page_files])
     if terminal_evidence:
@@ -1052,6 +1090,7 @@ def _clean_persisted() -> None:
         if target.exists():
             shutil.rmtree(target, ignore_errors=True)
     (SKILL_DIR / "output" / "candidates_merged.json").unlink(missing_ok=True)
+    _BROWSE_METADATA_FILE.unlink(missing_ok=True)
 
 
 def _load_persisted_candidates() -> list[dict[str, Any]]:
@@ -1222,7 +1261,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "duplicate_count": raw_count - unique,
         "coverage": coverage,
         "coverage_verified": bool(coverage.get("coverage_verified")),
-        "browse_metadata": _last_browse_metadata,
+        "browse_metadata": _last_browse_metadata or _load_browse_metadata(),
         "block_reason": "login/captcha/anti-bot" if blocked else None,
         "note": note or None,
         "evaluation_mode": "fresh_live",
