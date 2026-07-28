@@ -68,3 +68,10 @@ def test_parallel_fetch_source_prioritizes_generic_detail_evidence_for_card_spas
     assert "detail_result = browse_interact_mode" in fallback
     assert "if detail_result.get(\"jd_detail_evidence\")" in fallback
     assert "interact_fallback_no_detect" in fallback
+
+
+def test_only_plain_list_mode_may_use_the_url_cache() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    assert 'if args.mode != "list":\n        cache_mode = "off"' in source
+    assert 'if ch and args.mode == "list":' in source

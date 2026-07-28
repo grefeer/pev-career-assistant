@@ -2307,12 +2307,12 @@ def main() -> None:
     # Resolve cache mode: --ignore-cache flag overrides to "off"
     cache_mode = "off" if args.ignore_cache else args.cache_mode
 
-    # click mode content depends on the click target + count, not just the URL,
-    # so the URL-keyed cache must be bypassed for both reads and writes (a cached
-    # list-mode result for the same URL would be wrong, and writing back would
-    # corrupt the list-mode entry). parallel-fetch is likewise param-dependent
-    # (concurrency / max-pages / search terms) and self-contained.
-    if args.mode in ("click", "parallel-fetch"):
+    # A URL-keyed cache is valid only for plain ``list`` rendering.  Every
+    # other mode changes what evidence is collected (card details, search
+    # filtering, a named detail page, click count, or parallel pagination).
+    # Reusing a list result for ``search-interact`` is particularly dangerous:
+    # it makes the caller believe it saw JD bodies while it only saw titles.
+    if args.mode != "list":
         cache_mode = "off"
 
     # ---- Cache check (before browser launch) ----
@@ -2431,10 +2431,11 @@ def main() -> None:
             else:
                 result = browse_list_mode(page, url, out_dir, args.max_pages, args.wait)
 
-            # Persist cache entry (skip for click mode - content is param-dependent,
-            # not URL-keyed; writing would corrupt the list-mode entry for this URL).
+            # Persist only plain list-mode entries.  Non-list modes are
+            # parameter- and evidence-type-dependent, so writing them under a
+            # URL-only key would poison later list/detail reads.
             ch = result.get("content_hash")
-            if ch and args.mode != "click":
+            if ch and args.mode == "list":
                 _save_cache(out_dir, url, ch)
 
             browser.close()

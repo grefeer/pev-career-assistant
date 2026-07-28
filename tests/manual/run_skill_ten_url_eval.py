@@ -220,15 +220,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         # A cache hit may omit terminal/pagination fields. Retain the richer
         # first observed browse result instead of allowing a later cache hit to
         # erase a valid completion proof.
-        current_pages = int((_last_browse_metadata or {}).get("page_count", 0) or 0)
-        new_pages = int((metadata or {}).get("page_count", 0) or 0)
-        current_terminal = bool((_last_browse_metadata or {}).get("terminal_evidence"))
-        new_terminal = bool((metadata or {}).get("terminal_evidence"))
-        if metadata is not None and (
-            _last_browse_metadata is None
-            or new_pages > current_pages
-            or (new_terminal and not current_terminal)
-        ):
+        if metadata is not None and _browse_metadata_quality(metadata) > _browse_metadata_quality(_last_browse_metadata):
             _last_browse_metadata = metadata
             _persist_browse_metadata(metadata)
     if script == "coverage_gate":
@@ -290,6 +282,23 @@ def _persist_browse_metadata(metadata: dict[str, Any] | None) -> None:
         )
     except OSError:
         pass
+
+
+def _browse_metadata_quality(metadata: dict[str, Any] | None) -> tuple[int, int, int, int, int]:
+    """Rank real browse results without trusting an LLM's final summary.
+
+    Detail-page evidence is stronger than a list shell even when both report a
+    terminal marker.  The remaining components make the replacement stable for
+    ordinary paginated results.
+    """
+    raw = metadata or {}
+    return (
+        int(bool(raw.get("jd_detail_evidence"))),
+        int(bool(raw.get("terminal_evidence"))),
+        int(raw.get("page_count") or 0),
+        int(raw.get("listing_count") is not None),
+        int(raw.get("text_length") or 0),
+    )
 
 
 def _load_browse_metadata() -> dict[str, Any] | None:
@@ -525,12 +534,18 @@ def _coverage_for_run(
     if prior_gate is not None:
         verdict = dict(prior_gate)
         reasons = list(verdict.get("reasons") or [])
+        if str(verdict.get("terminal_evidence") or "") != terminal_evidence:
+            reasons.append("coverage_artifact_terminal_evidence_mismatch")
+        if int(verdict.get("page_count", -1)) != len(page_files):
+            reasons.append("coverage_artifact_page_count_mismatch")
         if expected_count is not None and len(candidates) != expected_count:
             reasons.append("expected_count_mismatch")
         if int(verdict.get("candidate_count", -1)) != len(candidates):
             reasons.append("coverage_artifact_candidate_count_mismatch")
         verdict["expected_count"] = expected_count
         verdict["candidate_count"] = len(candidates)
+        verdict["page_count"] = len(page_files)
+        verdict["terminal_evidence"] = terminal_evidence
         verdict["coverage_verified"] = not reasons
         verdict["reasons"] = list(dict.fromkeys(reasons))
         return verdict

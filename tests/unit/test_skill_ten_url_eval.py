@@ -88,6 +88,14 @@ def test_browse_metadata_reads_the_deterministic_tool_result_before_page_text() 
     assert metadata == {"status": "ok", "terminal_evidence": "finite_page_range_exhausted"}
 
 
+def test_richer_detail_browse_metadata_replaces_a_list_shell() -> None:
+    runner = _load_runner()
+
+    shell = {"page_count": 3, "terminal_evidence": "next_control_absent", "text_length": 4000}
+    details = {"page_count": 1, "jd_detail_evidence": True, "terminal_evidence": "detail_links_exhausted", "text_length": 19000}
+    assert runner._browse_metadata_quality(details) > runner._browse_metadata_quality(shell)
+
+
 def test_coverage_rejects_model_terminal_claim_without_browse_metadata(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"
@@ -139,7 +147,7 @@ def test_outer_coverage_reuses_the_agent_one_shot_gate_result(tmp_path: Path, mo
     (page_dir / "page_01.txt").write_text("岗位列表", encoding="utf-8")
     (skill_dir / "output" / "candidates_merged.json").write_text("[]", encoding="utf-8")
     gate_file = skill_dir / "output" / "evidence" / "coverage_gate_result.json"
-    gate_file.write_text('{"coverage_verified":true,"candidate_count":0,"reasons":[]}', encoding="utf-8")
+    gate_file.write_text('{"coverage_verified":true,"candidate_count":0,"page_count":1,"terminal_evidence":"next_control_absent","reasons":[]}', encoding="utf-8")
     monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
     monkeypatch.setattr(runner, "_BROWSE_METADATA_FILE", skill_dir / "output" / "evidence" / "browse_metadata.json")
     monkeypatch.setattr(runner, "_COVERAGE_GATE_RESULT_FILE", gate_file)
@@ -148,6 +156,29 @@ def test_outer_coverage_reuses_the_agent_one_shot_gate_result(tmp_path: Path, mo
     verdict = runner._coverage_for_run(candidates=[], content="", expected_count=None)
 
     assert verdict["coverage_verified"] is True
+
+
+def test_outer_coverage_rejects_agent_gate_with_unobserved_terminal_marker(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_runner()
+    skill_dir = tmp_path / "job-discovery"
+    page_dir = skill_dir / "output" / "evidence" / "pages"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page_01.txt").write_text("岗位列表", encoding="utf-8")
+    (skill_dir / "output" / "candidates_merged.json").write_text("[]", encoding="utf-8")
+    gate_file = skill_dir / "output" / "evidence" / "coverage_gate_result.json"
+    gate_file.write_text(
+        '{"coverage_verified":true,"candidate_count":0,"page_count":1,"terminal_evidence":"invented","reasons":[]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(runner, "_BROWSE_METADATA_FILE", skill_dir / "output" / "evidence" / "browse_metadata.json")
+    monkeypatch.setattr(runner, "_COVERAGE_GATE_RESULT_FILE", gate_file)
+    monkeypatch.setattr(runner, "_last_browse_metadata", {"terminal_evidence": "next_control_absent"})
+
+    verdict = runner._coverage_for_run(candidates=[], content="", expected_count=None)
+
+    assert verdict["coverage_verified"] is False
+    assert verdict["reasons"] == ["coverage_artifact_terminal_evidence_mismatch"]
 
 
 def test_observed_listing_count_takes_precedence_over_a_stale_reference(monkeypatch) -> None:
