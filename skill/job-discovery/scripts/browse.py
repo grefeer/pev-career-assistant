@@ -594,6 +594,7 @@ def browse_click_mode(
         "listing_count": (
             int(value) if (value := _scan_body_count(all_texts[-1])) is not None else None
         ),
+        "jd_detail_evidence": _has_jd_detail_evidence(full_text),
     }
 
 
@@ -698,6 +699,15 @@ def _scan_body_count(body: str | None) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+def _has_jd_detail_evidence(text: str | None) -> bool:
+    """Whether rendered text contains an actual role-detail section."""
+    normalized = (text or "").casefold()
+    return any(marker in normalized for marker in (
+        "职位描述", "岗位职责", "任职要求", "工作职责", "岗位要求",
+        "job description", "responsibilities", "qualifications",
+    ))
 
 
 def _detect_pagination(page: Any, retries: int) -> dict[str, Any] | None:
@@ -2081,9 +2091,15 @@ def browse_interact_mode(
             page.wait_for_timeout(wait_ms)
             _scroll_to_load(page, wait_ms)
             list_text = _extract_body_text(page)
-            second_text, second_clicked, second_found, second_failed = _interact_on_cards(
-                page, list_url, list_url, out_dir, max_cards, wait_ms, label_prefix="DETAIL"
-            )
+            detail_urls = _detail_urls_from_current_page(page, list_url, max_cards)
+            if detail_urls:
+                second_text, second_clicked, second_found, second_failed = _fetch_detail_urls(
+                    page, detail_urls, wait_ms, label_prefix="DETAIL"
+                )
+            else:
+                second_text, second_clicked, second_found, second_failed = _interact_on_cards(
+                    page, list_url, list_url, out_dir, max_cards, wait_ms, label_prefix="DETAIL"
+                )
             interact_text = second_text
             clicked += second_clicked
             found += second_found
@@ -2110,6 +2126,10 @@ def browse_interact_mode(
         }
 
     full_text = f"=== LIST PAGE ===\n{list_text}\n{interact_text}"
+    page_files = _save_page_files([full_text], out_dir)
+    listing_count_raw = _scan_body_count(list_text)
+    listing_count = int(listing_count_raw) if listing_count_raw is not None else None
+    detail_complete = listing_count is not None and clicked >= listing_count
     short_hash, text_path, screenshot_path = _save_evidence(full_text, out_dir)
     _save_screenshot(page, screenshot_path)
 
@@ -2125,6 +2145,12 @@ def browse_interact_mode(
         "cards_found": found,
         "cards_failed": failed,
         "categories_expanded": cats_clicked,
+        "page_count": len(page_files),
+        "page_files": page_files,
+        "listing_count": listing_count,
+        "jd_detail_evidence": _has_jd_detail_evidence(interact_text),
+        "terminal_evidence": "detail_links_exhausted" if detail_complete else None,
+        "truncated_by_max_cards": found >= max_cards and not detail_complete,
     }
 
 
@@ -2140,6 +2166,55 @@ def _navigated_list_url(*, start_url: str, interact_text: str, cards_found: int)
         if candidate and candidate != start_url and "#/jobs/" in candidate:
             return candidate
     return None
+
+
+def _detail_urls_from_current_page(page: Any, list_url: str, max_cards: int) -> list[str]:
+    """Extract unique hash/detail links from a public career listing page."""
+    try:
+        hrefs = page.evaluate(
+            "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.getAttribute('href'))"
+        )
+    except Exception:
+        return []
+    base = list_url.split("#", 1)[0]
+    urls: list[str] = []
+    seen: set[str] = set()
+    for href in hrefs if isinstance(hrefs, list) else []:
+        value = str(href or "").strip()
+        if "#/job/" not in value:
+            continue
+        full_url = value if value.startswith(("http://", "https://")) else base + value
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        urls.append(full_url)
+        if len(urls) >= max_cards:
+            break
+    return urls
+
+
+def _fetch_detail_urls(
+    page: Any, urls: list[str], wait_ms: int, *, label_prefix: str,
+) -> tuple[str, int, int, int]:
+    """Boundedly visit deterministic public detail links and retain their text."""
+    sections: list[str] = []
+    failed = 0
+    for index, detail_url in enumerate(urls, start=1):
+        try:
+            page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(wait_ms)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+            text = _extract_detail_text(page)
+            if len(text.strip()) < 50:
+                failed += 1
+                continue
+            sections.append(f"=== {label_prefix} {index} ({detail_url}) ===\n{text}")
+        except Exception:
+            failed += 1
+    return "\n".join(sections), len(sections), len(urls), failed
 
 
 # ---------------------------------------------------------------------------

@@ -609,6 +609,13 @@ failure modes):
   dispatch one `jd_extractor` per page. Each task description must give the
   sub-agent its page file path AND its output path
   (`output/candidates/page_NN.json`) AND the company name.
+- If browse returns `jd_detail_evidence:false` while still showing a nonempty
+  listing, do NOT infer JD bodies from titles. Use the one remaining browse
+  allowance for `run_skill_script(script="browse", cli_args="<URL> --mode interact --max-cards 50 --out output/evidence")`.
+  The bounded interact tool follows one homepage-to-list transition and visits
+  public `#/job/...` detail links. Replace `page_files` with its returned page
+  file and continue only when it reports `jd_detail_evidence:true`; otherwise
+  emit `needs_manual_review`.
 - Dispatch ALL page tasks in ONE assistant message (multiple `task` tool calls)
   so they run in parallel. One task per page file.
 - The `jd_extractor` reads its own page file via `read_evidence` - do NOT pass
@@ -710,9 +717,13 @@ SCHEMA ( condensed - produce one JSON object per distinct job on the page ):
   "locations": ["<city>"],
   "recruitment_types": ["校园招聘"],
   "apply_url": "<optional, if on the page>",
-  "evidence_refs": [{"content_hash": "", "evidence_type": "browsed_list_page_text"}]
+  "evidence_refs": [{"content_hash": "", "evidence_type": "browsed_detail_page"}]
 }
 - Default recruitment_types to ["校园招聘"] (campus) unless the page says 社招 / 实习.
+- When the input contains `=== DETAIL N ===` sections, use
+  `browsed_detail_page`. Use `browsed_list_page_text` only for fields that are
+  actually present on a listing page. Never construct JD text from a title-only
+  listing row.
 - For full field details you MAY `read_file("/job-discovery/references/schema.md")`
   on demand, but the condensed schema above is enough for most pages - skip the
   read to save a round-trip when the fields are clear.

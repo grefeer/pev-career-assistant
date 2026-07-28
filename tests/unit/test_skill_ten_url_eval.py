@@ -157,6 +157,13 @@ def test_observed_listing_count_takes_precedence_over_a_stale_reference(monkeypa
     assert runner._observed_listing_count() == 20
 
 
+def test_planner_uses_interact_for_a_listing_without_jd_detail_evidence() -> None:
+    runner = _load_runner()
+
+    assert "jd_detail_evidence:false" in runner._SKILL_SYSTEM_PROMPT
+    assert "--mode interact --max-cards 50" in runner._SKILL_SYSTEM_PROMPT
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"
@@ -244,6 +251,14 @@ def test_planner_requires_exact_per_page_count_when_browse_proves_page_size() ->
     assert "exact per-page cardinality" in runner._SKILL_SYSTEM_PROMPT
     assert "written == size_val" in runner._SKILL_SYSTEM_PROMPT
     assert "Do not cap page tasks with a fixed total-tool budget" in runner._SKILL_SYSTEM_PROMPT
+
+
+def test_jd_extractor_distinguishes_detail_evidence_from_listing_evidence() -> None:
+    runner = _load_runner()
+
+    assert "`=== DETAIL N ===`" in runner._JD_EXTRACTOR_PROMPT
+    assert "`browsed_detail_page`" in runner._JD_EXTRACTOR_PROMPT
+    assert "Never construct JD text from a title-only" in runner._JD_EXTRACTOR_PROMPT
 
 
 def test_planner_treats_coverage_rejection_as_terminal_not_a_cost_loop() -> None:
