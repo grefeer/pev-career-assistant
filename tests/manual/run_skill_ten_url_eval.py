@@ -129,8 +129,10 @@ _MAX_PAGE_TEXT_CHARS = 60_000
 _last_browse_metadata: dict[str, Any] | None = None
 _BROWSE_METADATA_FILE = SKILL_DIR / "output" / "evidence" / "browse_metadata.json"
 _TOOL_TRACE_FILE = SKILL_DIR / "output" / "evidence" / "tool_trace.jsonl"
+_COVERAGE_GATE_RESULT_FILE = SKILL_DIR / "output" / "evidence" / "coverage_gate_result.json"
 _run_started_at: float | None = None
 _coverage_gate_calls = 0
+_browse_calls = 0
 
 
 @tool
@@ -157,8 +159,14 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         under a ``[PAGE_TEXT]`` marker so the caller can extract JDs directly
         without resolving evidence file paths.
     """
-    global _last_browse_metadata, _coverage_gate_calls
+    global _last_browse_metadata, _coverage_gate_calls, _browse_calls
     started_at = time.monotonic()
+    if script == "browse":
+        if _browse_calls >= 2:
+            out = "ERROR: browse may run at most twice per discovery run"
+            _append_tool_trace(script=script, started_at=started_at, output=out)
+            return out
+        _browse_calls += 1
     if script == "coverage_gate":
         if _coverage_gate_calls >= 1:
             out = "ERROR: coverage_gate may run only once per discovery run"
@@ -217,6 +225,8 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         ):
             _last_browse_metadata = metadata
             _persist_browse_metadata(metadata)
+    if script == "coverage_gate":
+        _persist_coverage_gate_result(out)
         text = _read_browse_text(out)
         if text:
             out += "\n[PAGE_TEXT]\n" + text[:_MAX_PAGE_TEXT_CHARS]
@@ -279,6 +289,28 @@ def _persist_browse_metadata(metadata: dict[str, Any] | None) -> None:
 def _load_browse_metadata() -> dict[str, Any] | None:
     try:
         parsed = json.loads(_BROWSE_METADATA_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _persist_coverage_gate_result(output: str) -> None:
+    """Save the one allowed agent gate result for the outer evaluator to reuse."""
+    try:
+        parsed = json.loads(output.strip().splitlines()[0])
+        if not isinstance(parsed, dict):
+            return
+        _COVERAGE_GATE_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _COVERAGE_GATE_RESULT_FILE.write_text(
+            json.dumps(parsed, ensure_ascii=False), encoding="utf-8",
+        )
+    except (IndexError, json.JSONDecodeError, OSError):
+        pass
+
+
+def _load_coverage_gate_result() -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(_COVERAGE_GATE_RESULT_FILE.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -473,6 +505,19 @@ def _coverage_for_run(
             "terminal_evidence": None,
             "reasons": ["missing_observed_terminal_evidence"],
         }
+    prior_gate = _load_coverage_gate_result()
+    if prior_gate is not None:
+        verdict = dict(prior_gate)
+        reasons = list(verdict.get("reasons") or [])
+        if expected_count is not None and len(candidates) != expected_count:
+            reasons.append("expected_count_mismatch")
+        if int(verdict.get("candidate_count", -1)) != len(candidates):
+            reasons.append("coverage_artifact_candidate_count_mismatch")
+        verdict["expected_count"] = expected_count
+        verdict["candidate_count"] = len(candidates)
+        verdict["coverage_verified"] = not reasons
+        verdict["reasons"] = list(dict.fromkeys(reasons))
+        return verdict
     arguments.extend(["--pages", *page_files])
     if terminal_evidence:
         arguments.extend(["--terminal-evidence", terminal_evidence])
@@ -1134,6 +1179,7 @@ def _clean_persisted() -> None:
     (SKILL_DIR / "output" / "candidates_merged.json").unlink(missing_ok=True)
     _BROWSE_METADATA_FILE.unlink(missing_ok=True)
     _TOOL_TRACE_FILE.unlink(missing_ok=True)
+    _COVERAGE_GATE_RESULT_FILE.unlink(missing_ok=True)
 
 
 def _load_persisted_candidates() -> list[dict[str, Any]]:
@@ -1245,7 +1291,7 @@ def _normalize_replayed_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
-    global _last_browse_metadata, _run_started_at, _coverage_gate_calls
+    global _last_browse_metadata, _run_started_at, _coverage_gate_calls, _browse_calls
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
           flush=True)
     # Fresh per-URL persisted state so prior candidates/pages don't leak in.
@@ -1263,6 +1309,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     _run_started_at = t0
     _last_browse_metadata = None
     _coverage_gate_calls = 0
+    _browse_calls = 0
     content, note = _invoke_agent(agent, prompt)
     if note and note != "recursion_limit":
         print(f"  !! INVOKE ERROR: {note}", flush=True)

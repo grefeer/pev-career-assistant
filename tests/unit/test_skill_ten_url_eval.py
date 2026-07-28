@@ -131,6 +131,25 @@ def test_unique_count_keeps_distinct_titles_with_a_shared_listing_url() -> None:
     ]) == 2
 
 
+def test_outer_coverage_reuses_the_agent_one_shot_gate_result(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_runner()
+    skill_dir = tmp_path / "job-discovery"
+    page_dir = skill_dir / "output" / "evidence" / "pages"
+    page_dir.mkdir(parents=True)
+    (page_dir / "page_01.txt").write_text("岗位列表", encoding="utf-8")
+    (skill_dir / "output" / "candidates_merged.json").write_text("[]", encoding="utf-8")
+    gate_file = skill_dir / "output" / "evidence" / "coverage_gate_result.json"
+    gate_file.write_text('{"coverage_verified":true,"candidate_count":0,"reasons":[]}', encoding="utf-8")
+    monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
+    monkeypatch.setattr(runner, "_BROWSE_METADATA_FILE", skill_dir / "output" / "evidence" / "browse_metadata.json")
+    monkeypatch.setattr(runner, "_COVERAGE_GATE_RESULT_FILE", gate_file)
+    monkeypatch.setattr(runner, "_last_browse_metadata", {"terminal_evidence": "next_control_absent"})
+
+    verdict = runner._coverage_for_run(candidates=[], content="", expected_count=None)
+
+    assert verdict["coverage_verified"] is True
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"
