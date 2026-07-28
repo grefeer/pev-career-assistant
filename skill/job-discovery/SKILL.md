@@ -45,6 +45,11 @@ Use `scripts/adapter_supervisor.py` as the outer Supervisor when a backend
 - Adapter failure at any point: run the normal Skill workflow with the complete
   trajectory context; never return a partial adapter result as success.
 
+Before reporting a complete run, call `scripts/coverage_gate.py` on the merged
+candidates and page files. Only call a run coverage-verified when it has page
+evidence, a positive terminal signal, a body for every candidate, no duplicate
+`(title, apply_url)` identity, and (when public total is known) an exact count.
+
 The fallback still uses `parallel-fetch` first, makes only one
 `search-interact` retry for a thin SPA, fans out one extraction sub-agent per
 page file, then runs deterministic validation and deduplication.  Treat a
