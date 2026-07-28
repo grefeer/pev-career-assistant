@@ -192,7 +192,7 @@ def test_planner_uses_interact_for_a_listing_without_jd_detail_evidence() -> Non
     runner = _load_runner()
 
     assert "jd_detail_evidence:false" in runner._SKILL_SYSTEM_PROMPT
-    assert "--mode interact --max-cards 50" in runner._SKILL_SYSTEM_PROMPT
+    assert "--mode interact --max-cards 50 --wait 800" in runner._SKILL_SYSTEM_PROMPT
 
 
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:

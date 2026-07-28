@@ -54,6 +54,97 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 
+_PUBLIC_JOB_TITLE_KEYS = ("title", "name", "positionName", "jobTitle")
+_PUBLIC_JOB_BODY_KEYS = (
+    "jobDuty", "jobDescription", "description", "responsibilities",
+    "requirements", "requirement", "content", "duty",
+)
+_PUBLIC_JOB_TOTAL_KEYS = ("total", "totalCount", "totalElements", "count")
+
+
+class PublicJobEvidenceCollector:
+    """Capture only job-shaped records from JSON the public page already loads.
+
+    The collector never creates requests or guesses endpoints.  It observes
+    Playwright responses for the current public page, retains only records with
+    both a title and substantial JD text, and serializes a compact evidence
+    projection.  This makes API-backed career pages fast without becoming a
+    site adapter.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+        self.expected_count: int | None = None
+        self._seen: set[str] = set()
+
+    def attach(self, page: Any) -> None:
+        page.on("response", self._on_response)
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "json" not in content_type:
+                return
+            self.feed_payload(response.json())
+        except Exception:
+            return
+
+    def feed_payload(self, payload: Any) -> None:
+        for mapping in _walk_json_mappings(payload):
+            for total_key in _PUBLIC_JOB_TOTAL_KEYS:
+                value = mapping.get(total_key)
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < number <= 10000:
+                    self.expected_count = max(self.expected_count or 0, number)
+            record = _public_job_record(mapping)
+            if record is None:
+                continue
+            identity = "|".join(str(record.get(key) or "") for key in ("id", "title", "location"))
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
+            self.records.append(record)
+
+    def evidence_text(self) -> str:
+        sections = ["=== PUBLIC JSON JOB EVIDENCE ==="]
+        for index, record in enumerate(self.records, start=1):
+            sections.append(
+                f"=== PUBLIC JOB {index} ===\n" + json.dumps(record, ensure_ascii=False)
+            )
+        return "\n".join(sections)
+
+
+def _walk_json_mappings(value: Any) -> list[dict[str, Any]]:
+    """Iteratively visit JSON mappings without retaining arbitrary payloads."""
+    found: list[dict[str, Any]] = []
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            found.append(current)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return found
+
+
+def _public_job_record(mapping: dict[str, Any]) -> dict[str, Any] | None:
+    title = next((str(mapping.get(key) or "").strip() for key in _PUBLIC_JOB_TITLE_KEYS if mapping.get(key)), "")
+    body = next((str(mapping.get(key) or "").strip() for key in _PUBLIC_JOB_BODY_KEYS if mapping.get(key)), "")
+    if not title or len(body) < 50:
+        return None
+    return {
+        "id": mapping.get("id") or mapping.get("code"),
+        "title": title,
+        "department": mapping.get("department") or mapping.get("jobName"),
+        "location": mapping.get("workLocationName") or mapping.get("workLocation") or mapping.get("location"),
+        "responsibilities": body,
+    }
+
+
 # ---------------------------------------------------------------------------
 # URL-level cache
 # ---------------------------------------------------------------------------
@@ -310,7 +401,9 @@ def _scroll_to_load(page: Any, wait_ms: int = 2000, rounds: int = 3) -> None:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(wait_ms)
         try:
-            page.wait_for_load_state("networkidle", timeout=5000)
+            page.wait_for_load_state(
+                "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
+            )
         except Exception:
             pass
 
@@ -1685,7 +1778,11 @@ def browse_search_interact_mode(
 
     # ── Phase 2: Click through filtered cards ──────────────────────────
     # Expand category sections (Moka: "X-STAR顶尖人才 共3个职位")
-    cats_clicked = _expand_categories(page, wait_ms)
+    cats_clicked = (
+        _expand_categories(page, wait_ms)
+        if _should_expand_categories(len(_find_clickable_cards(page, 1)))
+        else 0
+    )
 
     interact_text, clicked, found, failed = _interact_on_cards(
         page, search_url, search_url, out_dir, max_cards, wait_ms,
@@ -1818,6 +1915,11 @@ def _expand_categories(page: Any, wait_ms: int) -> int:
     return clicked
 
 
+def _should_expand_categories(initial_card_count: int) -> bool:
+    """Expand broad category selectors only when no job card is already usable."""
+    return initial_card_count == 0
+
+
 def _find_clickable_cards_js(page: Any, max_cards: int) -> list[dict[str, Any]]:
     """Use JavaScript to find clickable job-card elements. Returns list of {tag, text, selector}.
 
@@ -1936,6 +2038,9 @@ def _find_clickable_cards(page: Any, max_cards: int) -> list[Any]:
                         abs(key[2] - sb[2]) < 30 and abs(key[3] - sb[3]) < 30):
                     is_dup = True
                     break
+                if _boxes_substantially_overlap(box, sb):
+                    is_dup = True
+                    break
             if not is_dup:
                 seen_boxes.append(key)
                 unique.append(el)
@@ -1945,6 +2050,20 @@ def _find_clickable_cards(page: Any, max_cards: int) -> list[Any]:
             break
 
     return unique[:max_cards]
+
+
+def _boxes_substantially_overlap(
+    box: dict[str, float], rounded_other: tuple[float, float, float, float],
+) -> bool:
+    """Whether a child title link substantially overlaps an existing card box."""
+    ax1, ay1 = float(box["x"]), float(box["y"])
+    ax2, ay2 = ax1 + float(box["width"]), ay1 + float(box["height"])
+    bx1, by1, bx2, by2 = rounded_other
+    width = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    height = max(0.0, min(ay2, by2) - max(ay1, by1))
+    overlap = width * height
+    smaller_area = min((ax2 - ax1) * (ay2 - ay1), (bx2 - bx1) * (by2 - by1))
+    return smaller_area > 0 and overlap / smaller_area >= 0.8
 
 
 def _extract_detail_text(page: Any) -> str:
@@ -1979,6 +2098,18 @@ def _close_detail_panel(page: Any) -> None:
         page.wait_for_timeout(1000)
     except Exception:
         pass
+
+
+def _card_interaction_idle_timeout_ms(wait_ms: int) -> int:
+    """Bound the optional network-idle wait after a card action.
+
+    Career SPAs frequently keep analytics, polling, or SSE connections open;
+    waiting eight seconds for ``networkidle`` once per public card turns a
+    20-position list into a multi-minute crawl.  Visible-detail extraction
+    still has the caller's explicit render wait, while this optional settle
+    check is kept short and bounded.
+    """
+    return max(500, min(1500, wait_ms * 2))
 
 
 def _interact_on_cards(
@@ -2032,7 +2163,9 @@ def _interact_on_cards(
             card.click(timeout=3000)
             page.wait_for_timeout(min(wait_ms, 2000))
             try:
-                page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_load_state(
+                    "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
+                )
             except Exception:
                 pass
 
@@ -2043,12 +2176,8 @@ def _interact_on_cards(
                 detail_sections.append(
                     f"\n=== {label_prefix} {i + 1} ({page.url}) ===\n{detail_text}"
                 )
-                page.go_back(timeout=10000)
+                page.go_back(wait_until="domcontentloaded", timeout=2500)
                 page.wait_for_timeout(wait_ms)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except Exception:
-                    pass
                 current_url = page.url
                 clicked += 1
             elif len(post_text) > len(pre_text) + 50:
@@ -2077,7 +2206,8 @@ def _interact_on_cards(
 
 
 def browse_interact_mode(
-    page: Any, url: str, out_dir: Path, max_cards: int, wait_ms: int
+    page: Any, url: str, out_dir: Path, max_cards: int, wait_ms: int,
+    collector: PublicJobEvidenceCollector | None = None,
 ) -> dict[str, Any]:
     """Click through job cards on a list page, collecting detail text from each."""
 
@@ -2088,9 +2218,68 @@ def browse_interact_mode(
     page.wait_for_timeout(wait_ms)
 
     # Expand category sections (Moka pattern: "X-STAR顶尖人才 共3个职位")
-    cats_clicked = _expand_categories(page, wait_ms)
+    cats_clicked = (
+        _expand_categories(page, wait_ms)
+        if _should_expand_categories(len(_find_clickable_cards(page, 1)))
+        else 0
+    )
 
-    list_text = _extract_body_text(page)
+    list_pages = [_extract_body_text(page)]
+    list_text = list_pages[0]
+
+    # Some public career pages already receive structured JD bodies in their
+    # own JSON responses.  Complete visible pagination first and use that
+    # direct evidence instead of opening and returning from every card.
+    if collector is not None and collector.records and collector.expected_count:
+        advances = 0
+        while len(collector.records) < collector.expected_count and advances < 20:
+            next_btn = _find_next_page_button(page)
+            if next_btn is None:
+                break
+            before_text = _extract_body_text(page)
+            try:
+                next_btn.click(timeout=5000)
+                page.wait_for_timeout(wait_ms)
+                try:
+                    page.wait_for_load_state(
+                        "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                break
+            next_text = _extract_body_text(page)
+            if next_text == before_text:
+                break
+            list_pages.append(next_text)
+            advances += 1
+
+        if len(collector.records) >= collector.expected_count:
+            list_text = "\n\n--- PAGE BREAK ---\n\n".join(list_pages)
+            full_text = f"=== LIST PAGE ===\n{list_text}\n{collector.evidence_text()}"
+            page_files = _save_page_files([full_text], out_dir)
+            short_hash, text_path, screenshot_path = _save_evidence(full_text, out_dir)
+            _save_screenshot(page, screenshot_path)
+            return {
+                "status": "ok",
+                "url": url,
+                "title": page.title(),
+                "content_hash": short_hash,
+                "text_path": str(text_path),
+                "screenshot_path": str(screenshot_path),
+                "text_length": len(full_text),
+                "cards_clicked": 0,
+                "cards_found": 0,
+                "cards_failed": 0,
+                "categories_expanded": 0,
+                "page_count": len(page_files),
+                "page_files": page_files,
+                "listing_count": collector.expected_count,
+                "jd_detail_evidence": True,
+                "terminal_evidence": "public_json_pages_exhausted",
+                "truncated_by_max_cards": False,
+                "used_path": "public_json_evidence",
+            }
 
     interact_text, clicked, found, failed = _interact_on_cards(
         page, url, url, out_dir, max_cards, wait_ms, label_prefix="JOB"
@@ -2123,6 +2312,44 @@ def browse_interact_mode(
             failed += second_failed
         except Exception:
             pass
+    else:
+        # A conventional public listing can expose detail cards one page at a
+        # time.  Collect the current page first, then advance only while cards
+        # remain under the global cap.  This is deliberately page-agnostic: no
+        # URL template or site adapter is required.
+        while found < max_cards:
+            next_btn = _find_next_page_button(page)
+            if next_btn is None:
+                break
+            before_text = _extract_body_text(page)
+            try:
+                next_btn.click(timeout=5000)
+                page.wait_for_timeout(wait_ms)
+                try:
+                    page.wait_for_load_state(
+                        "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
+                    )
+                except Exception:
+                    pass
+                _scroll_to_load(page, wait_ms)
+            except Exception:
+                break
+            next_text = _extract_body_text(page)
+            if next_text == before_text:
+                break
+            list_pages.append(next_text)
+            next_detail_text, next_clicked, next_found, next_failed = _interact_on_cards(
+                page, page.url, page.url, out_dir, max_cards - found, wait_ms,
+                label_prefix="JOB",
+            )
+            interact_text += "\n" + next_detail_text
+            clicked += next_clicked
+            found += next_found
+            failed += next_failed
+            if next_found == 0:
+                break
+
+        list_text = "\n\n--- PAGE BREAK ---\n\n".join(list_pages)
 
     if found == 0:
         short_hash, text_path, screenshot_path = _save_evidence(list_text, out_dir)
@@ -2221,7 +2448,9 @@ def _fetch_detail_urls(
             page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(wait_ms)
             try:
-                page.wait_for_load_state("networkidle", timeout=8000)
+                page.wait_for_load_state(
+                    "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
+                )
             except Exception:
                 pass
             text = _extract_detail_text(page)
@@ -2380,6 +2609,8 @@ def main() -> None:
                 viewport={"width": 1920, "height": 1080},
             )
             page = context.new_page()
+            public_job_collector = PublicJobEvidenceCollector()
+            public_job_collector.attach(page)
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -2410,7 +2641,9 @@ def main() -> None:
             if args.mode == "detail":
                 result = browse_detail_mode(page, url, out_dir, args.wait)
             elif args.mode == "interact":
-                result = browse_interact_mode(page, url, out_dir, args.max_cards, args.wait)
+                result = browse_interact_mode(
+                    page, url, out_dir, args.max_cards, args.wait, public_job_collector,
+                )
             elif args.mode == "search":
                 result = browse_search_mode(
                     page, url, out_dir, args.max_pages, args.wait,

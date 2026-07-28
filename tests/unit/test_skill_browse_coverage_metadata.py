@@ -75,3 +75,67 @@ def test_only_plain_list_mode_may_use_the_url_cache() -> None:
 
     assert 'if args.mode != "list":\n        cache_mode = "off"' in source
     assert 'if ch and args.mode == "list":' in source
+
+
+def test_card_interaction_idle_wait_is_bounded_for_long_lived_spa_connections() -> None:
+    assert _BROWSE._card_interaction_idle_timeout_ms(800) == 1500
+    assert _BROWSE._card_interaction_idle_timeout_ms(3000) == 1500
+    assert _BROWSE._card_interaction_idle_timeout_ms(100) == 500
+
+
+def test_category_expansion_is_only_a_recovery_for_an_empty_listing() -> None:
+    assert _BROWSE._should_expand_categories(0) is True
+    assert _BROWSE._should_expand_categories(1) is False
+
+
+def test_overlapping_parent_card_and_title_link_are_deduplicated() -> None:
+    assert _BROWSE._boxes_substantially_overlap(
+        {"x": 10, "y": 10, "width": 120, "height": 24},
+        (0, 0, 160, 80),
+    ) is True
+    assert _BROWSE._boxes_substantially_overlap(
+        {"x": 200, "y": 10, "width": 20, "height": 20},
+        (0, 0, 160, 80),
+    ) is False
+
+
+def test_interact_source_advances_generic_paginated_listings() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    section = source[source.index("def browse_interact_mode"):source.index("def _navigated_list_url")]
+    assert "while found < max_cards:" in section
+    assert "next_btn = _find_next_page_button(page)" in section
+    assert 'label_prefix="JOB"' in section
+
+
+def test_detail_navigation_uses_bounded_domcontentloaded_return() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    assert 'page.go_back(wait_until="domcontentloaded", timeout=2500)' in source
+
+
+def test_scroll_loading_reuses_the_bounded_idle_wait() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+    section = source[source.index("def _scroll_to_load"):source.index("# ---------------------------------------------------------------------------\n# Text extraction")]
+
+    assert 'timeout=_card_interaction_idle_timeout_ms(wait_ms)' in section
+
+
+def test_public_json_collector_keeps_only_title_and_jd_shaped_records() -> None:
+    collector = _BROWSE.PublicJobEvidenceCollector()
+    collector.feed_payload({
+        "result": {
+            "total": "2",
+            "list": [
+                {"id": "a", "name": "算法工程师", "jobDuty": "负责" * 30, "workLocation": "上海"},
+                {"id": "b", "name": "只有标题"},
+            ],
+        },
+    })
+
+    assert collector.expected_count == 2
+    assert collector.records == [{
+        "id": "a", "title": "算法工程师", "department": None,
+        "location": "上海", "responsibilities": "负责" * 30,
+    }]
+    assert "=== PUBLIC JOB 1 ===" in collector.evidence_text()

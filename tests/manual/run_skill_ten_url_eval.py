@@ -627,7 +627,7 @@ failure modes):
   (`output/candidates/page_NN.json`) AND the company name.
 - If browse returns `jd_detail_evidence:false` while still showing a nonempty
   listing, do NOT infer JD bodies from titles. Use the one remaining browse
-  allowance for `run_skill_script(script="browse", cli_args="<URL> --mode interact --max-cards 50 --out output/evidence")`.
+  allowance for `run_skill_script(script="browse", cli_args="<URL> --mode interact --max-cards 50 --wait 800 --out output/evidence")`.
   The bounded interact tool follows one homepage-to-list transition and visits
   public `#/job/...` detail links. Replace `page_files` with its returned page
   file and continue only when it reports `jd_detail_evidence:true`; otherwise
