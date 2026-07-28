@@ -139,3 +139,11 @@ def test_public_json_collector_keeps_only_title_and_jd_shaped_records() -> None:
         "location": "上海", "responsibilities": "负责" * 30,
     }]
     assert "=== PUBLIC JOB 1 ===" in collector.evidence_text()
+
+
+def test_parallel_fetch_fallback_passes_public_json_collector_to_interact() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+    section = source[source.index("def browse_parallel_fetch_mode"):source.index("# ---- Compute page URLs")]
+
+    assert "public_job_collector.attach(page)" in section
+    assert "collector=public_job_collector" in section

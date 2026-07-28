@@ -1098,6 +1098,8 @@ def browse_parallel_fetch_mode(
             user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
         )
         page = context.new_page()
+        public_job_collector = PublicJobEvidenceCollector()
+        public_job_collector.attach(page)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(wait_ms)
@@ -1162,6 +1164,7 @@ def browse_parallel_fetch_mode(
                 # historic serial-pagination fallback below.
                 detail_result = browse_interact_mode(
                     page, url, out_dir, max_cards=50, wait_ms=wait_ms,
+                    collector=public_job_collector,
                 )
                 if detail_result.get("jd_detail_evidence"):
                     detail_result["used_path"] = "interact_fallback_no_detect"
