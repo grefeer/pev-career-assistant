@@ -591,6 +591,9 @@ def browse_click_mode(
         "truncated_by_max_pages": not end_reason and clicks_effective >= click_count,
         "page_count": len(all_texts),
         "page_files": page_files,
+        "listing_count": (
+            int(value) if (value := _scan_body_count(all_texts[-1])) is not None else None
+        ),
     }
 
 
@@ -688,6 +691,7 @@ def _scan_body_count(body: str | None) -> str | None:
         r"[（(]\s*(\d{2,4})\s*[）)]",        # （151）  /  (151)
         r"(\d{2,4})\s*个?职位",               # 151 个职位 / 151 职位
         r"(\d{2,4})\s*results?",              # 151 results
+        r"(\d{1,4})\s*结果",                   # 20 结果
         r"共\s*(\d{2,4})",                    # 共 151
     ):
         m = re.search(pat, body)

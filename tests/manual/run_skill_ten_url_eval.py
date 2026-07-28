@@ -300,6 +300,16 @@ def _load_browse_metadata() -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _observed_listing_count() -> int | None:
+    """Return a current public listing total observed by browse, when available."""
+    raw = (_last_browse_metadata or _load_browse_metadata() or {}).get("listing_count")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 def _persist_coverage_gate_result(output: str) -> None:
     """Save the one allowed agent gate result for the outer evaluator to reuse."""
     try:
@@ -1337,8 +1347,10 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     # inspected later (the working output/ tree is cleared per-URL).
     merged_preserved = _preserve_merged(slug)
     unique = _unique_count(cands)
+    observed_listing_count = _observed_listing_count()
+    effective_expected_count = observed_listing_count if observed_listing_count is not None else real_count
     coverage = _coverage_for_run(
-        candidates=cands, content=content, expected_count=real_count,
+        candidates=cands, content=content, expected_count=effective_expected_count,
     )
     execution_status = _classify_run_status(note=note, blocked=blocked, candidates=cands)
     # A completed model invocation is not an accepted discovery result until
@@ -1350,6 +1362,8 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "company": company,
         "url": url,
         "real_count": real_count,
+        "observed_listing_count": observed_listing_count,
+        "effective_expected_count": effective_expected_count,
         "status": status,
         "execution_status": execution_status,
         "candidate_source": source,

@@ -64,6 +64,12 @@ _WS = re.compile(r"\s+")
 _PAGE_STEM_RE = re.compile(r"^page_\d+$")
 # Match the page_<digits> prefix of a suffixed stem (page_03_batch -> page_03).
 _PAGE_PREFIX_RE = re.compile(r"^(page_\d+)_.*$")
+_NON_JD_BODY_MARKERS = frozenset({
+    "see listing page for details",
+    "see job listing for details",
+    "详情请见职位列表",
+    "详情请见岗位列表",
+})
 
 
 def _norm_title(title: str | None) -> str:
@@ -233,7 +239,17 @@ def _valid_candidate(c: dict[str, Any]) -> bool:
         (c.get("requirements") or "").strip()
         if isinstance(c.get("requirements"), str) else ""
     )
-    return bool(title and company and (responsibilities or requirements))
+    body = " ".join(part for part in (responsibilities, requirements) if part).strip().casefold()
+    evidence_types = {
+        str(ref.get("evidence_type") or "").strip().casefold()
+        for ref in (c.get("evidence_refs") or [])
+        if isinstance(ref, dict)
+    }
+    # A title-only listing is not JD evidence. The model may try to infer a
+    # plausible responsibility from a title; reject it deterministically rather
+    # than letting fabricated detail satisfy the body check.
+    title_only_evidence = any("title_only" in evidence_type for evidence_type in evidence_types)
+    return bool(title and company and body and body not in _NON_JD_BODY_MARKERS and not title_only_evidence)
 
 
 def main() -> int:

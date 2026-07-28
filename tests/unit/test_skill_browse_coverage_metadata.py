@@ -27,3 +27,7 @@ def test_unknown_page_count_has_no_synthetic_terminal_proof() -> None:
     fetch_count, declared_count = _BROWSE._compute_total_pages(None, None, 20)
 
     assert (fetch_count, declared_count) == (20, None)
+
+
+def test_body_count_recognizes_chinese_result_total() -> None:
+    assert _BROWSE._scan_body_count("已选 0 条件 | 20 结果 | 清除") == "20"

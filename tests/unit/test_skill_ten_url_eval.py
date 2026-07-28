@@ -150,6 +150,13 @@ def test_outer_coverage_reuses_the_agent_one_shot_gate_result(tmp_path: Path, mo
     assert verdict["coverage_verified"] is True
 
 
+def test_observed_listing_count_takes_precedence_over_a_stale_reference(monkeypatch) -> None:
+    runner = _load_runner()
+    monkeypatch.setattr(runner, "_last_browse_metadata", {"listing_count": 20})
+
+    assert runner._observed_listing_count() == 20
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"

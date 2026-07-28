@@ -29,6 +29,21 @@ def test_writer_rejects_rows_missing_the_company_identity() -> None:
     })
 
 
+def test_writer_rejects_listing_pointer_as_a_fake_jd_body() -> None:
+    assert not _WRITER._valid_candidate({
+        "title": "算法工程师", "company_name": "示例公司",
+        "responsibilities": "See listing page for details",
+    })
+
+
+def test_writer_rejects_model_invented_body_from_title_only_evidence() -> None:
+    assert not _WRITER._valid_candidate({
+        "title": "产品经理", "company_name": "示例公司",
+        "responsibilities": "负责产品规划与落地",
+        "evidence_refs": [{"evidence_type": "browsed_list_page_title_only"}],
+    })
+
+
 def test_writer_refuses_non_page_candidate_output_path(monkeypatch, capsys, tmp_path: Path) -> None:
     monkeypatch.setattr(_WRITER.sys, "argv", ["write_candidates.py", "--out", "output/candidates/temp_fix.json"])
     monkeypatch.setattr(_WRITER.sys, "stdin", type("Input", (), {"read": lambda self: "[]"})())
