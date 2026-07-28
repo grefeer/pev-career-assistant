@@ -70,6 +70,30 @@ def test_utf8_requirement_explains_how_to_start_the_eval() -> None:
     assert "python -X utf8" in message
 
 
+def test_terminal_evidence_requires_the_explicit_final_json_field() -> None:
+    runner = _load_runner()
+
+    assert runner._terminal_evidence_from_content('{"status":"done","terminal_evidence":"last_page_disabled"}') == "last_page_disabled"
+    assert runner._terminal_evidence_from_content('{"status":"done"}') is None
+
+
+def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_runner()
+    skill_dir = tmp_path / "job-discovery"
+    (skill_dir / "output").mkdir(parents=True)
+    (skill_dir / "output" / "candidates_merged.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(runner, "SKILL_DIR", skill_dir)
+
+    verdict = runner._coverage_for_run(
+        candidates=[{"title": "算法", "responsibilities": "开发"}],
+        content='{"status":"done","terminal_evidence":"last_page_disabled"}',
+        expected_count=None,
+    )
+
+    assert verdict["coverage_verified"] is False
+    assert verdict["reasons"] == ["no_page_evidence"]
+
+
 
 
 def test_slug_filter_reuses_cache_unless_force_fresh_is_explicit() -> None:

@@ -31,3 +31,15 @@ def test_coverage_rejects_missing_body_duplicate_and_missing_terminal() -> None:
     )
     assert result["coverage_verified"] is False
     assert set(result["reasons"]) == {"missing_terminal_evidence", "missing_jd_body", "duplicate_candidate_identity"}
+
+
+def test_coverage_keeps_url_less_openings_in_different_departments_distinct() -> None:
+    result = _MODULE.evaluate_coverage(
+        page_files=["page_01.txt"], terminal_evidence="last_page_disabled",
+        candidates=[
+            {"title": "算法工程师", "department": "自动驾驶", "locations": ["北京"], "responsibilities": "开发"},
+            {"title": "算法工程师", "department": "机器人", "locations": ["北京"], "responsibilities": "开发"},
+        ],
+    )
+
+    assert result["coverage_verified"] is True

@@ -317,6 +317,80 @@ def _unique_count(candidates: list[dict[str, Any]]) -> int:
     return len(seen)
 
 
+def _terminal_evidence_from_content(content: str) -> str | None:
+    """Read only the terminal proof explicitly emitted by the DeepAgent.
+
+    The planner's final compact JSON is intentionally the sole source: page
+    evidence proves what was fetched, while this value explains why pagination
+    stopped.  A bare ``status=done`` is not a proof and therefore returns None.
+    """
+    matches = re.findall(
+        r'"terminal_evidence"\s*:\s*"([^"\\]+)"', content or "",
+    )
+    return matches[-1].strip() if matches and matches[-1].strip() else None
+
+
+def _coverage_for_run(
+    *, candidates: list[dict[str, Any]], content: str, expected_count: int | None,
+) -> dict[str, Any]:
+    """Execute the deterministic gate over evidence produced in this run."""
+    page_dir = SKILL_DIR / "output" / "evidence" / "pages"
+    page_files = sorted(str(path.relative_to(SKILL_DIR)) for path in page_dir.glob("*.txt")) \
+        if page_dir.exists() else []
+    terminal_evidence = _terminal_evidence_from_content(content)
+    arguments = ["output/candidates_merged.json"]
+    # The model may have returned final-message candidates without persisting a
+    # merged file.  In that case the gate cannot certify the run, rather than
+    # accidentally validating a stale or imaginary artifact.
+    if not (SKILL_DIR / "output" / "candidates_merged.json").exists():
+        return {
+            "coverage_verified": False,
+            "page_count": len(page_files),
+            "candidate_count": len(candidates),
+            "body_candidate_count": 0,
+            "unique_listing_count": 0,
+            "expected_count": expected_count,
+            "terminal_evidence": terminal_evidence,
+            "reasons": ["missing_merged_candidates_artifact"],
+        }
+    if not page_files:
+        return {
+            "coverage_verified": False,
+            "page_count": 0,
+            "candidate_count": len(candidates),
+            "body_candidate_count": sum(bool((candidate.get("responsibilities") or "").strip()
+                                               or (candidate.get("requirements") or "").strip())
+                                        for candidate in candidates),
+            "unique_listing_count": _unique_count(candidates),
+            "expected_count": expected_count,
+            "terminal_evidence": terminal_evidence,
+            "reasons": ["no_page_evidence"],
+        }
+    arguments.extend(["--pages", *page_files])
+    if terminal_evidence:
+        arguments.extend(["--terminal-evidence", terminal_evidence])
+    if expected_count is not None:
+        arguments.extend(["--expected-count", str(expected_count)])
+    output = run_skill_script("coverage_gate", " ".join(shlex.quote(arg) for arg in arguments))
+    try:
+        parsed = json.loads(output.strip().splitlines()[0])
+    except (IndexError, json.JSONDecodeError):
+        return {
+            "coverage_verified": False,
+            "page_count": len(page_files),
+            "candidate_count": len(candidates),
+            "body_candidate_count": 0,
+            "unique_listing_count": 0,
+            "expected_count": expected_count,
+            "terminal_evidence": terminal_evidence,
+            "reasons": ["coverage_gate_execution_error"],
+        }
+    return parsed if isinstance(parsed, dict) else {
+        "coverage_verified": False,
+        "reasons": ["coverage_gate_invalid_output"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Agent construction
 # ---------------------------------------------------------------------------
@@ -1060,18 +1134,28 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     # inspected later (the working output/ tree is cleared per-URL).
     merged_preserved = _preserve_merged(slug)
     unique = _unique_count(cands)
-    status = _classify_run_status(note=note, blocked=blocked, candidates=cands)
+    coverage = _coverage_for_run(
+        candidates=cands, content=content, expected_count=real_count,
+    )
+    execution_status = _classify_run_status(note=note, blocked=blocked, candidates=cands)
+    # A completed model invocation is not an accepted discovery result until
+    # deterministic evidence checks pass. Keep both fields so operational
+    # failures and quality failures remain distinguishable in the eval table.
+    status = "unverified" if execution_status == "succeeded" and not coverage.get("coverage_verified") else execution_status
     record: dict[str, Any] = {
         "slug": slug,
         "company": company,
         "url": url,
         "real_count": real_count,
         "status": status,
+        "execution_status": execution_status,
         "candidate_source": source,
         "merged_preserved": merged_preserved,
         "candidate_count": raw_count,
         "unique_listing_count": unique,
         "duplicate_count": raw_count - unique,
+        "coverage": coverage,
+        "coverage_verified": bool(coverage.get("coverage_verified")),
         "block_reason": "login/captcha/anti-bot" if blocked else None,
         "note": note or None,
         "evaluation_mode": "fresh_live",
@@ -1082,7 +1166,8 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
         f"  -> status={status} src={source} raw={raw_count} unique={unique} "
-        f"dups={record['duplicate_count']} elapsed={record['elapsed_sec']}s"
+        f"dups={record['duplicate_count']} coverage={record['coverage_verified']} "
+        f"elapsed={record['elapsed_sec']}s"
         + (f" note={note}" if note else ""),
         flush=True)
     return record

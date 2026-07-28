@@ -8,16 +8,41 @@ from pathlib import Path
 from typing import Any
 
 
+def _location_signature(locations: Any) -> str:
+    """Return a stable location key for URL-less job rows.
+
+    An apply URL is the strongest identity on a public recruiting site.  Some
+    sites, however, publish an application form only at the company level. In
+    that case title + department + location is safer than treating every blank
+    URL as the same vacancy.  This is deliberately aligned with the evaluator
+    rather than making the coverage gate reject valid URL-less listings.
+    """
+    if not isinstance(locations, list):
+        return ""
+    values = {str(location or "").strip() for location in locations}
+    return "|".join(sorted(value for value in values if value))
+
+
+def _candidate_identity(candidate: dict[str, Any]) -> tuple[str, ...]:
+    """Identify one concrete opening without collapsing shared JD templates."""
+    apply_url = str(candidate.get("apply_url") or "").strip()
+    if apply_url:
+        return ("url", apply_url)
+    return (
+        "fallback",
+        str(candidate.get("title") or "").strip(),
+        str(candidate.get("department") or "").strip(),
+        _location_signature(candidate.get("locations")),
+    )
+
+
 def evaluate_coverage(
     *, page_files: list[str], candidates: list[dict[str, Any]],
     terminal_evidence: str | None, expected_count: int | None = None,
 ) -> dict[str, Any]:
     """Return an auditable PASS only when observed evidence is complete."""
     body_count = sum(bool((c.get("responsibilities") or "").strip() or (c.get("requirements") or "").strip()) for c in candidates)
-    identities = {
-        (str(c.get("title") or "").strip(), str(c.get("apply_url") or "").strip())
-        for c in candidates
-    }
+    identities = {_candidate_identity(candidate) for candidate in candidates}
     reasons: list[str] = []
     if not page_files:
         reasons.append("no_page_evidence")
