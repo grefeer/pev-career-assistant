@@ -33,6 +33,23 @@ Instead, this skill uses:
 The result is a pipeline that adapts to new site types without new code - only new
 instructions in `references/site-catalog.md`.
 
+## Adapter-aware execution
+
+Use `scripts/adapter_supervisor.py` as the outer Supervisor when a backend
+`DomainAdapter` is supplied. Build the planner with `build_skill_deep_agent()`
+(`deepagents.create_deep_agent`) and give its tools the normal Skill operations:
+`browse`, `read_evidence`, `write_candidates`, `validate`, and `deduplicate`.
+
+- No adapter: run the normal Skill workflow.
+- Adapter success: retain its result and trajectory as evidence.
+- Adapter failure at any point: run the normal Skill workflow with the complete
+  trajectory context; never return a partial adapter result as success.
+
+The fallback still uses `parallel-fetch` first, makes only one
+`search-interact` retry for a thin SPA, fans out one extraction sub-agent per
+page file, then runs deterministic validation and deduplication.  Treat a
+login/captcha/anti-bot result as manual review, never as a retry target.
+
 ## Quick start
 
 ```bash
