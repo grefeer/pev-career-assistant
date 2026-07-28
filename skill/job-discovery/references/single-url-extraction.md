@@ -106,6 +106,21 @@ you - this keeps your context lean) and writes its own output file. The
 
 If `page_count == 1` you still dispatch one `jd_extractor` (consistency).
 
+### 3.1 Verify expected page cardinality when browse proves it
+
+For URL-keyed `parallel-fetch`, browse may return all three of
+`pagination.size_val`, `pagination.declared_total_pages`, and `page_count`.
+When present, these are deterministic listing evidence, not model estimates:
+
+- each non-final page must write exactly `size_val` candidates;
+- the final page must write `declared_total - size_val * (page_count - 1)`;
+- a smaller nonzero `written` count is a failed page, not a partial success.
+
+Re-dispatch only each deficient page once, using the same evidence file and
+`--append` output path. This recovers a single omitted card without re-crawling
+the site or reprocessing every page. If it remains short after that retry,
+preserve the artifacts and report `needs_manual_review`.
+
 ### 4. Merge + verify (verifier)
 Once all sub-agents return, merge the per-page files into one deduplicated,
 packaged, verified result:
@@ -143,9 +158,9 @@ avoid. If the page was a login/captcha/anti-bot wall, emit instead
 `{"status":"blocked","reason":"<one short line>"}` and stop.
 
 ## Constraints
-- Tool budget <= 14 (schema read + parallel-fetch browse + maybe search-interact
-  retry + N task calls + 1 deduplicate). The `task` calls count toward budget
-  but run in parallel.
+- Dispatch one task per discovered page; do not truncate a large site because
+  of a fixed total-tool budget. Restrict browsing to one `parallel-fetch` plus
+  one SPA retry, and give each failed/deficient page at most one parallel retry.
 - Run helper scripts ONLY via `run_skill_script`. Allowed: browse, validate,
   normalize, deduplicate, ocr_image, state, read_evidence, write_candidates.
 - Never bypass login / captcha / anti-bot. If blocked, emit the blocked JSON.

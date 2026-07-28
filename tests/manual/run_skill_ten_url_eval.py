@@ -477,6 +477,13 @@ failure modes):
   JSON summary. A page is FAILED if its summary is not
   `{"status":"ok",...}` with `written` > 0 (i.e. status is "error" or
   "blocked", OR `written` is 0/missing, OR the page file was never created).
+  For URL-keyed `parallel-fetch` results with
+  `pagination.size_val` and `pagination.declared_total_pages`, also require
+  exact per-page cardinality: every non-final page must report
+  `written == size_val`; the final page must report
+  `written == declared_total - size_val * (pages - 1)`. A smaller count is a
+  failed extraction even when it is nonzero. This catches a sub-agent silently
+  omitting one card from a full page.
   For every FAILED page, RE-DISPATCH ONE `jd_extractor` task for that page
   in a SINGLE assistant message (parallel) - the evidence file
   `output/evidence/pages/page_NN.txt` still exists, so the retry sub-agent can
@@ -513,7 +520,10 @@ CRITICAL - OUTPUT DISCIPLINE:
   `{"status":"blocked","reason":"<one short line>"}` and stop.
 
 CONSTRAINTS:
-- Total tool calls <= 14. The `task` calls count but run in parallel.
+- Do not cap page tasks with a fixed total-tool budget. Dispatch one task for
+  every discovered page, plus at most one retry per failed page, in parallel.
+  Limit only browse variants (one parallel-fetch plus one SPA retry) so a
+  16-page or 50-page site is never silently truncated for a prompt budget.
 - The virtual filesystem is READ-ONLY: `write_file`/`edit_file`/`str_replace`
   are DENIED everywhere under /job-discovery/** (they return a
   permission-denied error). Do NOT attempt them and do NOT invent or run
