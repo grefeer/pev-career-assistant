@@ -59,3 +59,12 @@ def test_detail_url_helper_deduplicates_hash_links_and_respects_limit() -> None:
         interact_text="=== JOB 1 (https://jobs.example/#/jobs/) ===\n列表",
         cards_found=2,
     ) == "https://jobs.example/#/jobs/"
+
+
+def test_parallel_fetch_source_prioritizes_generic_detail_evidence_for_card_spas() -> None:
+    source = _SCRIPT.read_text(encoding="utf-8")
+
+    fallback = source[source.index("if detect is None:"):source.index("# ---- Compute page URLs")]
+    assert "detail_result = browse_interact_mode" in fallback
+    assert "if detail_result.get(\"jd_detail_evidence\")" in fallback
+    assert "interact_fallback_no_detect" in fallback

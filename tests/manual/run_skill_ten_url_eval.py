@@ -596,7 +596,8 @@ WORKFLOW - load it first, then follow it exactly:
    is large.
 2. Follow that doc: read schema.md, browse with `--mode parallel-fetch` (v1.6:
    detects URL-keyed pagination and fetches all pages concurrently via a thread
-   pool; auto-falls back to serial click for load-more sites, and returns a thin
+   pool; auto-follows public card detail links for non-paginated SPAs, falls back
+   to serial click for load-more sites, and returns a thin
    `spa_shell_no_pagination` result for card-SPAs), retry ONCE with
    `--mode search-interact` if `[PAGE_TEXT]` is < ~500 chars, then fan out ONE
    `jd_extractor` task per page file in a SINGLE message (parallel), then

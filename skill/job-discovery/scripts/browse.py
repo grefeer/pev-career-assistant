@@ -1058,9 +1058,26 @@ def browse_parallel_fetch_mode(
             detect = _detect_pagination(page, detect_retries)
 
             if detect is None:
-                # FALLBACK A: page rendered real content but no URL-keyed
-                # pagination (load-more / next-page button style) -> serial
-                # click on this page (user step 4).
+                # FALLBACK A: Card-SPAs commonly expose a complete public list
+                # without URL-keyed pagination.  Their list text is not JD
+                # evidence, though: extracting from it creates title-only
+                # candidates.  Follow the bounded public detail links in this
+                # same browser invocation, rather than relying on an LLM to
+                # correctly schedule a second browse call after it has already
+                # seen the list.  This is generic capability detection, not a
+                # site strategy: if no cards/details are present, retain the
+                # historic serial-pagination fallback below.
+                detail_result = browse_interact_mode(
+                    page, url, out_dir, max_cards=50, wait_ms=wait_ms,
+                )
+                if detail_result.get("jd_detail_evidence"):
+                    detail_result["used_path"] = "interact_fallback_no_detect"
+                    browser.close()
+                    return detail_result
+
+                # A non-paginated page with no public detail cards may still be
+                # a conventional load-more/next-page list.  Preserve the old
+                # bounded click fallback for that case.
                 result = browse_click_mode(
                     page, url, out_dir, None, None, max_pages, wait_ms, click_auto=True
                 )

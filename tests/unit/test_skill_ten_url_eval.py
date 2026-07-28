@@ -251,6 +251,7 @@ def test_planner_requires_exact_per_page_count_when_browse_proves_page_size() ->
     assert "exact per-page cardinality" in runner._SKILL_SYSTEM_PROMPT
     assert "written == size_val" in runner._SKILL_SYSTEM_PROMPT
     assert "Do not cap page tasks with a fixed total-tool budget" in runner._SKILL_SYSTEM_PROMPT
+    assert "auto-follows public card detail links" in runner._SKILL_SYSTEM_PROMPT
 
 
 def test_jd_extractor_distinguishes_detail_evidence_from_listing_evidence() -> None:
