@@ -304,15 +304,16 @@ def _unique_count(candidates: list[dict[str, Any]]) -> int:
     seen: set = set()
     for c in candidates:
         title = normalize_title(c.get("title"))
+        department = normalize_title(c.get("department"))
         apply_url = str(c.get("apply_url") or "").strip()
         has_body = bool((c.get("responsibilities") or "").strip()
                         or (c.get("requirements") or "").strip())
         if apply_url:
             seen.add(("url", apply_url))
         elif has_body:
-            seen.add((title, _loc_signature(c.get("locations"))))
+            seen.add((title, department, _loc_signature(c.get("locations"))))
         else:
-            seen.add(title)
+            seen.add((title, department))
     return len(seen)
 
 
