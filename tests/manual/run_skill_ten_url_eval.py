@@ -594,7 +594,7 @@ WORKFLOW - load it first, then follow it exactly:
    It documents the full planner -> executor -> verifier flow. Do NOT read
    SKILL.md - it documents the SmartSheet batch workflow (not needed here) and
    is large.
-2. Follow that doc: read schema.md, browse with `--mode parallel-fetch` (v1.6:
+2. Follow that doc: read schema.md, browse with `--mode parallel-fetch --wait 800` (v1.6:
    detects URL-keyed pagination and fetches all pages concurrently via a thread
    pool; auto-follows public card detail links for non-paginated SPAs, falls back
    to serial click for load-more sites, and returns a thin

@@ -37,9 +37,13 @@ Do NOT read `SKILL.md` - it is large and documents the SmartSheet flow.
 
 ### 2. Render + paginate (planner)
 ```
-run_skill_script(script="browse", cli_args="<URL> --mode parallel-fetch --max-pages 20 --concurrency 4 --out output/evidence")
+run_skill_script(script="browse", cli_args="<URL> --mode parallel-fetch --max-pages 20 --concurrency 4 --wait 800 --out output/evidence")
 ```
-`parallel-fetch` (v1.6) is the default first call. It detects URL-keyed
+`parallel-fetch` (v1.6) is the default first call. Use `--wait 800` for the
+normal public-site path: it is long enough for a post-navigation render but
+avoids multiplying the CLI's conservative 3-second default by every bounded
+public detail URL. If the page is thin or incomplete, the existing one retry
+uses its normal wait. It detects URL-keyed
 pagination (click next -> read URL -> click prev -> read URL -> diff to find the
 `current`/`limit` params), pre-computes every page URL, and fetches them
 **concurrently** via a thread pool (`--concurrency 4` = 4 worker browsers, the
