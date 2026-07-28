@@ -109,6 +109,19 @@ def test_coverage_rejects_model_terminal_claim_without_browse_metadata(tmp_path:
     assert verdict["reasons"] == ["missing_observed_terminal_evidence"]
 
 
+def test_tool_trace_records_timing_without_raw_tool_output(tmp_path: Path, monkeypatch) -> None:
+    runner = _load_runner()
+    trace_path = tmp_path / "tool_trace.jsonl"
+    monkeypatch.setattr(runner, "_TOOL_TRACE_FILE", trace_path)
+    monkeypatch.setattr(runner, "_run_started_at", 10.0)
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 12.5)
+
+    runner._append_tool_trace(script="browse", started_at=11.0, output="PAGE TEXT secret")
+
+    event = __import__("json").loads(trace_path.read_text(encoding="utf-8"))
+    assert event == {"script": "browse", "start_sec": 1.0, "duration_sec": 1.5, "error": False}
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"

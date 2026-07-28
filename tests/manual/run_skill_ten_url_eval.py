@@ -128,6 +128,8 @@ _MAX_PAGE_TEXT_CHARS = 60_000
 # based on an observed browser terminal signal, not a hallucinated restatement.
 _last_browse_metadata: dict[str, Any] | None = None
 _BROWSE_METADATA_FILE = SKILL_DIR / "output" / "evidence" / "browse_metadata.json"
+_TOOL_TRACE_FILE = SKILL_DIR / "output" / "evidence" / "tool_trace.jsonl"
+_run_started_at: float | None = None
 
 
 @tool
@@ -155,6 +157,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         without resolving evidence file paths.
     """
     global _last_browse_metadata
+    started_at = time.monotonic()
     if script not in _SKILL_SCRIPTS:
         return (
             f"ERROR: unknown script {script!r}. "
@@ -220,6 +223,7 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
                 '{\"status\":\"blocked\",\"reason\":\"page did not render job '
                 'content\"} and stop immediately.)'
             )
+    _append_tool_trace(script=script, started_at=started_at, output=out)
     return out
 
 
@@ -264,6 +268,23 @@ def _load_browse_metadata() -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _append_tool_trace(*, script: str, started_at: float, output: str) -> None:
+    """Append timing-only tool telemetry without logging page text or secrets."""
+    try:
+        now = time.monotonic()
+        event = {
+            "script": script,
+            "start_sec": round(started_at - (_run_started_at or started_at), 3),
+            "duration_sec": round(now - started_at, 3),
+            "error": output.startswith("ERROR:") or "[exit code" in output,
+        }
+        _TOOL_TRACE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _TOOL_TRACE_FILE.open("a", encoding="utf-8") as trace:
+            trace.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def _read_browse_text(browse_stdout: str) -> str:
@@ -1091,6 +1112,7 @@ def _clean_persisted() -> None:
             shutil.rmtree(target, ignore_errors=True)
     (SKILL_DIR / "output" / "candidates_merged.json").unlink(missing_ok=True)
     _BROWSE_METADATA_FILE.unlink(missing_ok=True)
+    _TOOL_TRACE_FILE.unlink(missing_ok=True)
 
 
 def _load_persisted_candidates() -> list[dict[str, Any]]:
@@ -1202,7 +1224,7 @@ def _normalize_replayed_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
-    global _last_browse_metadata
+    global _last_browse_metadata, _run_started_at
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
           flush=True)
     # Fresh per-URL persisted state so prior candidates/pages don't leak in.
@@ -1217,6 +1239,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         f"short summary JSON as your final message."
     )
     t0 = time.monotonic()
+    _run_started_at = t0
     _last_browse_metadata = None
     content, note = _invoke_agent(agent, prompt)
     if note and note != "recursion_limit":
@@ -1262,6 +1285,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "coverage": coverage,
         "coverage_verified": bool(coverage.get("coverage_verified")),
         "browse_metadata": _last_browse_metadata or _load_browse_metadata(),
+        "tool_trace": str(_TOOL_TRACE_FILE) if _TOOL_TRACE_FILE.exists() else None,
         "block_reason": "login/captcha/anti-bot" if blocked else None,
         "note": note or None,
         "evaluation_mode": "fresh_live",
