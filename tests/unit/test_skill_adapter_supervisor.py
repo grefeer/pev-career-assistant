@@ -98,3 +98,13 @@ def test_load_adapter_uses_validation_before_execution(monkeypatch) -> None:
 
     assert _MODULE.load_adapter("example.Adapter", "https://jobs.example/campus") is not None
     assert _MODULE.load_adapter("example.Adapter", "https://jobs.example/social") is None
+
+
+def test_load_adapter_accepts_a_real_backend_adapter_for_its_domain() -> None:
+    adapter = _MODULE.load_adapter(
+        "backend.app.services.job_discovery.adapters.mioffice.MiofficeCrawlAdapter",
+        "https://xiaomi.jobs.f.mioffice.cn/s/kJVnd58xtWY",
+    )
+
+    assert adapter is not None
+    assert type(adapter).__name__ == "MiofficeCrawlAdapter"
