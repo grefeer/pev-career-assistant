@@ -294,17 +294,22 @@ def _loc_signature(locations: Any) -> str:
 
 
 def _unique_count(candidates: list[dict[str, Any]]) -> int:
-    """Unique count mirroring the production split identity.
+    """Count concrete openings without collapsing distinct apply routes.
 
-    Full-JD candidates (with responsibilities/requirements body) are counted by
-    ``(normalized_title, location_signature)``; title-only by normalized title.
+    Campus sites often reuse a title and JD template for openings in separate
+    departments.  A public job-level apply URL is stronger identity evidence
+    than title/location and must split those openings.  Only URL-less rows use
+    the conservative title/location fallback.
     """
     seen: set = set()
     for c in candidates:
         title = normalize_title(c.get("title"))
+        apply_url = str(c.get("apply_url") or "").strip()
         has_body = bool((c.get("responsibilities") or "").strip()
                         or (c.get("requirements") or "").strip())
-        if has_body:
+        if apply_url:
+            seen.add(("url", apply_url))
+        elif has_body:
             seen.add((title, _loc_signature(c.get("locations"))))
         else:
             seen.add(title)
