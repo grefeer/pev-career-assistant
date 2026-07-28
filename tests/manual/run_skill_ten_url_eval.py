@@ -130,6 +130,7 @@ _last_browse_metadata: dict[str, Any] | None = None
 _BROWSE_METADATA_FILE = SKILL_DIR / "output" / "evidence" / "browse_metadata.json"
 _TOOL_TRACE_FILE = SKILL_DIR / "output" / "evidence" / "tool_trace.jsonl"
 _run_started_at: float | None = None
+_coverage_gate_calls = 0
 
 
 @tool
@@ -156,8 +157,14 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         under a ``[PAGE_TEXT]`` marker so the caller can extract JDs directly
         without resolving evidence file paths.
     """
-    global _last_browse_metadata
+    global _last_browse_metadata, _coverage_gate_calls
     started_at = time.monotonic()
+    if script == "coverage_gate":
+        if _coverage_gate_calls >= 1:
+            out = "ERROR: coverage_gate may run only once per discovery run"
+            _append_tool_trace(script=script, started_at=started_at, output=out)
+            return out
+        _coverage_gate_calls += 1
     if script not in _SKILL_SCRIPTS:
         return (
             f"ERROR: unknown script {script!r}. "
@@ -201,8 +208,15 @@ def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
     # virtual filesystem backend - that path mapping is fragile and would cost a
     # second tool round-trip per page.
     if script == "browse":
-        _last_browse_metadata = _browse_metadata_from_output(out)
-        _persist_browse_metadata(_last_browse_metadata)
+        metadata = _browse_metadata_from_output(out)
+        # A cache hit may omit terminal/pagination fields. Retain the richer
+        # first observed browse result instead of allowing a later cache hit to
+        # erase a valid completion proof.
+        if metadata is not None and (
+            _last_browse_metadata is None or metadata.get("terminal_evidence")
+        ):
+            _last_browse_metadata = metadata
+            _persist_browse_metadata(metadata)
         text = _read_browse_text(out)
         if text:
             out += "\n[PAGE_TEXT]\n" + text[:_MAX_PAGE_TEXT_CHARS]
@@ -373,6 +387,13 @@ def _unique_count(candidates: list[dict[str, Any]]) -> int:
     than title/location and must split those openings.  Only URL-less rows use
     the conservative title/location fallback.
     """
+    titles_by_url: dict[str, set[str]] = {}
+    for candidate in candidates:
+        url = str(candidate.get("apply_url") or "").strip()
+        title = normalize_title(candidate.get("title"))
+        if url and title:
+            titles_by_url.setdefault(url, set()).add(title)
+    shared_urls = {url for url, titles in titles_by_url.items() if len(titles) > 1}
     seen: set = set()
     for c in candidates:
         title = normalize_title(c.get("title"))
@@ -380,7 +401,7 @@ def _unique_count(candidates: list[dict[str, Any]]) -> int:
         apply_url = str(c.get("apply_url") or "").strip()
         has_body = bool((c.get("responsibilities") or "").strip()
                         or (c.get("requirements") or "").strip())
-        if apply_url:
+        if apply_url and apply_url not in shared_urls:
             seen.add(("url", apply_url))
         elif has_body:
             seen.add((title, department, _loc_signature(c.get("locations"))))
@@ -1224,7 +1245,7 @@ def _normalize_replayed_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def _run_one(slug: str, company: str, url: str, real_count: int | None,
              agent: Any) -> dict[str, Any]:
-    global _last_browse_metadata, _run_started_at
+    global _last_browse_metadata, _run_started_at, _coverage_gate_calls
     print(f"\n{'='*70}\n  [{slug}] {company}  (real={real_count})\n  {url}\n{'='*70}",
           flush=True)
     # Fresh per-URL persisted state so prior candidates/pages don't leak in.
@@ -1241,6 +1262,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     t0 = time.monotonic()
     _run_started_at = t0
     _last_browse_metadata = None
+    _coverage_gate_calls = 0
     content, note = _invoke_agent(agent, prompt)
     if note and note != "recursion_limit":
         print(f"  !! INVOKE ERROR: {note}", flush=True)

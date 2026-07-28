@@ -122,6 +122,15 @@ def test_tool_trace_records_timing_without_raw_tool_output(tmp_path: Path, monke
     assert event == {"script": "browse", "start_sec": 1.0, "duration_sec": 1.5, "error": False}
 
 
+def test_unique_count_keeps_distinct_titles_with_a_shared_listing_url() -> None:
+    runner = _load_runner()
+
+    assert runner._unique_count([
+        {"title": "算法工程师", "apply_url": "https://jobs.example/list", "responsibilities": "开发"},
+        {"title": "产品经理", "apply_url": "https://jobs.example/list", "responsibilities": "规划"},
+    ]) == 2
+
+
 def test_coverage_without_page_artifacts_is_an_explicit_quality_failure(tmp_path: Path, monkeypatch) -> None:
     runner = _load_runner()
     skill_dir = tmp_path / "job-discovery"

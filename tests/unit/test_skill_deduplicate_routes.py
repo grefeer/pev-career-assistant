@@ -27,3 +27,14 @@ def test_same_apply_url_title_variant_still_merges() -> None:
     second = {**shared, "title": "算法工程师-校招"}
 
     assert _MODULE._cluster_by_title_substring([first, second]) == [[first, second]]
+
+
+def test_shared_listing_url_is_cleared_without_losing_distinct_jobs() -> None:
+    candidates = [
+        {"title": "算法工程师", "apply_url": "https://jobs.example/list"},
+        {"title": "产品经理", "apply_url": "https://jobs.example/list"},
+    ]
+
+    assert _MODULE._clear_shared_listing_apply_urls(candidates) == 2
+    assert [candidate["apply_url"] for candidate in candidates] == ["", ""]
+    assert all("SHARED_LISTING_URL_CLEARED" in candidate["normalization_warnings"] for candidate in candidates)

@@ -43,3 +43,16 @@ def test_coverage_keeps_url_less_openings_in_different_departments_distinct() ->
     )
 
     assert result["coverage_verified"] is True
+
+
+def test_coverage_does_not_collapse_distinct_titles_with_shared_listing_url() -> None:
+    result = _MODULE.evaluate_coverage(
+        page_files=["page_01.txt"], terminal_evidence="last_page_disabled",
+        candidates=[
+            {"title": "算法工程师", "apply_url": "https://jobs.example/list", "responsibilities": "开发"},
+            {"title": "产品经理", "apply_url": "https://jobs.example/list", "responsibilities": "规划"},
+        ],
+    )
+
+    assert result["coverage_verified"] is True
+    assert result["unique_listing_count"] == 2

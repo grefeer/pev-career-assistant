@@ -36,13 +36,34 @@ def _candidate_identity(candidate: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _identities(candidates: list[dict[str, Any]]) -> set[tuple[str, ...]]:
+    """Use fallback identity for a URL copied across distinct job titles."""
+    titles_by_url: dict[str, set[str]] = {}
+    for candidate in candidates:
+        url = str(candidate.get("apply_url") or "").strip()
+        title = str(candidate.get("title") or "").strip()
+        if url and title:
+            titles_by_url.setdefault(url, set()).add(title)
+    shared_urls = {url for url, titles in titles_by_url.items() if len(titles) > 1}
+    identities: set[tuple[str, ...]] = set()
+    for candidate in candidates:
+        url = str(candidate.get("apply_url") or "").strip()
+        if url and url in shared_urls:
+            copy = dict(candidate)
+            copy["apply_url"] = ""
+            identities.add(_candidate_identity(copy))
+        else:
+            identities.add(_candidate_identity(candidate))
+    return identities
+
+
 def evaluate_coverage(
     *, page_files: list[str], candidates: list[dict[str, Any]],
     terminal_evidence: str | None, expected_count: int | None = None,
 ) -> dict[str, Any]:
     """Return an auditable PASS only when observed evidence is complete."""
     body_count = sum(bool((c.get("responsibilities") or "").strip() or (c.get("requirements") or "").strip()) for c in candidates)
-    identities = {_candidate_identity(candidate) for candidate in candidates}
+    identities = _identities(candidates)
     reasons: list[str] = []
     if not page_files:
         reasons.append("no_page_evidence")

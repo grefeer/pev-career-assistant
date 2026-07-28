@@ -302,6 +302,35 @@ def _has_jd_body(c: dict[str, Any]) -> bool:
     )
 
 
+def _clear_shared_listing_apply_urls(candidates: list[dict[str, Any]]) -> int:
+    """Remove a shared list-page URL from otherwise distinct job records.
+
+    Some sites expose only one recruiting-list URL and an extractor copies that
+    URL into every row. It is not a concrete job application route, so using it
+    as identity collapses all positions and sends users to a misleading page.
+    A URL shared by two or more distinct normalized titles is treated as such;
+    the title/department/location identity remains available downstream.
+    """
+    titles_by_url: dict[str, set[str]] = {}
+    for candidate in candidates:
+        url = str(candidate.get("apply_url") or "").strip()
+        title = _normalize_title(candidate.get("title"))
+        if url and title:
+            titles_by_url.setdefault(url, set()).add(title)
+    shared_urls = {url for url, titles in titles_by_url.items() if len(titles) > 1}
+    cleared = 0
+    for candidate in candidates:
+        url = str(candidate.get("apply_url") or "").strip()
+        if url not in shared_urls:
+            continue
+        candidate["apply_url"] = ""
+        warnings = candidate.setdefault("normalization_warnings", [])
+        if isinstance(warnings, list) and "SHARED_LISTING_URL_CLEARED" not in warnings:
+            warnings.append("SHARED_LISTING_URL_CLEARED")
+        cleared += 1
+    return cleared
+
+
 def _loc_key(c: dict[str, Any]) -> str:
     locations = c.get("locations") or []
     norms: list[str] = []
@@ -541,6 +570,8 @@ def process(
             kept.append(c)
         deduped = kept
 
+    shared_listing_urls_cleared = _clear_shared_listing_apply_urls(deduped)
+
     duplicates_removed = input_count - len(deduped)
 
     # --- Pass 3: Add packaging keys ---
@@ -603,6 +634,7 @@ def process(
             "garbage_titles": garbage_dropped,
             "output_count": len(deduped),
             "duplicates_removed": duplicates_removed,
+            "shared_listing_urls_cleared": shared_listing_urls_cleared,
         },
         "verify_warnings": verify_warnings if verify else {},
         "load_errors": load_errors,
