@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
+from typing import Any
 
 
 SKILL_SOURCE = Path(__file__).resolve().parents[4] / "skill" / "job-discovery"
@@ -28,13 +29,19 @@ class SkillArtifact:
 class SkillArtifactStore:
     """Creates and enumerates a task's private Skill working directory."""
 
-    def __init__(self, task_id: str, root: Path, *, skill_source: Path = SKILL_SOURCE) -> None:
+    def __init__(
+        self, task_id: str, root: Path, *, run_id: str = "default",
+        skill_source: Path = SKILL_SOURCE,
+    ) -> None:
         if not task_id or task_id in {".", ".."} or any(char in task_id for char in "\\/"):
             raise ValueError("task_id must be a single non-empty path segment")
+        if not run_id or run_id in {".", ".."} or any(char in run_id for char in "\\/"):
+            raise ValueError("run_id must be a single non-empty path segment")
         self.task_id = task_id
+        self.run_id = run_id
         self.root = root.resolve()
         self.skill_source = skill_source.resolve()
-        self.skill_dir = self.root / task_id / "skill" / "job-discovery"
+        self.skill_dir = self.root / task_id / "runs" / run_id / "skill" / "job-discovery"
 
     def prepare(self) -> Path:
         """Clone the bundled Skill excluding prior output and bytecode."""
@@ -75,6 +82,24 @@ class SkillArtifactStore:
             )
         return artifacts
 
+    def publish_evidence(self, object_store: Any) -> dict[Path, str]:
+        """Publish evidence as encrypted objects and return stable object URIs.
+
+        This intentionally uploads only evidence, not the cloned Skill source or
+        raw model state.  The caller treats an exception as an audit failure.
+        """
+        published: dict[Path, str] = {}
+        for artifact in self.iter_evidence():
+            relative = artifact.path.relative_to(self.skill_dir).as_posix()
+            key = f"job-discovery/{self.task_id}/{self.run_id}/{relative}"
+            object_store.put(
+                key=key,
+                plaintext=artifact.path.read_bytes(),
+                content_type=_content_type(artifact.path),
+            )
+            published[artifact.path] = f"object://{key}"
+        return published
+
 
 def _evidence_type(path: Path) -> str:
     if path.name == "tool_trace.jsonl":
@@ -84,3 +109,15 @@ def _evidence_type(path: Path) -> str:
     if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
         return "skill_screenshot"
     return "skill_page_text"
+
+
+def _content_type(path: Path) -> str:
+    if path.suffix.lower() == ".json":
+        return "application/json"
+    if path.suffix.lower() == ".jsonl":
+        return "application/x-ndjson"
+    if path.suffix.lower() == ".png":
+        return "image/png"
+    if path.suffix.lower() in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    return "text/plain; charset=utf-8"

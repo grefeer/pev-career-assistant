@@ -26,6 +26,7 @@ from deepagents import create_deep_agent
 from deepagents.middleware.subagents import SubAgent
 
 from backend.app.config import Settings
+from backend.app.services.job_discovery.llm_factory import build_job_discovery_llm
 from backend.app.services.job_discovery.deduplication import deduplicate_candidates
 from backend.app.services.job_discovery.normalization.jd_normalizer import (
     normalize_title,
@@ -71,26 +72,7 @@ def _build_job_discovery_llm(settings: Settings) -> ChatOpenAI:
     Follows the same pattern as src.agents.build_llm but uses the model
     name from settings.job_discovery_model.
     """
-    from src.utils import get_api_key, get_base_url
-
-    kwargs: dict[str, Any] = {
-        "model": settings.job_discovery_model,
-        "temperature": 0,
-        # Bound every single LLM HTTP call and the retry backoff chain so a
-        # stalled DeepSeek response cannot hang the Web Navigation Agent loop
-        # indefinitely (the wall-clock budget in _nav_budget_check only fires
-        # between tool calls, not during an in-flight model request).
-        "request_timeout": 120,
-        "max_retries": 2,
-    }
-    api_key = get_api_key()
-    if api_key:
-        kwargs["api_key"] = api_key
-    base_url = get_base_url()
-    kwargs["base_url"] = base_url
-    if "deepseek" in base_url.lower() and settings.job_discovery_model.startswith("deepseek-v4"):
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    return ChatOpenAI(**kwargs)
+    return build_job_discovery_llm(settings)
 
 
 # ---------------------------------------------------------------------------

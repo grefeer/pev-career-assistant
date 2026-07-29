@@ -526,13 +526,16 @@ class JobDiscoveryWorker:
         crawl_driver_factory: Callable[[CrawlPlan, DiscoveryTaskInput], CrawlDriver]
         | None = None,
         skill_runtime: SkillDiscoveryRuntime | None = None,
+        object_store: Any | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.settings = settings
         self.worker_id = _build_worker_id()
         self._idle_cycles: int = 0
         self._crawl_driver_factory = crawl_driver_factory
-        self._skill_runtime = skill_runtime or SkillDiscoveryRuntime(settings)
+        self._skill_runtime = skill_runtime or SkillDiscoveryRuntime(
+            settings, object_store=object_store,
+        )
         # Personalized discovery v1: registry of single-source completeness
         # contracts. The production registry is empty; tests inject a fixture
         # registry to exercise the admission mechanism without enabling a
