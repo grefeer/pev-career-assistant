@@ -1,6 +1,29 @@
 # Job Discovery Agent 系统
 
-从腾讯文档（Tencent Smartsheet）同步的招聘 URL 出发，由 **Discovery Supervisor Agent**（LLM-in-the-loop）自主完成链接分类、委派 Web 导航子 Agent 抓取证据、确定性提取 / 校验 / 去重 / 打包，产出 `DiscoveredJobCandidate(pending_review)`，最终经管理员审核成为学生可见的 `JobPosting(verified)`。
+从腾讯文档（Tencent Smartsheet）同步的招聘 URL 出发，默认由 **Skill Discovery Runtime**（`create_deep_agent + job-discovery Skill + 受限工具 + JD Extractor 子 Agent`）完成公开页面浏览、逐页 JD 提取、去重与 coverage gate，产出 `DiscoveredJobCandidate(pending_review)`，最终经管理员审核成为学生可见的 `JobPosting(verified)`。
+
+## 当前默认运行时与审计存储（2026-07-29）
+
+`JOB_DISCOVERY_SKILL_RUNTIME_ENABLED=true`（默认）时，`worker.py` 在任何
+URL 策略匹配、Adapter 或旧 Supervisor 之前调用 Skill runtime，因此这些旧路径
+不会参与该任务。它们仅在显式关闭该开关时作为回滚代码保留。
+
+每个任务拥有隔离目录：`JOB_DISCOVERY_SKILL_ARTIFACT_ROOT/<task_id>/skill/job-discovery/`。
+目录内的 `output/evidence/pages/*.txt`、截图、`tool_trace.jsonl`、
+`browse_metadata.json`、`coverage_gate_result.json` 和
+`output/candidates_merged.json` 不会与其他任务共享。Worker 将它们映射到既有
+持久化模型：
+
+| 内容 | 权威存储 | 细节 |
+|---|---|---|
+| 任务结论 / coverage / artifact 根路径 | `job_discovery_tasks.result_summary_json` | `execution_path=skill_agent`，不存原始模型消息 |
+| JD 详细字段 | `discovered_job_candidates` | title、正文、职责、要求、地点、投递链接、证据引用等 |
+| 页面证据与工具工件索引 | `job_discovery_evidence` | 摘要在 MySQL；`storage_uri` 指向任务隔离工件文件 |
+| 工具调用轨迹 | `job_discovery_trajectories` | 经安全截断的工具名、状态、耗时；不写 token / 原始模型会话 |
+
+当前 `storage_uri` 使用本机 `file:` URI。生产环境若需要跨主机长期留存，需由
+部署层把该任务目录上传至已配置的加密对象存储，并把 URI 改写为对象存储 URI；
+这不会改变 MySQL 表或 Worker 的持久化契约。
 
 > 本文聚焦 `backend/app/services/job_discovery/` 子系统的 **agent 架构** 与 **URL → JDs 全过程**。整体平台架构、状态机、安全硬门见根目录 [CLAUDE.md](../../../../CLAUDE.md)。
 

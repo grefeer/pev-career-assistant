@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,7 @@ from backend.app.db.models import (
     JobDiscoveryEvidence,
     JobDiscoveryTask,
     JobDiscoveryTaskStatus,
+    JobDiscoveryTrajectory,
     JobSource,
     JobSourceProvider,
     RawJobRecord,
@@ -33,7 +35,8 @@ from backend.app.services.job_discovery.worker import (
     _fallback_with_record_fields_if_agent_missed_evidence,
     _parse_agent_result,
 )
-from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput
+from backend.app.services.job_discovery.schemas import DiscoveryRunResult, DiscoveryTaskInput, NormalizedJobCandidate, PageEvidence
+from backend.app.services.job_discovery.skill_runtime import SkillRuntimeResult
 from backend.app.services.job_discovery.single_source_proof import SingleSourceProof
 
 
@@ -72,6 +75,7 @@ def settings() -> Any:
         job_discovery_enabled=True,
         job_discovery_task_timeout_seconds=60,
         job_discovery_model="gpt-4o-mini",
+        job_discovery_skill_runtime_enabled=False,
     )
 
 
@@ -146,6 +150,33 @@ class TestWorkerId:
         assert len(parts) == 2
         assert parts[0]  # hostname
         assert parts[1].isdigit()  # PID
+
+
+def test_worker_uses_skill_runtime_not_legacy_supervisor(
+    worker: JobDiscoveryWorker, queued_task: JobDiscoveryTask, settings: Any,
+    db_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings.job_discovery_skill_runtime_enabled = True
+    expected = SkillRuntimeResult(
+        result=DiscoveryRunResult(
+            status="succeeded", candidates=[NormalizedJobCandidate(title="工程师", company_name="公司", responsibilities="开发")],
+            evidence=[PageEvidence(evidence_type="skill_page_text", content_hash="a" * 64, metadata={"storage_uri": "file:///task/page.txt"})],
+        ),
+        trace_steps=[{"tool": "browse", "status": "ok", "duration_ms": 1}], artifact_root=Path.cwd(), coverage_verified=True,
+    )
+    worker._skill_runtime = MagicMock()
+    worker._skill_runtime.run.return_value = expected
+    legacy = MagicMock()
+    monkeypatch.setattr("backend.app.services.job_discovery.worker.build_discovery_supervisor_agent", legacy)
+
+    assert worker.run_once() == 1
+    worker._skill_runtime.run.assert_called_once()
+    legacy.assert_not_called()
+    with db_session_factory() as session:
+        persisted = session.get(JobDiscoveryTask, queued_task.id)
+        assert persisted.result_summary_json["execution_path"] == "skill_agent"
+        assert session.query(JobDiscoveryEvidence).one().storage_uri == "file:///task/page.txt"
+        assert session.query(JobDiscoveryTrajectory).one().completed_steps[0]["tool"] == "browse"
 
 
 # ---------------------------------------------------------------------------

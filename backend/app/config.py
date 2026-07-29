@@ -86,6 +86,11 @@ class Settings(BaseSettings):
     # Job Discovery Agent settings
     # OCR is pluggable and defaults to needs_manual_review when unavailable.
     job_discovery_enabled: bool = False
+    # Default execution path: task-scoped DeepAgent + bundled Skill + bounded
+    # helper scripts. Legacy Supervisor/strategy/adapter routing is retained
+    # only as an explicit rollback path when this flag is disabled.
+    job_discovery_skill_runtime_enabled: bool = True
+    job_discovery_skill_artifact_root: str = "var/job-discovery-skill"
     job_discovery_agent_version: str = "1.0.0"
     job_discovery_model: str = "deepseek-v4-flash"
     job_discovery_max_pages_per_task: int = Field(default=20, ge=1, le=100)

@@ -52,6 +52,9 @@ from backend.app.services.job_discovery.schemas import (
     NormalizedJobCandidate,
     PageEvidence,
 )
+from backend.app.services.job_discovery.skill_runtime import (
+    SkillDiscoveryRuntime,
+)
 from backend.app.services.job_discovery.result_contract import (
     AgentResultParseError,
     enforce_result_invariants,
@@ -153,7 +156,7 @@ def _persist_evidence(
                 title=ev.title,
                 content_hash=ev.content_hash,
                 text_excerpt=ev.text_excerpt,
-                storage_uri=None,
+                storage_uri=(ev.metadata or {}).get("storage_uri"),
                 metadata_json=ev.metadata,
             )
 
@@ -522,12 +525,14 @@ class JobDiscoveryWorker:
         settings: Settings,
         crawl_driver_factory: Callable[[CrawlPlan, DiscoveryTaskInput], CrawlDriver]
         | None = None,
+        skill_runtime: SkillDiscoveryRuntime | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.settings = settings
         self.worker_id = _build_worker_id()
         self._idle_cycles: int = 0
         self._crawl_driver_factory = crawl_driver_factory
+        self._skill_runtime = skill_runtime or SkillDiscoveryRuntime(settings)
         # Personalized discovery v1: registry of single-source completeness
         # contracts. The production registry is empty; tests inject a fixture
         # registry to exercise the admission mechanism without enabling a
@@ -718,6 +723,11 @@ class JobDiscoveryWorker:
                 url_hash=task.url_hash,
                 record_fields=record_fields,
             )
+
+            # Default execution path.  It is intentionally before strategy
+            # routing so URL matching and adapters cannot affect a Skill run.
+            if self.settings.job_discovery_skill_runtime_enabled:
+                return self._run_skill_task(db, task, task_input)
 
             # ── 4a. Strategy routing ──────────────────────────────────
             strategy_record: StrategyRecord | None = None
@@ -1201,6 +1211,54 @@ class JobDiscoveryWorker:
             return 0
         finally:
             db.close()
+
+    def _run_skill_task(
+        self,
+        db: Session,
+        task: JobDiscoveryTask,
+        task_input: DiscoveryTaskInput,
+    ) -> int:
+        outcome = self._skill_runtime.run(task_input, task_id=task.id)
+        result = outcome.result
+        _persist_evidence(db, task, result.evidence)
+        _persist_candidates(db, task, result.candidates)
+
+        trajectory = TrajectoryBuffer(task.id, strategy_id=None, executor_type="skill_agent")
+        for step in outcome.trace_steps:
+            error = RuntimeError("skill_tool_failed") if step.get("status") == "failed" else None
+            trajectory.record_step(
+                str(step.get("tool", "skill")),
+                "failed" if error else "ok",
+                step.get("params") if isinstance(step.get("params"), dict) else {},
+                {"duration_ms": step.get("duration_ms", 0)}, error=error,
+                duration_ms=float(step.get("duration_ms", 0) or 0),
+            )
+
+        summary_json: dict[str, Any] = {
+            "summary": result.summary,
+            "evidence_count": len(result.evidence),
+            "candidate_count": len(result.candidates),
+            "body_candidate_count": sum(bool(candidate.responsibilities.strip() or candidate.requirements.strip()) for candidate in result.candidates),
+            "execution_path": "skill_agent",
+            "coverage_verified": outcome.coverage_verified,
+            "artifact_root_uri": outcome.artifact_root.resolve().as_uri(),
+            "legacy_fallback_reason": None,
+            "single_source_complete": None,
+        }
+        if result.status == "succeeded":
+            mark_task_succeeded(db, task, result_summary_json=summary_json)
+        elif result.status == "partial_success":
+            mark_task_partial_success(db, task, result_summary_json=summary_json)
+        elif result.status == "needs_manual_review":
+            mark_task_needs_manual_review(db, task, block_reason=_resolve_block_reason(result.block_reason), result_summary_json=summary_json)
+        else:
+            mark_task_failed(db, task, last_error=result.summary or "Skill runtime returned failed status")
+        try:
+            save_trajectory(db, trajectory, result, url=task.source_url, url_pattern=_extract_url_pattern(task.source_url))
+        except Exception:
+            logger.exception("Could not persist Skill trajectory for task %s", task.id)
+        db.commit()
+        return 1
 
     def run_loop(self, *, poll_interval: float = 10.0) -> None:
         """Continuously poll and process tasks until interrupted.
