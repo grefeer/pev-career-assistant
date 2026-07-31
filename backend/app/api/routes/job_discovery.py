@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import logging
-import hashlib
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import _get_db, require_admin
@@ -16,24 +14,19 @@ from backend.app.api.discovery_schemas import (
     JobDiscoveryTaskListResponse,
     JobDiscoveryTaskResponse,
 )
-from backend.app.db.models import (
-    DiscoveredJobCandidate,
-    DiscoveredJobCandidateStatus,
-    JobDiscoveryTask,
-    JobDiscoveryTaskStatus,
-    JobPosting,
-    JobPostingStatus,
-    JobSource,
-    User,
+from backend.app.db.models import User
+from backend.app.services.job_discovery.admin_service import (
+    JobDiscoveryAdminConflictError,
+    JobDiscoveryAdminNotFoundError,
+    JobDiscoveryAdminService,
 )
-from backend.app.repositories import job_discovery as repository
 
 
 router = APIRouter(tags=["job_discovery"])
 logger = logging.getLogger(__name__)
 
 
-def _task_to_response(task: JobDiscoveryTask, source_name: str | None = None) -> JobDiscoveryTaskResponse:
+def _task_to_response(task: Any, source_name: str | None = None) -> JobDiscoveryTaskResponse:
     return JobDiscoveryTaskResponse(
         id=task.id,
         source_key=task.source_key,
@@ -48,7 +41,7 @@ def _task_to_response(task: JobDiscoveryTask, source_name: str | None = None) ->
     )
 
 
-def _candidate_to_response(candidate: DiscoveredJobCandidate) -> DiscoveredJobCandidateResponse:
+def _candidate_to_response(candidate: Any) -> DiscoveredJobCandidateResponse:
     return DiscoveredJobCandidateResponse(
         id=candidate.id,
         task_id=candidate.task_id,
@@ -66,18 +59,12 @@ def _candidate_to_response(candidate: DiscoveredJobCandidate) -> DiscoveredJobCa
     )
 
 
-def _candidate_not_found() -> HTTPException:
-    return HTTPException(status_code=404, detail="候选记录不存在。")
-
-
-def _candidate_conflict(message: str) -> HTTPException:
-    return HTTPException(status_code=409, detail=message)
-
-
-def _posting_external_record_id(candidate: DiscoveredJobCandidate) -> str:
-    suffix = hashlib.sha256(candidate.idempotency_key.encode("utf-8")).hexdigest()[:16]
-    prefix = candidate.external_record_id[:75]
-    return f"{prefix}::jd::{suffix}"
+def _service_error(error: Exception) -> HTTPException:
+    if isinstance(error, JobDiscoveryAdminNotFoundError):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, JobDiscoveryAdminConflictError):
+        return HTTPException(status_code=409, detail=str(error))
+    raise error
 
 
 @router.get("/admin/job-discovery/tasks", response_model=JobDiscoveryTaskListResponse)
@@ -87,14 +74,7 @@ def list_job_discovery_tasks(
     status: str | None = Query(None),
 ) -> JobDiscoveryTaskListResponse:
     del admin
-    query = (
-        select(JobDiscoveryTask, JobSource.name)
-        .outerjoin(JobSource, JobDiscoveryTask.source_key == JobSource.source_key)
-        .order_by(JobDiscoveryTask.created_at.desc())
-    )
-    if status:
-        query = query.where(JobDiscoveryTask.status == status)
-    rows = db.execute(query).all()
+    rows = JobDiscoveryAdminService().list_tasks(db, status=status)
     return JobDiscoveryTaskListResponse(
         tasks=[_task_to_response(task, source_name) for task, source_name in rows]
     )
@@ -106,7 +86,7 @@ def list_review_groups(
     db: Annotated[Session, Depends(_get_db)],
 ) -> list[JobDiscoveryReviewGroupResponse]:
     del admin
-    groups = repository.list_review_groups(db)
+    groups = JobDiscoveryAdminService().list_review_groups(db)
     return [
         JobDiscoveryReviewGroupResponse(
             similarity_group_key=group["similarity_group_key"],
@@ -124,29 +104,12 @@ def retry_job_discovery_task(
     body: JobDiscoveryRetryRequest | None = None,
 ) -> JobDiscoveryTaskResponse:
     del body
-    del admin
-    task = db.get(JobDiscoveryTask, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="任务不存在。")
-    if task.status is JobDiscoveryTaskStatus.running:
-        raise HTTPException(status_code=409, detail="任务正在运行，无法重试。")
-
-    task.status = JobDiscoveryTaskStatus.queued
-    task.attempt_count = 0
-    task.last_error = None
-    task.block_reason = None
-    task.finished_at = None
-    db.commit()
-    db.refresh(task)
-
-    source_name: str | None = None
-    source = db.scalar(
-        select(JobSource).where(JobSource.source_key == task.source_key)
-    )
-    if source is not None:
-        source_name = source.name
-
-    return _task_to_response(task, source_name)
+    service = JobDiscoveryAdminService()
+    try:
+        task = service.retry_task(db, task_id=task_id, admin=admin)
+    except (JobDiscoveryAdminNotFoundError, JobDiscoveryAdminConflictError) as error:
+        raise _service_error(error) from error
+    return _task_to_response(task, service.source_name(db, task.source_key))
 
 
 @router.post("/admin/job-discovery/candidates/{candidate_id}/approve", response_model=DiscoveredJobCandidateResponse)
@@ -155,53 +118,12 @@ def approve_job_discovery_candidate(
     admin: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(_get_db)],
 ) -> DiscoveredJobCandidateResponse:
-    del admin
-    candidate = db.get(DiscoveredJobCandidate, candidate_id)
-    if candidate is None:
-        raise _candidate_not_found()
-    if candidate.status is not DiscoveredJobCandidateStatus.pending_review:
-        raise _candidate_conflict("候选记录状态不允许审批通过。")
-
-    candidate.status = DiscoveredJobCandidateStatus.approved
-    posting_external_record_id = _posting_external_record_id(candidate)
-
-    existing_posting = db.scalar(
-        select(JobPosting).where(
-            JobPosting.source_id == candidate.source_id,
-            JobPosting.external_record_id == posting_external_record_id,
+    try:
+        candidate = JobDiscoveryAdminService().approve_candidate(
+            db, candidate_id=candidate_id, admin=admin,
         )
-    )
-
-    if existing_posting is not None:
-        posting = existing_posting
-        if candidate.title is not None:
-            posting.title = candidate.title
-        if candidate.company_name is not None:
-            posting.company_name = candidate.company_name
-        if candidate.description_text is not None:
-            posting.description_text = candidate.description_text
-        if candidate.locations_json is not None:
-            posting.locations = candidate.locations_json
-        if candidate.apply_url is not None:
-            posting.apply_url = candidate.apply_url
-        posting.status = JobPostingStatus.PENDING_REVIEW
-    else:
-        posting = JobPosting(
-            source_id=candidate.source_id,
-            external_record_id=posting_external_record_id,
-            raw_record_id=candidate.raw_record_id,
-            mapper_version="discovery-agent-v1",
-            status=JobPostingStatus.PENDING_REVIEW,
-            company_name=candidate.company_name or "",
-            title=candidate.title or "",
-            description_text=candidate.description_text,
-            locations=candidate.locations_json or [],
-            apply_url=candidate.apply_url or "",
-        )
-        db.add(posting)
-
-    db.commit()
-    db.refresh(candidate)
+    except (JobDiscoveryAdminNotFoundError, JobDiscoveryAdminConflictError) as error:
+        raise _service_error(error) from error
     return _candidate_to_response(candidate)
 
 
@@ -211,14 +133,10 @@ def reject_job_discovery_candidate(
     admin: Annotated[User, Depends(require_admin)],
     db: Annotated[Session, Depends(_get_db)],
 ) -> DiscoveredJobCandidateResponse:
-    del admin
-    candidate = db.get(DiscoveredJobCandidate, candidate_id)
-    if candidate is None:
-        raise _candidate_not_found()
-    if candidate.status is not DiscoveredJobCandidateStatus.pending_review:
-        raise _candidate_conflict("候选记录状态不允许拒绝。")
-
-    candidate.status = DiscoveredJobCandidateStatus.rejected
-    db.commit()
-    db.refresh(candidate)
+    try:
+        candidate = JobDiscoveryAdminService().reject_candidate(
+            db, candidate_id=candidate_id, admin=admin,
+        )
+    except (JobDiscoveryAdminNotFoundError, JobDiscoveryAdminConflictError) as error:
+        raise _service_error(error) from error
     return _candidate_to_response(candidate)

@@ -1,6 +1,8 @@
 # Job Discovery Agent 系统
 
-从腾讯文档（Tencent Smartsheet）同步的招聘 URL 出发，默认由 **Skill Discovery Runtime**（`create_deep_agent + job-discovery Skill + 受限工具 + JD Extractor 子 Agent`）完成公开页面浏览、逐页 JD 提取、去重与 coverage gate，产出 `DiscoveredJobCandidate(pending_review)`，最终经管理员审核成为学生可见的 `JobPosting(verified)`。
+从腾讯文档（Tencent Smartsheet）同步的招聘 URL 出发，默认由 **Skill Discovery Runtime**（`create_deep_agent + job-discovery Skill + 受限工具 + JD Extractor 子 Agent`）完成公开页面浏览、逐页 JD 提取、去重与 coverage gate，产出 `DiscoveredJobCandidate`。候选不再经管理员审核晋升 `JobPosting(verified)`，而是经**个性化发现 v1**（预审核、owner-scoped 推荐直达用户，卡片标注「自动发现，建议自行确认」）送达用户；verified-only 的 `/api/jobs` 职位中心由 WP2 手动导入/补全流程喂养，与发现候选解耦。
+
+> **目标态说明（2026-07-29）**：发现候选不经管理员审核、改为个性化发现 v1 送达，是本文档描述的目标架构。代码侧发现候选 admin approve/reject -> `JobPosting` 晋升与 `AdminJobReview.vue` 仍存在，迁移待跟进；本文与 [docs/job-discovery-legacy-architecture-summary.md](../../../../docs/job-discovery-legacy-architecture-summary.md) 一致以目标态为准。下方「二、两个 Agent 的边界与工具」等节描述的 Supervisor / Strategy / PEV 路径仅在显式关闭 `JOB_DISCOVERY_SKILL_RUNTIME_ENABLED` 时作为回滚代码保留。
 
 ## 当前默认运行时与审计存储（2026-07-29）
 
@@ -69,8 +71,9 @@ flowchart TB
 
     RES["result_contract.parse_agent_result<br/>recover_evicted_payload · dedup<br/>enforce_result_invariants · worker 侧"]
     DB[("MySQL<br/>候选 / 证据")]
-    Admin["管理员审核"]
-    Student["学生可见 · 仅 verified"]
+    PD["个性化发现 v1<br/>预审核 · owner-scoped 推荐"]
+    User["用户 · owner-scoped 推荐<br/>「自动发现，建议自行确认」"]
+    JobCenter["/api/jobs · 仅 verified<br/>WP2 手动导入/补全喂养"]
 
     T --> W
     W --> SR
@@ -89,8 +92,9 @@ flowchart TB
     RWN -->|返回工具结果| OBS
     PLAN -->|收敛 / blocked| RES
     RES --> DB
-    DB --> Admin
-    Admin -->|JobPosting · verified| Student
+    DB --> PD
+    PD -->|预审核推荐直达| User
+    DB -.->|WP2 手动导入/补全 · 独立路径| JobCenter
 ```
 
 ### 分层职责
@@ -216,7 +220,7 @@ sequenceDiagram
     W->>DB: _persist_evidence + _persist_candidates (upsert)
     W->>DB: mark_task: succeeded / partial / needs_manual_review / failed
     W->>W: save_trajectory + update strategy counters
-    Note over DB: DiscoveredJobCandidate(pending_review)<br/>→ Admin Review → JobPosting(verified)<br/>→ 学生可见 (仅 verified)
+    Note over DB: DiscoveredJobCandidate<br/>→ 个性化发现 v1（预审核 owner-scoped 推荐）→ 用户<br/>卡片「自动发现，建议自行确认」<br/>/api/jobs（仅 verified）由 WP2 手动导入喂养 · 独立路径
 ```
 
 ---
@@ -273,7 +277,7 @@ flowchart TB
 - **两条抓取路径合流**：`run_web_navigation` 内部同时跑①确定性 baseline（`extract_rendered_job_evidence` 直接抓起始页）和②LLM 导航子 agent；按 `content_hash or url` 去重合并。baseline 保证即使 LLM 误判「无法导航」也至少有公开渲染证据（[deepagents_runner.py:473-557](deepagents_runner.py#L473)）。
 - **candidates 不依赖 Supervisor LLM 接线 `evidence_refs`**：`_extract_and_verify_candidates_from_evidence` 给每个候选挂了指向对应页的 `evidence_ref`，绕开 `verify_evidence` 对 refs 的强约束。
 - **Supervisor 非收敛降级**：[invoke_supervisor_agent](deepagents_runner.py#L2959) 在 `GraphRecursionError` 时保留 partial state，让 `parse_agent_result` 从工具输出恢复已抓候选（xiaomi：supervisor 调一次 `run_web_navigation` 抓 ~138 候选后循环不收敛 → 仍判 `succeeded`）。
-- **状态机终点**：task → `succeeded / partial_success / needs_manual_review / failed`；候选落 `DiscoveredJobCandidate(pending_review)`，经管理员审核才能成 `JobPosting(verified)` 对学生可见（安全硬门 #3：Student API 仅返回 `verified`）。
+- **状态机终点**：task → `succeeded / partial_success / needs_manual_review / failed`；候选落 `DiscoveredJobCandidate`，经**个性化发现 v1**（预审核、owner-scoped 推荐）直达用户，不再经管理员审核晋升 `JobPosting`（安全硬门 #3：`/api/jobs` 仍仅返回 `verified`，由 WP2 手动导入喂养，与发现候选解耦）。
 
 ---
 

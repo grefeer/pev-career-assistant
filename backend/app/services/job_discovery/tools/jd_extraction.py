@@ -316,7 +316,6 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
             fm_title = _fuzzy_extract_title(segment)
             if fm_title:
                 title = fm_title
-                title_conf = 0.5
             uses_unstructured_fallback = True
 
         # Build warnings

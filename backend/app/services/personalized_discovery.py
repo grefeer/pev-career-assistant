@@ -554,8 +554,9 @@ class PersonalizedDiscoveryService:
             return _block_reason_to_status(task.block_reason)
         summary = task.result_summary_json or {}
         coverage_ok = bool(summary.get("coverage_verified"))
+        targeted_recommendation_ok = bool(summary.get("targeted_recommendation_verified"))
         proof = summary.get("single_source_complete")
-        if coverage_ok or proof:
+        if coverage_ok or proof or targeted_recommendation_ok:
             return None  # eligible (coverage-verified)
         if self.settings.personalized_discovery_allow_provisional:
             return None  # eligible (provisional - coverage not verified)

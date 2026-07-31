@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import re
+import socket
 import sys
 import threading
 import time
@@ -60,6 +62,52 @@ _PUBLIC_JOB_BODY_KEYS = (
     "requirements", "requirement", "content", "duty",
 )
 _PUBLIC_JOB_TOTAL_KEYS = ("total", "totalCount", "totalElements", "count")
+
+
+def is_safe_public_url(value: str) -> bool:
+    """Allow only public HTTP(S) targets, including after DNS resolution."""
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        ip = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        return _hostname_resolves_only_to_public_ips(parsed.hostname) if "parsed" in locals() else False
+    return ip.is_global
+
+
+def _hostname_resolves_only_to_public_ips(hostname: str | None) -> bool:
+    if not hostname:
+        return False
+    try:
+        addresses = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    resolved: set[str] = {entry[4][0] for entry in addresses if entry[4]}
+    if not resolved:
+        return False
+    try:
+        return all(ipaddress.ip_address(address).is_global for address in resolved)
+    except ValueError:
+        return False
+
+
+def install_public_network_guard(context: Any) -> None:
+    """Abort browser requests whose final hostname is not publicly routable.
+
+    The guard runs on every request, so redirects and model-discovered detail
+    links get the same policy check as the source URL.
+    """
+    def guard(route: Any) -> None:
+        scheme = urlparse(route.request.url).scheme.lower()
+        if scheme in {"http", "https"} and not is_safe_public_url(route.request.url):
+            route.abort()
+            return
+        route.continue_()
+
+    context.route("**/*", guard)
 
 
 class PublicJobEvidenceCollector:
@@ -988,6 +1036,7 @@ def _fetch_one(url: str, wait_ms: int) -> str:
     context = browser.new_context(
         user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
     )
+    install_public_network_guard(context)
     page = context.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -1097,6 +1146,7 @@ def browse_parallel_fetch_mode(
         context = browser.new_context(
             user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
         )
+        install_public_network_guard(context)
         page = context.new_page()
         public_job_collector = PublicJobEvidenceCollector()
         public_job_collector.attach(page)
@@ -1132,20 +1182,59 @@ def browse_parallel_fetch_mode(
             # single-url-extraction.md ("If [PAGE_TEXT] < ~500 chars ... retry
             # ONCE with --mode search-interact").
             if len(body_1.strip()) < 500:
-                page_files = _save_page_files([body_1], out_dir)
-                short_hash, text_path, screenshot_path = _save_evidence(body_1, out_dir)
+                # Definitively empty shell: 0 chars of rendered body text AND
+                # no public JSON job records captured. This is a HARD BLOCK
+                # (anti-bot-gated SPA that silently no-ops in headless - the app
+                # bundle loads but never mounts and fires no job-list XHR; or a
+                # dead/404 URL), NOT a recoverable card-SPA that search-interact
+                # could fix (a 0-char shell has no rendered UI = no search box to
+                # drive). Returning ``status=blocked`` here makes the workflow
+                # stop immediately instead of burning a ~45s search-interact
+                # retry that cannot succeed, and it respects security gate #2
+                # (report the block; never attempt to circumvent anti-bot).
+                # Verified un-renderable in headless via live probes:
+                # didi (silent anti-bot signing), netease (anti-bot + redirects
+                # to social-recruitment), baidu (302 -> /jobs/404 -> about:blank).
+                if not body_1.strip() and not public_job_collector.records:
+                    page_title = page.title()
+                    _screenshot_path = out_dir / "blocked_empty_shell.png"
+                    _save_screenshot(page, _screenshot_path)
+                    _empty_hash = f"sha256_{hashlib.sha256(b'').hexdigest()[:16]}"
+                    browser.close()
+                    return {
+                        "status": "blocked",
+                        "url": url,
+                        "mode": "parallel-fetch",
+                        "used_path": "spa_shell_empty_no_evidence",
+                        "reason": "page rendered 0 chars of body text and no public job JSON evidence",
+                        "title": page_title,
+                        "content_hash": _empty_hash,
+                        "text_path": "",
+                        "screenshot_path": str(_screenshot_path),
+                        "text_length": 0,
+                        "page_count": 0,
+                        "page_files": [],
+                    }
+                # The SPA DOM may be empty while its public XHR already
+                # supplied structured job records. Preserve that observed JSON
+                # evidence instead of writing a zero-byte page and discarding
+                # the collector's work.
+                observed_text = public_job_collector.evidence_text() if public_job_collector.records else body_1
+                page_files = _save_page_files([observed_text], out_dir)
+                short_hash, text_path, screenshot_path = _save_evidence(observed_text, out_dir)
                 _save_screenshot(page, screenshot_path)
+                page_title = page.title()
                 browser.close()
                 return {
                     "status": "ok",
                     "url": url,
                     "mode": "parallel-fetch",
                     "used_path": "spa_shell_no_pagination",
-                    "title": page.title(),
+                    "title": page_title,
                     "content_hash": short_hash,
                     "text_path": str(text_path),
                     "screenshot_path": str(screenshot_path),
-                    "text_length": len(body_1),
+                    "text_length": len(observed_text),
                     "page_count": 1,
                     "page_files": page_files,
                 }
@@ -1213,6 +1302,7 @@ def browse_parallel_fetch_mode(
             context = browser.new_context(
                 user_agent=_BROWSER_UA, viewport={"width": 1920, "height": 1080}
             )
+            install_public_network_guard(context)
             page = context.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -2533,6 +2623,13 @@ def main() -> None:
     url = args.url
     out_dir = Path(args.out)
 
+    if not is_safe_public_url(url):
+        print(json.dumps({
+            "status": "blocked", "url": url,
+            "error": "unsafe_or_non_public_url",
+        }, ensure_ascii=False))
+        return
+
     # Parse search terms unconditionally (used by both search and search-interact modes)
     search_terms = [t.strip() for t in args.search_terms.split(",") if t.strip()]
 
@@ -2611,6 +2708,7 @@ def main() -> None:
                 ),
                 viewport={"width": 1920, "height": 1080},
             )
+            install_public_network_guard(context)
             page = context.new_page()
             public_job_collector = PublicJobEvidenceCollector()
             public_job_collector.attach(page)

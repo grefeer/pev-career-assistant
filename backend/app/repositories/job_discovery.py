@@ -3,17 +3,20 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import utc_now
 from backend.app.db.models import (
+    AuditEvent,
     DiscoveredJobCandidate,
     DiscoveredJobCandidateStatus,
     DiscoveryBlockReason,
     JobDiscoveryEvidence,
     JobDiscoveryTask,
     JobDiscoveryTaskStatus,
+    JobPosting,
+    JobSource,
 )
 
 
@@ -100,6 +103,28 @@ def claim_next_task(
     return task
 
 
+def renew_task_lease(
+    db: Session, *, task_id: str, worker_id: str, lease_seconds: int,
+) -> bool:
+    """Renew only the still-valid lease owned by this worker.
+
+    A stale worker must never revive a task that another worker has reclaimed.
+    """
+    now = utc_now()
+    result = db.execute(
+        update(JobDiscoveryTask)
+        .where(
+            JobDiscoveryTask.id == task_id,
+            JobDiscoveryTask.status == JobDiscoveryTaskStatus.running,
+            JobDiscoveryTask.lease_owner == worker_id,
+            JobDiscoveryTask.lease_expires_at > now,
+        )
+        .values(lease_expires_at=now + timedelta(seconds=lease_seconds))
+    )
+    db.flush()
+    return bool(result.rowcount)
+
+
 def mark_task_running(db: Session, task: JobDiscoveryTask) -> None:
     now = utc_now()
     task.status = JobDiscoveryTaskStatus.running
@@ -147,10 +172,19 @@ def mark_task_failed(
     task: JobDiscoveryTask,
     last_error: str,
 ) -> None:
-    task.status = JobDiscoveryTaskStatus.failed
+    next_attempt = task.attempt_count + 1
+    # Transient execution failures are automatically retried by the queue.
+    # Only exhaustion is terminal; a human retry can still explicitly reset it.
+    task.status = (
+        JobDiscoveryTaskStatus.failed
+        if next_attempt >= task.max_attempts
+        else JobDiscoveryTaskStatus.queued
+    )
     task.finished_at = utc_now()
     task.last_error = last_error
-    task.attempt_count = task.attempt_count + 1
+    task.attempt_count = next_attempt
+    task.lease_owner = None
+    task.lease_expires_at = None
     db.flush()
 
 
@@ -281,3 +315,58 @@ def list_review_groups(
         }
         for key, candidates in sorted(groups.items())
     ]
+
+
+def list_tasks_with_source_name(
+    db: Session, *, status: str | None = None,
+) -> list[tuple[JobDiscoveryTask, str | None]]:
+    """Return task rows for the admin read model; filtering is data access only."""
+    query = (
+        select(JobDiscoveryTask, JobSource.name)
+        .outerjoin(JobSource, JobDiscoveryTask.source_key == JobSource.source_key)
+        .order_by(JobDiscoveryTask.created_at.desc())
+    )
+    if status:
+        query = query.where(JobDiscoveryTask.status == status)
+    return list(db.execute(query).all())
+
+
+def get_task(db: Session, task_id: str) -> JobDiscoveryTask | None:
+    return db.get(JobDiscoveryTask, task_id)
+
+
+def get_source_name(db: Session, source_key: str) -> str | None:
+    return db.scalar(select(JobSource.name).where(JobSource.source_key == source_key))
+
+
+def get_candidate(
+    db: Session, candidate_id: str, *, lock: bool = False,
+) -> DiscoveredJobCandidate | None:
+    query = select(DiscoveredJobCandidate).where(DiscoveredJobCandidate.id == candidate_id)
+    if lock:
+        query = query.with_for_update()
+    return db.scalar(query)
+
+
+def has_durable_evidence(db: Session, task_id: str) -> bool:
+    return db.scalar(
+        select(JobDiscoveryEvidence.id).where(
+            JobDiscoveryEvidence.task_id == task_id,
+            JobDiscoveryEvidence.storage_uri.like("object://%"),
+        )
+    ) is not None
+
+
+def get_posting_for_discovery_candidate(
+    db: Session, *, source_id: str, external_record_id: str,
+) -> JobPosting | None:
+    return db.scalar(
+        select(JobPosting).where(
+            JobPosting.source_id == source_id,
+            JobPosting.external_record_id == external_record_id,
+        )
+    )
+
+
+def add_audit_event(db: Session, event: AuditEvent) -> None:
+    db.add(event)

@@ -123,8 +123,8 @@ def test_job_discovery_defaults() -> None:
     assert settings.job_discovery_enabled is False
     assert settings.job_discovery_agent_version == "1.0.0"
     assert settings.job_discovery_model == "deepseek-v4-flash"
-    assert settings.job_discovery_max_pages_per_task == 20
-    assert settings.job_discovery_max_candidates_per_task == 10
+    assert settings.job_discovery_max_pages_per_task == 50
+    assert settings.job_discovery_max_candidates_per_task == 500
     assert settings.job_discovery_task_timeout_seconds == 600
     assert settings.job_discovery_browser_headless is True
     assert settings.job_discovery_ocr_enabled is False

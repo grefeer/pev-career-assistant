@@ -93,8 +93,15 @@ class Settings(BaseSettings):
     job_discovery_skill_artifact_root: str = "var/job-discovery-skill"
     job_discovery_agent_version: str = "1.0.0"
     job_discovery_model: str = "deepseek-v4-flash"
-    job_discovery_max_pages_per_task: int = Field(default=20, ge=1, le=100)
-    job_discovery_max_candidates_per_task: int = Field(default=10, ge=1, le=50)
+    # Modern campus portals routinely expose 30-50 pages.  Twenty pages makes
+    # the generic Skill path deterministically incomplete before extraction
+    # begins (for example, the public Xiaopeng portal reports 44 pages).
+    # Keep 100 as the hard resource ceiling; deployments can still lower this.
+    job_discovery_max_pages_per_task: int = Field(default=50, ge=1, le=100)
+    # Campus sites routinely expose hundreds of openings.  This is a safety
+    # ceiling, not a recommendation cap: preference filtering happens after
+    # complete evidence extraction and must not make a 22+ role source fail.
+    job_discovery_max_candidates_per_task: int = Field(default=500, ge=1, le=1000)
     job_discovery_task_timeout_seconds: int = Field(default=600, ge=30, le=3600)
     job_discovery_browser_headless: bool = True
     job_discovery_ocr_enabled: bool = False

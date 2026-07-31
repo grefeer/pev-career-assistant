@@ -20,9 +20,15 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.db.models import JobDiscoveryTask
+from backend.app.db.models import DiscoveredJobCandidate, JobDiscoveryTask
+from backend.app.services.job_discovery.role_preferences import (
+    DEFAULT_ROLE_PREFERENCES,
+    filter_candidates_for_preferences,
+)
+from backend.app.services.job_discovery.schemas import NormalizedJobCandidate
 from backend.app.services.job_discovery.worker import JobDiscoveryWorker
 from tests.manual.test_pev_live_smoke import (
     SITES as PEV_SITE_CONFIG,
@@ -59,6 +65,7 @@ PEV_SITES = {
 
 _OUT = Path(__file__).resolve().parent / "_worker_ten_url_eval_summary.json"
 _ROW_OUT_DIR = Path(__file__).resolve().parent
+_EVAL_MODE = os.environ.get("JOB_DISCOVERY_EVAL_MODE", "adapter")
 
 
 def _bucket_for(summary: dict[str, object]) -> str:
@@ -69,21 +76,53 @@ def _bucket_for(summary: dict[str, object]) -> str:
     return "legacy"
 
 
-def _timeout_row(slug: str, company: str, url: str, timeout_sec: int) -> dict[str, Any]:
+def _timeout_row(
+    slug: str, company: str, url: str, timeout_sec: int, *, mode: str,
+) -> dict[str, Any]:
     """Return an explicit, non-success result for an isolated site timeout."""
     return {
         "slug": slug,
         "company": company,
         "url": url,
-        "target_path": "pev" if slug in PEV_SITES else "legacy",
+        "target_path": "skill_no_adapter" if mode == "skill" else (
+            "pev" if slug in PEV_SITES else "legacy"
+        ),
         "status": "timed_out",
         "bucket": "timed_out",
         "timeout_sec": timeout_sec,
     }
 
 
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    """Terminate a timed-out evaluator and every descendant on Windows.
+
+    ``venv\\Scripts\\python.exe`` starts the base interpreter as a child on
+    Windows.  Killing only the launcher leaves a live browser/LLM evaluator
+    behind, which can corrupt later URL measurements.  ``taskkill /T`` is the
+    platform process-tree primitive and is intentionally limited to the PID
+    created for this isolated manual-evaluation child.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True, check=False,
+        )
+    else:
+        process.kill()
+    try:
+        process.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _row_path(slug: str) -> Path:
-    return _ROW_OUT_DIR / f"_worker_ten_url_eval_{slug}.json"
+    suffix = "" if _EVAL_MODE == "adapter" else f"_{_EVAL_MODE}"
+    return _ROW_OUT_DIR / f"_worker_ten_url_eval_{slug}{suffix}.json"
+
+
+def _clear_row_file(slug: str) -> None:
+    """Prevent a polling caller from reading this site's prior evaluation."""
+    _row_path(slug).unlink(missing_ok=True)
 
 
 def _write_row(row: dict[str, Any]) -> None:
@@ -96,10 +135,35 @@ def _write_summary(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         bucket = str(row["bucket"])
         buckets[bucket] = buckets.get(bucket, 0) + 1
-    _OUT.write_text(
+    summary_path = _OUT.with_name(
+        _OUT.stem + ("" if _EVAL_MODE == "adapter" else f"_{_EVAL_MODE}") + _OUT.suffix
+    )
+    summary_path.write_text(
         json.dumps({"rows": rows, "buckets": buckets}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _preference_metrics(db: Session, task_id: str) -> dict[str, Any]:
+    candidates = [
+        NormalizedJobCandidate(
+            title=candidate.title,
+            description_text=candidate.description_text or "",
+            responsibilities=candidate.responsibilities or "",
+            requirements=candidate.requirements or "",
+        )
+        for candidate in db.scalars(
+            select(DiscoveredJobCandidate).where(
+                DiscoveredJobCandidate.task_id == task_id,
+            )
+        )
+    ]
+    matched = filter_candidates_for_preferences(candidates, DEFAULT_ROLE_PREFERENCES)
+    return {
+        "role_preferences": list(DEFAULT_ROLE_PREFERENCES),
+        "preferred_candidate_count": len(matched),
+        "preferred_candidate_titles": [candidate.title for candidate in matched if candidate.title],
+    }
 
 
 def _run_pev_row(slug: str, company: str, url: str) -> dict[str, Any]:
@@ -112,7 +176,11 @@ def _run_pev_row(slug: str, company: str, url: str) -> dict[str, Any]:
     with factory() as db:
         task = db.get(JobDiscoveryTask, task_id)
         summary = dict(task.result_summary_json or {}) if task else {}
+        preference_metrics = _preference_metrics(db, task_id)
     passed, metrics = _passes_pev_gate(summary)
+    execution_path = summary.get("execution_path")
+    adapter_routed = execution_path == "path_a_adapter"
+    passed = passed and adapter_routed
     return {
         "slug": slug,
         "company": company,
@@ -126,6 +194,61 @@ def _run_pev_row(slug: str, company: str, url: str) -> dict[str, Any]:
         "unique_listing_count": metrics["unique_listing_count"],
         "failed_detail_count": metrics["failed_detail_count"],
         "coverage_verified": metrics["coverage_verified"],
+        "execution_path": execution_path,
+        "adapter_routed": adapter_routed,
+        **preference_metrics,
+    }
+
+
+def _skill_site_config(company: str, url: str) -> dict[str, Any]:
+    """Seed only generic task context; its strategy remains disabled."""
+    site_cfg = dict(PEV_SITE_CONFIG["moka"])
+    site_cfg["url"] = url
+    site_cfg["raw_fields"] = [{"field_name": "公司名称", "value": company}]
+    return site_cfg
+
+
+def _run_skill_row(slug: str, company: str, url: str) -> dict[str, Any]:
+    """Run the deployed Worker Skill path with routing/adapters disabled."""
+    # The fixture needs a source/task, but the seeded strategy is unreachable:
+    # Skill Runtime executes before strategy routing.
+    site_cfg = _skill_site_config(company, url)
+    factory, task_id = _setup_db(site_cfg)
+    settings = _settings()
+    settings.job_discovery_skill_runtime_enabled = True
+    settings.job_discovery_strategy_enabled = False
+    settings.job_discovery_max_pages_per_task = 50
+    settings.job_discovery_max_candidates_per_task = 500
+    started = time.monotonic()
+    JobDiscoveryWorker(factory, settings).run_once()
+    elapsed = time.monotonic() - started
+    with factory() as db:
+        task = db.get(JobDiscoveryTask, task_id)
+        summary = dict(task.result_summary_json or {}) if task else {}
+        preference_metrics = _preference_metrics(db, task_id)
+    execution_path = summary.get("execution_path")
+    coverage_verified = bool(summary.get("coverage_verified"))
+    status = task.status.value if task is not None else "missing_task"
+    return {
+        "slug": slug,
+        "company": company,
+        "url": url,
+        "target_path": "skill_no_adapter",
+        "status": status,
+        # Targeted recommendation success no longer means that every opening
+        # was enumerated. It requires at least one preference-matched JD with
+        # an apply link, which the Worker only persists as ``succeeded``.
+        "bucket": "targeted_pass" if (
+            execution_path == "skill_agent"
+            and status == "succeeded"
+            and preference_metrics["preferred_candidate_count"] > 0
+        ) else "targeted_nonpass",
+        "elapsed_sec": round(elapsed, 1),
+        "candidate_count": int(summary.get("candidate_count") or 0),
+        "coverage_verified": coverage_verified,
+        "execution_path": execution_path,
+        "adapter_routed": False,
+        **preference_metrics,
     }
 
 
@@ -167,12 +290,15 @@ def _run_legacy_row(slug: str, company: str, url: str) -> dict[str, Any]:
     return record
 
 
-def _run_site(slug: str) -> dict[str, Any]:
+def _run_site(slug: str, *, mode: str) -> dict[str, Any]:
     for candidate_slug, company, url in URLS:
         if candidate_slug == slug:
             try:
-                row = (_run_pev_row(slug, company, url) if slug in PEV_SITES
-                       else _run_legacy_row(slug, company, url))
+                if mode == "skill":
+                    row = _run_skill_row(slug, company, url)
+                else:
+                    row = (_run_pev_row(slug, company, url) if slug in PEV_SITES
+                           else _run_legacy_row(slug, company, url))
             except Exception as exc:  # noqa: BLE001 - persist and continue parent eval
                 row = {
                     "slug": slug, "company": company, "url": url,
@@ -187,11 +313,16 @@ def _run_site(slug: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Isolated Worker/PEV ten-URL evaluator")
     parser.add_argument("--site", choices=[slug for slug, _, _ in URLS])
+    parser.add_argument("--mode", choices=["adapter", "skill"], default="adapter")
     parser.add_argument("--timeout-sec", type=int, default=360)
     args = parser.parse_args()
+    global _EVAL_MODE
+    _EVAL_MODE = args.mode
+    os.environ["JOB_DISCOVERY_EVAL_MODE"] = args.mode
 
     if args.site:
-        _run_site(args.site)
+        _clear_row_file(args.site)
+        _run_site(args.site, mode=args.mode)
         return 0
 
     from src.utils import load_env
@@ -201,13 +332,12 @@ def main() -> int:
     for slug, company, url in URLS:
         row_file = _row_path(slug)
         try:
-            subprocess.run(
-                [sys.executable, str(Path(__file__).resolve()), "--site", slug],
+            child = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--site", slug, "--mode", args.mode],
                 cwd=_PROJECT_ROOT,
                 env=os.environ.copy(),
-                timeout=args.timeout_sec,
-                check=False,
             )
+            child.wait(timeout=args.timeout_sec)
             if row_file.exists():
                 rows.append(json.loads(row_file.read_text(encoding="utf-8")))
             else:
@@ -218,7 +348,8 @@ def main() -> int:
                     "error": "child exited without a result record",
                 })
         except subprocess.TimeoutExpired:
-            row = _timeout_row(slug, company, url, args.timeout_sec)
+            _terminate_process_tree(child)
+            row = _timeout_row(slug, company, url, args.timeout_sec, mode=args.mode)
             _write_row(row)
             rows.append(row)
         _write_summary(rows)

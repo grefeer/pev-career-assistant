@@ -47,6 +47,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from backend.app.config import Settings
 from backend.app.db.base import Base
@@ -130,6 +131,10 @@ def _settings() -> Settings:
         redis_url="redis://localhost:6379/15",
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         job_discovery_enabled=True,
+        # This evaluator certifies PATH A adapters.  The production default is
+        # Skill Runtime, so disable it explicitly rather than accidentally
+        # measuring the generic path under an Adapter-labelled report.
+        job_discovery_skill_runtime_enabled=False,
         job_discovery_task_timeout_seconds=300,
         job_discovery_max_pages_per_task=20,
         job_discovery_ocr_enabled=True,
@@ -143,7 +148,14 @@ def _settings() -> Settings:
 def _setup_db(site_cfg: dict[str, Any]) -> tuple[sessionmaker[Session], str]:
     """In-memory DB seeded with ONLY this site's strategy enabled, plus one
     queued task targeting the site's listing URL."""
-    engine = create_engine("sqlite+pysqlite:///:memory:")
+    # Worker lease heartbeats intentionally open independent sessions.  A
+    # normal SQLite :memory: URL gives each connection its own empty database;
+    # StaticPool makes this manual test fixture behave like one shared DB.
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with Session(engine) as db:
@@ -161,7 +173,7 @@ def _setup_db(site_cfg: dict[str, Any]) -> tuple[sessionmaker[Session], str]:
             source_id=source.id,
             external_record_id="external",
             payload_hash="b" * 64,
-            raw_fields=[],
+            raw_fields=list(site_cfg.get("raw_fields", [])),
         )
         url = site_cfg["url"]
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:16]

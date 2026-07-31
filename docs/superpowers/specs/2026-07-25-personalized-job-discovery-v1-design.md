@@ -13,6 +13,16 @@ existing workflow or make pre-review candidates globally visible. A
 personalized recommendation is clearly labelled as automatically discovered
 and advises the user to confirm the source before applying.
 
+As of 2026-07-29, personalized discovery v1 is the **discovery candidate
+delivery path**: discovery candidates no longer go through admin
+approve/reject -> `JobPosting(verified)`; they reach users via personalized
+discovery (pre-review, owner-scoped, card labelled 「自动发现，建议自行确认」).
+The shared `JobPosting` workflow (WP2 manual import/completion -> `verified` ->
+`/api/jobs`) remains unchanged and is the sole feed for the verified-only job
+center. Pre-review delivery stays independent of `/api/jobs`, never writes
+`review_version`, and never transitions a `JobPosting`. (Code-side discovery
+candidate admin approve/reject still exists; migration is tracked separately.)
+
 v1 does not add shared crawl caching, scheduled refresh, query coalescing,
 push notifications, or automatic application/form filling. A user-triggered
 personalization run evaluates already discovered candidates; it does not start

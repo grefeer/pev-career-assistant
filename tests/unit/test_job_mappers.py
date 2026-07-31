@@ -159,6 +159,11 @@ def test_invalid_apply_urls_are_skipped(invalid_url: str) -> None:
         "https://999.999.999.999/jobs",
         "https://example.com:not-a-port/jobs",
         "https://example.com:70000/jobs",
+        "http://127.0.0.1/jobs",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/jobs",
+        "http://192.168.1.1/jobs",
+        "http://[::1]/jobs",
     ],
 )
 def test_malformed_hosts_and_ports_are_skipped(invalid_url: str) -> None:
@@ -170,8 +175,6 @@ def test_malformed_hosts_and_ports_are_skipped(invalid_url: str) -> None:
 @pytest.mark.parametrize(
     "apply_url",
     [
-        "http://127.0.0.1/jobs",
-        "https://[2001:db8::1]:8443/jobs",
         "https://例子.公司/职位",
         "https://xn--fsqu00a.xn--55qx5d/jobs",
         "https://example.com./jobs",

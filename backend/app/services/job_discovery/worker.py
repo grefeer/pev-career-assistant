@@ -12,8 +12,9 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Callable
 
 import yaml
@@ -33,6 +34,7 @@ from backend.app.repositories.job_discovery import (
     mark_task_needs_manual_review,
     mark_task_partial_success,
     mark_task_succeeded,
+    renew_task_lease,
     upsert_candidate,
     upsert_evidence,
 )
@@ -499,6 +501,29 @@ def _checkpoint_from_snapshot(snapshot_context: dict | None) -> CrawlCheckpoint 
         return None
 
 
+def _merge_recommendation_apply_urls(
+    discovered_candidates: list[NormalizedJobCandidate],
+    recommendation_candidates: list[NormalizedJobCandidate],
+) -> list[NormalizedJobCandidate]:
+    """Carry a verified source-page fallback URL into its persisted raw JD."""
+    def key(candidate: NormalizedJobCandidate) -> tuple[str, str, str, str, str]:
+        return (
+            candidate.title or "", candidate.company_name or "", candidate.department or "",
+            candidate.responsibilities or "", candidate.requirements or "",
+        )
+
+    urls = {
+        key(candidate): candidate.apply_url
+        for candidate in recommendation_candidates
+        if isinstance(candidate.apply_url, str) and candidate.apply_url.startswith(("https://", "http://"))
+    }
+    return [
+        replace(candidate, apply_url=urls[key(candidate)])
+        if not candidate.apply_url and key(candidate) in urls else candidate
+        for candidate in discovered_candidates
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -543,6 +568,44 @@ class JobDiscoveryWorker:
         self.single_source_proof_registry: SingleSourceProofRegistry = (
             PRODUCTION_REGISTRY
         )
+
+    def _start_lease_heartbeat(
+        self, *, task_id: str,
+    ) -> tuple[threading.Event, threading.Event, threading.Thread]:
+        """Keep a claimed task renewable while its external work is running."""
+        stop = threading.Event()
+        lost = threading.Event()
+        timeout = self.settings.job_discovery_task_timeout_seconds
+        interval = max(5, min(60, timeout // 3))
+
+        def renew() -> None:
+            while not stop.wait(interval):
+                heartbeat_db = self.db_factory()
+                try:
+                    renewed = renew_task_lease(
+                        heartbeat_db,
+                        task_id=task_id,
+                        worker_id=self.worker_id,
+                        lease_seconds=timeout,
+                    )
+                    heartbeat_db.commit()
+                    if not renewed:
+                        logger.warning("Lost lease for job discovery task %s", task_id)
+                        lost.set()
+                        return
+                except Exception:
+                    heartbeat_db.rollback()
+                    logger.exception("Could not renew lease for task %s", task_id)
+                    lost.set()
+                    return
+                finally:
+                    heartbeat_db.close()
+
+        thread = threading.Thread(
+            target=renew, name=f"job-discovery-lease-{task_id}", daemon=True,
+        )
+        thread.start()
+        return stop, lost, thread
 
     def _execute_planned_crawl(
         self,
@@ -698,6 +761,9 @@ class JobDiscoveryWorker:
         """
         db = self.db_factory()
         task: JobDiscoveryTask | None = None
+        heartbeat_stop: threading.Event | None = None
+        heartbeat_lost: threading.Event | None = None
+        heartbeat_thread: threading.Thread | None = None
         try:
             # 1. Claim a task from the queue
             task = claim_next_task(
@@ -707,6 +773,14 @@ class JobDiscoveryWorker:
             )
             if task is None:
                 return 0
+
+            # A claim is a short transactional operation.  Do not retain the
+            # SELECT ... FOR UPDATE lock while an LLM, browser, or Skill runs:
+            # a worker crash is recovered from the persisted lease expiry.
+            db.commit()
+            heartbeat_stop, heartbeat_lost, heartbeat_thread = self._start_lease_heartbeat(
+                task_id=task.id,
+            )
 
             # 2. Load the raw record for record_fields
             raw_record = db.scalar(
@@ -730,7 +804,9 @@ class JobDiscoveryWorker:
             # Default execution path.  It is intentionally before strategy
             # routing so URL matching and adapters cannot affect a Skill run.
             if self.settings.job_discovery_skill_runtime_enabled:
-                return self._run_skill_task(db, task, task_input)
+                return self._run_skill_task(
+                    db, task, task_input, lease_lost=heartbeat_lost,
+                )
 
             # ── 4a. Strategy routing ──────────────────────────────────
             strategy_record: StrategyRecord | None = None
@@ -1103,6 +1179,8 @@ class JobDiscoveryWorker:
                     )
             if agent_error is not None and not result.candidates and not result.evidence:
                 raise agent_error
+            if heartbeat_lost is not None and heartbeat_lost.is_set():
+                raise RuntimeError("job_discovery_lease_lost")
 
             # 6. Persist evidence and candidates
             _persist_evidence(db, task, result.evidence)
@@ -1205,6 +1283,11 @@ class JobDiscoveryWorker:
             return 1
 
         except Exception as exc:
+            if str(exc) == "job_discovery_lease_lost":
+                # A different worker may have reclaimed the task.  This stale
+                # session must not write a terminal state over its result.
+                db.rollback()
+                return 0
             if task is not None:
                 try:
                     mark_task_failed(db, task, last_error=str(exc))
@@ -1213,6 +1296,10 @@ class JobDiscoveryWorker:
                     db.rollback()
             return 0
         finally:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=1)
             db.close()
 
     def _run_skill_task(
@@ -1220,11 +1307,21 @@ class JobDiscoveryWorker:
         db: Session,
         task: JobDiscoveryTask,
         task_input: DiscoveryTaskInput,
+        *,
+        lease_lost: threading.Event | None = None,
     ) -> int:
         outcome = self._skill_runtime.run(task_input, task_id=task.id)
         result = outcome.result
+        if lease_lost is not None and lease_lost.is_set():
+            raise RuntimeError("job_discovery_lease_lost")
         _persist_evidence(db, task, result.evidence)
-        _persist_candidates(db, task, result.candidates)
+        # Retain all observed, evidence-backed JDs.  The result object is the
+        # immediate recommendation subset for this task, not an archival
+        # replacement for discovery output.
+        discovered_candidates = _merge_recommendation_apply_urls(
+            outcome.discovered_candidates or result.candidates, result.candidates,
+        )
+        _persist_candidates(db, task, discovered_candidates)
 
         trajectory = TrajectoryBuffer(task.id, strategy_id=None, executor_type="skill_agent")
         for step in outcome.trace_steps:
@@ -1240,11 +1337,25 @@ class JobDiscoveryWorker:
         summary_json: dict[str, Any] = {
             "summary": result.summary,
             "evidence_count": len(result.evidence),
-            "candidate_count": len(result.candidates),
-            "body_candidate_count": sum(bool(candidate.responsibilities.strip() or candidate.requirements.strip()) for candidate in result.candidates),
+            "candidate_count": len(discovered_candidates),
+            "raw_candidate_count": len(discovered_candidates),
+            "body_candidate_count": sum(bool(candidate.responsibilities.strip() or candidate.requirements.strip()) for candidate in discovered_candidates),
             "execution_path": "skill_agent",
             "coverage_verified": outcome.coverage_verified,
+            "targeted_recommendation_verified": bool(
+                result.status == "succeeded" and outcome.preferred_candidates
+            ),
             "artifact_root_uri": outcome.artifact_root.resolve().as_uri(),
+            # Recommendation metadata is separate from the persisted complete
+            # crawl result.  It makes the AI-application/Agent evaluation
+            # filter reproducible without deleting non-matching JDs.
+            "role_preferences": list(outcome.role_preferences),
+            "preferred_candidate_count": len(outcome.preferred_candidates),
+            "preferred_candidate_titles": [
+                candidate.title for candidate in outcome.preferred_candidates
+                if candidate.title
+            ],
+            "recommendation_candidate_count": len(result.candidates),
             "legacy_fallback_reason": None,
             "single_source_complete": None,
         }

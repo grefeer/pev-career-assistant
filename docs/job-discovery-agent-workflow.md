@@ -2,6 +2,8 @@
 
 > 本文档描述 Agent 是如何从腾讯智能表的两张 sheet 中读取招聘线索，创建发现任务，调用 Deep Agents 进行网页发现，以及为什么登录/验证码页面会导致 `needs_manual_review`。
 
+> **当前默认（2026-07-29）**：发现由 **Skill Discovery Runtime** 完成（`create_deep_agent` + 作业发现 Skill + 受限工具 + JD Extractor 子 Agent），早于任何 URL 策略匹配 / Adapter / 旧 Supervisor。下方「Legacy PATH C / Supervisor」流程仅在显式关闭 `JOB_DISCOVERY_SKILL_RUNTIME_ENABLED` 时作为回滚路径保留。发现候选**不再经管理员审核晋升 `JobPosting(verified)`**，而是经**个性化发现 v1**（预审核、owner-scoped 推荐直达用户，卡片标注「自动发现，建议自行确认」）送达；`/api/jobs` verified 职位中心由 WP2 手动导入喂养，与发现候选解耦。旧架构汇总见 [job-discovery-legacy-architecture-summary.md](job-discovery-legacy-architecture-summary.md)。
+
 ---
 
 ## 1. 整体流程
@@ -19,7 +21,7 @@ flowchart LR
     G -->|"解析图文"| I
     I -->|"标准化候选"| J["Evidence Verifier"]
     J -->|"打包入库"| K["discovered_job_candidates"]
-    K -->|"管理员审核"| L["job_postings"]
+    K -->|"个性化发现 v1<br/>预审核 · owner-scoped 推荐"| L["用户<br/>「自动发现，建议自行确认」"]
 ```
 
 ## 2. 两个腾讯智能表来源
@@ -88,7 +90,7 @@ Agent 通过 `finish_with_manual_review()` 工具返回 `needs_manual_review` �
 - `recruitment_type` — 招聘类型（全职/实习/校招）
 - `source_family` — 来源系列
 
-相同 key 的候选取 `pending_review` 状态出现在同一个审核分组中，`GET /admin/job-discovery/groups` 按 key 聚合返回。
+候选不再经管理员审核分组；达标候选（证据核验 + 覆盖完整 + URL 安全 + 去重 + 相关性达标）经**个性化发现 v1** 以 owner-scoped 推荐直达用户，卡片标注「自动发现，建议自行确认」。`GET /admin/job-discovery/groups`（按相似度 key 聚合）为旧审核分组端点，目标态下发现候选不再走此路。
 
 ## 7. 关键模型
 
@@ -96,7 +98,7 @@ Agent 通过 `finish_with_manual_review()` 工具返回 `needs_manual_review` �
 |---|---|
 | `JobDiscoveryTask` | 每个 URL 的发现任务，含状态、lease、重试 |
 | `JobDiscoveryEvidence` | 发现的证据（页面截图、文本摘录等） |
-| `DiscoveredJobCandidate` | 标准化后的候选岗位，待管理员审核 |
+| `DiscoveredJobCandidate` | 标准化后的候选岗位，经个性化发现 v1 送达用户（预审核，卡片标注「自动发现，建议自行确认」） |
 | `JobSource` | 数据源配置（智能表来源 Key、file_id、sheet_id） |
 | `RawJobRecord` | 同步后的原始记录快照 |
 

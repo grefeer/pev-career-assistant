@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A multi-agent campus-recruitment career assistant built with LangGraph, FastAPI, Vue 3, and Docker Compose. Core capabilities include an opt-in Tencent Smartsheet → Web Navigation Agent → structured JD extraction → admin review → student job-center pipeline, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for assisted form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
+A multi-agent campus-recruitment career assistant built with LangGraph, FastAPI, Vue 3, and Docker Compose. Core capabilities include an opt-in Tencent Smartsheet → Skill Discovery Runtime → structured JD extraction → personalized discovery v1 (pre-review, owner-scoped) pipeline, plus a WP2 manual-import → admin review → verified student job-center flow, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for assisted form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
 
 ## Tech Stack
 
@@ -156,14 +156,21 @@ These are code-level restrictions, NOT conventions:
 
 ## Job Discovery Agent System
 
+> **Default runtime (2026-07-29): Skill Discovery Runtime** (`JOB_DISCOVERY_SKILL_RUNTIME_ENABLED=true`). Discovery candidates are delivered via **personalized discovery v1** (pre-review, owner-scoped, card labelled 「自动发现，建议自行确认」), **not** via admin review -> JobPosting(verified). The verified-only `/api/jobs` job center is fed by the WP2 manual-import/completion workflow and is decoupled from discovery candidates. The Supervisor / Web Navigation Agent / Strategy Router / PEV paths below are **legacy fallback**, retained only when the skill runtime flag is off. Legacy architecture summary: [docs/job-discovery-legacy-architecture-summary.md](docs/job-discovery-legacy-architecture-summary.md). (Code-side discovery candidate admin approve/reject -> JobPosting promotion still exists; migration tracked separately.)
+
 ### Architecture
 
 ```
 Tencent Smartsheet → RawJobRecord → JobDiscoveryTask (queued)
-  → Worker (claim + lease) → DiscoverySupervisorAgent
-    → link_triage → WebNavigationAgent | wechat_parser
+  → Worker (claim + lease) → Skill Discovery Runtime (DEFAULT; create_deep_agent
+        + job-discovery Skill + restricted run_skill_script + per-page jd_extractor subagent)
+    → browse → per-page JD extraction → deduplicate → coverage gate
+  → DiscoveredJobCandidate → Personalized Discovery v1 (pre-review, owner-scoped)
+    → 用户 (卡片: 自动发现, 建议自行确认)   [skip admin review]
+
+Legacy fallback (JOB_DISCOVERY_SKILL_RUNTIME_ENABLED=false only):
+  → DiscoverySupervisorAgent → link_triage → WebNavigationAgent | wechat_parser
     → jd_extraction → evidence_verifier → candidate_packager
-  → DiscoveredJobCandidate (pending_review) → Admin Review → JobPosting (verified)
 ```
 
 ### Web Navigation Agent (deepagents_runner.py)
@@ -260,7 +267,8 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head include
 |----------|---------|
 | [WP1 Tech Doc](docs/WP1-平台基础与权威数据-技术文档.md) | Platform foundation explained (auth, state machine, encryption, layers) |
 | [WP2 Tech Doc](docs/WP2-真实职位同步与核验-技术文档.md) | Job sync, review pipeline, student submissions explained |
-| [Job Discovery Agent Design](docs/superpowers/specs/2026-07-18-job-discovery-agent-design.md) | Full agent architecture |
+| [Job Discovery (legacy summary)](docs/job-discovery-legacy-architecture-summary.md) | Superseded Supervisor/PEV/Strategy-Router architecture archive |
+| [Job Discovery Architecture (current)](backend/app/services/job_discovery/ARCHITECTURE.zh-CN.md) | Current skill-runtime agent architecture & URL->JDs flow |
 | [Job Discovery Workflow](docs/job-discovery-agent-workflow.md) | Agent workflow + architecture reference |
 | [Job Discovery Operations](docs/job-discovery-agent-operations.md) | Startup, config, API reference, troubleshooting |
 | [Platform Runbook](docs/runbooks/platform-foundation.md) | Full environment setup, backup, recovery |

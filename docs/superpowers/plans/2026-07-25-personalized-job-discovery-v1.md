@@ -4,7 +4,7 @@
 
 **Goal:** Let an authenticated user configure role preferences and receive owner-only, evidence-backed pre-review job recommendations from completed shared discovery tasks, while safely explaining sources that cannot be recommended.
 
-**Architecture:** Extend the existing `UserPreference` and `RelevanceRanker` stack. A new service selects retained shared tasks, applies completeness/evidence/URL/dedup/relevance gates, and persists separate user-scoped delivery records. It never changes `JobPosting`, `JobRelevanceScore`, or the verified-only `/jobs` path.
+**Architecture:** Extend the existing `UserPreference` and `RelevanceRanker` stack. A new service selects retained shared tasks, applies completeness/evidence/URL/dedup/relevance gates, and persists separate user-scoped delivery records. It never changes `JobPosting`, `JobRelevanceScore`, or the verified-only `/jobs` path. As of 2026-07-29, personalized discovery v1 is the discovery candidate delivery path (replaces the discovery admin approve/reject -> `JobPosting(verified)` terminal); the shared `JobPosting`/verified `/jobs` workflow (WP2 manual import) is unchanged. (Code-side discovery candidate admin approve/reject still exists; migration tracked separately.)
 
 **Tech Stack:** Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2, Alembic, MySQL, pytest, Ruff.
 

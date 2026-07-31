@@ -71,13 +71,15 @@ npm run dev
 | `job_discovery_enabled` | `false` | 是否启用发现功能（Worker 启动前设为 `true`） |
 | `job_discovery_agent_version` | `"1.0.0"` | Agent 版本，影响任务幂等 key |
 | `job_discovery_model` | `"deepseek-v4-flash"` | Agent 使用的 LLM 模型 |
-| `job_discovery_max_pages_per_task` | `20` | 每个任务最大浏览页数（1-100） |
-| `job_discovery_max_candidates_per_task` | `10` | 每个任务最大候选数（1-50） |
+| `job_discovery_max_pages_per_task` | `50` | 每个任务最大浏览页数（1-100） |
+| `job_discovery_max_candidates_per_task` | `500` | 每个任务最大候选数（1-1000） |
 | `job_discovery_task_timeout_seconds` | `600` | 任务 lease 超时（30-3600s） |
 | `job_discovery_browser_headless` | `true` | 浏览器是否为无头模式（预留，暂未集成浏览器） |
 | `job_discovery_ocr_enabled` | `false` | 是否启用 OCR（需配置 OCR 服务） |
+| `job_discovery_skill_runtime_enabled` | `true` | **默认**：Skill Discovery Runtime 早于策略 / Adapter / Supervisor 运行 |
+| `job_discovery_skill_artifact_root` | `var/job-discovery-skill` | 每任务隔离 skill 工件根目录 |
 
-PEV 灰度迁移 flags（默认全灰：PEV 关、legacy 开）：
+PEV 灰度迁移 flags（legacy；skill runtime 默认开启时以下均惰性）：
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
@@ -101,12 +103,12 @@ PEV 灰度迁移 flags（默认全灰：PEV 关、legacy 开）：
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/admin/job-discovery/tasks` | 列出发现任务（可传 `?status=queued` 过滤） |
-| GET | `/admin/job-discovery/groups` | 列出审核分组（按相似度 key 聚合） |
+| GET | `/admin/job-discovery/groups` | （旧）列出审核分组（按相似度 key 聚合）- 目标态发现候选不再走此路 |
 | POST | `/admin/job-discovery/tasks/{id}/retry` | 重试失败/阻塞任务 |
-| POST | `/admin/job-discovery/candidates/{id}/approve` | 审批通过候选，自动创建 `JobPosting` |
-| POST | `/admin/job-discovery/candidates/{id}/reject` | 拒绝候选 |
+| POST | `/admin/job-discovery/candidates/{id}/approve` | （旧）审批通过候选 -> `JobPosting` - 目标态改由个性化发现 v1 送达 |
+| POST | `/admin/job-discovery/candidates/{id}/reject` | （旧）拒绝候选 - 同上 |
 
-所有端点需要 `require_admin` 权限和 `Bearer` token。
+所有端点需要 `require_admin` 权限和 `Bearer` token。发现候选送达（个性化发现 v1）端点见 §8.7。
 
 ## 4. 同步触发
 
@@ -130,7 +132,7 @@ curl -X POST "http://127.0.0.1:8000/api/admin/sync/tencent-intern-referrals" \
 |---|---|
 | `job_discovery_tasks` | 发现任务队列 |
 | `job_discovery_evidence` | 发现的证据记录 |
-| `discovered_job_candidates` | 候选岗位（待审核） |
+| `discovered_job_candidates` | 候选岗位（经个性化发现 v1 送达用户） |
 | `job_sources` | 数据源配置 |
 | `raw_job_records` | 同步的原始记录 |
 
@@ -153,9 +155,9 @@ curl -X POST "http://127.0.0.1:8000/api/admin/sync/tencent-intern-referrals" \
 
 查看后端日志确认 `tencent_protocol_error` 详情。
 
-### 6.3 候选一直 pending_review
+### 6.3 候选去向
 
-这是正常状态——Agent 只负责发现，审核需要管理员通过管理端操作。管理员进入 `/admin/job-discovery`，切换到"审核分组"标签页审批。
+目标态下发现候选不再进入 `pending_review` 等待管理员审核，而是经**个性化发现 v1** 门控（证据核验 + 覆盖完整 + URL 安全 + 去重 + 相关性达标）后以 owner-scoped 预审核推荐直达用户（卡片「自动发现，建议自行确认」）；不达标候选落 `needs_manual_review`。`pending_review` 与 `/admin/job-discovery` 审核分组为旧路径（代码仍存在，迁移待跟进）。
 
 ### 6.4 任务一直 running
 
@@ -230,9 +232,9 @@ $env:FLAGS_use_onednn='0'
 
 ---
 
-## 8. 个性化发现（Personalized Discovery v1）
+## 8. 个性化发现（Personalized Discovery v1）- 发现送达方式
 
-个性化发现是 **预审核（pre-review）** 通道：把 worker 已完成的共享 `JobDiscoveryTask` 中「证据核验 + 覆盖完整 + URL 安全 + 去重 + 相关性达标」的候选，以 owner-scoped 推荐的形式直接送达单个用户，跳过管理员审核。它**独立于** verified-only 的 `/api/jobs` 路径，绝不修改 `JobPosting`、`JobRelevanceScore` 或 `review_version`。推荐卡片固定标注「自动发现，建议自行确认」。
+个性化发现 v1 是发现候选的**送达方式**（取代旧的管理员审核 -> `JobPosting(verified)` 终点）：把 worker 已完成的共享 `JobDiscoveryTask` 中「证据核验 + 覆盖完整 + URL 安全 + 去重 + 相关性达标」的候选，以 owner-scoped 推荐的形式直接送达单个用户，**跳过管理员审核**（预审核通道）。它**独立于** verified-only 的 `/api/jobs` 路径（后者由 WP2 手动导入喂养），绝不修改 `JobPosting`、`JobRelevanceScore` 或 `review_version`。推荐卡片固定标注「自动发现，建议自行确认」。
 
 ### 8.1 初始覆盖范围（v1）
 

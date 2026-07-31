@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.base import Base
 from backend.app.db.models import (
+    AuditEvent,
     DiscoveredJobCandidateStatus,
     DiscoveryBlockReason,
     JobDiscoveryTaskStatus,
+    JobDiscoveryEvidence,
     JobPosting,
     JobSource,
     JobSourceProvider,
@@ -18,8 +20,8 @@ from backend.app.db.models import (
     User,
     UserRole,
 )
-from backend.app.api.routes.job_discovery import approve_job_discovery_candidate
 from backend.app.repositories import job_discovery
+from backend.app.services.job_discovery.admin_service import JobDiscoveryAdminService
 
 
 @pytest.fixture
@@ -219,6 +221,26 @@ class TestClaimNextTask:
         )
         assert claimed is None
 
+    def test_renew_lease_requires_current_owner_and_unexpired_lease(self, db: Session) -> None:
+        source = create_source(db)
+        record = create_raw_record(db, source.id)
+        task, _ = job_discovery.create_or_get_task(
+            db, **default_task_kwargs(source_id=source.id, raw_record_id=record.id)
+        )
+        claimed = job_discovery.claim_next_task(
+            db, worker_id="worker-1", lease_seconds=30,
+        )
+        assert claimed is not None
+        before = claimed.lease_expires_at
+
+        assert job_discovery.renew_task_lease(
+            db, task_id=task.id, worker_id="worker-1", lease_seconds=60,
+        )
+        assert task.lease_expires_at > before
+        assert not job_discovery.renew_task_lease(
+            db, task_id=task.id, worker_id="worker-2", lease_seconds=60,
+        )
+
 
 class TestMarkTask:
     def test_mark_running(self, db: Session) -> None:
@@ -272,9 +294,22 @@ class TestMarkTask:
         job_discovery.mark_task_needs_manual_review(
             db, task, block_reason=DiscoveryBlockReason.captcha
         )
-
         assert task.status is JobDiscoveryTaskStatus.needs_manual_review
         assert task.block_reason is DiscoveryBlockReason.captcha
+
+    def test_failed_task_is_requeued_until_max_attempts(self, db: Session) -> None:
+        source = create_source(db)
+        record = create_raw_record(db, source.id)
+        task, _ = job_discovery.create_or_get_task(
+            db, **default_task_kwargs(source_id=source.id, raw_record_id=record.id)
+        )
+
+        job_discovery.mark_task_failed(db, task, last_error="temporary network error")
+
+        assert task.status is JobDiscoveryTaskStatus.queued
+        assert task.attempt_count == 1
+        claimed = job_discovery.claim_next_task(db, worker_id="retry-worker", lease_seconds=30)
+        assert claimed is not None
 
     def test_mark_failed_increments_attempt_count(self, db: Session) -> None:
         source = create_source(db)
@@ -286,9 +321,13 @@ class TestMarkTask:
 
         job_discovery.mark_task_failed(db, task, last_error="connection lost")
 
-        assert task.status is JobDiscoveryTaskStatus.failed
+        assert task.status is JobDiscoveryTaskStatus.queued
         assert task.last_error == "connection lost"
         assert task.attempt_count == 1
+
+        task.attempt_count = task.max_attempts - 1
+        job_discovery.mark_task_failed(db, task, last_error="final failure")
+        assert task.status is JobDiscoveryTaskStatus.failed
 
 
 class TestUpsertEvidence:
@@ -600,6 +639,12 @@ class TestApproveDiscoveryCandidate:
         task, _ = job_discovery.create_or_get_task(
             db, **default_task_kwargs(source_id=source.id, raw_record_id=record.id)
         )
+        task.status = JobDiscoveryTaskStatus.succeeded
+        task.result_summary_json = {"coverage_verified": True}
+        db.add(JobDiscoveryEvidence(
+            task_id=task.id, evidence_type="skill_page_text", content_hash="b" * 64,
+            storage_uri="object://job-discovery/test/page.txt",
+        ))
 
         first = job_discovery.upsert_candidate(
             db,
@@ -653,8 +698,9 @@ class TestApproveDiscoveryCandidate:
         )
         db.commit()
 
-        approve_job_discovery_candidate(first.id, admin, db)
-        approve_job_discovery_candidate(second.id, admin, db)
+        service = JobDiscoveryAdminService()
+        service.approve_candidate(db, candidate_id=first.id, admin=admin)
+        service.approve_candidate(db, candidate_id=second.id, admin=admin)
 
         postings = db.query(JobPosting).order_by(JobPosting.title).all()
         assert len(postings) == 2
@@ -663,3 +709,39 @@ class TestApproveDiscoveryCandidate:
             "后端开发工程师",
         }
         assert len({posting.external_record_id for posting in postings}) == 2
+        events = db.query(AuditEvent).filter(
+            AuditEvent.event_type == "job_discovery.approve"
+        ).all()
+        assert {event.entity_id for event in events} == {first.id, second.id}
+        assert {event.actor_user_id for event in events} == {admin.id}
+
+
+def test_approval_rejects_candidate_without_verified_durable_task(
+    db: Session,
+) -> None:
+    source = create_source(db)
+    record = create_raw_record(db, source.id)
+    task, _ = job_discovery.create_or_get_task(
+        db, **default_task_kwargs(source_id=source.id, raw_record_id=record.id)
+    )
+    candidate = job_discovery.upsert_candidate(
+        db, task_id=task.id, source_id=source.id, raw_record_id=record.id,
+        external_record_id="ext-1", idempotency_key="unverified-key",
+        similarity_group_key="group", title="Agent 开发工程师", company_name="示例",
+        department=None, description_text="JD", responsibilities="开发", requirements=None,
+        locations_json=None, recruitment_types_json=None, industries_json=None,
+        apply_url="https://example.com/jobs", application_channel_json=None,
+        deadline_text=None, referral_code=None, confidence=0.8,
+        evidence_refs_json=None, normalization_warnings_json=None,
+    )
+    admin = User(
+        id="admin-unverified", account="admin-unverified", nickname="Admin",
+        password_hash="x", role=UserRole.ADMIN,
+    )
+    db.add(admin)
+    db.commit()
+
+    with pytest.raises(Exception, match="任务证据未完成"):
+        JobDiscoveryAdminService().approve_candidate(
+            db, candidate_id=candidate.id, admin=admin,
+        )

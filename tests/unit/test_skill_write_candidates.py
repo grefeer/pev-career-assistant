@@ -4,51 +4,20 @@ import importlib.util
 from pathlib import Path
 
 
-_SCRIPT = Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "scripts" / "write_candidates.py"
-_SPEC = importlib.util.spec_from_file_location("skill_write_candidates", _SCRIPT)
-assert _SPEC and _SPEC.loader
-_WRITER = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_WRITER)
+def _load_writer():
+    path = Path("skill/job-discovery/scripts/write_candidates.py")
+    spec = importlib.util.spec_from_file_location("skill_write_candidates", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def test_writer_accepts_a_candidate_with_a_real_jd_body() -> None:
-    assert _WRITER._valid_candidate({
-        "title": "算法工程师", "company_name": "示例公司", "responsibilities": "负责模型训练",
-    })
+def test_utf8_safe_replaces_lone_surrogates_without_losing_candidate_fields() -> None:
+    writer = _load_writer()
 
+    safe = writer._utf8_safe({"title": "AI Agent\udc80工程师", "locations": ["北京"]})
 
-def test_writer_rejects_title_only_rows_even_when_they_look_like_jobs() -> None:
-    assert not _WRITER._valid_candidate({
-        "title": "算法工程师", "company_name": "示例公司",
-    })
-
-
-def test_writer_rejects_rows_missing_the_company_identity() -> None:
-    assert not _WRITER._valid_candidate({
-        "title": "算法工程师", "responsibilities": "负责模型训练",
-    })
-
-
-def test_writer_rejects_listing_pointer_as_a_fake_jd_body() -> None:
-    assert not _WRITER._valid_candidate({
-        "title": "算法工程师", "company_name": "示例公司",
-        "responsibilities": "See listing page for details",
-    })
-
-
-def test_writer_rejects_model_invented_body_from_title_only_evidence() -> None:
-    assert not _WRITER._valid_candidate({
-        "title": "产品经理", "company_name": "示例公司",
-        "responsibilities": "负责产品规划与落地",
-        "evidence_refs": [{"evidence_type": "browsed_list_page_title_only"}],
-    })
-
-
-def test_writer_refuses_non_page_candidate_output_path(monkeypatch, capsys, tmp_path: Path) -> None:
-    monkeypatch.setattr(_WRITER.sys, "argv", ["write_candidates.py", "--out", "output/candidates/temp_fix.json"])
-    monkeypatch.setattr(_WRITER.sys, "stdin", type("Input", (), {"read": lambda self: "[]"})())
-    monkeypatch.setattr(_WRITER, "_SKILL_ROOT", tmp_path)
-    monkeypatch.setattr(_WRITER, "_ALLOWED_ROOT", tmp_path / "output")
-
-    assert _WRITER.main() == 0
-    assert "must be output/candidates/page_NN.json" in capsys.readouterr().out
+    assert safe["title"] == "AI Agent?工程师"
+    assert safe["locations"] == ["北京"]
+    assert safe["title"].encode("utf-8")

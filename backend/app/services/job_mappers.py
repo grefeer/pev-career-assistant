@@ -180,8 +180,11 @@ def _normalize_url(value: str) -> str | None:
 
 def _is_valid_hostname(hostname: str) -> bool:
     try:
-        ipaddress.ip_address(hostname)
-        return True
+        # Discovery URLs are fetched by a privileged worker. Literal loopback,
+        # private, link-local, multicast and documentation addresses must never
+        # enter its queue. DNS names receive a second resolution-time check in
+        # the browser boundary.
+        return ipaddress.ip_address(hostname).is_global
     except ValueError:
         pass
     if ":" in hostname:

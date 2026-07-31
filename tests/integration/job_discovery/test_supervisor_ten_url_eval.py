@@ -78,6 +78,10 @@ from backend.app.services.job_discovery.result_contract import (
     enforce_result_invariants,
     parse_agent_result,
 )
+from backend.app.services.job_discovery.role_preferences import (
+    DEFAULT_ROLE_PREFERENCES,
+    filter_candidates_for_preferences,
+)
 from backend.app.services.job_discovery.schemas import (
     DiscoveryRunResult,
     DiscoveryTaskInput,
@@ -348,6 +352,9 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
             "duplicate_count": 0, "block_reason": None,
             "elapsed_sec": round(time.monotonic() - t0, 1),
             "error": str(exc)[:200],
+            "role_preferences": list(DEFAULT_ROLE_PREFERENCES),
+            "preferred_candidate_count": 0,
+            "preferred_candidate_titles": [],
         }
     elapsed = time.monotonic() - t0
 
@@ -357,6 +364,7 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
     bucket = _classify(summary, result)
 
     with_body = _body_count(cands)
+    preferred = filter_candidates_for_preferences(cands, DEFAULT_ROLE_PREFERENCES)
     record: dict[str, Any] = {
         "slug": slug,
         "company": company,
@@ -373,6 +381,9 @@ def _run_one(slug: str, company: str, url: str, real_count: int | None,
         "block_reason": summary["block_reason"],
         "elapsed_sec": round(elapsed, 1),
         "summary": (result.summary or "")[:300],
+        "role_preferences": list(DEFAULT_ROLE_PREFERENCES),
+        "preferred_candidate_count": len(preferred),
+        "preferred_candidate_titles": [candidate.title for candidate in preferred if candidate.title],
     }
     _OUT_DIR.mkdir(parents=True, exist_ok=True)
     (_OUT_DIR / f"_ten_url_eval_{slug}.json").write_text(

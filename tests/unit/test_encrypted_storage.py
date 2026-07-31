@@ -7,7 +7,11 @@ from typing import Any
 import pytest
 from cryptography.exceptions import InvalidTag
 
-from backend.app.services.storage import EncryptedObjectStore, S3BlobStore
+from backend.app.services.storage import (
+    EncryptedObjectStore,
+    S3BlobStore,
+    create_encrypted_object_store,
+)
 
 
 @dataclass
@@ -76,6 +80,26 @@ def test_round_trip_encrypts_before_blob_store(
     assert result.plaintext_size == len(b"private resume")
     assert result.encryption == "v1-aes-256-gcm"
     assert store.get(key=result.key) == b"private resume"
+
+
+def test_factory_builds_encrypted_store_and_ensures_bucket(encryption_key: str) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.checked = False
+
+        def head_bucket(self, **kwargs) -> None:
+            self.checked = True
+
+    class Settings:
+        object_store_bucket = "test-bucket"
+        object_store_region = "us-east-1"
+        object_encryption_key = encryption_key
+
+    client = Client()
+    store = create_encrypted_object_store(Settings(), client=client)
+
+    assert client.checked
+    assert isinstance(store, EncryptedObjectStore)
 
 
 def test_each_put_uses_a_fresh_twelve_byte_nonce(

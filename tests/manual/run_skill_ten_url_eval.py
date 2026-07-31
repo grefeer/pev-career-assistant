@@ -613,10 +613,13 @@ WORKFLOW - load it first, then follow it exactly:
    detects URL-keyed pagination and fetches all pages concurrently via a thread
    pool; auto-follows public card detail links for non-paginated SPAs, falls back
    to serial click for load-more sites, and returns a thin
-   `spa_shell_no_pagination` result for card-SPAs), retry ONCE with
-   `--mode search-interact` if `[PAGE_TEXT]` is < ~500 chars, then fan out ONE
-   `jd_extractor` task per page file in a SINGLE message (parallel), then
-   `deduplicate`-merge.
+   `spa_shell_no_pagination` result for card-SPAs). If browse returns
+   `status:"blocked"` (e.g. `used_path:"spa_shell_empty_no_evidence"` - a
+   confirmed 0-char anti-bot/empty shell with no public job JSON evidence), do
+   NOT retry: immediately emit `{"status":"blocked","reason":"<browse reason>"}` and stop.
+   Otherwise retry ONCE with `--mode search-interact` if `[PAGE_TEXT]` is
+   < ~500 chars, then fan out ONE `jd_extractor` task per page file in a SINGLE
+   message (parallel), then `deduplicate`-merge.
 
 KEY POINTS (also in the workflow doc - repeated because they are the common
 failure modes):
@@ -662,7 +665,12 @@ failure modes):
   Do NOT browse, redispatch extraction tasks, or call coverage_gate again after
   its verdict. Never claim coverage-verified in the final JSON without a
   passing gate.
-- If `[PAGE_TEXT]` from browse is missing/< ~500 chars, retry ONCE with
+- If browse returns `status:"blocked"` (definitive empty/anti-bot shell, e.g.
+  `used_path:"spa_shell_empty_no_evidence"`), emit
+  `{"status":"blocked","reason":"<browse reason>"}` and stop IMMEDIATELY - do
+  NOT spend the search-interact retry; the shell cannot render job content and
+  retrying only burns ~45s. Only if browse returned a non-blocked status but
+  `[PAGE_TEXT]` is missing/< ~500 chars, retry ONCE with
   `--mode search-interact`; if still empty, emit
   `{"status":"blocked","reason":"page did not render job content"}` and stop.
 - HARD LIMITS: at most ONE `parallel-fetch` browse and ONE search-interact

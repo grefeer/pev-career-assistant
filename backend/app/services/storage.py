@@ -164,6 +164,34 @@ class EncryptedObjectStore:
         )
 
 
+def create_encrypted_object_store(
+    settings: Any, *, client: Any | None = None,
+) -> EncryptedObjectStore:
+    """Build the one encrypted object-store contract used by app and workers."""
+    if client is None:
+        import boto3
+        from botocore.config import Config
+
+        timeout = getattr(settings, "readiness_timeout_seconds", 2)
+        client = boto3.client(
+            "s3",
+            endpoint_url=settings.object_store_endpoint,
+            region_name=settings.object_store_region,
+            aws_access_key_id=settings.object_store_access_key,
+            aws_secret_access_key=settings.object_store_secret_key,
+            config=Config(
+                connect_timeout=timeout,
+                read_timeout=timeout,
+                retries={"total_max_attempts": 2, "mode": "standard"},
+            ),
+        )
+    blob_store = S3BlobStore(
+        client, settings.object_store_bucket, region=settings.object_store_region,
+    )
+    blob_store.ensure_bucket()
+    return EncryptedObjectStore(blob_store, settings.object_encryption_key)
+
+
 @dataclass(frozen=True)
 class StoredObjectMetadata:
     content_type: str

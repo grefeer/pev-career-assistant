@@ -80,3 +80,4 @@ tests/manual/*
 skill/conversation_history/
 skill/tmp/
 nul
+var/

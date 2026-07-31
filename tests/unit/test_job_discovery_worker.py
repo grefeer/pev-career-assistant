@@ -32,6 +32,7 @@ from backend.app.db.models import (
 from backend.app.services.job_discovery.worker import (
     JobDiscoveryWorker,
     _build_worker_id,
+    _merge_recommendation_apply_urls,
     _fallback_with_record_fields_if_agent_missed_evidence,
     _parse_agent_result,
 )
@@ -163,6 +164,12 @@ def test_worker_uses_skill_runtime_not_legacy_supervisor(
             evidence=[PageEvidence(evidence_type="skill_page_text", content_hash="a" * 64, metadata={"storage_uri": "file:///task/page.txt"})],
         ),
         trace_steps=[{"tool": "browse", "status": "ok", "duration_ms": 1}], artifact_root=Path.cwd(), coverage_verified=True,
+        role_preferences=("AI应用开发", "Agent开发"),
+        preferred_candidates=[NormalizedJobCandidate(title="AI应用开发工程师", responsibilities="开发")],
+        discovered_candidates=[
+            NormalizedJobCandidate(title="工程师", company_name="公司", responsibilities="开发"),
+            NormalizedJobCandidate(title="销售培训生", company_name="公司", responsibilities="销售"),
+        ],
     )
     worker._skill_runtime = MagicMock()
     worker._skill_runtime.run.return_value = expected
@@ -175,8 +182,25 @@ def test_worker_uses_skill_runtime_not_legacy_supervisor(
     with db_session_factory() as session:
         persisted = session.get(JobDiscoveryTask, queued_task.id)
         assert persisted.result_summary_json["execution_path"] == "skill_agent"
+        assert persisted.result_summary_json["role_preferences"] == ["AI应用开发", "Agent开发"]
+        assert persisted.result_summary_json["preferred_candidate_count"] == 1
+        assert persisted.result_summary_json["raw_candidate_count"] == 2
+        assert persisted.result_summary_json["recommendation_candidate_count"] == 1
+        assert session.query(DiscoveredJobCandidate).count() == 2
         assert session.query(JobDiscoveryEvidence).one().storage_uri == "file:///task/page.txt"
         assert session.query(JobDiscoveryTrajectory).one().completed_steps[0]["tool"] == "browse"
+
+
+def test_worker_merges_verified_recommendation_apply_url_into_raw_candidate() -> None:
+    raw = NormalizedJobCandidate(title="Agent开发工程师", responsibilities="负责开发")
+    recommendation = NormalizedJobCandidate(
+        title="Agent开发工程师", responsibilities="负责开发",
+        apply_url="https://example.com/jobs",
+    )
+
+    persisted = _merge_recommendation_apply_urls([raw], [recommendation])
+
+    assert persisted[0].apply_url == "https://example.com/jobs"
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +732,7 @@ class TestCrashRecovery:
         with Session(engine) as vs:
             t = vs.get(JobDiscoveryTask, queued_task.id)
             assert t is not None
-            assert t.status is JobDiscoveryTaskStatus.failed
+            assert t.status is JobDiscoveryTaskStatus.queued
             assert t.last_error is not None
             assert "Agent crashed" in t.last_error
             # Attempt count should be incremented

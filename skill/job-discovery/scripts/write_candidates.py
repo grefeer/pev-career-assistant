@@ -103,6 +103,22 @@ def _identity(c: dict[str, Any]) -> tuple:
     return (company, _norm_title(c.get("title")), _loc_key(c))
 
 
+def _utf8_safe(value: Any) -> Any:
+    """Replace lone Unicode surrogates before persisting agent-provided JSON.
+
+    Browser and model text can occasionally contain an unpaired surrogate.
+    Python's JSON encoder permits it, but a UTF-8 file does not; one such title
+    must not discard every otherwise valid candidate on that page.
+    """
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, list):
+        return [_utf8_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(_utf8_safe(key)): _utf8_safe(item) for key, item in value.items()}
+    return value
+
+
 def _lenient_extract_json(raw: str) -> Any:
     """Parse JSON leniently: strip prose/code-fences, then brace-scan.
 
@@ -337,7 +353,7 @@ def main() -> int:
         except (json.JSONDecodeError, OSError):
             existing = []
 
-    merged: list[dict[str, Any]] = list(existing)
+    merged: list[dict[str, Any]] = [_utf8_safe(candidate) for candidate in existing]
     seen = {_identity(c) for c in existing}
     added = 0
     for c in kept:
@@ -345,7 +361,7 @@ def main() -> int:
         if ident in seen:
             continue
         seen.add(ident)
-        merged.append(c)
+        merged.append(_utf8_safe(c))
         added += 1
 
     out_p.parent.mkdir(parents=True, exist_ok=True)
