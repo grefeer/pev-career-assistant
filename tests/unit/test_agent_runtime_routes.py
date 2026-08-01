@@ -140,3 +140,34 @@ def test_get_agent_run_and_events_project_owner_safe_fields() -> None:
     }
     assert events.status_code == 200
     assert events.json()["items"][0]["event_type"] == "run_started"
+
+
+def test_list_agent_artifacts_projects_only_owner_safe_artifact_fields() -> None:
+    """JD evidence is readable by its owner without exposing run context or prompts."""
+    service = MagicMock()
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    service.list_artifacts.return_value = [
+        SimpleNamespace(
+            id="artifact-1",
+            artifact_type="public_job_page",
+            source_url="https://jobs.example/agent",
+            content_hash="a" * 64,
+            content_json={"title": "AI Agent 开发工程师", "visible_text": "岗位职责"},
+            created_at=now,
+        )
+    ]
+    app = _build_app(service)
+
+    response = TestClient(app).get(
+        "/api/agent-runs/run-1/artifacts", headers=_headers(app)
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [{
+        "id": "artifact-1",
+        "artifact_type": "public_job_page",
+        "source_url": "https://jobs.example/agent",
+        "content_hash": "a" * 64,
+        "content": {"title": "AI Agent 开发工程师", "visible_text": "岗位职责"},
+        "created_at": "2026-08-01T00:00:00Z",
+    }]}

@@ -8,6 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from backend.app.api.agent_runtime_schemas import (
+    AgentArtifactListResponse,
+    AgentArtifactResponse,
     AgentEventListResponse,
     AgentEventResponse,
     AgentRunCreatedResponse,
@@ -124,5 +126,32 @@ def list_agent_events(
                 created_at=event.created_at,
             )
             for event in events
+        ]
+    )
+
+
+@router.get("/{run_id}/artifacts", response_model=AgentArtifactListResponse)
+def list_agent_artifacts(
+    run_id: str,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+) -> AgentArtifactListResponse:
+    """Return the owner's evidence/result artifacts without run-private context."""
+    try:
+        artifacts = service.list_artifacts(db, user_id=current_user.id, run_id=run_id)
+    except AgentRunNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
+    return AgentArtifactListResponse(
+        items=[
+            AgentArtifactResponse(
+                id=artifact.id,
+                artifact_type=artifact.artifact_type,
+                source_url=artifact.source_url,
+                content_hash=artifact.content_hash,
+                content=artifact.content_json,
+                created_at=artifact.created_at,
+            )
+            for artifact in artifacts
         ]
     )

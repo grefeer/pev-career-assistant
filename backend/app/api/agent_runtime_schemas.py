@@ -53,3 +53,18 @@ class AgentEventResponse(BaseModel):
 
 class AgentEventListResponse(BaseModel):
     items: list[AgentEventResponse]
+
+
+class AgentArtifactResponse(BaseModel):
+    """Public, owner-safe projection of a persisted PEV output artifact."""
+
+    id: str
+    artifact_type: str
+    source_url: str
+    content_hash: str
+    content: dict[str, Any]
+    created_at: datetime
+
+
+class AgentArtifactListResponse(BaseModel):
+    items: list[AgentArtifactResponse]

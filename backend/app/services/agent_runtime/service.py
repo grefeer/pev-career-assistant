@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from backend.app.config import Settings
-from backend.app.db.models import AgentEvent, AgentRun
+from backend.app.db.models import AgentArtifact, AgentEvent, AgentRun
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.repositories import profiles as profile_repository
 from backend.app.services.agent_runtime.runtime import AgentRunResult, AgentRuntime
@@ -74,3 +74,10 @@ class AgentRunService:
         """Return a trace only after an owner-scoped existence check."""
         self.get_run(db, user_id=user_id, run_id=run_id)
         return run_repository.list_events(db, run_id)
+
+    def list_artifacts(
+        self, db: Session, *, user_id: str, run_id: str
+    ) -> list[AgentArtifact]:
+        """Return immutable artifacts only after verifying the run owner."""
+        self.get_run(db, user_id=user_id, run_id=run_id)
+        return run_repository.list_evidence_artifacts(db, run_id)
