@@ -71,6 +71,8 @@ class ExtractObservedJobDetailsOutput(BaseModel):
     """Structured JD candidates derived only from a selected captured page."""
 
     source_artifact_id: str
+    source_url: str
+    content_hash: str
     candidates: list[ExtractedJobDetails]
 
 
@@ -201,6 +203,8 @@ def extract_observed_job_details(
         )
     return ExtractObservedJobDetailsOutput(
         source_artifact_id=payload.artifact_id,
+        source_url=source_url,
+        content_hash=content_hash,
         candidates=candidates,
     )
 

@@ -184,6 +184,32 @@ def create_evidence_artifact(
     return artifact
 
 
+def create_artifact(
+    db: Session,
+    *,
+    run_id: str,
+    step_id: str,
+    artifact_type: str,
+    source_url: str,
+    content_hash: str,
+    content_json: dict[str, Any],
+) -> AgentArtifact:
+    """Store one immutable, schema-validated Skill result artifact."""
+    artifact = AgentArtifact(
+        run_id=run_id,
+        step_id=step_id,
+        artifact_type=artifact_type,
+        source_url=source_url,
+        content_hash=content_hash,
+        content_json=content_json,
+        created_by=AgentRole.executor,
+    )
+    db.add(artifact)
+    db.flush()
+    db.refresh(artifact)
+    return artifact
+
+
 def list_evidence_artifacts(db: Session, run_id: str) -> list[AgentArtifact]:
     """Return a run's immutable public evidence in production order."""
     return list(

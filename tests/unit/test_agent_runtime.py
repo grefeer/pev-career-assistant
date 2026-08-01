@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from backend.app.db.models import AgentStep, AgentTurn, User, UserRole
+from backend.app.db.models import AgentArtifact, AgentStep, AgentTurn, User, UserRole
 from backend.app.domain.agent_runtime import AgentRole, RunStatus
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
@@ -36,6 +36,12 @@ class FetchedJobOutput(BaseModel):
 
 class EvidenceOutput(BaseModel):
     complete: bool
+
+
+class StructuredJobOutput(BaseModel):
+    source_url: str
+    content_hash: str
+    candidates: list[dict[str, object]]
 
 
 class RoleScriptedGateway:
@@ -446,3 +452,52 @@ def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session
     assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
     events = run_repository.list_events(db_session, result.run_id)
     assert events[-1].payload_json == {"error_code": "model_request_failed"}
+
+
+def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_session) -> None:
+    """A parsed JD remains available after its Executor step instead of only in model context."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["结构化 JD"],
+            "steps": [{"step_id": "extract", "objective": "提取 JD", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "extract-job", "tool_input": {}},
+            {"action": "complete", "summary": "已提取完整 JD"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="extract-job", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=StructuredJobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "source_url": "https://jobs.example/agent", "content_hash": "d" * 64,
+            "candidates": [{"title": "AI Agent 开发工程师", "requirements": "Python"}],
+        },
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"]),
+    )
+
+    artifacts = list(
+        db_session.scalars(
+            select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+        )
+    )
+    assert [(artifact.artifact_type, artifact.content_json) for artifact in artifacts] == [
+        ("structured_job_details", {"candidates": [{"title": "AI Agent 开发工程师", "requirements": "Python"}]}),
+    ]
