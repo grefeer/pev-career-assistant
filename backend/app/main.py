@@ -36,6 +36,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_match_service: object | None = None
     owned_draft_service: object | None = None
     owned_interview_prep_service: object | None = None
+    owned_agent_runtime: object | None = None
+    owned_agent_run_service: object | None = None
     try:
         async with AsyncExitStack() as stack:
             timeout = app.state.settings.readiness_timeout_seconds
@@ -174,6 +176,39 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.application_tracking_service = ApplicationTrackingService(
                     app.state.settings
                 )
+            if not hasattr(app.state, "agent_run_service"):
+                from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+                from backend.app.services.agent_runtime.model_gateway import (
+                    AgentModelGatewayConfigError,
+                    build_agent_model_gateway,
+                )
+                from backend.app.services.agent_runtime.planner_agent import PlannerAgent
+                from backend.app.services.agent_runtime.runtime import AgentRuntime
+                from backend.app.services.agent_runtime.service import AgentRunService
+                from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+                from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+
+                runtime = getattr(app.state, "agent_runtime", None)
+                if not hasattr(app.state, "agent_runtime"):
+                    app.state.agent_runtime = None
+                if runtime is None and app.state.settings.agent_harness_enabled:
+                    try:
+                        gateway = build_agent_model_gateway(app.state.settings)
+                        tools = ToolRegistry()
+                        runtime = AgentRuntime(
+                            planner=PlannerAgent(gateway=gateway, tools=tools),
+                            executor=ExecutorAgent(gateway=gateway, tools=tools),
+                            verifier=VerifierAgent(gateway=gateway, tools=tools),
+                            agent_version="pev-1",
+                        )
+                        app.state.agent_runtime = runtime
+                        owned_agent_runtime = runtime
+                    except AgentModelGatewayConfigError:
+                        logger.warning("adaptive PEV runtime unavailable: model key missing")
+                owned_agent_run_service = AgentRunService(
+                    app.state.settings, runtime=runtime
+                )
+                app.state.agent_run_service = owned_agent_run_service
             yield
     finally:
         if owned_graph is not None and getattr(app.state, "graph", None) is owned_graph:
@@ -204,6 +239,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             is owned_interview_prep_service
         ):
             del app.state.interview_prep_service
+        if (
+            owned_agent_run_service is not None
+            and getattr(app.state, "agent_run_service", None) is owned_agent_run_service
+        ):
+            del app.state.agent_run_service
+        if (
+            owned_agent_runtime is not None
+            and getattr(app.state, "agent_runtime", None) is owned_agent_runtime
+        ):
+            del app.state.agent_runtime
 
 
 def create_app(
