@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
+import logging
 import os
 from typing import Any, AsyncIterator
 
@@ -21,6 +22,9 @@ from src.utils import load_env
 
 
 load_env()
+
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -103,8 +107,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 app.state.match_service = owned_match_service
             if not hasattr(app.state, "draft_service"):
                 from backend.app.services.resume_draft_service import ResumeDraftService
+                from backend.app.services.resume_tailoring.generator import (
+                    LLMDraftGenerator,
+                )
+                from backend.app.services.resume_tailoring.llm_factory import (
+                    build_draft_generator_llm,
+                )
 
-                owned_draft_service = ResumeDraftService()
+                # Construct the agent-driven generator when an LLM key is
+                # available; otherwise fall back to a generator-less service so
+                # the app still boots (drafts finalize as
+                # ``draft_generation_interrupted`` until a key is configured).
+                try:
+                    draft_llm = build_draft_generator_llm(app.state.settings)
+                    owned_draft_service = ResumeDraftService(
+                        LLMDraftGenerator(draft_llm, app.state.settings)
+                    )
+                except Exception:
+                    logger.warning(
+                        "resume-tailoring LLM unavailable; drafts disabled",
+                        exc_info=True,
+                    )
+                    owned_draft_service = ResumeDraftService()
                 app.state.draft_service = owned_draft_service
             yield
     finally:

@@ -166,6 +166,14 @@ class Settings(BaseSettings):
     company_research_artifact_root: str = "var/company-research-skill"
     company_research_agent_version: str = "1.0.0"
 
+    # Resume Tailoring skill settings.  An agent-driven LLM (DeepSeek, OpenAI-
+    # compatible) reads the target job snapshot + confirmed profile facts +
+    # user preferences + match analysis and emits a list of resume diff
+    # operations.  Construction is defensive: if no API key is available the
+    # service still boots (drafts finalize as ``draft_generation_interrupted``).
+    resume_tailoring_agent_version: str = "1.0.0"
+    resume_tailoring_model: str = "deepseek-v4-flash"
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

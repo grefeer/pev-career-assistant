@@ -420,8 +420,60 @@ class TestCreateDraft:
         assert draft.error_code is None
         assert draft.state_version == 0  # not changed by finalize
 
-    # -- Scenario 2: Failed match report -----------------------------------
+    # -- Scenario 1b: preferences + match_analysis passed to generator ------
 
+    def test_create_draft_passes_preferences_and_match_analysis(
+        self,
+        db_session: Session,
+        user: User,
+        completed_match_report: MatchReport,
+        mock_generator: MagicMock,
+    ) -> None:
+        """create_draft loads UserPreference + builds match_analysis for the generator."""
+        service = self._service(mock_generator)
+        service.create_draft(
+            db=db_session,
+            user_id=user.id,
+            match_report_id=completed_match_report.id,
+            idempotency_key="ik-prefs-1",
+        )
+
+        kwargs = mock_generator.generate_diffs.call_args.kwargs
+        assert "preferences" in kwargs
+        assert "match_analysis" in kwargs
+        # preferences defaults to an empty summary when no UserPreference row exists.
+        assert kwargs["preferences"]["desired_roles"] == []
+        # match_analysis is derived from the report's strengths/gaps.
+        assert kwargs["match_analysis"]["strengths"] == completed_match_report.strengths
+        assert kwargs["match_analysis"]["gaps"] == completed_match_report.gaps
+        assert kwargs["match_analysis"]["unknowns"] == []
+        assert kwargs["match_analysis"]["risks"] == []
+
+    # -- Scenario 1c: Generator raises -> draft finalized as failed ---------
+
+    def test_create_draft_generator_exception_finalizes_failed(
+        self,
+        db_session: Session,
+        user: User,
+        completed_match_report: MatchReport,
+        mock_generator: MagicMock,
+    ) -> None:
+        """A generator exception finalizes the draft as draft_generation_interrupted."""
+        mock_generator.generate_diffs.side_effect = RuntimeError("llm offline")
+        service = self._service(mock_generator)
+
+        draft = service.create_draft(
+            db=db_session,
+            user_id=user.id,
+            match_report_id=completed_match_report.id,
+            idempotency_key="ik-gen-err-1",
+        )
+
+        assert draft.status == "failed"
+        assert draft.error_code == "draft_generation_interrupted"
+        assert draft.diffs is None
+
+    # -- Scenario 2: Failed match report -----------------------------------
     def test_create_draft_incomplete_match_report(
         self,
         db_session: Session,

@@ -38,6 +38,8 @@ from backend.app.repositories.attachments import (
     reserve_or_reset_pending,
 )
 from backend.app.repositories.drafts import StaleDraftVersionError
+from backend.app.repositories.preferences import to_summary as preferences_summary
+from backend.app.repositories.preferences import get_for_user as get_preference_for_user
 from backend.app.services.attachment_service import (
     TEXT_FORMATS,
     compensate_attachments,
@@ -55,13 +57,21 @@ logger = logging.getLogger(__name__)
 
 
 class DraftGenerator(Protocol):
-    """Interface for the draft-generation component (LangGraph or mock)."""
+    """Interface for the draft-generation component (LangGraph or mock).
+
+    The optional ``preferences`` and ``match_analysis`` inputs let an
+    agent-driven generator tailor diffs to the user's stated preferences and
+    to the match report's strengths/gaps. They default to ``None`` so legacy
+    generators (and mocks) that ignore them remain compatible.
+    """
 
     def generate_diffs(
         self,
         *,
         job_snapshot: dict[str, Any],
         profile_facts: dict[str, Any],
+        preferences: dict[str, Any] | None = None,
+        match_analysis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -158,10 +168,24 @@ class ResumeDraftService:
         evidence_refs: dict[str, list[str]] = profile_version.evidence_refs
 
         # --- 5. Call draft generator (no DB tx held) -------------------------
+        # The generator tailors diffs to the user's preferences and to the
+        # match report's strengths/gaps. Both inputs degrade gracefully to
+        # ``None`` so a generator that ignores them still works.
+        preferences = preferences_summary(
+            get_preference_for_user(db, user_id)
+        )
+        match_analysis: dict[str, Any] = {
+            "strengths": match_report.strengths or [],
+            "gaps": match_report.gaps or [],
+            "unknowns": match_report.unknowns or [],
+            "risks": match_report.risks or [],
+        }
         try:
             result = self.draft_generator.generate_diffs(
                 job_snapshot=match_report.job_snapshot,
                 profile_facts=facts,
+                preferences=preferences,
+                match_analysis=match_analysis,
             )
             diffs: list[dict[str, Any]] = result.get("diffs", [])
         except Exception:
