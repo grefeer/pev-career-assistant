@@ -501,3 +501,41 @@ def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_s
     assert [(artifact.artifact_type, artifact.content_json) for artifact in artifacts] == [
         ("structured_job_details", {"candidates": [{"title": "AI Agent 开发工程师", "requirements": "Python"}]}),
     ]
+
+
+def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_code(db_session) -> None:
+    """A real Agent retry must be explainable from persisted tool observations."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["尝试工具"],
+            "steps": [{"step_id": "discover", "objective": "尝试", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "missing-tool", "tool_input": {}},
+            {"action": "complete", "summary": "已安全降级"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"]),
+    )
+
+    events = run_repository.list_events(db_session, result.run_id)
+    assert (events[2].event_type, events[2].payload_json) == (
+        "executor_tool_failed",
+        {"sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool"},
+    )

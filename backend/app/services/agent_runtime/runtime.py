@@ -207,6 +207,9 @@ class AgentRuntime:
                 )
             if execution.status != "succeeded":
                 return self._fail_step(db, run_id, persisted_step, "executor_failed")
+            self._record_failed_executor_observations(
+                db, run_id, persisted_step, execution
+            )
             execution = execution.model_copy(
                 update={
                     "artifact_refs": self._persist_observed_evidence(
@@ -468,6 +471,28 @@ class AgentRuntime:
                 },
             )
         return artifact_refs
+
+    @staticmethod
+    def _record_failed_executor_observations(
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        execution: ExecutorResult,
+    ) -> None:
+        """Persist stable failure codes so Agent retries are independently auditable."""
+        for observation in execution.observations:
+            if observation.status != "failed" or not observation.error_code:
+                continue
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="executor_tool_failed",
+                payload_json={
+                    "sequence": step.sequence,
+                    "tool": observation.tool_name,
+                    "error_code": observation.error_code,
+                },
+            )
 
     def _finish_planner_non_plan(
         self,
