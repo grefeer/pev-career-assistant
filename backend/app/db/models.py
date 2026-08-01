@@ -58,6 +58,10 @@ from backend.app.domain.personalized_discovery import (
     RecommendationPresentationState,
     SourceStatusReason,
 )
+from backend.app.domain.company_research import (
+    CompanyResearchBlockReason,
+    CompanyResearchStatus,
+)
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -1395,4 +1399,60 @@ class UserDiscoverySourceStatus(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     display_text: Mapped[str] = mapped_column(Text, nullable=False)
     retry_guidance: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Company-research skill
+# ---------------------------------------------------------------------------
+
+
+class CompanyResearchReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One user-scoped company-research result.
+
+    Read-only research output: a company profile plus its open positions,
+    built from a public careers/about URL.  Never an auto-submit and never a
+    JobPosting - the verified-only ``/api/jobs`` path is decoupled from this.
+    """
+
+    __tablename__ = "company_research_reports"
+    __table_args__ = (
+        Index(
+            "ix_company_research_user_status_created",
+            "user_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_company_research_url_hash", "source_url_hash"),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    company_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_url_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    agent_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[CompanyResearchStatus] = mapped_column(
+        Enum(
+            CompanyResearchStatus,
+            name="company_research_status",
+            **enum_kwargs,
+        ),
+        default=CompanyResearchStatus.queued,
+        index=True,
+        nullable=False,
+    )
+    block_reason: Mapped[CompanyResearchBlockReason | None] = mapped_column(
+        Enum(
+            CompanyResearchBlockReason,
+            name="company_research_block_reason",
+            **enum_kwargs,
+        ),
+    )
+    profile_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    openings_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    summary: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
 
