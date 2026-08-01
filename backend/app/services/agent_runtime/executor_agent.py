@@ -51,6 +51,10 @@ class ExecutorAgent:
                     "context": task.context,
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),
+                    "available_tools": self._tools.tool_catalog(
+                        role=AgentRole.executor,
+                        allowed_skills=frozenset(step.allowed_skills),
+                    ),
                     "observations": [
                         observation.model_dump(mode="json")
                         for observation in observations

@@ -52,6 +52,10 @@ class VerifierAgent:
                     "goal": task.goal,
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),
+                    "available_tools": self._tools.tool_catalog(
+                        role=AgentRole.verifier,
+                        allowed_skills=frozenset(step.allowed_skills),
+                    ),
                     "execution": execution.model_dump(mode="json"),
                     "observations": [
                         observation.model_dump(mode="json")

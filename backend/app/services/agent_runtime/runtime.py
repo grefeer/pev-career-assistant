@@ -15,6 +15,7 @@ from backend.app.domain.agent_runtime import (
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
@@ -64,7 +65,7 @@ class AgentRuntime:
             budget_json=task.budget.model_dump(mode="json"),
             agent_version=self._agent_version,
         )
-        context = ToolContext(user_id=user_id, run_id=run.id)
+        context = self._tool_context(user_id=user_id, run_id=run.id, task=task)
         run_repository.start_run(db, run)
         run_repository.append_event(
             db,
@@ -77,9 +78,12 @@ class AgentRuntime:
         replans = 0
         trace = self._build_decision_trace(db, run.id)
         while True:
-            planner_result = self._planner.run(
-                task=planning_task, context=context, trace=trace
-            )
+            try:
+                planner_result = self._planner.run(
+                    task=planning_task, context=context, trace=trace
+                )
+            except AgentModelGatewayError as error:
+                return self._fail_run(db, run.id, error.code)
             if planner_result.status != "planned" or planner_result.plan is None:
                 return self._finish_planner_non_plan(db, run.id, run, planner_result)
 
@@ -130,6 +134,12 @@ class AgentRuntime:
                 if outcome.status is not RunStatus.running:
                     return outcome
                 final_summary = outcome.summary or final_summary
+                planning_task = self._with_observed_public_evidence(
+                    db, planning_task, run.id
+                )
+                context = self._tool_context(
+                    user_id=user_id, run_id=run.id, task=planning_task
+                )
             if replan_feedback is not None:
                 replans += 1
                 if replans > task.budget.max_replans:
@@ -148,7 +158,7 @@ class AgentRuntime:
                     return AgentRunResult(
                         run.id, RunStatus.failed, None, "replan_budget_exhausted"
                     )
-                feedback_context = dict(task.context)
+                feedback_context = dict(planning_task.context)
                 feedback = list(feedback_context.get("verifier_feedback", []))
                 feedback.append(replan_feedback)
                 feedback_context["verifier_feedback"] = feedback
@@ -181,13 +191,16 @@ class AgentRuntime:
         retries = 0
         execution_task = task
         while True:
-            execution = self._executor.run(
-                task=execution_task,
-                plan=plan,
-                step=plan_step,
-                context=context,
-                trace=trace,
-            )
+            try:
+                execution = self._executor.run(
+                    task=execution_task,
+                    plan=plan,
+                    step=plan_step,
+                    context=context,
+                    trace=trace,
+                )
+            except AgentModelGatewayError as error:
+                return self._fail_step(db, run_id, persisted_step, error.code)
             if execution.status == "needs_user":
                 return self._wait_for_user(
                     db, run_id, persisted_step, execution.user_question
@@ -215,14 +228,17 @@ class AgentRuntime:
                     payload_json={"sequence": persisted_step.sequence},
                 )
                 return AgentRunResult(run_id, RunStatus.running, execution.summary)
-            verification = self._verifier.run(
-                task=task,
-                plan=plan,
-                step=plan_step,
-                execution=execution,
-                context=context,
-                trace=trace,
-            )
+            try:
+                verification = self._verifier.run(
+                    task=task,
+                    plan=plan,
+                    step=plan_step,
+                    execution=execution,
+                    context=context,
+                    trace=trace,
+                )
+            except AgentModelGatewayError as error:
+                return self._fail_step(db, run_id, persisted_step, error.code)
             if verification.decision is VerificationDecision.PASS:
                 run_repository.finish_step(
                     db,
@@ -313,6 +329,49 @@ class AgentRuntime:
             )
 
         return trace
+
+    @staticmethod
+    def _with_observed_public_evidence(
+        db: Session, task: AgentTaskRequest, run_id: str
+    ) -> AgentTaskRequest:
+        """Expose bounded, tool-produced public evidence to later Agent turns."""
+        remaining_characters = 48_000
+        evidence: list[dict[str, str]] = []
+        for artifact in run_repository.list_evidence_artifacts(db, run_id):
+            visible_text = artifact.content_json.get("visible_text")
+            if not isinstance(visible_text, str) or not visible_text:
+                continue
+            text = visible_text[:remaining_characters]
+            if not text:
+                break
+            item = {
+                "artifact_id": artifact.id,
+                "source_url": artifact.source_url,
+                "content_hash": artifact.content_hash,
+                "visible_text": text,
+            }
+            title = artifact.content_json.get("title")
+            if isinstance(title, str):
+                item["title"] = title
+            evidence.append(item)
+            remaining_characters -= len(text)
+            if remaining_characters <= 0:
+                break
+        context = dict(task.context)
+        context["observed_public_evidence"] = evidence
+        return task.model_copy(update={"context": context})
+
+    @staticmethod
+    def _tool_context(
+        *, user_id: str, run_id: str, task: AgentTaskRequest
+    ) -> ToolContext:
+        """Project only verified public evidence into deterministic tool authority."""
+        evidence = task.context.get("observed_public_evidence", [])
+        return ToolContext(
+            user_id=user_id,
+            run_id=run_id,
+            metadata={"observed_public_evidence": evidence if isinstance(evidence, list) else []},
+        )
 
     @staticmethod
     def _persist_observed_evidence(
@@ -426,12 +485,17 @@ class AgentRuntime:
     def _fail_step(
         self, db: Session, run_id: str, step: AgentStep, error_code: str
     ) -> AgentRunResult:
-        run = db.get(AgentRun, run_id)
-        if run is None:  # defensive: foreign-key integrity normally prevents this.
-            raise RuntimeError("Agent run disappeared during execution")
         run_repository.finish_step(
             db, step, status=StepStatus.failed, error_code=error_code
         )
+        return self._fail_run(db, run_id, error_code)
+
+    @staticmethod
+    def _fail_run(db: Session, run_id: str, error_code: str) -> AgentRunResult:
+        """Close an already-created run with a stable, user-safe error code."""
+        run = db.get(AgentRun, run_id)
+        if run is None:  # defensive: foreign-key integrity normally prevents this.
+            raise RuntimeError("Agent run disappeared during execution")
         run_repository.finish_run(
             db, run, status=RunStatus.failed, error_code=error_code
         )

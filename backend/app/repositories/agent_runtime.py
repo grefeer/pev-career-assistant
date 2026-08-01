@@ -184,6 +184,17 @@ def create_evidence_artifact(
     return artifact
 
 
+def list_evidence_artifacts(db: Session, run_id: str) -> list[AgentArtifact]:
+    """Return a run's immutable public evidence in production order."""
+    return list(
+        db.scalars(
+            select(AgentArtifact)
+            .where(AgentArtifact.run_id == run_id)
+            .order_by(AgentArtifact.created_at.asc(), AgentArtifact.id.asc())
+        )
+    )
+
+
 def create_turn(
     db: Session,
     *,

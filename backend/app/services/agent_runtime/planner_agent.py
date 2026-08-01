@@ -46,6 +46,10 @@ class PlannerAgent:
                 state={
                     "goal": task.goal,
                     "allowed_skills": task.allowed_skills,
+                    "available_tools": self._tools.tool_catalog(
+                        role=AgentRole.planner,
+                        allowed_skills=frozenset(task.allowed_skills),
+                    ),
                     "context": task.context,
                     "observations": [
                         observation.model_dump(mode="json")

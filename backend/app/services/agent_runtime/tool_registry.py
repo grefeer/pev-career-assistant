@@ -43,6 +43,32 @@ class ToolRegistry:
             raise ValueError(f"tool already registered: {definition.name}")
         self._definitions[definition.name] = definition
 
+    def tool_catalog(
+        self,
+        *,
+        role: AgentRole,
+        allowed_skills: frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Describe only the tools an autonomous role may safely request."""
+        catalog: list[dict[str, Any]] = []
+        for definition in sorted(self._definitions.values(), key=lambda item: item.name):
+            if role not in definition.allowed_roles:
+                continue
+            if (
+                allowed_skills is not None
+                and definition.skill_name is not None
+                and definition.skill_name not in allowed_skills
+            ):
+                continue
+            catalog.append(
+                {
+                    "name": definition.name,
+                    "skill_name": definition.skill_name,
+                    "input_schema": definition.input_model.model_json_schema(),
+                }
+            )
+        return catalog
+
     def invoke(
         self,
         *,

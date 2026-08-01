@@ -121,3 +121,8 @@ def test_executor_observes_failure_and_uses_a_second_allowed_tool() -> None:
     ]
     assert result.artifact_refs == [{"uri": "artifact://job/1"}]
     assert gateway.states[1]["observations"][0]["error_code"] == "tool_execution_failed"
+    assert [tool["name"] for tool in gateway.states[0]["available_tools"]] == [
+        "fallback-fetch",
+        "primary-fetch",
+    ]
+    assert all(tool["skill_name"] == "job-discovery" for tool in gateway.states[0]["available_tools"])
