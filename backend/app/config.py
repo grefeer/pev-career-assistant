@@ -174,6 +174,14 @@ class Settings(BaseSettings):
     resume_tailoring_agent_version: str = "1.0.0"
     resume_tailoring_model: str = "deepseek-v4-flash"
 
+    # Interview Prep skill settings.  An agent-driven LLM reads the target job
+    # snapshot (+ confirmed profile facts + preferences) and emits a structured
+    # interview-prep kit (questions, talking points, topics to review).  Like
+    # resume tailoring, construction is defensive when no API key is configured.
+    interview_prep_enabled: bool = False
+    interview_prep_agent_version: str = "1.0.0"
+    interview_prep_model: str = "deepseek-v4-flash"
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

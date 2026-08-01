@@ -14,6 +14,7 @@ from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
 from backend.app.services.company_research.service import CompanyResearchService
+from backend.app.services.interview_prep.service import InterviewPrepService
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.storage import EncryptedObjectStore
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
@@ -74,6 +75,21 @@ def get_company_research_service(request: Request) -> CompanyResearchService:
     settings = request.app.state.settings
     object_store = getattr(request.app.state, "object_store", None)
     return CompanyResearchService(settings, object_store=object_store)
+
+
+def get_interview_prep_service(request: Request) -> InterviewPrepService:
+    """Resolve the interview-prep service.
+
+    Prefers a lifespan-injected service (which carries the LLM generator when
+    a key is available). Falls back to a generator-less service so the app
+    still boots - kits then finalize as ``failed`` with
+    ``interview_prep_generator_unavailable`` until a key is configured.
+    """
+    injected = getattr(request.app.state, "interview_prep_service", None)
+    if injected is not None:
+        return cast(InterviewPrepService, injected)
+    settings = request.app.state.settings
+    return InterviewPrepService(settings)
 
 
 def get_device_service(request: Request, redis_client=Depends(get_redis)):

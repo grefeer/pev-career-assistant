@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     owned_session_factory: Any | None = None
     owned_match_service: object | None = None
     owned_draft_service: object | None = None
+    owned_interview_prep_service: object | None = None
     try:
         async with AsyncExitStack() as stack:
             timeout = app.state.settings.readiness_timeout_seconds
@@ -130,6 +131,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     )
                     owned_draft_service = ResumeDraftService()
                 app.state.draft_service = owned_draft_service
+            if not hasattr(app.state, "interview_prep_service"):
+                from backend.app.services.interview_prep.generator import (
+                    LLMInterviewPrepGenerator,
+                )
+                from backend.app.services.interview_prep.llm_factory import (
+                    build_interview_prep_llm,
+                )
+                from backend.app.services.interview_prep.service import (
+                    InterviewPrepService,
+                )
+
+                # Construct the agent-driven generator when an LLM key is
+                # available; otherwise fall back to a generator-less service so
+                # the app still boots (kits finalize as failed with
+                # ``interview_prep_generator_unavailable`` until a key is set).
+                try:
+                    prep_llm = build_interview_prep_llm(app.state.settings)
+                    owned_interview_prep_service = InterviewPrepService(
+                        app.state.settings,
+                        generator=LLMInterviewPrepGenerator(
+                            prep_llm, app.state.settings
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "interview-prep LLM unavailable; prep disabled",
+                        exc_info=True,
+                    )
+                    owned_interview_prep_service = InterviewPrepService(
+                        app.state.settings
+                    )
+                app.state.interview_prep_service = owned_interview_prep_service
             yield
     finally:
         if owned_graph is not None and getattr(app.state, "graph", None) is owned_graph:
@@ -154,6 +187,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             del app.state.match_service
         if owned_draft_service is not None and getattr(app.state, "draft_service", None) is owned_draft_service:
             del app.state.draft_service
+        if (
+            owned_interview_prep_service is not None
+            and getattr(app.state, "interview_prep_service", None)
+            is owned_interview_prep_service
+        ):
+            del app.state.interview_prep_service
 
 
 def create_app(

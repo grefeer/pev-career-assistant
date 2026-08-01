@@ -62,6 +62,7 @@ from backend.app.domain.company_research import (
     CompanyResearchBlockReason,
     CompanyResearchStatus,
 )
+from backend.app.domain.interview_prep import InterviewPrepKitStatus
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -1456,3 +1457,51 @@ class CompanyResearchReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
 
+
+class InterviewPrepKit(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One user-scoped interview-prep kit.
+
+    Agent-driven generation output: an LLM read the target job snapshot (plus,
+    optionally, the user's confirmed profile facts + preferences) and produced
+    a structured prep kit.  Read-only study material - never an auto-submit and
+    never a JobPosting.
+    """
+
+    __tablename__ = "interview_prep_kits"
+    __table_args__ = (
+        Index(
+            "ix_interview_prep_user_status_created",
+            "user_id",
+            "status",
+            "created_at",
+        ),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    target_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="SET NULL"), index=True
+    )
+    profile_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id", ondelete="SET NULL"),
+        index=True,
+    )
+    job_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    agent_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[InterviewPrepKitStatus] = mapped_column(
+        Enum(
+            InterviewPrepKitStatus,
+            name="interview_prep_kit_status",
+            **enum_kwargs,
+        ),
+        default=InterviewPrepKitStatus.generating,
+        index=True,
+        nullable=False,
+    )
+    content_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    preferences_summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    match_analysis_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
