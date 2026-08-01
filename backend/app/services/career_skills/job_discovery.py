@@ -179,10 +179,22 @@ def extract_observed_job_details(
     candidates = []
     for candidate in extract_jd_candidates(visible_text, source_url):
         inferred_title = _infer_official_page_title(visible_text)
-        title = inferred_title or candidate.title
+        title = (
+            inferred_title
+            if candidate.title in {None, "申请职位"}
+            else candidate.title
+        )
         locations = candidate.locations or _infer_official_page_locations(
             visible_text, title
         )
+        recruitment_types = _infer_recruitment_types(
+            source_url, candidate.recruitment_types
+        )
+        warnings = [
+            warning
+            for warning in candidate.normalization_warnings
+            if not (locations and warning == "No location information found")
+        ]
         responsibilities = _extract_jd_section(
             visible_text,
             labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责"),
@@ -205,12 +217,12 @@ def extract_observed_job_details(
                 locations=locations,
                 responsibilities=responsibilities,
                 requirements=requirements,
-                recruitment_types=candidate.recruitment_types,
+                recruitment_types=recruitment_types,
                 apply_url=candidate.apply_url,
                 deadline_text=candidate.deadline_text,
                 confidence=round(candidate.confidence, 4),
                 evidence_refs=[evidence_ref],
-                normalization_warnings=candidate.normalization_warnings,
+                normalization_warnings=warnings,
             )
         )
     return ExtractObservedJobDetailsOutput(
@@ -299,3 +311,15 @@ def _infer_official_page_locations(text: str, title: str | None) -> list[str]:
         if re.search(r"(?:岗位职责|工作职责|职位描述)", line):
             break
     return []
+
+
+def _infer_recruitment_types(source_url: str, fallback: list[str]) -> list[str]:
+    """Prefer an official career URL's explicit recruitment segment when present."""
+    upper_url = source_url.upper()
+    if "/SOCIAL/" in upper_url:
+        return ["social"]
+    if "/GRADUATE/" in upper_url:
+        return ["campus"]
+    if "/INTERN/" in upper_url:
+        return ["internship"]
+    return fallback

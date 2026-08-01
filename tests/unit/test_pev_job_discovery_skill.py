@@ -132,3 +132,33 @@ def test_extract_observed_job_details_handles_official_page_without_labeled_titl
     assert candidate.locations == ["北京市"]
     assert candidate.responsibilities == "负责 AI Agent 的设计与研发。"
     assert candidate.requirements == "熟悉 Python、RAG 和 Agent 开发框架。"
+
+
+def test_extract_observed_job_details_derives_social_type_and_clears_resolved_location_warning() -> None:
+    """Source path and recovered location must correct, not contradict, legacy heuristics."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-social",
+            "source_url": "https://talent.example/jobs/detail/SOCIAL/abc",
+            "content_hash": "c" * 64,
+            "title": "官方招聘",
+            "visible_text": """
+Agent研发工程师
+北京市
+工作职责：负责 Agent 系统研发。
+职责要求：熟悉 Python。
+申请职位
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-social"),
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.recruitment_types == ["social"]
+    assert "No location information found" not in candidate.normalization_warnings
