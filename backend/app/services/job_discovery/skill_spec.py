@@ -73,6 +73,20 @@ COMPANY_RESEARCH_SPEC = SkillSpec(
 )
 
 
+#: The resume-tailoring skill produces LLM resume-diff operations for a target
+#: job.  ``generate`` runs the bounded LLM call + tolerant JSON parse; ``validate``
+#: grounds each diff against confirmed facts/evidence before application.  Both
+#: are deterministic CLIs (the runtime calls them through ``run_skill_script``);
+#: the skill is a parallel artifact and does not touch the backend resume store.
+RESUME_TAILORING_SCRIPTS: frozenset[str] = frozenset({"generate", "validate"})
+
+RESUME_TAILORING_SPEC = SkillSpec(
+    name="resume-tailoring",
+    allowed_scripts=RESUME_TAILORING_SCRIPTS,
+    skill_type="deterministic",
+)
+
+
 #: Registry of skills available to the runtime.  Add a parallel skill by
 #: appending a ``SkillSpec`` here and creating its ``skill/<name>`` source
 #: directory; the shared artifact store and script tool then accept its
@@ -80,6 +94,7 @@ COMPANY_RESEARCH_SPEC = SkillSpec(
 SKILL_REGISTRY: dict[str, SkillSpec] = {
     JOB_DISCOVERY_SPEC.name: JOB_DISCOVERY_SPEC,
     COMPANY_RESEARCH_SPEC.name: COMPANY_RESEARCH_SPEC,
+    RESUME_TAILORING_SPEC.name: RESUME_TAILORING_SPEC,
 }
 
 

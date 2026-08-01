@@ -1,0 +1,33 @@
+{
+  "skill_name": "resume-tailoring",
+  "evals": [
+    {
+      "id": 1,
+      "name": "valid-generation",
+      "prompt": "针对一个 AI 应用开发岗位，给定 job_snapshot（title+requirements）、profile_facts（含 work_experience/projects/skills 三个键）、preferences、match_analysis，运行 scripts/generate.py 生成 diff 列表，再用 scripts/validate.py 校验。期望所有 diff 的 op 合法、section 非空、fact_ref 命中 profile_facts 的键、evidence_ids（如有）命中 evidence_refs。",
+      "expected_output": "status=ok；diffs 为非空列表；每个 diff 含 op∈{reorder,rephrase,summarize,omit,highlight}、非空 section、合法 fact_ref；validate 输出 status=ok 且 diff_count 与生成数一致。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "parse-error-degrades-gracefully",
+      "prompt": "当 LLM 返回非 JSON 文本（纯散文或无 diffs 字段）时，scripts/generate.py 应优雅降级：输出 status=failed、code=draft_generation_parse_error，进程退出码为 0，不抛出未捕获异常，out 文件被写入失败结果。",
+      "expected_output": "status=failed；code=draft_generation_parse_error；exit code=0；out 文件存在且含 status/code/last_error/agent_version；stdout 为单行 JSON 摘要。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "missing-api-key-degrades-gracefully",
+      "prompt": "在未设置 DEEPSEEK_API_KEY 与 OPENAI_API_KEY（且 Windows User scope 也无）的环境下运行 scripts/generate.py，应输出 status=failed、code=missing_api_key，退出码 0，不发起任何网络调用。",
+      "expected_output": "status=failed；code=missing_api_key；exit code=0；不产生 langchain_openai 调用；stdout 单行 JSON 摘要含 code=missing_api_key。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "validate-rejects-ungrounded-fact-ref",
+      "prompt": "给定一份 diff 列表，其中某 diff 的 fact_ref 不在 profile_facts 的键中，运行 scripts/validate.py 应报 status=failed、code=draft_validation_invalid_fact_ref，并给出 index；其它合法 diff 不影响首个错误的报告。",
+      "expected_output": "status=failed；code=draft_validation_invalid_fact_ref；index 指向首个非法 diff；exit code=0；out 文件含 index 与 last_error。",
+      "files": []
+    }
+  ]
+}

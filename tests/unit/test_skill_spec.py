@@ -18,6 +18,7 @@ from backend.app.services.job_discovery.skill_runtime import SkillToolPolicy, _s
 from backend.app.services.job_discovery.skill_spec import (
     JOB_DISCOVERY_SCRIPTS,
     JOB_DISCOVERY_SPEC,
+    RESUME_TAILORING_SPEC,
     SKILL_REGISTRY,
     SkillSpec,
     get_skill_spec,
@@ -163,6 +164,55 @@ def test_script_tool_accepts_a_custom_allowlist_for_a_parallel_skill(
     assert not tool.invoke(
         {"script": "extract_company", "cli_args": "--out output/company.json"},
     ).startswith("ERROR:")
+    assert tool.invoke(
+        {"script": "browse", "cli_args": "https://example.com --out output/evidence"},
+    ) == "ERROR: unsupported Skill script 'browse'"
+
+
+def test_resume_tailoring_spec_is_registered_with_generate_and_validate() -> None:
+    spec = get_skill_spec("resume-tailoring")
+
+    assert spec is RESUME_TAILORING_SPEC
+    assert spec.name == "resume-tailoring"
+    assert spec.skill_type == "deterministic"
+    assert spec.allowed_scripts == frozenset({"generate", "validate"})
+    assert SKILL_REGISTRY["resume-tailoring"] is RESUME_TAILORING_SPEC
+
+
+def test_resume_tailoring_source_path_points_at_the_real_skill_dir() -> None:
+    source = RESUME_TAILORING_SPEC.source_path
+
+    assert source.name == "resume-tailoring"
+    assert (source / "SKILL.md").is_file()
+    assert (source / "scripts" / "generate.py").is_file()
+    assert (source / "scripts" / "validate.py").is_file()
+
+
+def test_script_tool_allows_resume_tailoring_scripts_via_its_allowlist(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    scripts = skill_dir / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "generate.py").write_text("", encoding="utf-8")
+    (scripts / "validate.py").write_text("", encoding="utf-8")
+    (scripts / "browse.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "backend.app.services.job_discovery.skill_runtime.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="{}", stderr="", returncode=0),
+    )
+    tool = _script_tool(
+        skill_dir, SkillToolPolicy(), allowed_scripts=RESUME_TAILORING_SPEC.allowed_scripts,
+    )
+
+    # resume-tailoring scripts are allowed through its own allowlist...
+    assert not tool.invoke(
+        {"script": "generate", "cli_args": "--input output/input.json --out output/evidence/draft_diffs.json"},
+    ).startswith("ERROR:")
+    assert not tool.invoke(
+        {"script": "validate", "cli_args": "--out output/validation.json"},
+    ).startswith("ERROR:")
+    # ...but a job-discovery script is outside this skill's allowlist.
     assert tool.invoke(
         {"script": "browse", "cli_args": "https://example.com --out output/evidence"},
     ) == "ERROR: unsupported Skill script 'browse'"
