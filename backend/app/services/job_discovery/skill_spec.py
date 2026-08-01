@@ -102,6 +102,23 @@ INTERVIEW_PREP_SPEC = SkillSpec(
 )
 
 
+#: The application-tracking skill is a non-agent *service* utility: it advises
+#: on whether a status transition is legal (saved -> applied -> screening ->
+#: interview -> offer / rejected / withdrawn) and normalizes/ enumerates
+#: statuses.  There is no LLM and no crawl, and - critically - **no auto-submit**
+#: (security gate #1): every status advance is an explicit human action recorded
+#: by the backend ``ApplicationTrackingService``, which this skill does not
+#: touch.  Only ``track`` is needed; its four subcommands mirror
+#: ``backend.app.domain.application_tracking`` inline (stdlib-only).
+APPLICATION_TRACKING_SCRIPTS: frozenset[str] = frozenset({"track"})
+
+APPLICATION_TRACKING_SPEC = SkillSpec(
+    name="application-tracking",
+    allowed_scripts=APPLICATION_TRACKING_SCRIPTS,
+    skill_type="service",
+)
+
+
 #: Registry of skills available to the runtime.  Add a parallel skill by
 #: appending a ``SkillSpec`` here and creating its ``skill/<name>`` source
 #: directory; the shared artifact store and script tool then accept its
@@ -111,6 +128,7 @@ SKILL_REGISTRY: dict[str, SkillSpec] = {
     COMPANY_RESEARCH_SPEC.name: COMPANY_RESEARCH_SPEC,
     RESUME_TAILORING_SPEC.name: RESUME_TAILORING_SPEC,
     INTERVIEW_PREP_SPEC.name: INTERVIEW_PREP_SPEC,
+    APPLICATION_TRACKING_SPEC.name: APPLICATION_TRACKING_SPEC,
 }
 
 

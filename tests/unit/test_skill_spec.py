@@ -16,6 +16,7 @@ import pytest
 from backend.app.services.job_discovery.skill_artifacts import SkillArtifactStore
 from backend.app.services.job_discovery.skill_runtime import SkillToolPolicy, _script_tool
 from backend.app.services.job_discovery.skill_spec import (
+    APPLICATION_TRACKING_SPEC,
     INTERVIEW_PREP_SPEC,
     JOB_DISCOVERY_SCRIPTS,
     JOB_DISCOVERY_SPEC,
@@ -256,6 +257,57 @@ def test_script_tool_allows_interview_prep_scripts_via_its_allowlist(
     # interview-prep's generate script is allowed through its own allowlist...
     assert not tool.invoke(
         {"script": "generate", "cli_args": "--input output/input.json --out output/evidence/prep_kit.json"},
+    ).startswith("ERROR:")
+    # ...but a job-discovery script is outside this skill's allowlist.
+    assert tool.invoke(
+        {"script": "browse", "cli_args": "https://example.com --out output/evidence"},
+    ) == "ERROR: unsupported Skill script 'browse'"
+
+
+def test_application_tracking_spec_is_registered_with_track() -> None:
+    spec = get_skill_spec("application-tracking")
+
+    assert spec is APPLICATION_TRACKING_SPEC
+    assert spec.name == "application-tracking"
+    assert spec.skill_type == "service"
+    assert spec.allowed_scripts == frozenset({"track"})
+    assert SKILL_REGISTRY["application-tracking"] is APPLICATION_TRACKING_SPEC
+
+
+def test_application_tracking_source_path_points_at_the_real_skill_dir() -> None:
+    source = APPLICATION_TRACKING_SPEC.source_path
+
+    assert source.name == "application-tracking"
+    assert (source / "SKILL.md").is_file()
+    assert (source / "scripts" / "track.py").is_file()
+
+
+def test_script_tool_allows_application_tracking_scripts_via_its_allowlist(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    skill_dir = tmp_path / "skill"
+    scripts = skill_dir / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "track.py").write_text("", encoding="utf-8")
+    (scripts / "browse.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "backend.app.services.job_discovery.skill_runtime.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="{}", stderr="", returncode=0),
+    )
+    tool = _script_tool(
+        skill_dir,
+        SkillToolPolicy(),
+        allowed_scripts=APPLICATION_TRACKING_SPEC.allowed_scripts,
+    )
+
+    # application-tracking's track script is allowed through its own allowlist
+    # (--out optional; here omitted, which _valid_output_args permits)...
+    assert not tool.invoke(
+        {"script": "track", "cli_args": "list-statuses"},
+    ).startswith("ERROR:")
+    # ...and --out under output/ is accepted.
+    assert not tool.invoke(
+        {"script": "track", "cli_args": "list-statuses --out output/evidence/statuses.json"},
     ).startswith("ERROR:")
     # ...but a job-discovery script is outside this skill's allowlist.
     assert tool.invoke(
