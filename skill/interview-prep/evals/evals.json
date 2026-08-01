@@ -1,0 +1,33 @@
+{
+  "skill_name": "interview-prep",
+  "evals": [
+    {
+      "id": 1,
+      "name": "valid-generation",
+      "prompt": "针对一个后端工程师岗位，给定 job_snapshot（title+requirements+responsibilities）、profile_facts（含后端经验）、preferences、match_analysis，运行 scripts/generate.py 生成面试准备包。期望返回 status=ok，content 含全部五个键，每个键为字符串列表，且至少一个键非空，内容贴合岗位。",
+      "expected_output": "status=ok；content 为对象，包含 technical_questions/behavioral_questions/talking_points/topics_to_review/questions_to_ask 五键；每键为 list[str]；section_count>=1；stdout 单行 JSON 摘要含 section_count。",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "parse-error-degrades-gracefully",
+      "prompt": "当 LLM 返回非 JSON 文本（纯散文或非对象）时，scripts/generate.py 应优雅降级：输出 status=failed、code=interview_prep_parse_error，进程退出码 0，不抛出未捕获异常，out 文件被写入失败结果。",
+      "expected_output": "status=failed；code=interview_prep_parse_error；exit code=0；out 文件存在且含 status/code/last_error/agent_version；stdout 单行 JSON 摘要。",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "empty-content-degrades-gracefully",
+      "prompt": "当 LLM 返回可解析的 JSON 对象但五个内容键全为空（或均缺失）时，scripts/generate.py 应输出 status=failed、code=interview_prep_empty_content，退出码 0。",
+      "expected_output": "status=failed；code=interview_prep_empty_content；exit code=0；out 文件含该 code；stdout 摘要 section_count=0。",
+      "files": []
+    },
+    {
+      "id": 4,
+      "name": "missing-api-key-degrades-gracefully",
+      "prompt": "在未设置 DEEPSEEK_API_KEY 与 OPENAI_API_KEY（且 Windows User scope 也无）的环境下运行 scripts/generate.py，应输出 status=failed、code=missing_api_key，退出码 0，不发起任何网络调用。",
+      "expected_output": "status=failed；code=missing_api_key；exit code=0；不产生 langchain_openai 调用；stdout 单行 JSON 摘要含 code=missing_api_key。",
+      "files": []
+    }
+  ]
+}

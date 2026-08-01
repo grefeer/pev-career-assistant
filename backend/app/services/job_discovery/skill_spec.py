@@ -87,6 +87,21 @@ RESUME_TAILORING_SPEC = SkillSpec(
 )
 
 
+#: The interview-prep skill produces a five-section interview-prep kit for a
+#: target job via a single LLM call.  Only ``generate`` is needed - there is no
+#: grounding step (the five content sections are study material, not fact
+#: references).  Deterministic CLI; the runtime calls it through
+#: ``run_skill_script``.  Like resume-tailoring it is a parallel artifact and
+#: does not touch the backend interview-prep store.
+INTERVIEW_PREP_SCRIPTS: frozenset[str] = frozenset({"generate"})
+
+INTERVIEW_PREP_SPEC = SkillSpec(
+    name="interview-prep",
+    allowed_scripts=INTERVIEW_PREP_SCRIPTS,
+    skill_type="deterministic",
+)
+
+
 #: Registry of skills available to the runtime.  Add a parallel skill by
 #: appending a ``SkillSpec`` here and creating its ``skill/<name>`` source
 #: directory; the shared artifact store and script tool then accept its
@@ -95,6 +110,7 @@ SKILL_REGISTRY: dict[str, SkillSpec] = {
     JOB_DISCOVERY_SPEC.name: JOB_DISCOVERY_SPEC,
     COMPANY_RESEARCH_SPEC.name: COMPANY_RESEARCH_SPEC,
     RESUME_TAILORING_SPEC.name: RESUME_TAILORING_SPEC,
+    INTERVIEW_PREP_SPEC.name: INTERVIEW_PREP_SPEC,
 }
 
 
