@@ -1681,7 +1681,10 @@ class AgentArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "agent_artifacts"
     __table_args__ = (
         UniqueConstraint(
-            "step_id", "content_hash", name="uq_agent_artifacts_step_content_hash"
+            "step_id",
+            "artifact_type",
+            "content_hash",
+            name="uq_agent_artifacts_step_type_content_hash",
         ),
         Index("ix_agent_artifacts_run_created", "run_id", "created_at"),
     )

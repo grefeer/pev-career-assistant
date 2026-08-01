@@ -97,3 +97,40 @@ def test_repository_owner_lookup_does_not_leak_another_users_run(db_session) -> 
 
     assert agent_runtime.get_run_for_owner(db_session, run.id, second_user.id) is None
     assert agent_runtime.get_run_for_owner(db_session, run.id, first_user.id) is not None
+
+
+def test_repository_keeps_distinct_artifact_types_for_one_source_and_deduplicates_each_type(db_session) -> None:
+    """A page snapshot and its parsed JD share a hash but are distinct immutable products."""
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = agent_runtime.create_run(
+        db_session, user_id=user.id, goal="提取 JD", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    plan = agent_runtime.create_plan(
+        db_session, run_id=run.id, revision=1, complexity=ComplexityLevel.L2,
+        plan_json={"steps": ["discover"]},
+    )
+    step = agent_runtime.create_step(
+        db_session, run_id=run.id, plan_id=plan.id, sequence=1,
+        objective="提取 JD", allowed_skills=["job-discovery"],
+    )
+    page = agent_runtime.create_artifact(
+        db_session, run_id=run.id, step_id=step.id, artifact_type="public_job_page",
+        source_url="https://jobs.example/1", content_hash="a" * 64,
+        content_json={"visible_text": "JD"},
+    )
+    structured = agent_runtime.create_artifact(
+        db_session, run_id=run.id, step_id=step.id, artifact_type="structured_job_details",
+        source_url="https://jobs.example/1", content_hash="a" * 64,
+        content_json={"candidates": []},
+    )
+    repeated = agent_runtime.create_artifact(
+        db_session, run_id=run.id, step_id=step.id, artifact_type="structured_job_details",
+        source_url="https://jobs.example/1", content_hash="a" * 64,
+        content_json={"candidates": []},
+    )
+
+    assert page.id != structured.id
+    assert repeated.id == structured.id

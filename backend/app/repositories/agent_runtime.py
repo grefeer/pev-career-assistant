@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import utc_now
@@ -169,19 +170,15 @@ def create_evidence_artifact(
     content_json: dict[str, Any],
 ) -> AgentArtifact:
     """Store immutable, public tool output once for the producing step."""
-    artifact = AgentArtifact(
+    return create_artifact(
+        db,
         run_id=run_id,
         step_id=step_id,
         artifact_type="public_job_page",
         source_url=source_url,
         content_hash=content_hash,
         content_json=content_json,
-        created_by=AgentRole.executor,
     )
-    db.add(artifact)
-    db.flush()
-    db.refresh(artifact)
-    return artifact
 
 
 def create_artifact(
@@ -195,6 +192,16 @@ def create_artifact(
     content_json: dict[str, Any],
 ) -> AgentArtifact:
     """Store one immutable, schema-validated Skill result artifact."""
+    existing = db.scalar(
+        select(AgentArtifact).where(
+            AgentArtifact.step_id == step_id,
+            AgentArtifact.artifact_type == artifact_type,
+            AgentArtifact.content_hash == content_hash,
+        )
+    )
+    if existing is not None:
+        return existing
+
     artifact = AgentArtifact(
         run_id=run_id,
         step_id=step_id,
@@ -204,8 +211,21 @@ def create_artifact(
         content_json=content_json,
         created_by=AgentRole.executor,
     )
-    db.add(artifact)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(artifact)
+            db.flush()
+    except IntegrityError:
+        existing = db.scalar(
+            select(AgentArtifact).where(
+                AgentArtifact.step_id == step_id,
+                AgentArtifact.artifact_type == artifact_type,
+                AgentArtifact.content_hash == content_hash,
+            )
+        )
+        if existing is not None:
+            return existing
+        raise
     db.refresh(artifact)
     return artifact
 
