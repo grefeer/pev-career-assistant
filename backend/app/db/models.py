@@ -64,6 +64,12 @@ from backend.app.domain.company_research import (
 )
 from backend.app.domain.interview_prep import InterviewPrepKitStatus
 from backend.app.domain.application_tracking import ApplicationStatus
+from backend.app.domain.agent_runtime import (
+    AgentRole,
+    ComplexityLevel,
+    RunStatus,
+    StepStatus,
+)
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -1571,6 +1577,146 @@ class ApplicationRecordEvent(Base):
     from_status: Mapped[str] = mapped_column(String(40), nullable=False)
     to_status: Mapped[str] = mapped_column(String(40), nullable=False)
     note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Adaptive Planner–Executor–Verifier runtime.  These rows are deliberately
+# separate from LangGraph/checkpoint state: MySQL is the durable source of
+# truth for what a user asked, what autonomous roles observed, and why a run
+# ended.  JSON columns only hold schema-whitelisted summaries and artifact refs.
+# ---------------------------------------------------------------------------
+
+
+class AgentRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One user-scoped adaptive PEV run and its terminal summary."""
+
+    __tablename__ = "agent_runs"
+    __table_args__ = (
+        Index("ix_agent_runs_user_status_created", "user_id", "status", "created_at"),
+    )
+
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed_skills_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    context_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    budget_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    agent_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    complexity: Mapped[ComplexityLevel | None] = mapped_column(
+        Enum(ComplexityLevel, name="agent_complexity_level", **enum_kwargs)
+    )
+    status: Mapped[RunStatus] = mapped_column(
+        Enum(RunStatus, name="agent_run_status", **enum_kwargs),
+        default=RunStatus.queued,
+        nullable=False,
+        index=True,
+    )
+    final_summary: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    state_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class AgentPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A versioned Planner output for one run."""
+
+    __tablename__ = "agent_plans"
+    __table_args__ = (
+        UniqueConstraint("run_id", "revision", name="uq_agent_plans_run_revision"),
+        Index("ix_agent_plans_run_revision", "run_id", "revision"),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    complexity: Mapped[ComplexityLevel] = mapped_column(
+        Enum(ComplexityLevel, name="agent_plan_complexity_level", **enum_kwargs),
+        nullable=False,
+    )
+    plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[AgentRole] = mapped_column(
+        Enum(AgentRole, name="agent_role", **enum_kwargs),
+        default=AgentRole.planner,
+        nullable=False,
+    )
+
+
+class AgentStep(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable execution record for one ordered Planner step."""
+
+    __tablename__ = "agent_steps"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "sequence", name="uq_agent_steps_plan_sequence"),
+        Index("ix_agent_steps_run_sequence", "run_id", "sequence"),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    objective: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed_skills_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    status: Mapped[StepStatus] = mapped_column(
+        Enum(StepStatus, name="agent_step_status", **enum_kwargs),
+        default=StepStatus.planned,
+        nullable=False,
+    )
+    input_summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    output_artifact_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class AgentTurn(Base):
+    """A role decision summary, excluding raw prompts and private material."""
+
+    __tablename__ = "agent_turns"
+    __table_args__ = (
+        UniqueConstraint("run_id", "role", "turn_index", name="uq_agent_turns_run_role_index"),
+        Index("ix_agent_turns_run_created", "run_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(audit_id_type, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[AgentRole] = mapped_column(
+        Enum(AgentRole, name="agent_turn_role", **enum_kwargs), nullable=False
+    )
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    decision_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(128))
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class AgentEvent(Base):
+    """Append-only, sequence-addressable trace event for UI and audit."""
+
+    __tablename__ = "agent_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_agent_events_run_sequence"),
+        Index("ix_agent_events_run_sequence", "run_id", "sequence"),
+    )
+
+    id: Mapped[int] = mapped_column(audit_id_type, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )

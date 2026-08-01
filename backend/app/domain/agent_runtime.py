@@ -48,6 +48,16 @@ class RunStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class StepStatus(StrEnum):
+    """Lifecycle of a planned outcome while Executor works on it."""
+
+    planned = "planned"
+    running = "running"
+    succeeded = "succeeded"
+    failed = "failed"
+    skipped = "skipped"
+
+
 class VerificationDecision(StrEnum):
     """Verifier outcomes consumed by the harness, never guessed by it."""
 
