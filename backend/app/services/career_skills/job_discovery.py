@@ -178,19 +178,31 @@ def extract_observed_job_details(
     }
     candidates = []
     for candidate in extract_jd_candidates(visible_text, source_url):
+        inferred_title = _infer_official_page_title(visible_text)
+        title = inferred_title or candidate.title
+        locations = candidate.locations or _infer_official_page_locations(
+            visible_text, title
+        )
         responsibilities = _extract_jd_section(
             visible_text,
             labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责"),
         ) or candidate.responsibilities
         requirements = _extract_jd_section(
             visible_text,
-            labels=("任职要求", "岗位要求", "职位要求", "资格要求", "招聘要求"),
+            labels=(
+                "任职要求",
+                "职责要求",
+                "岗位要求",
+                "职位要求",
+                "资格要求",
+                "招聘要求",
+            ),
         ) or candidate.requirements
         candidates.append(
             ExtractedJobDetails(
-                title=candidate.title,
+                title=title,
                 company_name=candidate.company_name,
-                locations=candidate.locations,
+                locations=locations,
                 responsibilities=responsibilities,
                 requirements=requirements,
                 recruitment_types=candidate.recruitment_types,
@@ -233,6 +245,7 @@ def _extract_jd_section(text: str, *, labels: tuple[str, ...]) -> str:
             "工作内容",
             "主要职责",
             "任职要求",
+            "职责要求",
             "岗位要求",
             "职位要求",
             "资格要求",
@@ -243,6 +256,7 @@ def _extract_jd_section(text: str, *, labels: tuple[str, ...]) -> str:
             "申请方式",
             "截止日期",
             "截止时间",
+            "申请职位",
         )
     )
     match = re.search(
@@ -254,3 +268,34 @@ def _extract_jd_section(text: str, *, labels: tuple[str, ...]) -> str:
     if match is None:
         return ""
     return " ".join(match.group(1).split()).strip()
+
+
+def _infer_official_page_title(text: str) -> str | None:
+    """Infer a title from the header area of official pages lacking a title label."""
+    header = re.split(r"(?:岗位职责|工作职责|职位描述)\s*[:：]?", text, maxsplit=1)[0]
+    for line in reversed(header.splitlines()):
+        candidate = line.strip()
+        if (
+            3 <= len(candidate) <= 100
+            and re.search(r"(?:工程师|开发|算法|研究员|实习生|架构师|科学家)", candidate)
+            and "申请" not in candidate
+        ):
+            return candidate
+    return None
+
+
+def _infer_official_page_locations(text: str, title: str | None) -> list[str]:
+    """Read a city-shaped line following a title in an official page header."""
+    if not title:
+        return []
+    lines = [line.strip() for line in text.splitlines()]
+    try:
+        title_index = lines.index(title)
+    except ValueError:
+        return []
+    for line in lines[title_index + 1 :]:
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:市|省)?", line):
+            return [line]
+        if re.search(r"(?:岗位职责|工作职责|职位描述)", line):
+            break
+    return []

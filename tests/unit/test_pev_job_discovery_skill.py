@@ -95,3 +95,40 @@ def test_extract_observed_job_details_returns_structured_fields_only_from_captur
         }],
         "normalization_warnings": [],
     }]
+
+
+def test_extract_observed_job_details_handles_official_page_without_labeled_title() -> None:
+    """A navigation button must not replace the true title on common official career pages."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-official",
+            "source_url": "https://jobs.example/official",
+            "content_hash": "b" * 64,
+            "title": "官方招聘",
+            "visible_text": """
+首页
+职位
+2027AIDU-智能体算法工程师(J99969)
+北京市
+技术
+工作职责：
+负责 AI Agent 的设计与研发。
+职责要求：
+熟悉 Python、RAG 和 Agent 开发框架。
+申请职位
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-official"),
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.title == "2027AIDU-智能体算法工程师(J99969)"
+    assert candidate.locations == ["北京市"]
+    assert candidate.responsibilities == "负责 AI Agent 的设计与研发。"
+    assert candidate.requirements == "熟悉 Python、RAG 和 Agent 开发框架。"
