@@ -33,12 +33,15 @@ from backend.app.services.job_discovery.preference_expansion import (
     preference_search_terms,
 )
 from backend.app.services.job_discovery.skill_artifacts import SkillArtifactStore
+from backend.app.services.job_discovery.skill_spec import (
+    JOB_DISCOVERY_SCRIPTS,
+    get_skill_spec,
+)
 
 
-_ALLOWED_SCRIPTS = {
-    "browse", "validate", "normalize", "deduplicate", "ocr_image", "state",
-    "read_evidence", "write_candidates", "coverage_gate",
-}
+#: Allowlist of scripts the job-discovery coordinator may invoke.  Sourced from
+#: ``skill_spec`` so a parallel skill declares its own set without editing here.
+_ALLOWED_SCRIPTS = JOB_DISCOVERY_SCRIPTS
 
 
 @dataclass(frozen=True)
@@ -81,13 +84,20 @@ class SkillDiscoveryRuntime:
         object_store: Any | None = None, role_preferences: tuple[str, ...] = DEFAULT_ROLE_PREFERENCES,
     ) -> None:
         self.settings = settings
+        # The default path resolves the job-discovery spec so the shared
+        # artifact store and script tool exercise the extension point; a
+        # parallel skill resolves its own spec the same way.
+        self.spec = get_skill_spec("job-discovery")
         configured_root = getattr(settings, "job_discovery_skill_artifact_root", "var/job-discovery-skill")
         self.artifact_root = artifact_root or Path(configured_root)
         self.object_store = object_store
         self.role_preferences = role_preferences
 
     def run(self, task: DiscoveryTaskInput, *, task_id: str) -> SkillRuntimeResult:
-        store = SkillArtifactStore(task_id, self.artifact_root, run_id=uuid4().hex)
+        store = SkillArtifactStore(
+            task_id, self.artifact_root, run_id=uuid4().hex,
+            skill_name=self.spec.name, skill_source=self.spec.source_path,
+        )
         skill_dir = store.prepare()
         try:
             self._invoke(task=task, skill_dir=skill_dir)
@@ -151,7 +161,7 @@ class SkillDiscoveryRuntime:
             # preference-targeted search (primary), then a parallel listing
             # crawl (fallback), then an optional declared-page-count expansion.
             max_browse_calls=3,
-        ))
+        ), allowed_scripts=self.spec.allowed_scripts)
         backend = FilesystemBackend(root_dir=str(skill_dir.parent), virtual_mode=True)
         permissions = [
             FilesystemPermission(operations=["read"], paths=["/job-discovery/**"]),
@@ -482,12 +492,17 @@ def _safe_utf8_text(value: Any) -> str:
     return value.encode("utf-8", errors="replace").decode("utf-8")
 
 
-def _script_tool(skill_dir: Path, policy: SkillToolPolicy) -> StructuredTool:
+def _script_tool(
+    skill_dir: Path, policy: SkillToolPolicy, *,
+    allowed_scripts: frozenset[str] | None = None,
+) -> StructuredTool:
     trace_lock = threading.Lock()
+    allowlist = allowed_scripts if allowed_scripts is not None else _ALLOWED_SCRIPTS
+
     def run_skill_script(script: str, cli_args: str = "", stdin: str = "") -> str:
         started = time.monotonic()
         script_failed = False
-        if script not in _ALLOWED_SCRIPTS:
+        if script not in allowlist:
             return f"ERROR: unsupported Skill script {script!r}"
         try:
             args = shlex.split(cli_args, posix=(sys.platform != "win32")) if cli_args else []

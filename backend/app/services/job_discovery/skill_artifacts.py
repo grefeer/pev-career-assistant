@@ -14,7 +14,10 @@ import shutil
 from typing import Any
 
 
-SKILL_SOURCE = Path(__file__).resolve().parents[4] / "skill" / "job-discovery"
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+#: Default source for the job-discovery skill (kept for backward compatibility;
+#: ``skill_source`` now derives from ``skill_name`` when not passed explicitly).
+SKILL_SOURCE = _REPO_ROOT / "skill" / "job-discovery"
 
 
 @dataclass(frozen=True)
@@ -31,22 +34,29 @@ class SkillArtifactStore:
 
     def __init__(
         self, task_id: str, root: Path, *, run_id: str = "default",
-        skill_source: Path = SKILL_SOURCE,
+        skill_name: str = "job-discovery", skill_source: Path | None = None,
     ) -> None:
         if not task_id or task_id in {".", ".."} or any(char in task_id for char in "\\/"):
             raise ValueError("task_id must be a single non-empty path segment")
         if not run_id or run_id in {".", ".."} or any(char in run_id for char in "\\/"):
             raise ValueError("run_id must be a single non-empty path segment")
+        if not skill_name or skill_name in {".", ".."} or any(char in skill_name for char in "\\/"):
+            raise ValueError("skill_name must be a single non-empty path segment")
         self.task_id = task_id
         self.run_id = run_id
+        self.skill_name = skill_name
         self.root = root.resolve()
+        if skill_source is None:
+            # Derive the on-disk source from the skill name so a parallel skill
+            # is cloned from ``skill/<name>`` without an explicit path.
+            skill_source = _REPO_ROOT / "skill" / skill_name
         self.skill_source = skill_source.resolve()
-        self.skill_dir = self.root / task_id / "runs" / run_id / "skill" / "job-discovery"
+        self.skill_dir = self.root / task_id / "runs" / run_id / "skill" / skill_name
 
     def prepare(self) -> Path:
         """Clone the bundled Skill excluding prior output and bytecode."""
         if not (self.skill_source / "SKILL.md").is_file():
-            raise FileNotFoundError(f"job-discovery Skill not found: {self.skill_source}")
+            raise FileNotFoundError(f"{self.skill_name} Skill not found: {self.skill_source}")
         if not self.skill_dir.exists():
             self.skill_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(
@@ -91,7 +101,7 @@ class SkillArtifactStore:
         published: dict[Path, str] = {}
         for artifact in self.iter_evidence():
             relative = artifact.path.relative_to(self.skill_dir).as_posix()
-            key = f"job-discovery/{self.task_id}/{self.run_id}/{relative}"
+            key = f"{self.skill_name}/{self.task_id}/{self.run_id}/{relative}"
             object_store.put(
                 key=key,
                 plaintext=artifact.path.read_bytes(),
