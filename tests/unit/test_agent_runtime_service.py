@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from backend.app.db.models import User, UserRole
+from backend.app.db.models import ConfirmedProfileVersion, Profile, User, UserRole
+from backend.app.domain.agent_runtime import RunStatus
 from backend.app.repositories import agent_runtime as run_repository
+from backend.app.services.agent_runtime.runtime import AgentRunResult
+from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.service import (
     AgentRuntimeDisabledError,
     AgentRunNotFoundError,
@@ -22,6 +25,17 @@ def _user(user_id: str, account: str) -> User:
         password_hash="not-a-real-password-hash",
         role=UserRole.STUDENT,
     )
+
+
+class CapturingRuntime:
+    """Runtime boundary double that exposes the task passed by the service."""
+
+    def __init__(self) -> None:
+        self.task: AgentTaskRequest | None = None
+
+    def run(self, _db, *, user_id: str, task: AgentTaskRequest) -> AgentRunResult:
+        self.task = task
+        return AgentRunResult("run-a", status=RunStatus.succeeded, summary=user_id)
 
 
 def test_service_fails_closed_when_adaptive_harness_is_disabled(db_session) -> None:
@@ -61,3 +75,32 @@ def test_service_hides_other_users_persisted_run_and_events(db_session) -> None:
         service.list_events(db_session, user_id=other.id, run_id=run.id)
     assert service.get_run(db_session, user_id=owner.id, run_id=run.id).id == run.id
     assert len(service.list_events(db_session, user_id=owner.id, run_id=run.id)) == 1
+
+
+def test_service_injects_only_the_owners_latest_confirmed_profile_into_private_task_context(db_session) -> None:
+    """Resume tailoring must source facts from server-owned confirmed profile data."""
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    profile = Profile(user_id=user.id, version=1, local_sensitive_references={})
+    db_session.add(profile)
+    db_session.flush()
+    db_session.add(ConfirmedProfileVersion(
+        profile_id=profile.id, version_number=1, aggregate_version=1,
+        facts_snapshot={"skills": ["Python", "RAG"]}, evidence_refs={},
+        local_sensitive_references={},
+    ))
+    db_session.commit()
+    runtime = CapturingRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+
+    service.create_run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(goal="修改简历", allowed_skills=["resume-tailoring"]),
+    )
+
+    assert runtime.task is not None
+    assert runtime.task.private_context == {
+        "confirmed_profile_facts": {"skills": ["Python", "RAG"]}
+    }

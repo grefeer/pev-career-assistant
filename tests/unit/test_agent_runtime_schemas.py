@@ -75,3 +75,15 @@ def test_execution_plan_keeps_a_simple_request_as_a_real_one_step_plan() -> None
 
     assert plan.steps[0].objective == "从公开来源提取岗位"
     assert plan.complexity is ComplexityLevel.L1
+
+
+def test_task_private_context_is_excluded_from_persistable_dumps() -> None:
+    """Confirmed resume facts must never be copied into run or plan audit JSON."""
+    task = AgentTaskRequest(
+        goal="根据岗位修改简历",
+        allowed_skills=["resume-tailoring"],
+        private_context={"confirmed_profile_facts": {"skills": ["Python"]}},
+    )
+
+    assert task.private_context == {"confirmed_profile_facts": {"skills": ["Python"]}}
+    assert "private_context" not in task.model_dump(mode="json")

@@ -367,10 +367,16 @@ class AgentRuntime:
     ) -> ToolContext:
         """Project only verified public evidence into deterministic tool authority."""
         evidence = task.context.get("observed_public_evidence", [])
+        profile_facts = task.private_context.get("confirmed_profile_facts", {})
         return ToolContext(
             user_id=user_id,
             run_id=run_id,
-            metadata={"observed_public_evidence": evidence if isinstance(evidence, list) else []},
+            metadata={
+                "observed_public_evidence": evidence if isinstance(evidence, list) else [],
+                "confirmed_profile_facts": profile_facts
+                if isinstance(profile_facts, dict)
+                else {},
+            },
         )
 
     @staticmethod

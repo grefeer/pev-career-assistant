@@ -49,6 +49,7 @@ class ExecutorAgent:
                 state={
                     "goal": task.goal,
                     "context": task.context,
+                    "private_context": task.private_context,
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),
                     "available_tools": self._tools.tool_catalog(

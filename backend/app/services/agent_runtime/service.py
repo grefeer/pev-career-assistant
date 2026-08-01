@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from backend.app.config import Settings
 from backend.app.db.models import AgentEvent, AgentRun
 from backend.app.repositories import agent_runtime as run_repository
+from backend.app.repositories import profiles as profile_repository
 from backend.app.services.agent_runtime.runtime import AgentRunResult, AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 
@@ -42,7 +43,23 @@ class AgentRunService:
             raise AgentRuntimeDisabledError("agent_harness_disabled")
         if self._runtime is None:
             raise AgentRuntimeUnavailableError("agent_harness_unavailable")
-        return self._runtime.run(db, user_id=user_id, task=task)
+        return self._runtime.run(
+            db,
+            user_id=user_id,
+            task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
+        )
+
+    @staticmethod
+    def _with_confirmed_profile_facts(
+        db: Session, *, user_id: str, task: AgentTaskRequest
+    ) -> AgentTaskRequest:
+        """Supply only owner-confirmed profile facts as non-persisted run context."""
+        versions = profile_repository.list_versions(db, user_id)
+        if not versions:
+            return task
+        private_context = dict(task.private_context)
+        private_context["confirmed_profile_facts"] = versions[0].facts_snapshot
+        return task.model_copy(update={"private_context": private_context})
 
     def get_run(self, db: Session, *, user_id: str, run_id: str) -> AgentRun:
         """Read a trace summary only for its owner."""

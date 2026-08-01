@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
-from backend.app.services.career_skills import job_discovery, job_matching
+from backend.app.services.career_skills import (
+    career_planning,
+    job_discovery,
+    job_matching,
+    resume_tailoring,
+)
 
 
 def build_career_tool_registry() -> ToolRegistry:
@@ -28,6 +33,26 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_matching.MatchObservedJobsOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_matching.match_observed_jobs,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="build-resume-tailoring-brief",
+            skill_name="resume-tailoring",
+            input_model=resume_tailoring.BuildResumeTailoringBriefInput,
+            output_model=resume_tailoring.ResumeTailoringBriefOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=resume_tailoring.build_resume_tailoring_brief,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="build-preparation-plan",
+            skill_name="career-planning",
+            input_model=career_planning.BuildPreparationPlanInput,
+            output_model=career_planning.PreparationPlanOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=career_planning.build_preparation_plan,
         )
     )
     return registry

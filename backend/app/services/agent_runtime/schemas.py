@@ -39,6 +39,7 @@ class AgentTaskRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=8_000)
     allowed_skills: list[str] = Field(min_length=1, max_length=16)
     context: dict[str, Any] = Field(default_factory=dict)
+    private_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
     budget: AgentBudget = Field(default_factory=AgentBudget)
 
     @field_validator("goal")
