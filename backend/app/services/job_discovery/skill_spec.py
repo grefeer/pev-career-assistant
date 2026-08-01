@@ -60,12 +60,26 @@ JOB_DISCOVERY_SPEC = SkillSpec(
 )
 
 
+#: The company-research coordinator only needs its own page fetcher.  Unlike
+#: job-discovery it does not paginate, preference-filter, or run a coverage
+#: gate, so its allowlist is intentionally a single script.  Extraction is
+#: deterministic (page text is parsed in-process by the runtime).
+COMPANY_RESEARCH_SCRIPTS: frozenset[str] = frozenset({"browse"})
+
+COMPANY_RESEARCH_SPEC = SkillSpec(
+    name="company-research",
+    allowed_scripts=COMPANY_RESEARCH_SCRIPTS,
+    skill_type="deterministic",
+)
+
+
 #: Registry of skills available to the runtime.  Add a parallel skill by
 #: appending a ``SkillSpec`` here and creating its ``skill/<name>`` source
 #: directory; the shared artifact store and script tool then accept its
 #: ``allowed_scripts`` without touching the job-discovery default path.
 SKILL_REGISTRY: dict[str, SkillSpec] = {
     JOB_DISCOVERY_SPEC.name: JOB_DISCOVERY_SPEC,
+    COMPANY_RESEARCH_SPEC.name: COMPANY_RESEARCH_SPEC,
 }
 
 
