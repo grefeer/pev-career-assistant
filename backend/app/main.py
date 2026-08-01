@@ -185,7 +185,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
                 from backend.app.services.agent_runtime.runtime import AgentRuntime
                 from backend.app.services.agent_runtime.service import AgentRunService
-                from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+                from backend.app.services.career_skills.registry import (
+                    build_career_tool_registry,
+                )
                 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
                 runtime = getattr(app.state, "agent_runtime", None)
@@ -194,7 +196,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 if runtime is None and app.state.settings.agent_harness_enabled:
                     try:
                         gateway = build_agent_model_gateway(app.state.settings)
-                        tools = ToolRegistry()
+                        tools = build_career_tool_registry()
                         runtime = AgentRuntime(
                             planner=PlannerAgent(gateway=gateway, tools=tools),
                             executor=ExecutorAgent(gateway=gateway, tools=tools),
