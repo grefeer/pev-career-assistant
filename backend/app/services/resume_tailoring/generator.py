@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from backend.app.config import Settings
+from backend.app.services.common.llm_json import extract_content, extract_json
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,6 @@ _SYSTEM_PROMPT = (
     '"before": ..., "after": ... }, ... ]}\n\n'
     "Do not include prose, markdown fences, or commentary."
 )
-
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 
 class LLMDraftGenerator:
@@ -99,7 +97,7 @@ class LLMDraftGenerator:
             match_analysis=match_analysis,
         )
         response = self.llm.invoke(messages)
-        content = _extract_content(response)
+        content = extract_content(response)
         diffs = _parse_diffs(content)
         return {"diffs": diffs, "agent_version": self.agent_version}
 
@@ -132,37 +130,13 @@ class LLMDraftGenerator:
 # ---------------------------------------------------------------------------
 
 
-def _extract_content(response: Any) -> str:
-    """Coerce an LLM response into a string.
-
-    Handles (a) objects with a ``.content`` string (langchain ``AIMessage``),
-    (b) objects whose ``.content`` is a list of content blocks, and (c) plain
-    strings passed straight through (useful for tests).
-    """
-    if response is None:
-        return ""
-    content = getattr(response, "content", response)
-    if isinstance(content, list):
-        return "".join(_block_text(block) for block in content)
-    return content if isinstance(content, str) else str(content)
-
-
-def _block_text(block: Any) -> str:
-    """Extract text from one content block (string or {"text": ...} dict)."""
-    if isinstance(block, str):
-        return block
-    if isinstance(block, dict):
-        return str(block.get("text", ""))
-    return str(block)
-
-
 def _parse_diffs(content: str) -> list[dict[str, Any]]:
     """Parse the LLM response text into a list of diff dicts.
 
     Raises :class:`DraftGenerationError` when no JSON can be located or the
     JSON does not contain a diffs list.
     """
-    payload = _extract_json(content)
+    payload = extract_json(content)
     if payload is None:
         raise DraftGenerationError(
             "draft_generation_parse_error",
@@ -175,61 +149,6 @@ def _parse_diffs(content: str) -> list[dict[str, Any]]:
             "LLM response JSON did not contain a 'diffs' list.",
         )
     return diffs
-
-
-def _extract_json(content: str) -> Any:
-    """Best-effort extraction of the first JSON value from ``content``.
-
-    Tries a fenced ```json block first, then the whole text, then a bracket
-    slice for the common "preamble {json} postamble" shape.
-    """
-    match = _FENCE_RE.search(content)
-    candidates = [match.group(1)] if match else []
-    candidates.append(content)
-    for candidate in candidates:
-        result = _try_parse_json(candidate)
-        if result is not None:
-            return result
-    return None
-
-
-def _try_parse_json(text: str) -> Any:
-    stripped = text.strip()
-    if not stripped:
-        return None
-    try:
-        return json.loads(stripped)
-    except (ValueError, TypeError):
-        pass
-    obj = _slice_between(stripped, "{", "}")
-    if obj is not None:
-        try:
-            return json.loads(obj)
-        except (ValueError, TypeError):
-            pass
-    arr = _slice_between(stripped, "[", "]")
-    if arr is not None:
-        try:
-            return json.loads(arr)
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def _slice_between(text: str, open_ch: str, close_ch: str) -> str | None:
-    """Return the substring from the first ``open_ch`` to the last ``close_ch``.
-
-    Returns ``None`` when either bracket is absent or out of order. Using the
-    last close bracket correctly captures a single top-level JSON value even
-    when it contains nested objects.
-    """
-    start = text.find(open_ch)
-    if start == -1:
-        return None
-    end = text.rfind(close_ch)
-    if end <= start:
-        return None
-    return text[start : end + 1]
 
 
 def _coerce_diffs(payload: Any) -> list[dict[str, Any]] | None:

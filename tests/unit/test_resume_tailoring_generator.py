@@ -15,16 +15,18 @@ from typing import Any
 import pytest
 
 from backend.app.config import Settings
+from backend.app.services.common.llm_json import (
+    block_text,
+    extract_content,
+    extract_json,
+    slice_between,
+    try_parse_json,
+)
 from backend.app.services.resume_tailoring.generator import (
     DraftGenerationError,
     LLMDraftGenerator,
-    _block_text,
     _coerce_diffs,
-    _extract_content,
-    _extract_json,
     _parse_diffs,
-    _slice_between,
-    _try_parse_json,
 )
 from backend.app.services.resume_tailoring.llm_factory import (
     DraftGeneratorConfigError,
@@ -192,14 +194,14 @@ def test_generate_diffs_empty_content_raises():
     (_msg(["a", {"text": "b"}, 3]), "ab3"),        # list content blocks
 ])
 def test_extract_content_variants(response, expected):
-    assert _extract_content(response) == expected
+    assert extract_content(response) == expected
 
 
 def test_block_text_variants():
-    assert _block_text("x") == "x"
-    assert _block_text({"text": "y"}) == "y"
-    assert _block_text({"other": "z"}) == ""       # dict without "text"
-    assert _block_text(5) == "5"                   # other -> str()
+    assert block_text("x") == "x"
+    assert block_text({"text": "y"}) == "y"
+    assert block_text({"other": "z"}) == ""       # dict without "text"
+    assert block_text(5) == "5"                   # other -> str()
 
 
 # ---------------------------------------------------------------------------
@@ -208,36 +210,36 @@ def test_block_text_variants():
 
 
 def test_extract_json_returns_none_when_unparseable():
-    assert _extract_json("totally not json at all") is None
+    assert extract_json("totally not json at all") is None
 
 
 def test_try_parse_json_empty_returns_none():
-    assert _try_parse_json("   ") is None
+    assert try_parse_json("   ") is None
 
 
 def test_try_parse_json_broken_object_slice_returns_none():
     # A ``{...}`` span is found but is not valid JSON -> falls through to the
     # array branch (absent) and finally returns None.
-    assert _try_parse_json("noise { broken object } more") is None
+    assert try_parse_json("noise { broken object } more") is None
 
 
 def test_try_parse_json_broken_array_slice_returns_none():
     # No object span; a ``[...]`` span is found but is not valid JSON.
-    assert _try_parse_json("noise [ broken array ] more") is None
+    assert try_parse_json("noise [ broken array ] more") is None
 
 
 def test_slice_between_missing_open_returns_none():
-    assert _slice_between("no brackets", "{", "}") is None
+    assert slice_between("no brackets", "{", "}") is None
 
 
 def test_slice_between_unterminated_returns_none():
     # close bracket precedes/equals open -> out of order
-    assert _slice_between("} {", "{", "}") is None
+    assert slice_between("} {", "{", "}") is None
 
 
 def test_slice_between_missing_close_after_open_returns_none():
     # open present, but no close at all -> rfind returns -1 (<= start)
-    assert _slice_between("{unterminated", "{", "}") is None
+    assert slice_between("{unterminated", "{", "}") is None
 
 
 def test_coerce_diffs_variants():
