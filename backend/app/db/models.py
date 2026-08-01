@@ -63,6 +63,7 @@ from backend.app.domain.company_research import (
     CompanyResearchStatus,
 )
 from backend.app.domain.interview_prep import InterviewPrepKitStatus
+from backend.app.domain.application_tracking import ApplicationStatus
 
 from .base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc_now
 
@@ -1505,3 +1506,71 @@ class InterviewPrepKit(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class ApplicationRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One user-scoped tracked job application (NOT the GUI executor task).
+
+    A personal tracker entry the user maintains by hand: the job they saved or
+    applied to, where they found it, and how far it has progressed through the
+    state machine.  ``target_job_id`` optionally links to a verified
+    ``JobPosting``; off-platform applications carry company/title directly.
+    The platform never auto-submits (security gate #1) - status advances are an
+    explicit human action, each recorded in :class:`ApplicationRecordEvent`.
+    """
+
+    __tablename__ = "application_records"
+    __table_args__ = (
+        Index(
+            "ix_application_records_user_status_created",
+            "user_id",
+            "status",
+            "created_at",
+        ),
+    )
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    target_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("job_postings.id", ondelete="SET NULL"), index=True
+    )
+    company_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    apply_url: Mapped[str | None] = mapped_column(String(1024))
+    source: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[ApplicationStatus] = mapped_column(
+        Enum(
+            ApplicationStatus,
+            name="application_record_status",
+            **enum_kwargs,
+        ),
+        default=ApplicationStatus.saved,
+        index=True,
+        nullable=False,
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
+    state_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+class ApplicationRecordEvent(Base):
+    """Append-only audit row for one application status transition."""
+
+    __tablename__ = "application_record_events"
+    __table_args__ = (
+        Index(
+            "ix_application_record_events_app_created",
+            "application_id",
+            "created_at",
+        ),
+    )
+    id: Mapped[int] = mapped_column(audit_id_type, primary_key=True, autoincrement=True)
+    application_id: Mapped[str] = mapped_column(
+        ForeignKey("application_records.id", ondelete="CASCADE"), nullable=False
+    )
+    from_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    to_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )

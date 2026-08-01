@@ -182,6 +182,14 @@ class Settings(BaseSettings):
     interview_prep_agent_version: str = "1.0.0"
     interview_prep_model: str = "deepseek-v4-flash"
 
+    # Application tracking (投递进度跟踪): a non-agent, user-scoped skill. The
+    # user records the jobs they have applied to and advances each through the
+    # state machine (saved -> applied -> screening -> interview -> offer /
+    # rejected / withdrawn). No crawl, no LLM, no auto-submit (security gate #1);
+    # every status advance is an explicit human action logged in an append-only
+    # event table.
+    application_tracking_enabled: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

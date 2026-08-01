@@ -14,6 +14,9 @@ from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
 from backend.app.services.company_research.service import CompanyResearchService
+from backend.app.services.application_tracking.service import (
+    ApplicationTrackingService,
+)
 from backend.app.services.interview_prep.service import InterviewPrepService
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.storage import EncryptedObjectStore
@@ -90,6 +93,19 @@ def get_interview_prep_service(request: Request) -> InterviewPrepService:
         return cast(InterviewPrepService, injected)
     settings = request.app.state.settings
     return InterviewPrepService(settings)
+
+
+def get_application_tracking_service(request: Request) -> ApplicationTrackingService:
+    """Resolve the application-tracking service.
+
+    No LLM / object store is needed, so the service is cheap to build per
+    request.  A lifespan-injected instance is still preferred when present.
+    """
+    injected = getattr(request.app.state, "application_tracking_service", None)
+    if injected is not None:
+        return cast(ApplicationTrackingService, injected)
+    settings = request.app.state.settings
+    return ApplicationTrackingService(settings)
 
 
 def get_device_service(request: Request, redis_client=Depends(get_redis)):

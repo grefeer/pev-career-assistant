@@ -163,6 +163,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         app.state.settings
                     )
                 app.state.interview_prep_service = owned_interview_prep_service
+            if not hasattr(app.state, "application_tracking_service"):
+                from backend.app.services.application_tracking.service import (
+                    ApplicationTrackingService,
+                )
+
+                # Non-agent skill: no LLM / object store, so construction never
+                # fails. Held on app.state so the DI provider can reuse one
+                # instance across requests.
+                app.state.application_tracking_service = ApplicationTrackingService(
+                    app.state.settings
+                )
             yield
     finally:
         if owned_graph is not None and getattr(app.state, "graph", None) is owned_graph:
