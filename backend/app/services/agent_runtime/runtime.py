@@ -70,60 +70,94 @@ class AgentRuntime:
             event_type="run_started",
             payload_json={"agent_version": self._agent_version},
         )
-        planner_result = self._planner.run(task=task, context=context)
-        if planner_result.status != "planned" or planner_result.plan is None:
-            return self._finish_planner_non_plan(db, run.id, run, planner_result)
+        planning_task = task
+        revision = 0
+        replans = 0
+        while True:
+            planner_result = self._planner.run(task=planning_task, context=context)
+            if planner_result.status != "planned" or planner_result.plan is None:
+                return self._finish_planner_non_plan(db, run.id, run, planner_result)
 
-        plan = planner_result.plan
-        run_repository.set_run_complexity(db, run, plan.complexity)
-        persisted_plan = run_repository.create_plan(
-            db,
-            run_id=run.id,
-            revision=1,
-            complexity=plan.complexity,
-            plan_json=plan.model_dump(mode="json"),
-        )
-        run_repository.append_event(
-            db,
-            run_id=run.id,
-            event_type="plan_created",
-            payload_json={
-                "complexity": plan.complexity.value,
-                "step_count": len(plan.steps),
-            },
-        )
-        final_summary: str | None = None
-        for sequence, plan_step in enumerate(plan.steps, start=1):
-            step = run_repository.create_step(
+            plan = planner_result.plan
+            revision += 1
+            run_repository.set_run_complexity(db, run, plan.complexity)
+            persisted_plan = run_repository.create_plan(
                 db,
                 run_id=run.id,
-                plan_id=persisted_plan.id,
-                sequence=sequence,
-                objective=plan_step.objective,
-                allowed_skills=plan_step.allowed_skills,
+                revision=revision,
+                complexity=plan.complexity,
+                plan_json=plan.model_dump(mode="json"),
             )
-            outcome = self._run_step(
-                db=db,
+            run_repository.append_event(
+                db,
                 run_id=run.id,
-                task=task,
-                plan=plan,
-                plan_step=plan_step,
-                persisted_step=step,
-                context=context,
+                event_type="plan_created",
+                payload_json={
+                    "revision": revision,
+                    "complexity": plan.complexity.value,
+                    "step_count": len(plan.steps),
+                },
             )
-            if outcome.status is not RunStatus.running:
-                return outcome
-            final_summary = outcome.summary or final_summary
-        run_repository.finish_run(
-            db, run, status=RunStatus.succeeded, final_summary=final_summary
-        )
-        run_repository.append_event(
-            db,
-            run_id=run.id,
-            event_type="run_succeeded",
-            payload_json={"summary": final_summary},
-        )
-        return AgentRunResult(run.id, RunStatus.succeeded, final_summary)
+            final_summary: str | None = None
+            replan_feedback: str | None = None
+            for sequence, plan_step in enumerate(plan.steps, start=1):
+                step = run_repository.create_step(
+                    db,
+                    run_id=run.id,
+                    plan_id=persisted_plan.id,
+                    sequence=sequence,
+                    objective=plan_step.objective,
+                    allowed_skills=plan_step.allowed_skills,
+                )
+                outcome = self._run_step(
+                    db=db,
+                    run_id=run.id,
+                    task=planning_task,
+                    plan=plan,
+                    plan_step=plan_step,
+                    persisted_step=step,
+                    context=context,
+                )
+                if outcome.error_code == "replan_required":
+                    replan_feedback = outcome.summary
+                    break
+                if outcome.status is not RunStatus.running:
+                    return outcome
+                final_summary = outcome.summary or final_summary
+            if replan_feedback is not None:
+                replans += 1
+                if replans > task.budget.max_replans:
+                    run_repository.finish_run(
+                        db,
+                        run,
+                        status=RunStatus.failed,
+                        error_code="replan_budget_exhausted",
+                    )
+                    run_repository.append_event(
+                        db,
+                        run_id=run.id,
+                        event_type="run_failed",
+                        payload_json={"error_code": "replan_budget_exhausted"},
+                    )
+                    return AgentRunResult(
+                        run.id, RunStatus.failed, None, "replan_budget_exhausted"
+                    )
+                feedback_context = dict(task.context)
+                feedback = list(feedback_context.get("verifier_feedback", []))
+                feedback.append(replan_feedback)
+                feedback_context["verifier_feedback"] = feedback
+                planning_task = task.model_copy(update={"context": feedback_context})
+                continue
+            run_repository.finish_run(
+                db, run, status=RunStatus.succeeded, final_summary=final_summary
+            )
+            run_repository.append_event(
+                db,
+                run_id=run.id,
+                event_type="run_succeeded",
+                payload_json={"summary": final_summary},
+            )
+            return AgentRunResult(run.id, RunStatus.succeeded, final_summary)
 
     def _run_step(
         self,
@@ -218,11 +252,27 @@ class AgentRuntime:
                 return self._wait_for_user(
                     db, run_id, persisted_step, verification.feedback
                 )
-            # REPLAN needs a fresh Planner revision; the first foundation
-            # iteration records the evidence and ends safely rather than
-            # pretending the old plan remains valid. Runtime-level replan is
-            # added with the plan-revision service/API in the next slice.
-            return self._fail_step(db, run_id, persisted_step, "replan_required")
+            run_repository.finish_step(
+                db,
+                persisted_step,
+                status=StepStatus.skipped,
+                error_code="replan_required",
+            )
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="verification_replan",
+                payload_json={
+                    "sequence": persisted_step.sequence,
+                    "feedback": verification.feedback,
+                },
+            )
+            return AgentRunResult(
+                run_id,
+                RunStatus.running,
+                verification.feedback,
+                "replan_required",
+            )
 
     @staticmethod
     def _requires_verification(plan: ExecutionPlan, plan_step: PlanStep) -> bool:

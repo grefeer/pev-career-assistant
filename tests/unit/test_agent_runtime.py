@@ -207,3 +207,72 @@ def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session
     assert gateway.states[AgentRole.executor][1]["context"]["verifier_feedback"] == [
         "补充职责和任职要求。"
     ]
+
+
+def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_session) -> None:
+    """A broken plan is replanned by Planner rather than mislabeled as execution failure."""
+    user = User(
+        id="user-a",
+        account="user-a@example.test",
+        nickname="user-a",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    plan_decision = {
+        "action": "plan",
+        "complexity": "L3",
+        "success_criteria": ["完整 JD"],
+        "steps": [
+            {
+                "step_id": "discover",
+                "objective": "提取岗位",
+                "allowed_skills": ["job-discovery"],
+                "requires_verification": True,
+            }
+        ],
+    }
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [plan_decision, plan_decision],
+            AgentRole.executor: [
+                {"action": "complete", "summary": "旧方案结果"},
+                {"action": "complete", "summary": "新方案结果"},
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "decide",
+                    "verification_decision": "REPLAN",
+                    "feedback": "来源改版，需要重新规划提取路径。",
+                },
+                {"action": "decide", "verification_decision": "PASS"},
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找岗位",
+            allowed_skills=["job-discovery"],
+            budget={"max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 1},
+        ),
+    )
+
+    assert result.status is RunStatus.succeeded
+    assert result.summary == "新方案结果"
+    assert gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"] == [
+        "来源改版，需要重新规划提取路径。"
+    ]
+    assert [event.event_type for event in run_repository.list_events(db_session, result.run_id)].count(
+        "plan_created"
+    ) == 2
