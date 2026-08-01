@@ -12,8 +12,14 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from backend.app.db.base import utc_now
 from backend.app.db.models import AgentEvent, AgentPlan, AgentRun, AgentStep, AgentTurn
-from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
+from backend.app.domain.agent_runtime import (
+    AgentRole,
+    ComplexityLevel,
+    RunStatus,
+    StepStatus,
+)
 
 
 def create_run(
@@ -46,6 +52,43 @@ def get_run_for_owner(db: Session, run_id: str, user_id: str) -> AgentRun | None
     return db.scalar(
         select(AgentRun).where(AgentRun.id == run_id, AgentRun.user_id == user_id)
     )
+
+
+def start_run(db: Session, run: AgentRun) -> AgentRun:
+    """Persist a service-approved transition into active execution."""
+    run.status = RunStatus.running
+    run.started_at = utc_now()
+    run.state_version += 1
+    db.flush()
+    return run
+
+
+def set_run_complexity(
+    db: Session, run: AgentRun, complexity: ComplexityLevel
+) -> AgentRun:
+    """Persist the Planner-selected operating level."""
+    run.complexity = complexity
+    db.flush()
+    return run
+
+
+def finish_run(
+    db: Session,
+    run: AgentRun,
+    *,
+    status: RunStatus,
+    final_summary: str | None = None,
+    error_code: str | None = None,
+) -> AgentRun:
+    """Persist a service-approved terminal or user-waiting run result."""
+    run.status = status
+    run.final_summary = final_summary
+    run.error_code = error_code
+    if status in {RunStatus.succeeded, RunStatus.failed, RunStatus.cancelled}:
+        run.finished_at = utc_now()
+    run.state_version += 1
+    db.flush()
+    return run
 
 
 def create_plan(
@@ -90,6 +133,22 @@ def create_step(
     db.add(step)
     db.flush()
     db.refresh(step)
+    return step
+
+
+def finish_step(
+    db: Session,
+    step: AgentStep,
+    *,
+    status: StepStatus,
+    output_artifact_refs: list[dict[str, Any]] | None = None,
+    error_code: str | None = None,
+) -> AgentStep:
+    """Write a service-approved step outcome without deciding that outcome."""
+    step.status = status
+    step.output_artifact_refs_json = output_artifact_refs
+    step.error_code = error_code
+    db.flush()
     return step
 
 
