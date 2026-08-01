@@ -38,6 +38,7 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     )
 
     assert result.source_url == "https://jobs.example/ai-agent"
+    assert result.artifact_id.startswith("observed:")
     assert result.title == "AI Agent 开发工程师"
     assert "职责：构建智能体。" in result.visible_text
     assert len(result.content_hash) == 64

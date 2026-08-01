@@ -42,6 +42,7 @@ class ExecutorAgent:
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
+        tool_context = context
         for _turn in range(task.budget.max_agent_turns):
             decision = self._gateway.decide(
                 role=AgentRole.executor,
@@ -71,15 +72,15 @@ class ExecutorAgent:
                     ),
                 )
             if decision.action == "call_tool":
-                observations.append(
-                    self._tools.invoke(
-                        role=AgentRole.executor,
-                        name=decision.tool_name or "",
-                        context=context,
-                        payload=decision.tool_input,
-                        allowed_skills=frozenset(step.allowed_skills),
-                    )
+                observation = self._tools.invoke(
+                    role=AgentRole.executor,
+                    name=decision.tool_name or "",
+                    context=tool_context,
+                    payload=decision.tool_input,
+                    allowed_skills=frozenset(step.allowed_skills),
                 )
+                observations.append(observation)
+                tool_context = _with_observed_page(tool_context, observation)
                 continue
             if decision.action == "complete":
                 return ExecutorResult(
@@ -98,3 +99,29 @@ class ExecutorAgent:
             observations=observations,
             summary="Executor turn budget exhausted before completing the step.",
         )
+
+
+def _with_observed_page(
+    context: ToolContext, observation: ToolObservation
+) -> ToolContext:
+    """Expose a successful page fetch to the next Executor-selected tool call."""
+    output = observation.output or {}
+    if not all(
+        isinstance(output.get(key), str) and output[key]
+        for key in ("artifact_id", "source_url", "content_hash", "visible_text")
+    ):
+        return context
+    existing = context.metadata.get("observed_public_evidence", [])
+    evidence = list(existing) if isinstance(existing, list) else []
+    evidence.append(
+        {
+            "artifact_id": output["artifact_id"],
+            "source_url": output["source_url"],
+            "content_hash": output["content_hash"],
+            "visible_text": output["visible_text"],
+            "title": output.get("title"),
+        }
+    )
+    metadata = dict(context.metadata)
+    metadata["observed_public_evidence"] = evidence
+    return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)

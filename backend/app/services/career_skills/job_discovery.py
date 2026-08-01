@@ -39,6 +39,7 @@ class FetchPublicJobPageInput(BaseModel):
 
 
 class FetchPublicJobPageOutput(BaseModel):
+    artifact_id: str
     source_url: str
     title: str | None
     visible_text: str
@@ -152,6 +153,7 @@ def fetch_public_job_page(
         raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
     return FetchPublicJobPageOutput(
+        artifact_id=f"observed:{hashlib.sha256(html.encode('utf-8', errors='replace')).hexdigest()}",
         source_url=payload.url,
         title=title,
         visible_text=visible_text,
@@ -240,7 +242,10 @@ def _find_observed_evidence(
     if not isinstance(raw_evidence, list):
         return None
     for item in raw_evidence:
-        if isinstance(item, dict) and item.get("artifact_id") == artifact_id:
+        if isinstance(item, dict) and (
+            item.get("artifact_id") == artifact_id
+            or f"observed:{item.get('content_hash')}" == artifact_id
+        ):
             return item
     return None
 

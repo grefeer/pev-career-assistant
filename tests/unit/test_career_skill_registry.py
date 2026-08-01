@@ -12,6 +12,7 @@ def test_registry_exposes_public_job_evidence_tool_to_executor(monkeypatch) -> N
     monkeypatch.setattr(
         "backend.app.services.career_skills.job_discovery.fetch_public_job_page",
         lambda context, payload: {
+            "artifact_id": "observed:" + "a" * 64,
             "source_url": payload.url,
             "title": "AI 应用开发工程师",
             "visible_text": "岗位职责和要求",
