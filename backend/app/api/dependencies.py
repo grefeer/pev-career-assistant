@@ -17,6 +17,7 @@ from backend.app.services.company_research.service import CompanyResearchService
 from backend.app.services.application_tracking.service import (
     ApplicationTrackingService,
 )
+from backend.app.services.agent_runtime.service import AgentRunService
 from backend.app.services.interview_prep.service import InterviewPrepService
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.storage import EncryptedObjectStore
@@ -106,6 +107,17 @@ def get_application_tracking_service(request: Request) -> ApplicationTrackingSer
         return cast(ApplicationTrackingService, injected)
     settings = request.app.state.settings
     return ApplicationTrackingService(settings)
+
+
+def get_agent_run_service(request: Request) -> AgentRunService:
+    """Resolve the app-scoped adaptive PEV service without rebuilding models."""
+    injected = getattr(request.app.state, "agent_run_service", None)
+    if injected is not None:
+        return cast(AgentRunService, injected)
+    return AgentRunService(
+        request.app.state.settings,
+        runtime=getattr(request.app.state, "agent_runtime", None),
+    )
 
 
 def get_device_service(request: Request, redis_client=Depends(get_redis)):
