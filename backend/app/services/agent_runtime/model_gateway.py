@@ -80,11 +80,84 @@ class LangChainModelGateway:
             structured_model = self._model.with_structured_output(response_model)
             raw_result = structured_model.invoke(messages)
         except Exception as exc:  # noqa: BLE001 - provider exceptions are untrusted.
+            if _response_format_unavailable(exc):
+                return self._decide_with_local_json_validation(
+                    messages=messages,
+                    role=role,
+                    response_model=response_model,
+                )
             raise AgentModelGatewayError("model_request_failed") from exc
         try:
             return response_model.model_validate(raw_result)
         except Exception as exc:  # noqa: BLE001 - invalid JSON/model output is recoverable.
             raise AgentModelGatewayError("invalid_model_response") from exc
+
+    def _decide_with_local_json_validation(
+        self,
+        *,
+        messages: list[SystemMessage | HumanMessage],
+        role: AgentRole,
+        response_model: type[ResponseT],
+    ) -> ResponseT:
+        """Use ordinary JSON output only when a provider rejects response_format."""
+        fallback_messages = [
+            *messages,
+            SystemMessage(
+                content=(
+                    "Return only one JSON object matching this schema exactly: "
+                    f"{json.dumps(response_model.model_json_schema(), ensure_ascii=False)} "
+                    f"{_role_action_contract(role)}"
+                )
+            ),
+        ]
+        try:
+            raw_result = self._model.invoke(fallback_messages)
+        except Exception as exc:  # noqa: BLE001 - provider boundary.
+            raise AgentModelGatewayError("model_request_failed") from exc
+        content = getattr(raw_result, "content", raw_result)
+        if not isinstance(content, str):
+            raise AgentModelGatewayError("invalid_model_response")
+        try:
+            return response_model.model_validate(json.loads(_strip_json_fence(content)))
+        except Exception as exc:  # noqa: BLE001 - untrusted model content.
+            raise AgentModelGatewayError("invalid_model_response") from exc
+
+
+def _response_format_unavailable(error: Exception) -> bool:
+    message = str(error).lower()
+    return "response_format" in message and (
+        "unavailable" in message or "not supported" in message
+    )
+
+
+def _strip_json_fence(content: str) -> str:
+    """Accept a provider's harmless Markdown JSON fence, never surrounding prose."""
+    cleaned = content.strip()
+    if cleaned.startswith("```json") and cleaned.endswith("```"):
+        return cleaned[7:-3].strip()
+    if cleaned.startswith("```") and cleaned.endswith("```"):
+        return cleaned[3:-3].strip()
+    return cleaned
+
+
+def _role_action_contract(role: AgentRole) -> str:
+    """Spell out validator-only action constraints absent from JSON Schema."""
+    if role is AgentRole.planner:
+        return (
+            "The action must be exactly one of: call_tool, plan, need_user. "
+            "call_tool needs tool_name; plan needs complexity, success_criteria and steps; "
+            "need_user needs user_question."
+        )
+    if role is AgentRole.executor:
+        return (
+            "The action must be exactly one of: call_tool, complete, need_user. "
+            "call_tool needs tool_name; complete needs summary; need_user needs user_question."
+        )
+    return (
+        "The action must be exactly one of: call_tool, decide. "
+        "call_tool needs tool_name; decide needs verification_decision, which must be "
+        "PASS, RETRY_EXECUTOR, REPLAN, NEED_USER or FAIL."
+    )
 
 
 def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
