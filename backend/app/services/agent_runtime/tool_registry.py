@@ -1,0 +1,102 @@
+"""Role-aware registry for safe Agent-selected tool execution."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from pydantic import BaseModel, ValidationError
+
+from backend.app.domain.agent_runtime import AgentRole
+from backend.app.services.agent_runtime.schemas import ToolObservation
+from backend.app.services.agent_runtime.tool_context import ToolContext
+
+ToolHandler = Callable[[ToolContext, BaseModel], BaseModel | Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class ToolDefinition:
+    """One explicitly registered handler and its role/schema boundary."""
+
+    name: str
+    input_model: type[BaseModel]
+    output_model: type[BaseModel]
+    allowed_roles: frozenset[AgentRole]
+    handler: ToolHandler
+    skill_name: str | None = None
+
+
+class ToolRegistry:
+    """Execute only registered, role-authorized, schema-valid Agent actions."""
+
+    def __init__(self) -> None:
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, definition: ToolDefinition) -> None:
+        """Register a unique, non-empty tool name before runtime startup."""
+        if not definition.name.strip():
+            raise ValueError("tool name must not be empty")
+        if not definition.allowed_roles:
+            raise ValueError("tool must authorize at least one Agent role")
+        if definition.name in self._definitions:
+            raise ValueError(f"tool already registered: {definition.name}")
+        self._definitions[definition.name] = definition
+
+    def invoke(
+        self,
+        *,
+        role: AgentRole,
+        name: str,
+        context: ToolContext,
+        payload: Mapping[str, Any],
+        allowed_skills: frozenset[str] | None = None,
+    ) -> ToolObservation:
+        """Return an observation instead of leaking handler exceptions to Agents."""
+        definition = self._definitions.get(name)
+        if definition is None:
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="unknown_tool",
+            )
+        if role not in definition.allowed_roles:
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="tool_role_forbidden",
+            )
+        if allowed_skills is not None and definition.skill_name not in allowed_skills:
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="tool_skill_forbidden",
+            )
+        try:
+            validated_input = definition.input_model.model_validate(payload)
+        except ValidationError:
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="invalid_tool_input",
+            )
+        try:
+            result = definition.handler(context, validated_input)
+            validated_output = definition.output_model.model_validate(result)
+        except ValidationError:
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="invalid_tool_output",
+            )
+        except Exception:  # noqa: BLE001 - external tools need a stable observation.
+            return ToolObservation(
+                tool_name=name,
+                status="failed",
+                error_code="tool_execution_failed",
+            )
+        return ToolObservation(
+            tool_name=name,
+            status="succeeded",
+            output=validated_output.model_dump(mode="json"),
+        )
