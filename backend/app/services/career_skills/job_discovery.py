@@ -49,7 +49,7 @@ class FetchPublicJobPageOutput(BaseModel):
 class ExtractObservedJobDetailsInput(BaseModel):
     """The immutable evidence artifact selected by an autonomous Agent."""
 
-    artifact_id: str = Field(min_length=1, max_length=64)
+    artifact_id: str = Field(min_length=1, max_length=80)
 
 
 class ExtractedJobDetails(BaseModel):

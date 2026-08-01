@@ -53,6 +53,13 @@ def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:
         )
 
 
+def test_extract_input_accepts_the_ephemeral_id_emitted_by_public_page_fetch() -> None:
+    """One Executor step can pass the exact fetch observation into detail extraction."""
+    payload = ExtractObservedJobDetailsInput(artifact_id="observed:" + "a" * 64)
+
+    assert payload.artifact_id == "observed:" + "a" * 64
+
+
 def test_extract_observed_job_details_returns_structured_fields_only_from_captured_evidence() -> None:
     """Detailed JD output must be derived from the selected immutable page evidence."""
     context = ToolContext(
