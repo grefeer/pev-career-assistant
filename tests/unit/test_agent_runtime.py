@@ -25,6 +25,12 @@ class JobOutput(BaseModel):
     title: str
 
 
+class FetchedJobOutput(BaseModel):
+    title: str
+    source_url: str
+    content_hash: str
+
+
 class EvidenceOutput(BaseModel):
     complete: bool
 
@@ -276,3 +282,48 @@ def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_
     assert [event.event_type for event in run_repository.list_events(db_session, result.run_id)].count(
         "plan_created"
     ) == 2
+
+
+def test_runtime_replaces_model_artifact_claim_with_observed_public_evidence(db_session) -> None:
+    """A model cannot invent an artifact URI when no tool observation supports it."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [{
+                "action": "plan", "complexity": "L2", "success_criteria": ["有来源"],
+                "steps": [{"step_id": "discover", "objective": "提取岗位", "allowed_skills": ["job-discovery"]}],
+            }],
+            AgentRole.executor: [
+                {"action": "call_tool", "tool_name": "fetch-job", "tool_input": {}},
+                {"action": "complete", "summary": "完成", "artifact_refs": [{"uri": "artifact://invented"}]},
+            ],
+            AgentRole.verifier: [],
+        }
+    )
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=FetchedJobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {"title": "AI 应用开发", "source_url": "https://jobs.example/1", "content_hash": "b" * 64},
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"]),
+    )
+
+    events = run_repository.list_events(db_session, result.run_id)
+    observed = [event for event in events if event.event_type == "executor_tool_observation"]
+    assert observed[0].payload_json["source_url"] == "https://jobs.example/1"
+    assert observed[0].payload_json["content_hash"] == "b" * 64
+    assert all("artifact://invented" not in str(event.payload_json) for event in events)

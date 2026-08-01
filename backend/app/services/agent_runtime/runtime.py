@@ -18,6 +18,7 @@ from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
+    ExecutorResult,
     PlanStep,
     PlannerResult,
 )
@@ -183,6 +184,13 @@ class AgentRuntime:
                 )
             if execution.status != "succeeded":
                 return self._fail_step(db, run_id, persisted_step, "executor_failed")
+            execution = execution.model_copy(
+                update={
+                    "artifact_refs": self._persist_observed_evidence(
+                        db, run_id, persisted_step, execution
+                    )
+                }
+            )
             if not self._requires_verification(plan, plan_step):
                 run_repository.finish_step(
                     db,
@@ -277,6 +285,40 @@ class AgentRuntime:
     @staticmethod
     def _requires_verification(plan: ExecutionPlan, plan_step: PlanStep) -> bool:
         return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
+
+    @staticmethod
+    def _persist_observed_evidence(
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        execution: ExecutorResult,
+    ) -> list[dict[str, str]]:
+        """Persist only tool-derived public evidence, never model-proposed URIs."""
+        artifact_refs: list[dict[str, str]] = []
+        for observation in execution.observations:
+            output = observation.output or {}
+            source_url = output.get("source_url")
+            content_hash = output.get("content_hash")
+            if not isinstance(source_url, str) or not isinstance(content_hash, str):
+                continue
+            artifact_ref = {
+                "uri": f"agent-run://{run_id}/evidence/{content_hash}",
+                "source_url": source_url,
+                "content_hash": content_hash,
+            }
+            artifact_refs.append(artifact_ref)
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="executor_tool_observation",
+                payload_json={
+                    "sequence": step.sequence,
+                    "tool": observation.tool_name,
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                },
+            )
+        return artifact_refs
 
     def _finish_planner_non_plan(
         self,
