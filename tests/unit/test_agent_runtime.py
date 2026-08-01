@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel
+from sqlalchemy import select
 
-from backend.app.db.models import User, UserRole
+from backend.app.db.models import AgentStep, AgentTurn, User, UserRole
 from backend.app.domain.agent_runtime import AgentRole, RunStatus
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
@@ -29,6 +30,7 @@ class FetchedJobOutput(BaseModel):
     title: str
     source_url: str
     content_hash: str
+    visible_text: str
 
 
 class EvidenceOutput(BaseModel):
@@ -150,6 +152,20 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         "step_succeeded",
         "verification_passed",
         "run_succeeded",
+    ]
+    turns = list(
+        db_session.scalars(
+            select(AgentTurn)
+            .where(AgentTurn.run_id == result.run_id)
+            .order_by(AgentTurn.created_at.asc(), AgentTurn.id.asc())
+        )
+    )
+    assert [(turn.role, turn.decision_json["action"]) for turn in turns] == [
+        (AgentRole.planner, "plan"),
+        (AgentRole.executor, "call_tool"),
+        (AgentRole.executor, "complete"),
+        (AgentRole.verifier, "call_tool"),
+        (AgentRole.verifier, "decide"),
     ]
 
 
@@ -309,7 +325,10 @@ def test_runtime_replaces_model_artifact_claim_with_observed_public_evidence(db_
     registry.register(ToolDefinition(
         name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
         output_model=FetchedJobOutput, allowed_roles=frozenset({AgentRole.executor}),
-        handler=lambda _context, _payload: {"title": "AI 应用开发", "source_url": "https://jobs.example/1", "content_hash": "b" * 64},
+        handler=lambda _context, _payload: {
+            "title": "AI 应用开发", "source_url": "https://jobs.example/1",
+            "content_hash": "b" * 64, "visible_text": "负责 Agent 应用开发与部署。",
+        },
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
@@ -327,3 +346,10 @@ def test_runtime_replaces_model_artifact_claim_with_observed_public_evidence(db_
     assert observed[0].payload_json["source_url"] == "https://jobs.example/1"
     assert observed[0].payload_json["content_hash"] == "b" * 64
     assert all("artifact://invented" not in str(event.payload_json) for event in events)
+    step = db_session.scalar(select(AgentStep).where(AgentStep.run_id == result.run_id))
+    assert step is not None
+    assert step.output_artifact_refs_json == [{
+        "artifact_id": step.output_artifact_refs_json[0]["artifact_id"],
+        "source_url": "https://jobs.example/1",
+        "content_hash": "b" * 64,
+    }]

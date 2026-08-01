@@ -1675,6 +1675,34 @@ class AgentStep(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
 
 
+class AgentArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Immutable tool-observed evidence that later PEV steps can reference."""
+
+    __tablename__ = "agent_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "step_id", "content_hash", name="uq_agent_artifacts_step_content_hash"
+        ),
+        Index("ix_agent_artifacts_run_created", "run_id", "created_at"),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    )
+    step_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_steps.id", ondelete="CASCADE"), nullable=False
+    )
+    artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str] = mapped_column(String(2_048), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[AgentRole] = mapped_column(
+        Enum(AgentRole, name="agent_artifact_role", **enum_kwargs),
+        default=AgentRole.executor,
+        nullable=False,
+    )
+
+
 class AgentTurn(Base):
     """A role decision summary, excluding raw prompts and private material."""
 

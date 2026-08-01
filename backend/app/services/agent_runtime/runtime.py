@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.db.models import AgentRun, AgentStep
 from backend.app.domain.agent_runtime import (
+    AgentRole,
     RunStatus,
     StepStatus,
     VerificationDecision,
@@ -74,8 +75,11 @@ class AgentRuntime:
         planning_task = task
         revision = 0
         replans = 0
+        trace = self._build_decision_trace(db, run.id)
         while True:
-            planner_result = self._planner.run(task=planning_task, context=context)
+            planner_result = self._planner.run(
+                task=planning_task, context=context, trace=trace
+            )
             if planner_result.status != "planned" or planner_result.plan is None:
                 return self._finish_planner_non_plan(db, run.id, run, planner_result)
 
@@ -118,6 +122,7 @@ class AgentRuntime:
                     plan_step=plan_step,
                     persisted_step=step,
                     context=context,
+                    trace=trace,
                 )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
@@ -170,13 +175,18 @@ class AgentRuntime:
         plan_step: PlanStep,
         persisted_step: AgentStep,
         context: ToolContext,
+        trace,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
         execution_task = task
         while True:
             execution = self._executor.run(
-                task=execution_task, plan=plan, step=plan_step, context=context
+                task=execution_task,
+                plan=plan,
+                step=plan_step,
+                context=context,
+                trace=trace,
             )
             if execution.status == "needs_user":
                 return self._wait_for_user(
@@ -211,6 +221,7 @@ class AgentRuntime:
                 step=plan_step,
                 execution=execution,
                 context=context,
+                trace=trace,
             )
             if verification.decision is VerificationDecision.PASS:
                 run_repository.finish_step(
@@ -287,6 +298,23 @@ class AgentRuntime:
         return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
 
     @staticmethod
+    def _build_decision_trace(db: Session, run_id: str):
+        """Return a run-local, role-indexed callback for safe decision summaries."""
+        turn_indices = {role: 0 for role in AgentRole}
+
+        def trace(role: AgentRole, decision_json: dict[str, str]) -> None:
+            turn_indices[role] += 1
+            run_repository.create_turn(
+                db,
+                run_id=run_id,
+                role=role,
+                turn_index=turn_indices[role],
+                decision_json=decision_json,
+            )
+
+        return trace
+
+    @staticmethod
     def _persist_observed_evidence(
         db: Session,
         run_id: str,
@@ -299,10 +327,25 @@ class AgentRuntime:
             output = observation.output or {}
             source_url = output.get("source_url")
             content_hash = output.get("content_hash")
-            if not isinstance(source_url, str) or not isinstance(content_hash, str):
+            visible_text = output.get("visible_text")
+            if not all(
+                isinstance(value, str)
+                for value in (source_url, content_hash, visible_text)
+            ):
                 continue
+            artifact = run_repository.create_evidence_artifact(
+                db,
+                run_id=run_id,
+                step_id=step.id,
+                source_url=source_url,
+                content_hash=content_hash,
+                content_json={
+                    "title": output.get("title"),
+                    "visible_text": visible_text,
+                },
+            )
             artifact_ref = {
-                "uri": f"agent-run://{run_id}/evidence/{content_hash}",
+                "artifact_id": artifact.id,
                 "source_url": source_url,
                 "content_hash": content_hash,
             }
@@ -314,6 +357,7 @@ class AgentRuntime:
                 payload_json={
                     "sequence": step.sequence,
                     "tool": observation.tool_name,
+                    "artifact_id": artifact.id,
                     "source_url": source_url,
                     "content_hash": content_hash,
                 },

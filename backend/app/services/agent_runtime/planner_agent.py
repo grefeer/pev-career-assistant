@@ -13,6 +13,7 @@ from backend.app.services.agent_runtime.schemas import (
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
 _PLANNER_INSTRUCTION = (
     "You are the Planner Agent. Observe only the supplied user-scoped context "
@@ -29,7 +30,13 @@ class PlannerAgent:
         self._gateway = gateway
         self._tools = tools
 
-    def run(self, *, task: AgentTaskRequest, context: ToolContext) -> PlannerResult:
+    def run(
+        self,
+        *,
+        task: AgentTaskRequest,
+        context: ToolContext,
+        trace: DecisionTrace | None = None,
+    ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
         for _turn in range(task.budget.max_agent_turns):
@@ -47,6 +54,13 @@ class PlannerAgent:
                 },
                 response_model=PlannerDecision,
             )
+            if trace is not None:
+                trace(
+                    AgentRole.planner,
+                    decision_summary(
+                        action=decision.action, tool_name=decision.tool_name
+                    ),
+                )
             if decision.action == "call_tool":
                 observations.append(
                     self._tools.invoke(

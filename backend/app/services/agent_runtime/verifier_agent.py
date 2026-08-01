@@ -15,6 +15,7 @@ from backend.app.services.agent_runtime.schemas import (
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
 _VERIFIER_INSTRUCTION = (
     "You are the Verifier Agent. Independently inspect the planned success "
@@ -39,6 +40,7 @@ class VerifierAgent:
         step: PlanStep,
         execution: ExecutorResult,
         context: ToolContext,
+        trace: DecisionTrace | None = None,
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
@@ -58,6 +60,13 @@ class VerifierAgent:
                 },
                 response_model=VerifierDecision,
             )
+            if trace is not None:
+                trace(
+                    AgentRole.verifier,
+                    decision_summary(
+                        action=decision.action, tool_name=decision.tool_name
+                    ),
+                )
             if decision.action == "call_tool":
                 observations.append(
                     self._tools.invoke(

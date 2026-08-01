@@ -13,7 +13,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from backend.app.db.base import utc_now
-from backend.app.db.models import AgentEvent, AgentPlan, AgentRun, AgentStep, AgentTurn
+from backend.app.db.models import (
+    AgentArtifact,
+    AgentEvent,
+    AgentPlan,
+    AgentRun,
+    AgentStep,
+    AgentTurn,
+)
 from backend.app.domain.agent_runtime import (
     AgentRole,
     ComplexityLevel,
@@ -150,6 +157,31 @@ def finish_step(
     step.error_code = error_code
     db.flush()
     return step
+
+
+def create_evidence_artifact(
+    db: Session,
+    *,
+    run_id: str,
+    step_id: str,
+    source_url: str,
+    content_hash: str,
+    content_json: dict[str, Any],
+) -> AgentArtifact:
+    """Store immutable, public tool output once for the producing step."""
+    artifact = AgentArtifact(
+        run_id=run_id,
+        step_id=step_id,
+        artifact_type="public_job_page",
+        source_url=source_url,
+        content_hash=content_hash,
+        content_json=content_json,
+        created_by=AgentRole.executor,
+    )
+    db.add(artifact)
+    db.flush()
+    db.refresh(artifact)
+    return artifact
 
 
 def create_turn(

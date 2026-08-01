@@ -14,6 +14,7 @@ from backend.app.services.agent_runtime.schemas import (
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
 _EXECUTOR_INSTRUCTION = (
     "You are the Executor Agent. Work toward the current planned outcome using "
@@ -37,6 +38,7 @@ class ExecutorAgent:
         plan: ExecutionPlan,
         step: PlanStep,
         context: ToolContext,
+        trace: DecisionTrace | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
@@ -56,6 +58,13 @@ class ExecutorAgent:
                 },
                 response_model=ExecutorDecision,
             )
+            if trace is not None:
+                trace(
+                    AgentRole.executor,
+                    decision_summary(
+                        action=decision.action, tool_name=decision.tool_name
+                    ),
+                )
             if decision.action == "call_tool":
                 observations.append(
                     self._tools.invoke(
