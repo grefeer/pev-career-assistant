@@ -159,6 +159,13 @@ class Settings(BaseSettings):
     # way to surface the supervisor's evidence-backed candidates.
     personalized_discovery_allow_provisional: bool = Field(default=False)
 
+    # Company Research skill settings.  A deterministic single-page fetcher
+    # (Playwright) parses a company's careers landing page into a structured
+    # profile + opening list.  Disabled by default; opt in per deployment.
+    company_research_enabled: bool = False
+    company_research_artifact_root: str = "var/company-research-skill"
+    company_research_agent_version: str = "1.0.0"
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

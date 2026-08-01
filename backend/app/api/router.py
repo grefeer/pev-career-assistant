@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from backend.app.api.routes import (
     application_snapshots,
     auth,
+    company_research,
     devices,
     executor_tasks,
     health,
@@ -37,3 +38,4 @@ api_router.include_router(application_snapshots.router)
 api_router.include_router(job_discovery.router)
 api_router.include_router(personalized_discovery.router)
 api_router.include_router(site_adapters.router)
+api_router.include_router(company_research.router)

@@ -14,10 +14,10 @@ import sys
 
 if sys.version_info >= (3, 11):
     from enum import StrEnum
-else:
+else:  # pragma: no cover - Python < 3.11 polyfill, dead on the 3.12 runtime
     from enum import Enum
 
-    class StrEnum(str, Enum):
+    class StrEnum(str, Enum):  # pragma: no cover
         """Minimal StrEnum polyfill for Python < 3.11."""
 
         pass

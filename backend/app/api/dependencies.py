@@ -13,6 +13,7 @@ from backend.app.config import get_settings
 from backend.app.db.models import Device, User, UserRole
 from backend.app.repositories.users import get_by_id
 from backend.app.services.auth import AuthService
+from backend.app.services.company_research.service import CompanyResearchService
 from backend.app.services.job_sync import JobSyncService
 from backend.app.services.storage import EncryptedObjectStore
 from backend.app.services.tencent_smartsheet import TencentSmartsheetGateway
@@ -64,6 +65,15 @@ def get_job_sync_service(request: Request) -> JobSyncService:
         discovery_enabled=settings.job_discovery_enabled,
         discovery_agent_version=settings.job_discovery_agent_version,
     )
+
+
+def get_company_research_service(request: Request) -> CompanyResearchService:
+    injected = getattr(request.app.state, "company_research_service", None)
+    if injected is not None:
+        return cast(CompanyResearchService, injected)
+    settings = request.app.state.settings
+    object_store = getattr(request.app.state, "object_store", None)
+    return CompanyResearchService(settings, object_store=object_store)
 
 
 def get_device_service(request: Request, redis_client=Depends(get_redis)):
