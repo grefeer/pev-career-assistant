@@ -27,6 +27,16 @@ def build_career_tool_registry() -> ToolRegistry:
     )
     registry.register(
         ToolDefinition(
+            name="extract-observed-job-details",
+            skill_name="job-discovery",
+            input_model=job_discovery.ExtractObservedJobDetailsInput,
+            output_model=job_discovery.ExtractObservedJobDetailsOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=job_discovery.extract_observed_job_details,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="match-observed-jobs",
             skill_name="job-matching",
             input_model=job_matching.MatchObservedJobsInput,

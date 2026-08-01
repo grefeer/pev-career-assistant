@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from backend.app.services.career_skills.job_discovery import (
+    ExtractObservedJobDetailsInput,
     FetchPublicJobPageInput,
     PublicJobFetchError,
+    extract_observed_job_details,
     fetch_public_job_page,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
@@ -48,3 +50,48 @@ def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:
             ToolContext(user_id="user-a", run_id="run-a"),
             FetchPublicJobPageInput(url="http://127.0.0.1:8000/private"),
         )
+
+
+def test_extract_observed_job_details_returns_structured_fields_only_from_captured_evidence() -> None:
+    """Detailed JD output must be derived from the selected immutable page evidence."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-ai-agent",
+            "source_url": "https://jobs.example/ai-agent",
+            "content_hash": "a" * 64,
+            "title": "招聘详情",
+            "visible_text": """
+岗位名称：AI Agent 开发工程师
+公司：示例科技
+岗位职责：负责 RAG、Agent 平台和工具调用能力开发。
+任职要求：熟悉 Python、LLM 和工程化部署。
+工作地点：北京
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-ai-agent"),
+    )
+
+    assert result.source_artifact_id == "artifact-ai-agent"
+    assert [candidate.model_dump() for candidate in result.candidates] == [{
+        "title": "AI Agent 开发工程师",
+        "company_name": "示例科技",
+        "locations": ["北京"],
+        "responsibilities": "负责 RAG、Agent 平台和工具调用能力开发。",
+        "requirements": "熟悉 Python、LLM 和工程化部署。",
+        "recruitment_types": [],
+        "apply_url": "https://jobs.example/ai-agent",
+        "deadline_text": None,
+        "confidence": 1.0,
+        "evidence_refs": [{
+            "artifact_id": "artifact-ai-agent",
+            "source_url": "https://jobs.example/ai-agent",
+            "content_hash": "a" * 64,
+        }],
+        "normalization_warnings": [],
+    }]
