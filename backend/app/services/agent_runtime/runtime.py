@@ -138,9 +138,10 @@ class AgentRuntime:
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
+        execution_task = task
         while True:
             execution = self._executor.run(
-                task=task, plan=plan, step=plan_step, context=context
+                task=execution_task, plan=plan, step=plan_step, context=context
             )
             if execution.status == "needs_user":
                 return self._wait_for_user(
@@ -201,6 +202,14 @@ class AgentRuntime:
                     },
                 )
                 if retries <= task.budget.max_replans:
+                    retry_context = dict(task.context)
+                    feedback = list(retry_context.get("verifier_feedback", []))
+                    if verification.feedback:
+                        feedback.append(verification.feedback)
+                    retry_context["verifier_feedback"] = feedback
+                    execution_task = task.model_copy(
+                        update={"context": retry_context}
+                    )
                     continue
                 return self._fail_step(
                     db, run_id, persisted_step, "executor_retry_budget_exhausted"

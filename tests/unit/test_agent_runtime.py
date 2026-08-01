@@ -34,6 +34,9 @@ class RoleScriptedGateway:
 
     def __init__(self, scripts: dict[AgentRole, list[dict[str, Any]]]) -> None:
         self.scripts = scripts
+        self.states: dict[AgentRole, list[dict[str, Any]]] = {
+            role: [] for role in AgentRole
+        }
 
     def decide(
         self,
@@ -44,6 +47,7 @@ class RoleScriptedGateway:
         response_model: type[BaseModel],
     ) -> BaseModel:
         assert instruction and state
+        self.states[role].append(state)
         return response_model.model_validate(self.scripts[role].pop(0))
 
 
@@ -140,4 +144,66 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         "step_succeeded",
         "verification_passed",
         "run_succeeded",
+    ]
+
+
+def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session) -> None:
+    """Retry is a real feedback loop, not merely a second identical call."""
+    user = User(
+        id="user-a",
+        account="user-a@example.test",
+        nickname="user-a",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [
+                {
+                    "action": "plan",
+                    "complexity": "L3",
+                    "success_criteria": ["完整 JD"],
+                    "steps": [
+                        {
+                            "step_id": "discover",
+                            "objective": "提取岗位",
+                            "allowed_skills": ["job-discovery"],
+                            "requires_verification": True,
+                        }
+                    ],
+                }
+            ],
+            AgentRole.executor: [
+                {"action": "complete", "summary": "信息不完整"},
+                {"action": "complete", "summary": "信息已补齐"},
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "decide",
+                    "verification_decision": "RETRY_EXECUTOR",
+                    "feedback": "补充职责和任职要求。",
+                },
+                {"action": "decide", "verification_decision": "PASS"},
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"]),
+    )
+
+    assert result.status is RunStatus.succeeded
+    assert gateway.states[AgentRole.executor][1]["context"]["verifier_feedback"] == [
+        "补充职责和任职要求。"
     ]

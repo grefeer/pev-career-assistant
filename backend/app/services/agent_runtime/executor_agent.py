@@ -46,6 +46,7 @@ class ExecutorAgent:
                 instruction=_EXECUTOR_INSTRUCTION,
                 state={
                     "goal": task.goal,
+                    "context": task.context,
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),
                     "observations": [
