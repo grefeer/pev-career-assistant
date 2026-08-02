@@ -17,7 +17,12 @@ from backend.app.db.base import Base
 from backend.app.db.models import User, UserRole
 from backend.app.domain.agent_runtime import RunStatus
 from backend.app.services.agent_runtime.runtime import AgentRunResult
-from backend.app.services.agent_runtime.service import AgentRuntimeDisabledError
+from backend.app.services.agent_runtime.service import (
+    AgentRunNotFoundError,
+    AgentRunNotResumableError,
+    AgentRuntimeDisabledError,
+    AgentRuntimeUnavailableError,
+)
 from backend.app.services.auth import AuthService
 from tests.conftest import settings_override
 
@@ -308,3 +313,86 @@ def test_list_agent_plans_projects_only_owner_safe_plan_fields() -> None:
         }],
         "created_at": "2026-08-01T00:00:00Z",
     }]}
+
+
+def test_serializers_drop_malformed_plan_values_and_default_missing_enums() -> None:
+    """A corrupt persisted payload cannot leak or break the owner-safe projection."""
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    projected = routes_module._to_plan_response(
+        SimpleNamespace(
+            id="plan-1",
+            revision=1,
+            complexity=None,
+            plan_json={
+                "success_criteria": ["valid", 3],
+                "steps": [None, {"step_id": 1, "objective": "bad"}, {
+                    "step_id": "bad-skills", "objective": "bad", "allowed_skills": [1],
+                }, {
+                    "step_id": "bad-criteria", "objective": "bad", "allowed_skills": [],
+                    "success_criteria": [1],
+                }],
+            },
+            created_at=now,
+        )
+    )
+    run = routes_module._to_run_response(
+        SimpleNamespace(
+            id="run-1", goal="x", status=None, complexity=None,
+            final_summary=None, error_code=None, created_at=now, updated_at=now,
+        )
+    )
+
+    assert projected.complexity == "L1"
+    assert projected.success_criteria == []
+    assert projected.steps == []
+    assert run.status == "failed"
+    assert run.complexity is None
+
+
+def test_create_run_reports_unavailable_model_gateway() -> None:
+    service = MagicMock()
+    service.create_run.side_effect = AgentRuntimeUnavailableError("agent_harness_unavailable")
+    app = _build_app(service)
+
+    response = TestClient(app).post(
+        "/api/agent-runs", headers=_headers(app),
+        json={"goal": "找岗位", "allowed_skills": ["job-discovery"]},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "agent_harness_unavailable"
+
+
+def test_resume_and_recover_translate_all_recoverable_service_errors() -> None:
+    cases = (
+        ("resume_run", "/api/agent-runs/run-1/resume", {"user_response": "北京"}, AgentRunNotFoundError("x"), 404),
+        ("resume_run", "/api/agent-runs/run-1/resume", {"user_response": "北京"}, AgentRunNotResumableError("x"), 409),
+        ("resume_run", "/api/agent-runs/run-1/resume", {"user_response": "北京"}, AgentRuntimeDisabledError("x"), 503),
+        ("resume_run", "/api/agent-runs/run-1/resume", {"user_response": "北京"}, AgentRuntimeUnavailableError("x"), 503),
+        ("recover_run", "/api/agent-runs/run-1/recover", {}, AgentRunNotFoundError("x"), 404),
+        ("recover_run", "/api/agent-runs/run-1/recover", {}, AgentRunNotResumableError("x"), 409),
+        ("recover_run", "/api/agent-runs/run-1/recover", {}, AgentRuntimeDisabledError("x"), 503),
+        ("recover_run", "/api/agent-runs/run-1/recover", {}, AgentRuntimeUnavailableError("x"), 503),
+    )
+    for method, path, payload, error, expected_status in cases:
+        service = MagicMock()
+        getattr(service, method).side_effect = error
+        app = _build_app(service)
+        response = TestClient(app).post(path, headers=_headers(app), json=payload)
+        assert response.status_code == expected_status
+
+
+def test_owner_read_routes_translate_missing_runs_without_disclosing_state() -> None:
+    cases = (
+        ("get_run", "/api/agent-runs/run-1"),
+        ("list_events", "/api/agent-runs/run-1/events"),
+        ("list_plans", "/api/agent-runs/run-1/plans"),
+        ("list_artifacts", "/api/agent-runs/run-1/artifacts"),
+    )
+    for method, path in cases:
+        service = MagicMock()
+        getattr(service, method).side_effect = AgentRunNotFoundError("run-1")
+        app = _build_app(service)
+        response = TestClient(app).get(path, headers=_headers(app))
+        assert response.status_code == 404
+        assert response.json()["detail"] == {"code": "not_found"}
