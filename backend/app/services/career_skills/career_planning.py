@@ -14,6 +14,7 @@ class BuildPreparationPlanInput(BaseModel):
 
     target_artifact_id: str = Field(min_length=1, max_length=80)
     focus_keywords: list[str] = Field(min_length=1, max_length=30)
+    time_budget_hours: int = Field(default=6, ge=1, le=80)
 
     @field_validator("focus_keywords")
     @classmethod
@@ -38,6 +39,17 @@ class PreparationPlanOutput(BaseModel):
     source_url: str
     jd_topics: list[str]
     actions: list[str]
+    plan_items: list["PreparationPlanItem"]
+
+
+class PreparationPlanItem(BaseModel):
+    """One bounded JD-grounded preparation action awaiting user execution."""
+
+    topic: str
+    priority: str
+    time_budget_hours: int
+    completion_criteria: str
+    review_checkpoint: str
 
 
 def build_preparation_plan(
@@ -65,11 +77,27 @@ def build_preparation_plan(
             f"为 {topic_text} 各准备一个可量化的项目案例，并标明你的具体贡献。",
             f"围绕 JD 中的 {topic_text} 做一次 30 分钟技术讲解演练，准备架构取舍与故障排查追问。",
         ]
+    base_hours, remaining_hours = divmod(payload.time_budget_hours, len(topics)) if topics else (0, 0)
+    plan_items = [
+        PreparationPlanItem(
+            topic=normalized,
+            priority="P0" if index == 0 else "P1",
+            time_budget_hours=base_hours + (1 if index < remaining_hours else 0),
+            completion_criteria=(
+                f"准备一个 {display} 相关项目案例，说明你的具体贡献和可核验结果。"
+            ),
+            review_checkpoint=(
+                f"完成后用 JD 的 {display} 要求复盘：案例是否覆盖职责、取舍和追问。"
+            ),
+        )
+        for index, (display, normalized) in enumerate(topic_pairs)
+    ]
     return PreparationPlanOutput(
         target_artifact_id=payload.target_artifact_id,
         source_url=source_url,
         jd_topics=topics,
         actions=actions,
+        plan_items=plan_items,
     )
 
 

@@ -183,6 +183,8 @@ function artifactDetail(artifact: AgentArtifactResponse): string {
   if (Array.isArray(candidates)) return `已提取 ${candidates.length} 个结构化岗位条目。`
   const proposedDiffs = artifact.content.proposed_diffs
   if (Array.isArray(proposedDiffs)) return `已生成 ${proposedDiffs.length} 条可审核的简历修改操作。`
+  const planItems = artifact.content.plan_items
+  if (Array.isArray(planItems)) return `已生成 ${planItems.length} 项带优先级和复盘节点的准备计划。`
   const topics = artifact.content.jd_topics
   if (Array.isArray(topics)) return `围绕 JD 中的 ${topics.length} 个主题生成准备计划。`
   return "该工件没有可展示的文本摘要。"
