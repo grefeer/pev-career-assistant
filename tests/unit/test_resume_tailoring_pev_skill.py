@@ -42,6 +42,22 @@ def test_resume_brief_never_recommends_claiming_a_jd_keyword_absent_from_confirm
         "在项目经历中优先展示已确认的 Python、RAG 事实，并量化可核验结果。",
         "LangGraph、Agent 尚无已确认事实：仅在能补充项目证据时添加，不得虚构。",
     ]
+    assert [item.model_dump() for item in result.proposed_diffs] == [
+        {
+            "op": "highlight",
+            "section": "skills",
+            "fact_ref": "skills",
+            "target_evidence_ref": "artifact-agent",
+            "change_summary": "将已确认的 Python 事实前置到技能部分，并保留原有可核验表述。",
+        },
+        {
+            "op": "highlight",
+            "section": "skills",
+            "fact_ref": "skills",
+            "target_evidence_ref": "artifact-agent",
+            "change_summary": "将已确认的 RAG 事实前置到技能部分，并保留原有可核验表述。",
+        },
+    ]
 
 
 def test_resume_brief_accepts_the_observed_page_artifact_identifier() -> None:

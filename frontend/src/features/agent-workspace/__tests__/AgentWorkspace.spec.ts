@@ -83,6 +83,22 @@ describe("AgentWorkspace", () => {
     expect(wrapper.text()).not.toContain("private_context")
   })
 
+  it("renders a persisted grounded resume diff as a reviewable artifact", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.fetchAgentRunArtifacts.mockResolvedValue({
+      items: [{
+        id: "artifact-resume", artifact_type: "resume_tailoring_brief",
+        source_url: "https://jobs.example/1", content_hash: "b".repeat(64),
+        content: { proposed_diffs: [{ fact_ref: "skills" }] }, created_at: run.created_at,
+      }],
+    })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain("简历定制修改建议")
+    expect(wrapper.text()).toContain("1 条可审核的简历修改操作")
+  })
+
   it("maps an unavailable runtime to a user-readable safe error", async () => {
     api.createAgentRun.mockRejectedValue(
       new ApiError(503, { code: "agent_harness_unavailable" }, "agent_harness_unavailable"),

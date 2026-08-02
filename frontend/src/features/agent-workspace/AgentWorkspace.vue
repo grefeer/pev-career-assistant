@@ -146,6 +146,7 @@ function eventLabel(event: AgentEventResponse): string {
     plan_created: "Planner 已生成计划",
     executor_tool_observation: "Executor 获取了岗位证据",
     executor_structured_artifact: "Executor 已结构化 JD",
+    executor_skill_artifact: "Executor 已生成求职工件",
     executor_tool_failed: "Executor 工具调用未成功",
     verification_passed: "Verifier 已通过核验",
     verification_retry_executor: "Verifier 请求补充执行",
@@ -165,7 +166,14 @@ function artifactTitle(artifact: AgentArtifactResponse): string {
     const candidateTitle = (candidates[0] as Record<string, unknown>).title
     if (typeof candidateTitle === "string" && candidateTitle) return candidateTitle
   }
-  return artifact.artifact_type === "structured_job_details" ? "结构化 JD" : "公开岗位页面"
+  const titles: Record<string, string> = {
+    structured_job_details: "结构化 JD",
+    job_search_results: "岗位搜索结果",
+    job_matching_report: "岗位匹配报告",
+    resume_tailoring_brief: "简历定制修改建议",
+    career_preparation_plan: "面试准备计划",
+  }
+  return titles[artifact.artifact_type] ?? "公开岗位页面"
 }
 
 function artifactDetail(artifact: AgentArtifactResponse): string {
@@ -173,6 +181,10 @@ function artifactDetail(artifact: AgentArtifactResponse): string {
   if (typeof visibleText === "string" && visibleText) return visibleText.slice(0, 180)
   const candidates = artifact.content.candidates
   if (Array.isArray(candidates)) return `已提取 ${candidates.length} 个结构化岗位条目。`
+  const proposedDiffs = artifact.content.proposed_diffs
+  if (Array.isArray(proposedDiffs)) return `已生成 ${proposedDiffs.length} 条可审核的简历修改操作。`
+  const topics = artifact.content.jd_topics
+  if (Array.isArray(topics)) return `围绕 JD 中的 ${topics.length} 个主题生成准备计划。`
   return "该工件没有可展示的文本摘要。"
 }
 

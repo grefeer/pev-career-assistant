@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 
 from sqlalchemy.orm import Session
 
@@ -607,6 +609,54 @@ class AgentRuntime:
                     "artifact_id": artifact.id,
                     "source_url": source_url,
                     "content_hash": content_hash,
+                },
+            )
+        skill_artifact_types = {
+            "match-observed-jobs": "job_matching_report",
+            "build-resume-tailoring-brief": "resume_tailoring_brief",
+            "build-preparation-plan": "career_preparation_plan",
+        }
+        for observation in execution.observations:
+            artifact_type = skill_artifact_types.get(observation.tool_name)
+            output = observation.output or {}
+            source_url = output.get("source_url")
+            if artifact_type is None or not isinstance(source_url, str):
+                continue
+            content_json = dict(output)
+            content_hash = hashlib.sha256(
+                json.dumps(
+                    content_json,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            artifact = run_repository.create_artifact(
+                db,
+                run_id=run_id,
+                step_id=step.id,
+                artifact_type=artifact_type,
+                source_url=source_url,
+                content_hash=content_hash,
+                content_json=content_json,
+            )
+            artifact_refs.append(
+                {
+                    "artifact_id": artifact.id,
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                }
+            )
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="executor_skill_artifact",
+                payload_json={
+                    "sequence": step.sequence,
+                    "tool": observation.tool_name,
+                    "artifact_id": artifact.id,
+                    "artifact_type": artifact_type,
                 },
             )
         return artifact_refs

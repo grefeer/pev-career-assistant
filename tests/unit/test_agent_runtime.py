@@ -51,6 +51,16 @@ class SearchResultsOutput(BaseModel):
     results: list[dict[str, str]]
 
 
+class ResumeTailoringOutput(BaseModel):
+    target_artifact_id: str
+    target_title: str | None
+    source_url: str
+    supported_keywords: list[str]
+    missing_keywords: list[str]
+    safe_actions: list[str]
+    proposed_diffs: list[dict[str, str]]
+
+
 class RoleScriptedGateway:
     """Controlled model boundary; real PEV roles and tool handlers execute."""
 
@@ -188,6 +198,64 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         (AgentRole.verifier, "call_tool"),
         (AgentRole.verifier, "decide"),
     ]
+
+
+def test_runtime_persists_resume_tailoring_as_a_reviewable_skill_artifact(db_session) -> None:
+    """An Executor-created resume diff must remain available after the model turn."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["resume diff"],
+            "steps": [{
+                "step_id": "tailor", "objective": "produce a grounded resume diff",
+                "allowed_skills": ["resume-tailoring"],
+            }],
+        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "build-resume-tailoring-brief", "tool_input": {}},
+            {"action": "complete", "summary": "resume diff ready"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="build-resume-tailoring-brief", skill_name="resume-tailoring", input_model=EmptyInput,
+        output_model=ResumeTailoringOutput,
+        allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "target_artifact_id": "observed:job", "target_title": "AI Agent 开发工程师",
+            "source_url": "https://jobs.example/agent", "supported_keywords": ["python"],
+            "missing_keywords": ["langgraph"], "safe_actions": ["不得虚构"],
+            "proposed_diffs": [{
+                "op": "highlight", "section": "skills", "fact_ref": "skills",
+                "target_evidence_ref": "observed:job", "change_summary": "highlight Python",
+            }],
+        },
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="tailor resume", allowed_skills=["resume-tailoring"]),
+    )
+
+    artifacts = list(db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+    ))
+    assert result.status is RunStatus.succeeded
+    assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
+        ("resume_tailoring_brief", "https://jobs.example/agent")
+    ]
+    assert artifacts[0].content_json["proposed_diffs"][0]["fact_ref"] == "skills"
 
 
 def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session) -> None:

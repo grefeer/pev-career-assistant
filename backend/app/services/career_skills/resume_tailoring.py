@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -32,7 +32,7 @@ class BuildResumeTailoringBriefInput(BaseModel):
 
 
 class ResumeTailoringBriefOutput(BaseModel):
-    """Safe rewrite guidance, never an auto-applied or unsupported resume diff."""
+    """Fact-grounded resume changes that await user review before application."""
 
     target_artifact_id: str
     target_title: str | None
@@ -40,6 +40,17 @@ class ResumeTailoringBriefOutput(BaseModel):
     supported_keywords: list[str]
     missing_keywords: list[str]
     safe_actions: list[str]
+    proposed_diffs: list["ResumeTailoringDiff"]
+
+
+class ResumeTailoringDiff(BaseModel):
+    """One reviewable operation grounded in both a fact field and selected JD."""
+
+    op: Literal["highlight", "reorder"]
+    section: str
+    fact_ref: str
+    target_evidence_ref: str
+    change_summary: str
 
 
 def build_resume_tailoring_brief(
@@ -60,6 +71,7 @@ def build_resume_tailoring_brief(
         if keyword.lower() in job_text
     ]
     confirmed_text = _flatten_text(context.metadata.get("confirmed_profile_facts")).lower()
+    confirmed_facts = context.metadata.get("confirmed_profile_facts")
     supported_pairs = [
         pair for pair in required_keywords if pair[1] in confirmed_text
     ]
@@ -78,6 +90,21 @@ def build_resume_tailoring_brief(
         actions.append(
             f"{'、'.join(display for display, _normalized in missing_pairs)} 尚无已确认事实：仅在能补充项目证据时添加，不得虚构。"
         )
+    proposed_diffs = [
+        ResumeTailoringDiff(
+            op="highlight",
+            section=_resume_section_for_fact(fact_ref),
+            fact_ref=fact_ref,
+            target_evidence_ref=payload.target_artifact_id,
+            change_summary=(
+                f"将已确认的 {display} 事实前置到"
+                f"{_resume_section_label(_resume_section_for_fact(fact_ref))}部分，并保留原有可核验表述。"
+            ),
+        )
+        for display, normalized in supported_pairs
+        if (fact_ref := _find_fact_ref_for_keyword(confirmed_facts, normalized))
+        is not None
+    ]
     return ResumeTailoringBriefOutput(
         target_artifact_id=payload.target_artifact_id,
         target_title=target.get("title") if isinstance(target.get("title"), str) else None,
@@ -85,6 +112,7 @@ def build_resume_tailoring_brief(
         supported_keywords=supported,
         missing_keywords=missing,
         safe_actions=actions,
+        proposed_diffs=proposed_diffs,
     )
 
 
@@ -105,3 +133,26 @@ def _flatten_text(value: object) -> str:
     if isinstance(value, (list, tuple)):
         return "\n".join(_flatten_text(item) for item in value)
     return ""
+
+
+def _find_fact_ref_for_keyword(facts: object, keyword: str) -> str | None:
+    """Choose the first confirmed top-level fact field containing one JD term."""
+    if not isinstance(facts, dict):
+        return None
+    for field_path, value in facts.items():
+        if isinstance(field_path, str) and keyword in _flatten_text(value).lower():
+            return field_path
+    return None
+
+
+def _resume_section_for_fact(fact_ref: str) -> str:
+    """Map known profile fields to a user-visible resume section without inference."""
+    if fact_ref in {"skills", "languages", "certificates"}:
+        return "skills"
+    if fact_ref in {"projects", "project", "experience"}:
+        return "projects"
+    return "summary"
+
+
+def _resume_section_label(section: str) -> str:
+    return {"skills": "技能", "projects": "项目经历", "summary": "个人概述"}[section]
