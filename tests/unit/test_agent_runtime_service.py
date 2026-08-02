@@ -112,6 +112,11 @@ def test_queued_execution_ignores_missing_or_nonqueued_runs_and_persists_unexpec
     assert run_repository.list_events(db_session, run_id)[-1].event_type == "run_failed"
 
 
+def test_queued_execution_is_a_noop_when_runtime_has_been_unavailable() -> None:
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=None)
+    service.execute_queued_run(lambda: pytest.fail("must not create a database session"), user_id="user-a", run_id="run-a")
+
+
 def test_service_hides_other_users_persisted_run_and_events(db_session) -> None:
     """A trace may reveal goals and artifacts, so service ownership is mandatory."""
     owner = _user("user-a", "user-a@example.test")

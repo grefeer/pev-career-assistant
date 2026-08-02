@@ -251,6 +251,22 @@ def test_agent_event_stream_replays_only_owner_safe_events_after_a_cursor() -> N
     assert service.list_events.call_args.kwargs == {"user_id": "user-a", "run_id": "run-1"}
 
 
+def test_agent_event_stream_honors_last_event_id_and_hides_missing_runs() -> None:
+    assert routes_module._effective_event_cursor(2, "5") == 5
+    assert routes_module._effective_event_cursor(2, "invalid") == 2
+    service = MagicMock()
+    service.list_events.side_effect = AgentRunNotFoundError("run-1")
+    app = _build_app(service)
+
+    response = TestClient(app).get(
+        "/api/agent-runs/run-1/events/stream?follow=false",
+        headers={**_headers(app), "Last-Event-ID": "4"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "not_found"
+
+
 def test_list_agent_runs_projects_only_safe_owner_history_fields() -> None:
     """Workspace history exposes safe summaries, never context or model messages."""
     service = MagicMock()

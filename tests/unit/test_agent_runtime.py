@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
 from pydantic import BaseModel
 import pytest
@@ -129,6 +130,26 @@ class CrashAfterFirstExecutorDecisionGateway:
                 })
             raise RuntimeError("simulated_process_loss")
         raise AssertionError("Verifier should not run for an L2 step")
+
+
+def test_runtime_can_persist_a_queued_run_before_background_execution(db_session) -> None:
+    user = User(
+        id="queued-user", account="queued@example.test", nickname="queued",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    runtime = AgentRuntime(
+        planner=MagicMock(), executor=MagicMock(), verifier=MagicMock(), agent_version="pev-test",
+    )
+
+    run = runtime.create_queued_run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="后台任务", allowed_skills=["job-discovery"]),
+    )
+
+    assert run.status is RunStatus.queued
+    assert run.goal == "后台任务"
 
 
 def _runtime_for_gateway(gateway: object) -> AgentRuntime:
