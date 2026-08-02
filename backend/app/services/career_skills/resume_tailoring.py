@@ -12,7 +12,7 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 class BuildResumeTailoringBriefInput(BaseModel):
     """One evidence-backed target JD and the terms the Agent wants checked."""
 
-    target_artifact_id: str = Field(min_length=1, max_length=64)
+    target_artifact_id: str = Field(min_length=1, max_length=80)
     target_keywords: list[str] = Field(min_length=1, max_length=30)
 
     @field_validator("target_keywords")

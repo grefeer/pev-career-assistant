@@ -34,3 +34,28 @@ def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
         "为 Python、RAG、Agent 各准备一个可量化的项目案例，并标明你的具体贡献。",
         "围绕 JD 中的 Python、RAG、Agent 做一次 30 分钟技术讲解演练，准备架构取舍与故障排查追问。",
     ]
+
+
+def test_preparation_plan_accepts_the_observed_page_artifact_identifier() -> None:
+    """A FetchPublicJobPageOutput identifier must be usable by this Skill."""
+    artifact_id = f"observed:{'a' * 64}"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": artifact_id,
+            "source_url": "https://jobs.example/agent",
+            "content_hash": "a" * 64,
+            "visible_text": "岗位要求 Python。",
+        }]},
+    )
+
+    result = build_preparation_plan(
+        context,
+        BuildPreparationPlanInput(
+            target_artifact_id=artifact_id,
+            focus_keywords=["Python"],
+        ),
+    )
+
+    assert result.target_artifact_id == artifact_id

@@ -12,7 +12,7 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 class BuildPreparationPlanInput(BaseModel):
     """One evidence-backed target JD plus topics the Agent wants validated."""
 
-    target_artifact_id: str = Field(min_length=1, max_length=64)
+    target_artifact_id: str = Field(min_length=1, max_length=80)
     focus_keywords: list[str] = Field(min_length=1, max_length=30)
 
     @field_validator("focus_keywords")

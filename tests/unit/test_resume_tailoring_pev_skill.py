@@ -42,3 +42,31 @@ def test_resume_brief_never_recommends_claiming_a_jd_keyword_absent_from_confirm
         "在项目经历中优先展示已确认的 Python、RAG 事实，并量化可核验结果。",
         "LangGraph、Agent 尚无已确认事实：仅在能补充项目证据时添加，不得虚构。",
     ]
+
+
+def test_resume_brief_accepts_the_observed_page_artifact_identifier() -> None:
+    """A FetchPublicJobPageOutput identifier must be usable by this Skill."""
+    artifact_id = f"observed:{'a' * 64}"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "observed_public_evidence": [{
+                "artifact_id": artifact_id,
+                "source_url": "https://jobs.example/agent",
+                "content_hash": "a" * 64,
+                "visible_text": "岗位要求 Python。",
+            }],
+            "confirmed_profile_facts": {"skills": ["Python"]},
+        },
+    )
+
+    result = build_resume_tailoring_brief(
+        context,
+        BuildResumeTailoringBriefInput(
+            target_artifact_id=artifact_id,
+            target_keywords=["Python"],
+        ),
+    )
+
+    assert result.target_artifact_id == artifact_id
