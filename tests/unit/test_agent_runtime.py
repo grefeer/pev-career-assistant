@@ -1169,6 +1169,41 @@ def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_s
     ]
 
 
+def test_runtime_persists_every_valid_detail_from_one_batch_extraction(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    execution = ExecutorResult(
+        status="succeeded", summary="已结构化两份 JD",
+        observations=[ToolObservation(
+            tool_name="extract-observed-job-details-batch", status="succeeded",
+            output={"details": [
+                {"source_url": "https://jobs.example/a", "content_hash": "a" * 64,
+                 "candidates": [{"title": "岗位 A"}]},
+                {"source_url": "https://jobs.example/b", "content_hash": "b" * 64,
+                 "candidates": [{"title": "岗位 B"}]},
+                "malformed-detail",
+            ]},
+        )],
+    )
+
+    refs = AgentRuntime._persist_observed_evidence(db_session, run.id, step, execution)
+
+    assert len(refs) == 2
+    assert [artifact.content_json for artifact in db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == run.id)
+    )] == [
+        {"candidates": [{"title": "岗位 A"}]},
+        {"candidates": [{"title": "岗位 B"}]},
+    ]
+
+
 def test_runtime_persists_public_search_results_as_discovery_evidence(db_session) -> None:
     """A URL-discovery decision remains traceable after its Executor context is released."""
     user = User(

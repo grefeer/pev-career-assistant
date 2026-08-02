@@ -618,43 +618,48 @@ class AgentRuntime:
             )
         for observation in execution.observations:
             output = observation.output or {}
-            source_url = output.get("source_url")
-            content_hash = output.get("content_hash")
-            candidates = output.get("candidates")
-            if not (
-                isinstance(source_url, str)
-                and isinstance(content_hash, str)
-                and isinstance(candidates, list)
-            ):
-                continue
-            artifact = run_repository.create_artifact(
-                db,
-                run_id=run_id,
-                step_id=step.id,
-                artifact_type="structured_job_details",
-                source_url=source_url,
-                content_hash=content_hash,
-                content_json={"candidates": candidates},
-            )
-            artifact_refs.append(
-                {
-                    "artifact_id": artifact.id,
-                    "source_url": source_url,
-                    "content_hash": content_hash,
-                }
-            )
-            run_repository.append_event(
-                db,
-                run_id=run_id,
-                event_type="executor_structured_artifact",
-                payload_json={
-                    "sequence": step.sequence,
-                    "tool": observation.tool_name,
-                    "artifact_id": artifact.id,
-                    "source_url": source_url,
-                    "content_hash": content_hash,
-                },
-            )
+            raw_details = output.get("details")
+            details = raw_details if isinstance(raw_details, list) else [output]
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                source_url = detail.get("source_url")
+                content_hash = detail.get("content_hash")
+                candidates = detail.get("candidates")
+                if not (
+                    isinstance(source_url, str)
+                    and isinstance(content_hash, str)
+                    and isinstance(candidates, list)
+                ):
+                    continue
+                artifact = run_repository.create_artifact(
+                    db,
+                    run_id=run_id,
+                    step_id=step.id,
+                    artifact_type="structured_job_details",
+                    source_url=source_url,
+                    content_hash=content_hash,
+                    content_json={"candidates": candidates},
+                )
+                artifact_refs.append(
+                    {
+                        "artifact_id": artifact.id,
+                        "source_url": source_url,
+                        "content_hash": content_hash,
+                    }
+                )
+                run_repository.append_event(
+                    db,
+                    run_id=run_id,
+                    event_type="executor_structured_artifact",
+                    payload_json={
+                        "sequence": step.sequence,
+                        "tool": observation.tool_name,
+                        "artifact_id": artifact.id,
+                        "source_url": source_url,
+                        "content_hash": content_hash,
+                    },
+                )
         skill_artifact_types = {
             "match-observed-jobs": "job_matching_report",
             "build-resume-tailoring-brief": "resume_tailoring_brief",

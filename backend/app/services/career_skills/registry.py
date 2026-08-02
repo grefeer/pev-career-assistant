@@ -17,6 +17,16 @@ def build_career_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
+            name="extract-observed-job-details-batch",
+            skill_name="job-discovery",
+            input_model=job_discovery.ExtractObservedJobDetailsBatchInput,
+            output_model=job_discovery.ExtractObservedJobDetailsBatchOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=job_discovery.extract_observed_job_details_batch,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="fetch-public-job-pages",
             skill_name="job-discovery",
             input_model=job_discovery.FetchPublicJobPagesInput,

@@ -158,6 +158,26 @@ class ExtractObservedJobDetailsOutput(BaseModel):
     candidates: list[ExtractedJobDetails]
 
 
+class ExtractObservedJobDetailsBatchInput(BaseModel):
+    """A finite set of previously observed evidence artifacts to normalize."""
+
+    artifact_ids: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("artifact_ids")
+    @classmethod
+    def validate_artifact_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned) or len(set(cleaned)) != len(cleaned):
+            raise ValueError("artifact_ids must be non-empty and unique")
+        return cleaned
+
+
+class ExtractObservedJobDetailsBatchOutput(BaseModel):
+    """One structured result per requested immutable public-page artifact."""
+
+    details: list[ExtractObservedJobDetailsOutput]
+
+
 class _VisibleTextParser(HTMLParser):
     _IGNORED = {"script", "style", "noscript", "svg"}
 
@@ -544,6 +564,20 @@ def extract_observed_job_details(
         source_url=source_url,
         content_hash=content_hash,
         candidates=candidates,
+    )
+
+
+def extract_observed_job_details_batch(
+    context: ToolContext, payload: ExtractObservedJobDetailsBatchInput
+) -> ExtractObservedJobDetailsBatchOutput:
+    """Normalize a bounded observed set without letting the model supply JD text."""
+    return ExtractObservedJobDetailsBatchOutput(
+        details=[
+            extract_observed_job_details(
+                context, ExtractObservedJobDetailsInput(artifact_id=artifact_id)
+            )
+            for artifact_id in payload.artifact_ids
+        ]
     )
 
 

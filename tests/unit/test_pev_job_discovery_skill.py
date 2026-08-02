@@ -8,12 +8,14 @@ import pytest
 
 from backend.app.services.career_skills.job_discovery import (
     ExtractObservedJobDetailsInput,
+    ExtractObservedJobDetailsBatchInput,
     FetchPublicJobPageInput,
     FetchPublicJobPageOutput,
     FetchPublicJobPagesInput,
     PublicJobFetchError,
     SearchPublicJobPagesInput,
     extract_observed_job_details,
+    extract_observed_job_details_batch,
     fetch_public_job_page,
     fetch_public_job_pages,
     search_public_job_pages,
@@ -407,6 +409,10 @@ def test_extract_observed_job_details_returns_structured_fields_only_from_captur
         }],
         "normalization_warnings": [],
     }]
+    batch = extract_observed_job_details_batch(
+        context, ExtractObservedJobDetailsBatchInput(artifact_ids=["artifact-ai-agent"])
+    )
+    assert batch.details == [result]
 
 
 def test_extract_observed_job_details_handles_official_page_without_labeled_title() -> None:
