@@ -20,6 +20,8 @@ from backend.app.services.career_skills.job_discovery import (
     fetch_public_job_pages,
     search_public_job_pages,
     _assert_public_url,
+    _BingSearchResultParser,
+    _SoSearchResultParser,
     _direct_bing_result_url,
     _extract_jd_section,
     _find_observed_evidence,
@@ -482,3 +484,103 @@ Agent研发工程师
     candidate = result.candidates[0]
     assert candidate.recruitment_types == ["social"]
     assert "No location information found" not in candidate.normalization_warnings
+
+
+def test_bing_result_parser_ignores_non_content_start_tags_inside_a_result() -> None:
+    """A <div> inside <li> hits no h2/p/a-in-heading branch and is ignored."""
+    parser = _BingSearchResultParser()
+    parser.feed('<li class="b_algo"><div>ignored</div></li>')
+    assert parser.results == []
+
+
+def test_bing_result_parser_skips_anchor_in_heading_without_href() -> None:
+    """An <a> inside <h2> without href captures no url and yields no result."""
+    parser = _BingSearchResultParser()
+    parser.feed('<li class="b_algo"><h2><a>title no href</a></h2><p>snip</p></li>')
+    assert parser.results == []
+
+
+def test_bing_result_parser_drops_data_outside_heading_and_snippet() -> None:
+    """Loose text before <h2> is neither title nor snippet and is dropped."""
+    parser = _BingSearchResultParser()
+    parser.feed(
+        '<li class="b_algo">loose text<h2><a href="https://x.example">t</a></h2><p>s</p></li>'
+    )
+    assert [r["url"] for r in parser.results] == ["https://x.example"]
+
+
+def test_so_search_parser_skips_whitespace_only_and_empty_anchor_text() -> None:
+    """Whitespace-only and empty anchor text produce no result entry."""
+    whitespace = _SoSearchResultParser()
+    whitespace.feed('<a data-mdurl="https://x.example">   </a>')
+    assert whitespace.results == []
+
+    empty = _SoSearchResultParser()
+    empty.feed('<a data-mdurl="https://x.example"></a>')
+    assert empty.results == []
+
+
+def test_assert_public_url_accepts_a_globally_routable_host(monkeypatch) -> None:
+    """A public hostname resolving to a global IP passes without raising."""
+    import socket as _socket
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.socket.getaddrinfo",
+        lambda *args, **kwargs: [
+            (_socket.AF_INET, _socket.SOCK_STREAM, 0, "", ("1.1.1.1", 0)),
+        ],
+    )
+    _assert_public_url("https://jobs.example")  # must not raise
+
+
+def test_search_fallback_keeps_all_plausible_results_when_under_the_limit(monkeypatch) -> None:
+    """The fallback loop continues past the first result when the cap is not yet hit."""
+    responses = iter([
+        SimpleNamespace(
+            text="<html><body></body></html>", encoding="utf-8",
+            apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+        SimpleNamespace(
+            text="""
+            <html><body>
+              <a data-mdurl="https://careers.example/jobs/agent">AI Agent 开发工程师招聘</a>
+              <a data-mdurl="https://careers.example/jobs/second">第二个岗位招聘</a>
+            </body></html>
+            """, encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    ])
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+    )
+    assert [item.url for item in result.results] == [
+        "https://careers.example/jobs/agent",
+        "https://careers.example/jobs/second",
+    ]
+
+
+def test_find_observed_evidence_skips_non_matching_items_before_a_match() -> None:
+    """A non-matching evidence item is skipped (loop continues) before the match."""
+    other = {"artifact_id": "other", "content_hash": "b" * 64}
+    target = {"artifact_id": "jd", "content_hash": "a" * 64}
+    context = ToolContext(
+        user_id="u", run_id="r", metadata={"observed_public_evidence": [other, target]}
+    )
+    assert _find_observed_evidence(context, "jd") is target
+    assert _find_observed_evidence(context, f"observed:{'a' * 64}") is target
+    assert _find_observed_evidence(context, "missing") is None
+
+
+def test_infer_official_page_locations_returns_empty_when_no_city_line_follows_title() -> None:
+    """A non-city, non-responsibilities line after the title is skipped and the loop ends empty."""
+    assert _infer_official_page_locations("标题\nabc", "标题") == []

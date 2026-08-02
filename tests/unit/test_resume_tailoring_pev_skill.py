@@ -145,3 +145,38 @@ def test_resume_tailoring_fact_helpers_only_use_dict_backed_confirmed_facts() ->
     assert _flatten_text(("Python", {"nested": [1, None, "RAG"]})) == "Python\n\n\nRAG"
     assert _find_fact_ref_for_keyword(["Python"], "python") is None
     assert _find_fact_ref_for_keyword({"skills": ["Python"]}, "rag") is None
+    # A non-matching dict evidence item is skipped before the match is found.
+    other = {"artifact_id": "other", "source_url": "https://jobs.example/other"}
+    target = {"artifact_id": "jd", "source_url": "https://jobs.example"}
+    assert _find_target([other, target], "jd") is target
+
+
+def test_resume_brief_emits_only_missing_gap_when_no_keyword_is_supported_by_facts() -> None:
+    """Every JD keyword absent from confirmed facts yields a gap, no highlight."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "observed_public_evidence": [{
+                "artifact_id": "jd",
+                "source_url": "https://jobs.example",
+                "content_hash": "a" * 64,
+                "visible_text": "岗位要求 Python 与 RAG 开发经验。",
+            }],
+            "confirmed_profile_facts": {},
+        },
+    )
+
+    result = build_resume_tailoring_brief(
+        context,
+        BuildResumeTailoringBriefInput(
+            target_artifact_id="jd", target_keywords=["Python", "RAG"],
+        ),
+    )
+
+    assert result.supported_keywords == []
+    assert result.missing_keywords == ["python", "rag"]
+    assert result.proposed_diffs == []
+    assert result.safe_actions == [
+        "Python、RAG 尚无已确认事实：仅在能补充项目证据时添加，不得虚构。",
+    ]

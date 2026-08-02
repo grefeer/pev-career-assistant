@@ -279,6 +279,47 @@ def test_executor_keeps_agent_in_control_after_blocking_redundant_search() -> No
     assert gateway.states[1]["observations"][0]["error_code"] == "candidate_urls_already_supplied"
 
 
+def test_executor_surfaces_prior_observations_and_verifier_feedback_on_retry() -> None:
+    """On a Verifier retry the Executor must see what was already done and what is missing."""
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="match-jobs", skill_name="job-matching", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {"title": "AI 应用开发工程师"},
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "match-jobs", "tool_input": {"url": "unused"}},
+        {"action": "complete", "summary": "已生成匹配报告"},
+    ])
+    task = AgentTaskRequest(
+        goal="推荐岗位", allowed_skills=["job-matching"],
+        context={"verifier_feedback": ["missing match-observed-jobs"]},
+    )
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["匹配报告"],
+        steps=[PlanStep(step_id="match", objective="匹配 JD", allowed_skills=["job-matching"])],
+    )
+    prior_fetch = ToolObservation(
+        tool_name="fetch-public-job-pages", status="succeeded",
+        output={"artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+                "title": "AI Agent 开发", "visible_text": "JD 正文", "content_hash": "a" * 64},
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        prior_observations=[prior_fetch],
+    )
+
+    assert result.status == "succeeded"
+    # The prior fetch is surfaced so the model does not repeat discovery.
+    assert gateway.states[0]["prior_observations"][0]["tool_name"] == "fetch-public-job-pages"
+    assert gateway.states[0]["verifier_feedback"] == ["missing match-observed-jobs"]
+    # The Executor called the named missing tool, not a repeat discovery fetch.
+    assert result.observations[0].tool_name == "match-jobs"
+
+
 def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
     task = AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"])
     plan = ExecutionPlan(
@@ -309,3 +350,120 @@ def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
         task=task, plan=plan, step=plan.steps[0], context=context, deadline=0,
     ).error_code == "wall_clock_budget_exhausted"
     assert exhausted.status == "failed"
+
+
+def test_executor_deduplicates_consecutive_identical_tool_calls_without_consuming_budget() -> None:
+    """A repeat of a just-succeeded identical call is short-circuited, not re-invoked."""
+    invocations = {"count": 0}
+
+    def handler(_context, _payload):
+        invocations["count"] += 1
+        return {"title": "AI 应用开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="extract-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=handler,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "extract-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "extract-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "complete", "summary": "已提取 JD"},
+    ])
+    task = AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["完整 JD"],
+        steps=[PlanStep(step_id="discover", objective="提取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        # Only one tool call is budgeted; the duplicate must be deduped, not retried,
+        # or this run would fail with tool_budget_exhausted.
+        tool_budget=ToolCallBudget(1),
+    )
+
+    assert result.status == "succeeded"
+    assert invocations["count"] == 1
+    assert [obs.error_code for obs in result.observations] == [None, "duplicate_tool_call"]
+    assert result.observations[1].tool_name == "extract-page"
+
+
+def test_executor_allows_repeated_tool_call_when_input_differs() -> None:
+    """A same-named call with different input is a distinct action, not a duplicate."""
+    titles = iter(["岗位一", "岗位二"])
+
+    def handler(_context, _payload):
+        return {"title": next(titles)}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=handler,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/2"}},
+        {"action": "complete", "summary": "已抓取两个页面"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["两个 JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(2),
+    )
+
+    assert result.status == "succeeded"
+    assert [obs.output for obs in result.observations] == [
+        {"title": "岗位一"}, {"title": "岗位二"},
+    ]
+    assert all(obs.error_code is None for obs in result.observations)
+
+
+def test_executor_retries_an_identical_call_after_the_prior_one_failed() -> None:
+    """A duplicate after a *failed* call is a legitimate retry, not a short-circuit."""
+    attempts = {"count": 0}
+
+    def flaky(_context, _payload):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("transient failure")
+        return {"title": "AI Agent 开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=flaky,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "complete", "summary": "重试后抓取成功"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(2),
+    )
+
+    assert result.status == "succeeded"
+    assert attempts["count"] == 2
+    assert [obs.error_code for obs in result.observations] == ["tool_execution_failed", None]

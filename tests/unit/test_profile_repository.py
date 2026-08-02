@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, inspect, select, func
@@ -158,6 +159,31 @@ def test_evidence_diff_reports_add_unchanged_replace_and_conflict(
 
     assert diff2.get("projects") == EvidenceDiffAction.ADD
     assert diff2.get("skills") == EvidenceDiffAction.UNCHANGED
+
+
+def test_compute_evidence_diff_marks_conflicting_new_field_and_skips_duplicates() -> None:
+    """Two evidence rows for one new field with different values are a CONFLICT."""
+    rows = [
+        _evidence("phone", "13800138000"),
+        _evidence("phone", "13900139000"),
+    ]
+    diff = profiles.compute_evidence_diff(rows, latest_snapshot={})
+    assert diff["phone"] is EvidenceDiffAction.CONFLICT
+
+
+def test_compute_evidence_diff_marks_conflicting_field_against_snapshot() -> None:
+    """A field present in the snapshot with conflicting values is also CONFLICT."""
+    rows = [
+        _evidence("skills", ["Python"]),
+        _evidence("skills", ["Java"]),
+    ]
+    diff = profiles.compute_evidence_diff(rows, latest_snapshot={"skills": ["Go"]})
+    assert diff["skills"] is EvidenceDiffAction.CONFLICT
+
+
+def _evidence(field_path: str, candidate_value: object) -> SimpleNamespace:
+    """Build a minimal stand-in for compute_evidence_diff, which reads only two attrs."""
+    return SimpleNamespace(field_path=field_path, candidate_value=candidate_value)
 
 
 def test_profile_evidence_list_does_not_duplicate_append_only_decisions(

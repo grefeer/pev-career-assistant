@@ -26,6 +26,12 @@ def test_terminal_run_cannot_be_reopened() -> None:
         require_valid_run_transition(RunStatus.cancelled, RunStatus.running)
 
 
+def test_invalid_non_terminal_transition_is_rejected() -> None:
+    """A non-terminal run may only move along its declared lifecycle edges."""
+    with pytest.raises(ValueError, match="invalid Agent run transition"):
+        require_valid_run_transition(RunStatus.queued, RunStatus.waiting_user)
+
+
 def test_agent_roles_are_three_distinct_autonomous_roles() -> None:
     """The PEV contract must not collapse a role into an unnamed model node."""
     assert {role.value for role in AgentRole} == {"planner", "executor", "verifier"}

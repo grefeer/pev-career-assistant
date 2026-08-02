@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import time
 from typing import Any
 from urllib.parse import quote
@@ -12,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 
+import backend.entrypoint as entrypoint
 from backend.entrypoint import CredentialConfigurationError, run
 
 
@@ -95,6 +97,60 @@ def test_entrypoint_rejects_line_breaks_with_fixed_redacted_error(
 
     assert str(exc_info.value) == "required service credentials are not configured"
     assert "not-disclosed" not in str(exc_info.value)
+
+
+def test_entrypoint_run_raises_runtime_error_when_argv_empty() -> None:
+    environment = {"DB_PASSWORD": "db-value", "REDIS_PASSWORD": "redis-value"}
+
+    with pytest.raises(RuntimeError, match="container command is not configured"):
+        run([], environment, lambda executable, argv: None)
+
+
+def test_entrypoint_main_returns_zero_when_run_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    executed: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(sys, "argv", ["entrypoint", "alembic", "upgrade", "head"])
+    monkeypatch.setattr(os, "environ", {"DB_PASSWORD": "v", "REDIS_PASSWORD": "v"})
+    monkeypatch.setattr(
+        os, "execvp", lambda executable, argv: executed.append((executable, argv))
+    )
+
+    assert entrypoint.main() == 0
+    assert executed == [("alembic", ["alembic", "upgrade", "head"])]
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("argv", "env", "expect_message"),
+    [
+        (
+            ["entrypoint", "true"],
+            {"REDIS_PASSWORD": "v"},
+            "required service credentials are not configured",
+        ),
+        (
+            ["entrypoint"],
+            {"DB_PASSWORD": "v", "REDIS_PASSWORD": "v"},
+            "container command is not configured",
+        ),
+    ],
+    ids=["credential_error", "empty_argv"],
+)
+def test_entrypoint_main_returns_78_and_reports_error_to_stderr(
+    argv: list[str],
+    env: dict[str, str],
+    expect_message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(os, "environ", env)
+    monkeypatch.setattr(os, "execvp", lambda executable, argv_inner: None)
+
+    assert entrypoint.main() == 78
+    assert expect_message in capsys.readouterr().err
 
 
 def test_compose_resolved_command_never_contains_redis_password() -> None:

@@ -16,6 +16,7 @@ from backend.app.db.models import (
 from backend.app.domain.profiles import (
     EvidenceCandidate,
     EvidenceDecisionAction,
+    ResumeImportStatus,
 )
 from backend.app.repositories import profiles as profile_repository
 from backend.app.services.profiles import (
@@ -250,3 +251,30 @@ def test_apply_decisions_enforces_corrected_value_contract(
             expected_version=0,
             decisions=(decision,),
         )
+
+
+def test_import_processing_advances_status_when_a_parseable_resume_yields_no_evidence(
+    profile_db: Session,
+    object_store: EncryptedObjectStore,
+) -> None:
+    """A resume with only headings (no content lines) produces no evidence but still advances."""
+    asset_service = ResumeAssetService(object_store)
+    # Two section headings and no content lines -> extract_evidence_candidates == []
+    resume_content = "技能\n教育经历".encode("utf-8")
+    asset = asset_service.create_pending_asset(
+        profile_db,
+        user_id="user-1",
+        filename="resume.txt",
+        content_type="text/plain",
+        raw=resume_content,
+    )
+    profile_db.commit()
+    asset_service.write_encrypted_object(asset, resume_content)
+    asset_service.reconcile(profile_db, user_id="user-1", asset_id=asset.id)
+
+    import_service = ResumeImportService(object_store)
+    import_row = import_service.start(profile_db, user_id="user-1", asset_id=asset.id)
+    import_service.process(profile_db, user_id="user-1", import_id=import_row.id)
+
+    assert import_row.status is ResumeImportStatus.AWAITING_CONFIRMATION
+    assert profile_repository.list_import_evidence(profile_db, import_row.id) == []

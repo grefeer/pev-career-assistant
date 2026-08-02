@@ -55,4 +55,19 @@ describe("route guards", () => {
 
     expect(next).toHaveBeenCalledWith();
   });
+
+  it("keeps polling while bootstrap is still loading, then proceeds", async () => {
+    state.loading.value = true;
+    const next = vi.fn();
+    // Resolve loading only AFTER the first 50ms interval tick has already
+    // fired while still loading -> exercises the ``if (!auth.loading.value)``
+    // False arm (keep polling) before the True arm resolves the wait.
+    setTimeout(() => {
+      state.loading.value = false;
+    }, 70);
+
+    await guard({ meta: {} }, {}, next);
+
+    expect(next).toHaveBeenCalledWith();
+  });
 });

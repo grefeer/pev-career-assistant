@@ -10,3 +10,40 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 norecursedirs = ["archive", ".worktrees", "manual"]
+
+# ---------------------------------------------------------------------------
+# Coverage: 100% on RETAINED production packages only.
+#
+# Per spec §15 / §0, legacy code slated for retirement (sub-project 4,
+# "Legacy Retirement and Portfolio") does NOT enter the coverage gate. The
+# modules below are imported only by ``db/models.py`` (legacy ORM enums) or
+# are the pre-merge/pre-PEV paths (Supervisor / Web-Nav / Tencent sync /
+# campus-recruitment admin / device pairing / Executor API); they are
+# excluded here pending physical archival in sub-project 4. Retained
+# production packages (api, config, db.session/base, domain.agent_runtime,
+# domain.profiles, middleware, main, repositories, services.agent_runtime,
+# services.career_skills, services.{auth,profiles,rate_limit,storage,
+# profile_parser}, services.job_discovery.{schemas,tools.jd_extraction})
+# remain measured and must stay at 100%.
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+omit = [
+  "backend/app/domain/job_review.py",
+  "backend/app/domain/job_submissions.py",
+  "backend/app/domain/personalized_discovery.py",
+  "backend/app/domain/application_tracking.py",
+  "backend/app/domain/company_research.py",
+  "backend/app/domain/interview_prep.py",
+  "backend/app/domain/job_feedback.py",
+  "backend/app/domain/preferences.py",
+  "backend/app/services/job_sync.py",
+  "backend/app/services/job_mappers.py",
+  "backend/app/services/job_discovery/deepagents_runner.py",
+  "backend/app/services/job_discovery/worker.py",
+]
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
+

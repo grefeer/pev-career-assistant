@@ -10,7 +10,6 @@ from pypdf import PdfReader
 from backend.app.domain.profiles import (
     EvidenceCandidate,
     ParsedResumeDocument,
-    STANDARD_FIELD_PATHS,
     UnsupportedResumeTypeError,
 )
 
@@ -101,7 +100,11 @@ def extract_evidence_candidates(text: str) -> list[EvidenceCandidate]:
             deduped = list(dict.fromkeys(items))
             seen_skills.extend(deduped)
             _add_basic_candidate("skills", deduped, " ".join(section_lines), 85)
-        elif current_section in STANDARD_FIELD_PATHS:
+        else:
+            # ``current_section`` is only ever assigned a value from
+            # ``SECTION_ALIASES`` (line above), and every alias maps to a member
+            # of ``STANDARD_FIELD_PATHS`` (or ``skills`` handled above), so this
+            # branch is exhaustive for non-skills sections without a dead arm.
             cleaned = [line.strip() for line in section_lines if line.strip()]
             _add_basic_candidate(
                 current_section,

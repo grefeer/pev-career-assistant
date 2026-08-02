@@ -336,4 +336,153 @@ describe("AgentWorkspace", () => {
     expect(wrapper.find('[aria-label="可审核的简历修改"]').exists()).toBe(false)
     expect(wrapper.find('[aria-label="带复盘的准备计划"]').exists()).toBe(false)
   })
+
+  it("aborts selectRun and startEventStream when the token is cleared mid-session", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // mount auto-selected run-1 with the token present (guards' false arms)
+    expect(api.fetchAgentRun).toHaveBeenCalledWith("student-token", "run-1")
+
+    // clearing the token mid-session: the UI never re-invokes these, so exercise
+    // the token-absent guards through the exposed instance.
+    await wrapper.setProps({ token: undefined })
+    await wrapper.vm.selectRun("run-1")
+    wrapper.vm.startEventStream("run-1", 0)
+    await flushPromises()
+
+    // neither path issued a fetch/stream for the now-absent token
+    expect(api.fetchAgentRun).not.toHaveBeenCalledWith(undefined, "run-1")
+    expect(api.streamAgentRunEvents).toHaveBeenCalledTimes(1)
+  })
+
+  it("skips recovery when there is no active running run", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [] })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // no runs -> activeRun stays null -> the recover button is not rendered,
+    // so the entry guard is exercised through the exposed instance.
+    await wrapper.vm.recoverActiveRun()
+    expect(api.recoverAgentRun).not.toHaveBeenCalled()
+  })
+
+  it("surfaces a non-harness API error with its own message", async () => {
+    api.createAgentRun.mockRejectedValue(new ApiError(500, { code: "internal" }, "服务内部错误"))
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    await wrapper.get('textarea[name="goal"]').setValue("找岗位")
+    await wrapper.get("form").trigger("submit.prevent")
+    await flushPromises()
+    // ApiError whose message is neither harness_unavailable nor harness_disabled
+    expect(wrapper.text()).toContain("服务内部错误")
+    expect(wrapper.text()).not.toContain("智能求职助手暂不可用")
+  })
+
+  it("falls back to the artifact-type label when a candidate has an empty title", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.fetchAgentRunArtifacts.mockResolvedValue({
+      items: [{
+        id: "empty-title", artifact_type: "structured_job_details", source_url: "https://jobs.example/7",
+        content_hash: "1".repeat(64), content: { candidates: [{ title: "" }] }, created_at: run.created_at,
+      }],
+    })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // candidateTitle === "" (string but falsy) -> falls through to the titles map
+    expect(wrapper.text()).toContain("结构化 JD")
+  })
+
+  it("shows a placeholder complexity when a run has no complexity", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [{ ...run, complexity: null as unknown as string }] })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // run.complexity ?? "待规划" -> null -> "待规划"
+    expect(wrapper.text()).toContain("待规划")
+  })
+
+  it("labels deterministic plan steps distinctly from verified ones", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.fetchAgentRunPlans.mockResolvedValue({
+      items: [{
+        id: "plan-1", revision: 1, complexity: "L3", success_criteria: [],
+        steps: [{
+          id: "fetch", objective: "抓取公开页面", allowed_skills: ["job-discovery"],
+          success_criteria: [], requires_verification: false,
+        }], created_at: run.created_at,
+      }],
+    })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // step.requires_verification ? ... : "确定性校验" -> false
+    expect(wrapper.text()).toContain("确定性校验")
+  })
+
+  it("drops stale stream events and orders live events by sequence", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run, { ...run, id: "run-2", goal: "第二任务" }] })
+    api.fetchAgentRun.mockImplementation((_t: string, id: string) =>
+      Promise.resolve(id === "run-2" ? { ...run, id: "run-2", goal: "第二任务" } : run))
+    const streams: Array<{ runId: string; onEvent: (event: unknown) => void }> = []
+    api.streamAgentRunEvents.mockImplementation(
+      (_t: string, runId: string, _cursor: number, _signal: AbortSignal, onEvent: (event: unknown) => void) => {
+        streams.push({ runId, onEvent })
+        return Promise.resolve()
+      },
+    )
+    // seed one event so a live callback sorts >= 2 entries (covers the comparator)
+    api.fetchAgentRunEvents.mockResolvedValue({
+      items: [{ sequence: 1, event_type: "run_started", payload: {}, created_at: run.created_at }],
+    })
+
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    const run1Stream = streams[0]
+    expect(run1Stream.runId).toBe("run-1")
+
+    // live event for the active run: keeps seq 1 + appends seq 3 -> comparator runs
+    run1Stream.onEvent({ sequence: 3, event_type: "plan_created", payload: {}, created_at: run.created_at })
+    await flushPromises()
+    expect(wrapper.text()).toContain("Planner 已生成计划")
+
+    // switch active run to run-2 -> the run-1 stream becomes stale
+    await wrapper.findAll(".run-button")[1].trigger("click")
+    await flushPromises()
+    // a late event on the stale run-1 stream is dropped (activeRun.id !== runId -> return)
+    run1Stream.onEvent({ sequence: 99, event_type: "run_failed", payload: {}, created_at: run.created_at })
+    expect(wrapper.text()).not.toContain("任务未完成")
+  })
+
+  it("surfaces a non-aborted event-stream failure", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.streamAgentRunEvents.mockRejectedValue(new Error("事件流中断"))
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    // mount auto-selects run-1 -> stream rejects while controller is NOT aborted
+    expect(wrapper.text()).toContain("事件流中断")
+  })
+
+  it("silently drops an event-stream failure that arrives after the run was switched away", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run, { ...run, id: "run-2", goal: "第二任务" }] })
+    api.fetchAgentRun.mockImplementation((_t: string, id: string) =>
+      Promise.resolve(id === "run-2" ? { ...run, id: "run-2", goal: "第二任务" } : run))
+    const rejectors: Array<(error: unknown) => void> = []
+    api.streamAgentRunEvents.mockImplementation(
+      () => new Promise<void>((_resolve, reject) => {
+        rejectors.push(reject)
+      }),
+    )
+
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    expect(rejectors.length).toBe(1)
+
+    // switch to run-2 -> run-1 controller is aborted; run-2 stream is pending
+    await wrapper.findAll(".run-button")[1].trigger("click")
+    await flushPromises()
+    expect(rejectors.length).toBe(2)
+
+    // the stale run-1 stream now rejects; its controller is aborted -> silent return
+    rejectors[0](new Error("run-1 stream died"))
+    await flushPromises()
+    expect(wrapper.text()).not.toContain("run-1 stream died")
+  })
 })

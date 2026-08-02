@@ -73,3 +73,28 @@ def test_candidate_extraction_covers_standard_profile_sections() -> None:
     assert by_path["skills"].candidate_value == ["Python", "FastAPI"]
     assert by_path["portfolio_links"].candidate_value == ["https://example.com/me"]
     assert all(0 <= item.confidence <= 100 for item in candidates)
+
+
+def test_candidate_extraction_skips_blank_lines_and_captures_phone() -> None:
+    """Blank lines are ignored and a mobile number is captured exactly once."""
+    candidates = extract_evidence_candidates(
+        "李四\n\n联系方式\n13800138000\n技能\nPython\n"
+    )
+    by_path = {item.field_path: item for item in candidates}
+    assert by_path["basics.name"].candidate_value == "李四"
+    assert by_path["basics.phone"].candidate_value == "13800138000"
+
+
+def test_candidate_extraction_deduplicates_repeated_urls_on_one_line() -> None:
+    """A URL repeated on a single line is captured once, not twice."""
+    candidates = extract_evidence_candidates(
+        "张三\n参考 https://example.com 与 https://example.com 同一链接\n"
+    )
+    by_path = {item.field_path: item for item in candidates}
+    assert by_path["portfolio_links"].candidate_value == ["https://example.com"]
+
+
+def test_candidate_extraction_ignores_an_unstructured_first_line_longer_than_a_name() -> None:
+    """A first line too long to be a name and without a heading yields no candidate."""
+    candidates = extract_evidence_candidates("x" * 130)
+    assert candidates == []

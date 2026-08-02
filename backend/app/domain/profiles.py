@@ -1,25 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import sys
-from typing import Any
-from typing import Union
-
-if sys.version_info >= (3, 10):
-    from typing import TypeAlias
-else:
-    from typing_extensions import TypeAlias  # Python 3.9 compat
-
-if sys.version_info >= (3, 11):
-    from enum import StrEnum
-else:
-    from enum import Enum
-
-    class StrEnum(str, Enum):
-        """Minimal StrEnum polyfill for Python < 3.11."""
-
-        pass
-
+from enum import StrEnum
+from typing import Any, TypeAlias, Union
 import re
 
 

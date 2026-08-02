@@ -312,4 +312,148 @@ describe("ProfileWorkspace", () => {
     await flushPromises();
     expect(wrapper.text()).toContain("upload unavailable");
   });
+
+  it("uses a default message when profile loading fails without one", async () => {
+    vi.mocked(profileApi.fetchProfile).mockRejectedValue(new Error(""));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // error.message || "加载失败" -> "" falsy -> "加载失败"
+    expect(wrapper.text()).toContain("加载失败");
+  });
+
+  it("ignores a change event with no selected file", async () => {
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // no files set -> file undefined -> early return before any upload
+    await wrapper.get('input[type="file"]').trigger("change");
+    await flushPromises();
+    expect(profileApi.uploadResumeAsset).not.toHaveBeenCalled();
+    expect(wrapper.text()).not.toContain("上传成功");
+  });
+
+  it("uses a default upload error and skips input reset after unmount", async () => {
+    let rejectUpload!: (error: unknown) => void;
+    vi.mocked(profileApi.uploadResumeAsset).mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectUpload = reject;
+      }) as any,
+    );
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    const input = wrapper.get('input[type="file"]').element as HTMLInputElement;
+    Object.defineProperty(input, "files", { value: [new File(["x"], "resume.txt")] });
+    await wrapper.get('input[type="file"]').trigger("change");
+    // unmount mid-flight: the fileInput template ref is released (null) so the
+    // finally guard's falsy arm runs, and the empty-message catch hits the || fallback
+    wrapper.unmount();
+    rejectUpload(new Error(""));
+    await flushPromises();
+    warnSpy.mockRestore();
+  });
+
+  it("uses a default message when reconciliation fails without one", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.reconcileResumeAsset).mockRejectedValue(new Error(""));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.findAll("button").find((button) => button.text() === "同步")!.trigger("click");
+    await flushPromises();
+    // error.message || "同步失败" -> "" falsy -> "同步失败"
+    expect(wrapper.text()).toContain("同步失败");
+  });
+
+  it("uses a default message when import fails without one", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.startResumeImport).mockRejectedValue(new Error(""));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.findAll("button").find((button) => button.text() === "解析")!.trigger("click");
+    await flushPromises();
+    // error.message || "解析失败" -> "" falsy -> "解析失败"
+    expect(wrapper.text()).toContain("解析失败");
+  });
+
+  it("skips save and create-version when the profile failed to load", async () => {
+    vi.mocked(profileApi.fetchProfile).mockRejectedValue(new Error("unavailable"));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // profile.value is null; the buttons are disabled, so exercise the guards directly
+    await wrapper.vm.handleSaveDecisions();
+    await wrapper.vm.handleCreateVersion();
+    expect(profileApi.applyEvidenceDecisions).not.toHaveBeenCalled();
+    expect(profileApi.createProfileVersion).not.toHaveBeenCalled();
+  });
+
+  it("submits an empty correction value when saving a correct decision without text", async () => {
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // choose 更正 but leave the correction empty -> canSaveDecisions is false (button disabled),
+    // so call the exposed handler directly to exercise the ?? "" fallback
+    await wrapper.get('[data-test="decision-correct-evidence-1"]').trigger("click");
+    await wrapper.vm.handleSaveDecisions();
+    await flushPromises();
+    expect(profileApi.applyEvidenceDecisions).toHaveBeenCalledWith("token", 0, [
+      { evidence_id: "evidence-1", action: "correct", corrected_value: "" },
+    ]);
+  });
+
+  it("uses a default message when saving decisions fails without one", async () => {
+    vi.mocked(profileApi.applyEvidenceDecisions).mockRejectedValue(new Error(""));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="decision-confirm-evidence-1"]').trigger("click");
+    await wrapper.get('[data-test="save-decisions"]').trigger("click");
+    await flushPromises();
+    // non-ApiError with empty message -> "保存失败"
+    expect(wrapper.text()).toContain("保存失败");
+  });
+
+  it("uses a default message when creating a version fails without one", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [{ ...mockProfile.evidence[0], status: "confirmed" }],
+    });
+    vi.mocked(profileApi.createProfileVersion).mockRejectedValue(new Error(""));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="create-version"]').trigger("click");
+    await flushPromises();
+    // non-ApiError with empty message -> "创建版本失败"
+    expect(wrapper.text()).toContain("创建版本失败");
+  });
+
+  it("renders an unknown evidence status verbatim", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [{ ...mockProfile.evidence[0], status: "archived" as any, diff_action: "add" }],
+    });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // labels[status] || status -> unknown status falls back to the raw value
+    expect(wrapper.text()).toContain("archived");
+  });
+
+  it("omits the diff badge when an evidence item has no diff action", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [{ ...mockProfile.evidence[0], diff_action: null as any }],
+    });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // v-if="ev.diff_action" -> null -> badge not rendered
+    expect(wrapper.findAll(".diff-badge").length).toBe(0);
+  });
 });

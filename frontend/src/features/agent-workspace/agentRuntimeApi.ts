@@ -97,7 +97,8 @@ function parseSseEvent(block: string): AgentEventResponse | null {
       || Array.isArray(event.payload)
       || typeof event.created_at !== "string"
     ) return null
-    return event as AgentEventResponse
+    // All required fields are validated above, so the narrow cast is sound.
+    return event as unknown as AgentEventResponse
   } catch {
     return null
   }
@@ -131,7 +132,9 @@ export async function streamAgentRunEvents(
     const { done, value } = await reader.read()
     buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
     const blocks = buffer.split(/\r?\n\r?\n/)
-    buffer = blocks.pop() ?? ""
+    // ``String.split`` always yields a non-empty array, so ``pop()`` is
+    // always a string here (never ``undefined``) and needs no fallback.
+    buffer = blocks.pop()!
     for (const block of blocks) {
       const event = parseSseEvent(block)
       if (event) onEvent(event)

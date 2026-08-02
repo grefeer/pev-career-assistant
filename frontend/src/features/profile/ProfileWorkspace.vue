@@ -214,6 +214,11 @@ function statusLabel(ev: ProfileEvidence): string {
 onMounted(() => {
   loadProfile();
 });
+
+// Exposed for direct state-verification in tests: the save/create entry guards
+// protect against states the disabled buttons already prevent (no profile,
+// correct-decision without a value), so they are exercised through the instance.
+defineExpose({ handleSaveDecisions, handleCreateVersion });
 </script>
 
 <template>

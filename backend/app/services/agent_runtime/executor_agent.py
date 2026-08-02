@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
@@ -53,7 +54,18 @@ _EXECUTOR_INSTRUCTION = (
     "verified provider limitation: do not search again; immediately ask the user "
     "for an official careers URL or relax the source constraint. If a fetched "
     "page does not contain a usable JD, state that evidence limitation and choose "
-    "a different returned direct URL at most once before asking the user."
+    "a different returned direct URL at most once before asking the user. "
+    "When verifier_feedback is present, the Verifier found a tool-backed "
+    "deliverable missing from the prior attempt for this same step. The "
+    "missing deliverable is named in feedback. Call that named tool next, "
+    "reusing the observed public evidence that prior_observations already "
+    "captured; do not repeat a discovery tool (fetch/extract/search) whose "
+    "result already appears in prior_observations, and do not re-fetch a URL "
+    "that prior_observations already observed. "
+    "A duplicate_tool_call observation means you just re-issued an identical "
+    "tool call that already succeeded: that result is already in observations. "
+    "Move to the next distinct action (extract, match, tailor, plan, verify, or "
+    "complete) instead of repeating the same call."
 )
 
 
@@ -75,10 +87,14 @@ class ExecutorAgent:
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
         deadline: float | None = None,
+        prior_observations: list[ToolObservation] | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
         tool_context = context
+        last_tool_name: str | None = None
+        last_tool_input: dict[str, Any] | None = None
+        last_tool_succeeded = False
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return ExecutorResult(
@@ -120,6 +136,11 @@ class ExecutorAgent:
                         _observation_for_decision(observation)
                         for observation in observations
                     ],
+                    "prior_observations": [
+                        _observation_for_decision(observation)
+                        for observation in (prior_observations or [])
+                    ],
+                    "verifier_feedback": task.context.get("verifier_feedback", []),
                 },
                 response_model=ExecutorDecision,
             )
@@ -143,6 +164,19 @@ class ExecutorAgent:
                         )
                     )
                     continue
+                if (
+                    last_tool_succeeded
+                    and decision.tool_name == last_tool_name
+                    and decision.tool_input == last_tool_input
+                ):
+                    observations.append(
+                        ToolObservation(
+                            tool_name=decision.tool_name or "",
+                            status="failed",
+                            error_code="duplicate_tool_call",
+                        )
+                    )
+                    continue
                 if tool_budget is not None and not tool_budget.try_consume():
                     return ExecutorResult(
                         status="failed",
@@ -159,6 +193,9 @@ class ExecutorAgent:
                 )
                 observations.append(observation)
                 tool_context = _with_observed_page(tool_context, observation)
+                last_tool_name = decision.tool_name
+                last_tool_input = decision.tool_input
+                last_tool_succeeded = observation.status == "succeeded"
                 continue
             if decision.action == "complete":
                 return ExecutorResult(

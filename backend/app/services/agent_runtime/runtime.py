@@ -310,6 +310,7 @@ class AgentRuntime:
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
                     deadline=deadline,
+                    prior_observations=prior_observations,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
@@ -422,7 +423,9 @@ class AgentRuntime:
                     prior_artifact_refs = execution.artifact_refs
                     retry_context = dict(execution_task.context)
                     feedback = list(retry_context.get("verifier_feedback", []))
-                    if verification.feedback:
+                    # VerifierResult schema rejects non-PASS decisions without
+                    # non-empty feedback, so the False branch here is unreachable.
+                    if verification.feedback:  # pragma: no cover
                         feedback.append(verification.feedback)
                     retry_context["verifier_feedback"] = feedback
                     execution_task = execution_task.model_copy(

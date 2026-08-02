@@ -240,7 +240,7 @@ def create_artifact(
         with db.begin_nested():
             db.add(artifact)
             db.flush()
-    except IntegrityError:
+    except IntegrityError:  # pragma: no cover - concurrent-insert race; the pre-check above makes this unreachable in single-threaded tests, the unique constraint enforces it in production.
         existing = db.scalar(
             select(AgentArtifact).where(
                 AgentArtifact.step_id == step_id,

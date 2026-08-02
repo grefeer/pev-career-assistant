@@ -31,10 +31,13 @@ _LOCATION_PATTERNS: list[re.Pattern] = [
     re.compile(r"(?:工作地点|工作地址|上班地点|工作城市|地点|location|work location)\s*[:：]?\s*(.+?)(?:\n|$)", re.IGNORECASE),
 ]
 
-_RECRUITMENT_TYPE_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(?:实习|intern|实习生)", re.IGNORECASE),
-    re.compile(r"(?:校招|校园|应届|campus|graduate)", re.IGNORECASE),
-    re.compile(r"(?:社招|社会|全职|full.?time)", re.IGNORECASE),
+# Each rule pairs a detection regex with the single normalized type it maps to.
+# A type is appended at most once, so the ``type_name not in types`` guard is the
+# only branch in ``_detect_recruitment_types`` and both its arms are reachable.
+_RECRUITMENT_TYPE_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"(?:实习|intern|实习生)", re.IGNORECASE), "internship"),
+    (re.compile(r"(?:校招|校园|应届|campus|graduate)", re.IGNORECASE), "campus_recruitment"),
+    (re.compile(r"(?:社招|社会|全职|full.?time)", re.IGNORECASE), "full_time"),
 ]
 
 _APPLY_METHOD_PATTERNS: list[re.Pattern] = [
@@ -79,7 +82,10 @@ def _split_multi_job_page(text: str) -> list[str]:
             result = []
             if before:
                 result.append(before)
-            if after:
+            # ``after`` always begins at the matched ``\n`` and therefore always
+            # contains the separator marker (e.g. ``岗位二：``), so its falsy
+            # arm is unreachable.
+            if after:  # pragma: no cover
                 result.append(after)
             return result[:2]
 
@@ -181,18 +187,9 @@ def _extract_locations(text: str) -> list[str]:
 def _detect_recruitment_types(text: str) -> list[str]:
     """Detect recruitment type keywords in text."""
     types: list[str] = []
-    for pattern in _RECRUITMENT_TYPE_PATTERNS:
-        if pattern.search(text):
-            type_str = pattern.pattern
-            if "实习" in type_str or "intern" in type_str:
-                if "internship" not in types:
-                    types.append("internship")
-            elif "校招" in type_str or "campus" in type_str or "graduate" in type_str:
-                if "campus_recruitment" not in types:
-                    types.append("campus_recruitment")
-            elif "社招" in type_str or "full.?time" in type_str:
-                if "full_time" not in types:
-                    types.append("full_time")
+    for pattern, type_name in _RECRUITMENT_TYPE_RULES:
+        if pattern.search(text) and type_name not in types:
+            types.append(type_name)
     return types
 
 
@@ -290,7 +287,9 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
     seen_dedup_keys: set[str] = set()
 
     for segment in segments:
-        if len(results) >= 10:
+        # Unreachable: _split_multi_job_page returns at most 2 segments, so
+        # the 10-candidate cap can never trigger. Retained as a hard guard.
+        if len(results) >= 10:  # pragma: no cover
             break
 
         title, title_conf = _extract_title(segment)
@@ -376,7 +375,12 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
         results.append(candidate)
 
     # ── If still no results, try whole-text extraction ──
-    if not results:
+    # Unreachable: the loop above always appends at least one candidate for
+    # non-empty text (the first segment is never a dedup hit, and
+    # _split_multi_job_page returns >=1 segment for non-empty input). The
+    # empty-text case returns early at line ~284. Retained as a last-resort
+    # guard; _extract_from_unstructured_text is exercised directly in tests.
+    if not results:  # pragma: no cover
         result = _extract_from_unstructured_text(page_text, url)
         if result:
             results.append(result)
@@ -489,7 +493,9 @@ def _extract_from_unstructured_text(text: str, url: str) -> NormalizedJobCandida
         first_line = text.split("\n")[0].strip()
         if "丨" in first_line:
             parts = first_line.split("丨")
-            if parts:
+            # ``split`` on a string known to contain ``丨`` always yields a
+            # non-empty list, so the falsy arm here is unreachable.
+            if parts:  # pragma: no cover
                 company = parts[0].strip()[:60]
 
     recruitment_types = _detect_recruitment_types(text)

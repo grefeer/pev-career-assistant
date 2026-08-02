@@ -132,4 +132,75 @@ describe("agent runtime API", () => {
       sequence: 3, event_type: "plan_created", payload: { revision: 1 }, created_at: "2026-08-02T00:00:00Z",
     }])
   })
+
+  it("sends an empty context when no source hints are supplied", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: "run-1", status: "queued", summary: null, error_code: null }), {
+        status: 201, headers: { "Content-Type": "application/json" },
+      }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await createAgentRun("t", { goal: "找岗位", allowed_skills: ["job-discovery"] })
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      goal: "找岗位", allowed_skills: ["job-discovery"], context: {},
+    })
+  })
+
+  it("ignores SSE blocks without a data line", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response("event: ping\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+    ))
+    const received: unknown[] = []
+    await streamAgentRunEvents("t", "run-1", 0, undefined, (e) => received.push(e))
+    expect(received).toEqual([])
+  })
+
+  it("ignores SSE blocks whose data is not a JSON object", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response("data: 123\n\ndata: null\n\ndata: [1,2]\n\n", {
+        status: 200, headers: { "Content-Type": "text/event-stream" },
+      }),
+    ))
+    const received: unknown[] = []
+    await streamAgentRunEvents("t", "run-1", 0, undefined, (e) => received.push(e))
+    expect(received).toEqual([])
+  })
+
+  it("ignores SSE blocks whose payload misses required event fields", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response('data: {"foo":"bar"}\n\n', {
+        status: 200, headers: { "Content-Type": "text/event-stream" },
+      }),
+    ))
+    const received: unknown[] = []
+    await streamAgentRunEvents("t", "run-1", 0, undefined, (e) => received.push(e))
+    expect(received).toEqual([])
+  })
+
+  it("ignores SSE blocks whose data line is not parseable JSON", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response("data: {not-json\n\ndata: also-broken\n\n", {
+        status: 200, headers: { "Content-Type": "text/event-stream" },
+      }),
+    ))
+    const received: unknown[] = []
+    await streamAgentRunEvents("t", "run-1", 0, undefined, (e) => received.push(e))
+    expect(received).toEqual([])
+  })
+
+  it("raises an API error when the event stream responds non-OK", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("", { status: 503 })))
+    await expect(
+      streamAgentRunEvents("t", "run-1", 0, undefined, () => {}),
+    ).rejects.toMatchObject({ status: 503 })
+  })
+
+  it("raises when the event stream has no readable body", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 200 })))
+    await expect(
+      streamAgentRunEvents("t", "run-1", 0, undefined, () => {}),
+    ).rejects.toThrow("事件流不可用")
+  })
 })

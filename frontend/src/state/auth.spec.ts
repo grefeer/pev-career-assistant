@@ -60,4 +60,11 @@ describe("auth state", () => {
     api.register.mockResolvedValue({ ok: false });
     await expect(auth.register("b", "B", "p")).rejects.toThrow("注册失败");
   });
+
+  it("uses a default error message when a login response omits one", async () => {
+    const { useAuth } = await import("./auth");
+    const auth = useAuth();
+    api.login.mockResolvedValue({ ok: false });
+    await expect(auth.login("a", "p")).rejects.toThrow("登录失败");
+  });
 });

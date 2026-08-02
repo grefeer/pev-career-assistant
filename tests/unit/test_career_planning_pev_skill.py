@@ -116,3 +116,38 @@ def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence()
             incomplete_context,
             BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=["Python"]),
         )
+
+
+def test_preparation_plan_emits_no_actions_when_no_focus_keyword_is_in_the_jd() -> None:
+    """Topics absent from the public JD are dropped, leaving an empty plan."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "jd",
+            "source_url": "https://jobs.example",
+            "content_hash": "a" * 64,
+            "visible_text": "岗位要求 Python 与 RAG 工程化能力。",
+        }]},
+    )
+
+    result = build_preparation_plan(
+        context,
+        BuildPreparationPlanInput(
+            target_artifact_id="jd",
+            focus_keywords=["Kubernetes", "Spark"],
+        ),
+    )
+
+    assert result.jd_topics == []
+    assert result.actions == []
+    assert result.plan_items == []
+    assert result.schedule_assumption.startswith("未提供目标日期")
+
+
+def test_find_target_skips_non_matching_evidence_items_before_returning_a_match() -> None:
+    """A non-matching dict item is skipped (loop continues) before the match is found."""
+    other = {"artifact_id": "other", "source_url": "https://jobs.example/other"}
+    target = {"artifact_id": "jd", "source_url": "https://jobs.example"}
+    assert _find_target([other, target], "jd") is target
+    assert _find_target([other], "jd") is None

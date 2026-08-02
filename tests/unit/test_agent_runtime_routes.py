@@ -409,6 +409,20 @@ def test_serializers_drop_malformed_plan_values_and_default_missing_enums() -> N
     assert run.complexity is None
 
 
+def test_to_plan_response_skips_steps_when_payload_steps_is_not_a_list() -> None:
+    """A non-list ``steps`` value skips the projection loop (71->98)."""
+    projected = routes_module._to_plan_response(
+        SimpleNamespace(
+            id="plan-1",
+            revision=1,
+            complexity=None,
+            plan_json={"steps": "not-a-list"},
+            created_at=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        )
+    )
+    assert projected.steps == []
+
+
 def test_create_run_reports_unavailable_model_gateway() -> None:
     service = MagicMock()
     service.queue_run.side_effect = AgentRuntimeUnavailableError("agent_harness_unavailable")

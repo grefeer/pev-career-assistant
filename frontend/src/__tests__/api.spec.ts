@@ -55,6 +55,33 @@ describe("shared API client", () => {
     });
   });
 
+  it("falls back to the generic message when a JSON object error omits detail and message", async () => {
+    // ``body.detail ?? body.message ?? null`` resolves to ``null`` (covers the
+    // ``?? null`` arm), so neither the string nor structured-detail branches fire.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ unrelated: "field" }), { status: 418 }),
+    ));
+
+    await expect(request("/failing")).rejects.toMatchObject<ApiError>({
+      status: 418,
+      detail: null,
+      message: "请求失败：418",
+    });
+  });
+
+  it("falls back to the generic message when an error body is non-object JSON", async () => {
+    // A JSON string body is not an object -> the object-detail block is skipped.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify("plain string body"), { status: 599 }),
+    ));
+
+    await expect(request("/failing")).rejects.toMatchObject<ApiError>({
+      status: 599,
+      detail: null,
+      message: "请求失败：599",
+    });
+  });
+
   it("uses the three auth endpoint contracts", async () => {
     const fetchMock = vi.fn().mockImplementation(() => new Response(JSON.stringify({ ok: true })));
     vi.stubGlobal("fetch", fetchMock);

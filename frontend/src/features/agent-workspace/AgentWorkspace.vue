@@ -112,7 +112,7 @@ async function selectRun(runId: string): Promise<void> {
     events.value = eventResponse.items
     plans.value = planResponse.items
     artifacts.value = artifactResponse.items
-    startEventStream(runId, events.value.at(-1)?.sequence ?? 0)
+    startEventStream(runId, events.value[events.value.length - 1]?.sequence ?? 0)
   } catch (error: unknown) {
     errorMessage.value = userFacingError(error)
   } finally {
@@ -293,6 +293,12 @@ function preparationPlanItems(artifact: AgentArtifactResponse): PreparationPlanI
 function formatDate(value: string): string {
   return new Date(value).toLocaleString("zh-CN", { dateStyle: "medium", timeStyle: "short" })
 }
+
+// Exposed for direct state-verification in tests: several entry guards below
+// (e.g. token cleared mid-flight, recover with no active run) protect against
+// states the UI itself prevents, so they are exercised through the instance
+// rather than through DOM interaction.
+defineExpose({ selectRun, startEventStream, recoverActiveRun })
 </script>
 
 <template>

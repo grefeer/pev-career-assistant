@@ -28,6 +28,7 @@ env/
 .ruff_cache/
 .coverage
 .coverage.*
+.coverage-report.json
 coverage.xml
 htmlcov/
 .npm-cache/
