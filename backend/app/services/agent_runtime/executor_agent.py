@@ -131,6 +131,18 @@ class ExecutorAgent:
                     ),
                 )
             if decision.action == "call_tool":
+                if (
+                    decision.tool_name == "search-public-job-pages"
+                    and _has_candidate_urls(task)
+                ):
+                    observations.append(
+                        ToolObservation(
+                            tool_name=decision.tool_name,
+                            status="failed",
+                            error_code="candidate_urls_already_supplied",
+                        )
+                    )
+                    continue
                 if tool_budget is not None and not tool_budget.try_consume():
                     return ExecutorResult(
                         status="failed",
@@ -227,6 +239,14 @@ def _observation_for_decision(observation: ToolObservation) -> dict[str, object]
         ]
     payload["output"] = projected
     return payload
+
+
+def _has_candidate_urls(task: AgentTaskRequest) -> bool:
+    """Avoid redundant public search when the user already bounded the evidence set."""
+    candidate_urls = task.context.get("candidate_urls")
+    return isinstance(candidate_urls, list) and any(
+        isinstance(url, str) and url.strip() for url in candidate_urls
+    )
 
 
 def _page_for_decision(page: dict[str, object]) -> dict[str, object]:

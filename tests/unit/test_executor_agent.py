@@ -254,6 +254,31 @@ def test_executor_projects_batch_details_to_identifiers_and_titles_only() -> Non
     }]
 
 
+def test_executor_keeps_agent_in_control_after_blocking_redundant_search() -> None:
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "search-public-job-pages", "tool_input": {"url": "unused"}},
+        {"action": "complete", "summary": "改用已提供的候选页面"},
+    ])
+    task = AgentTaskRequest(
+        goal="处理候选 JD", allowed_skills=["job-discovery"],
+        context={"candidate_urls": ["https://jobs.example/agent"]},
+    )
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["处理候选 JD"],
+        steps=[PlanStep(step_id="discover", objective="处理候选", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "succeeded"
+    assert result.observations[0].error_code == "candidate_urls_already_supplied"
+    assert gateway.states[1]["observations"][0]["error_code"] == "candidate_urls_already_supplied"
+
+
 def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
     task = AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"])
     plan = ExecutionPlan(
