@@ -9,14 +9,27 @@ import pytest
 from sqlalchemy import select
 
 from backend.app.db.models import AgentArtifact, AgentPlan, AgentRun, AgentStep, AgentTurn, User, UserRole
-from backend.app.domain.agent_runtime import AgentRole, RunStatus
+from backend.app.domain.agent_runtime import (
+    AgentRole,
+    ComplexityLevel,
+    RunStatus,
+)
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.runtime import AgentRuntime
-from backend.app.services.agent_runtime.schemas import AgentTaskRequest
+from backend.app.services.agent_runtime.schemas import (
+    AgentBudget,
+    AgentTaskRequest,
+    ExecutionPlan,
+    PlanStep,
+    PlannerResult,
+)
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
 
@@ -114,6 +127,69 @@ class CrashAfterFirstExecutorDecisionGateway:
                 })
             raise RuntimeError("simulated_process_loss")
         raise AssertionError("Verifier should not run for an L2 step")
+
+
+def _runtime_for_gateway(gateway: object) -> AgentRuntime:
+    registry = ToolRegistry()
+    return AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+
+def _create_running_step(
+    db_session,
+    user: User,
+    *,
+    requires_verification: bool,
+    budget: AgentBudget | None = None,
+):
+    task = AgentTaskRequest(
+        goal="验证运行时失败分支",
+        allowed_skills=["job-discovery"],
+        budget=budget or AgentBudget(max_agent_turns=4, max_tool_calls=4, max_replans=0),
+    )
+    plan_step = PlanStep(
+        step_id="discover",
+        objective="提取公开岗位",
+        allowed_skills=["job-discovery"],
+        requires_verification=requires_verification,
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L3 if requires_verification else ComplexityLevel.L2,
+        success_criteria=["有证据"],
+        steps=[plan_step],
+    )
+    run = run_repository.create_run(
+        db_session,
+        user_id=user.id,
+        goal=task.goal,
+        allowed_skills=task.allowed_skills,
+        context_summary={},
+        budget_json=task.budget.model_dump(mode="json"),
+        agent_version="pev-test",
+    )
+    run_repository.start_run(db_session, run)
+    stored_plan = run_repository.create_plan(
+        db_session,
+        run_id=run.id,
+        revision=1,
+        complexity=plan.complexity,
+        plan_json=plan.model_dump(mode="json"),
+    )
+    step = run_repository.create_step(
+        db_session,
+        run_id=run.id,
+        plan_id=stored_plan.id,
+        sequence=1,
+        objective=plan_step.objective,
+        allowed_skills=plan_step.allowed_skills,
+    )
+    return run, task, plan, plan_step, step
 
 
 def test_runtime_persists_planner_executor_verifier_success_trace(db_session) -> None:
@@ -288,6 +364,202 @@ def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(d
     assert "run_recovery_started" in [
         event.event_type for event in run_repository.list_events(db_session, interrupted.id)
     ]
+
+
+def test_runtime_rejects_resume_or_recovery_for_missing_or_wrong_state_runs(db_session) -> None:
+    runtime = object.__new__(AgentRuntime)
+    task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+    with pytest.raises(ValueError, match="not_found"):
+        runtime.resume(db_session, user_id="none", run_id="missing", task=task)
+    with pytest.raises(ValueError, match="not_found"):
+        runtime.recover(db_session, user_id="none", run_id="missing", task=task)
+
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    with pytest.raises(ValueError, match="not_waiting_user"):
+        runtime.resume(db_session, user_id=user.id, run_id=run.id, task=task)
+    with pytest.raises(ValueError, match="not_running"):
+        runtime.recover(db_session, user_id=user.id, run_id=run.id, task=task)
+
+
+def test_runtime_handles_executor_and_verifier_provider_errors_without_leaving_run_open(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    result = _runtime_for_gateway(FailingGateway())._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+    assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
+
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=True
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.verifier: [],
+    })
+    runtime = _runtime_for_gateway(gateway)
+    runtime._verifier = VerifierAgent(gateway=FailingGateway(), tools=ToolRegistry())
+    result = runtime._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+    assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
+
+
+def test_runtime_persists_an_executor_input_request_as_waiting_for_user(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "need_user", "user_question": "请确认城市"}],
+        AgentRole.verifier: [],
+    })
+
+    result = _runtime_for_gateway(gateway)._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    assert step.error_code == "need_user"
+
+
+@pytest.mark.parametrize(
+    ("verdict", "feedback", "expected_status", "expected_error"),
+    [
+        ("RETRY_EXECUTOR", "补充来源", RunStatus.failed, "executor_retry_budget_exhausted"),
+        ("NEED_USER", "请确认城市", RunStatus.waiting_user, None),
+    ],
+)
+def test_runtime_routes_verifier_nonpass_outcomes_to_safe_terminal_state(
+    db_session, verdict: str, feedback: str, expected_status: RunStatus, expected_error: str | None
+) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=True
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.verifier: [{
+            "action": "decide", "verification_decision": verdict, "feedback": feedback,
+        }],
+    })
+    result = _runtime_for_gateway(gateway)._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+    assert result.status is expected_status
+    assert result.error_code == expected_error
+
+
+def test_runtime_private_terminal_helpers_reject_disappeared_runs_and_persist_waiting_state(db_session) -> None:
+    runtime = object.__new__(AgentRuntime)
+    with pytest.raises(RuntimeError, match="disappeared"):
+        runtime._fail_run(db_session, "missing", "failed")
+    with pytest.raises(RuntimeError, match="disappeared"):
+        runtime._wait_for_user(db_session, "missing", None, "请确认")
+
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    waiting = runtime._wait_for_user(db_session, run.id, step, "请确认城市")
+    assert waiting.status is RunStatus.waiting_user
+    assert step.error_code == "need_user"
+
+
+def test_runtime_marks_failed_planner_outcome_as_a_safe_failed_run(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    runtime = object.__new__(AgentRuntime)
+    result = runtime._finish_planner_non_plan(
+        db_session, run.id, run, PlannerResult(status="failed", error_code="planner_failed")
+    )
+    assert (result.status, result.error_code) == (RunStatus.failed, "planner_failed")
+
+
+def test_runtime_fails_safely_when_verifier_replan_budget_is_exhausted(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L3", "success_criteria": ["有证据"],
+            "steps": [{
+                "step_id": "discover", "objective": "提取公开 JD",
+                "allowed_skills": ["job-discovery"], "requires_verification": True,
+            }],
+        }],
+        AgentRole.executor: [{"action": "complete", "summary": "已提取"}],
+        AgentRole.verifier: [{
+            "action": "decide", "verification_decision": "REPLAN", "feedback": "目标不完整",
+        }],
+    })
+
+    result = _runtime_for_gateway(gateway).run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找岗位",
+            allowed_skills=["job-discovery"],
+            budget=AgentBudget(max_agent_turns=4, max_tool_calls=4, max_replans=0),
+        ),
+    )
+
+    assert (result.status, result.error_code) == (
+        RunStatus.failed,
+        "replan_budget_exhausted",
+    )
 
 
 def test_runtime_persists_resume_tailoring_as_a_reviewable_skill_artifact(db_session) -> None:
@@ -755,6 +1027,31 @@ def test_runtime_supplies_observed_public_evidence_to_the_next_planned_step(db_s
         "title": "AI Agent 开发工程师",
         "visible_text": "负责 Agent 平台、RAG 与工具调用。",
     }]
+
+
+def test_runtime_bounds_public_evidence_context_to_the_configured_character_limit(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    run_repository.create_evidence_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        source_url="https://jobs.example/large",
+        content_hash="d" * 64,
+        content_json={"visible_text": "x" * 48_001},
+    )
+
+    projected = AgentRuntime._with_observed_public_evidence(db_session, task, run.id)
+
+    evidence = projected.context["observed_public_evidence"]
+    assert evidence[0]["visible_text"] == "x" * 48_000
 
 
 def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session) -> None:

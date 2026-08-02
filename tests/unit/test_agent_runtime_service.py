@@ -234,6 +234,10 @@ def test_service_fails_closed_when_enabled_but_runtime_is_unavailable(db_session
         service.create_run(
             db_session, user_id="user-a", task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
         )
+    with pytest.raises(AgentRuntimeUnavailableError):
+        service.resume_run(db_session, user_id="user-a", run_id="run-a", user_response="北京")
+    with pytest.raises(AgentRuntimeUnavailableError):
+        service.recover_run(db_session, user_id="user-a", run_id="run-a")
 
 
 def test_service_resume_and_recovery_enforce_lifecycle_and_nonempty_reply(db_session) -> None:

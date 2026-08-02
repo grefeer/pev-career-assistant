@@ -34,7 +34,7 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     monkeypatch.setattr(
         "backend.app.services.career_skills.job_discovery.requests.get",
         lambda *args, **kwargs: SimpleNamespace(
-            text="<html><title>AI Agent 开发工程师</title><body><h1>AI Agent 开发工程师</h1><p>职责：构建智能体。</p></body></html>",
+            text="<html><title>AI Agent 开发工程师</title><body><script>secret</script><style>.x{}</style><h1>AI Agent 开发工程师</h1><p>职责：构建智能体。</p></body></html>",
             encoding="utf-8",
             apparent_encoding="utf-8",
             raise_for_status=lambda: None,
@@ -138,7 +138,10 @@ def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job
         ),
         SimpleNamespace(
             text="""
-            <html><body><a data-mdurl="https://careers.example/jobs/agent">AI Agent 开发工程师招聘</a></body></html>
+            <html><body>
+              <a data-mdurl="https://careers.example/jobs/agent">AI Agent 开发工程师招聘</a>
+              <a data-mdurl="https://careers.example/jobs/second">第二个岗位</a>
+            </body></html>
             """, encoding="utf-8", apparent_encoding="utf-8",
             raise_for_status=lambda: None,
         ),
@@ -154,7 +157,7 @@ def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job
 
     result = search_public_job_pages(
         ToolContext(user_id="user-a", run_id="run-a"),
-        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=1),
     )
 
     assert result.source_url.startswith("https://www.so.com/s?")
@@ -241,6 +244,33 @@ def test_search_and_extraction_reject_missing_or_malformed_public_evidence(monke
         )
 
 
+def test_search_reports_a_fallback_provider_failure_without_fabricating_results(monkeypatch) -> None:
+    import requests
+
+    responses = iter([
+        SimpleNamespace(
+            text="<html><body></body></html>", encoding="utf-8",
+            apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+        requests.RequestException("360 down"),
+    ])
+
+    def request_or_raise(*_args, **_kwargs):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", request_or_raise
+    )
+
+    with pytest.raises(PublicJobFetchError, match="public_search_failed"):
+        search_public_job_pages(
+            ToolContext(user_id="u", run_id="r"), SearchPublicJobPagesInput(query="AI Agent")
+        )
+
+
 def test_job_discovery_helpers_only_accept_safe_bing_urls_and_known_recruitment_paths(monkeypatch) -> None:
     with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
         _assert_public_url("ftp://jobs.example/file")
@@ -257,6 +287,7 @@ def test_job_discovery_helpers_only_accept_safe_bing_urls_and_known_recruitment_
     assert _infer_recruitment_types("https://talent.example/INTERN/1", ["fallback"]) == ["internship"]
     assert _infer_recruitment_types("https://talent.example/other", ["fallback"]) == ["fallback"]
     assert _extract_jd_section("没有标签", labels=("岗位职责",)) == ""
+    assert _direct_bing_result_url("https://www.bing.com/ck/a?u=a1ZnRwOi8vZXhhbXBsZS5jb20=") is None
 
 
 def test_job_discovery_helper_fallbacks_do_not_infer_missing_header_values() -> None:
@@ -271,6 +302,7 @@ def test_job_discovery_helper_fallbacks_do_not_infer_missing_header_values() -> 
 
 def test_search_skips_redirects_and_unsafe_results_and_honors_result_limit(monkeypatch) -> None:
     html = """
+    <li class='b_algo'><h2><a href='https://careers.example/jobs/empty'>   </a></h2></li>
     <li class='b_algo'><h2><a href='https://www.bing.com/not-a-redirect'>ignored</a></h2></li>
     <li class='b_algo'><h2><a href='https://unsafe.example/jobs/agent'>unsafe job</a></h2></li>
     <li class='b_algo'><h2><a href='https://careers.example/jobs/agent'>safe job</a></h2></li>

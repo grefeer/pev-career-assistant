@@ -80,6 +80,20 @@ class InvalidStructuredThenJsonModel:
         return type("RawResponse", (), {"content": '{"action":"need_user","user_question":"请确认城市。"}'})()
 
 
+class InvalidStructuredThenFailureModel:
+    """A malformed structured result must preserve a subsequent provider outage."""
+
+    def with_structured_output(self, _schema: type[BaseModel]) -> "InvalidStructuredThenFailureModel":
+        self.structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        if getattr(self, "structured", False):
+            self.structured = False
+            return {"action": "not-valid"}
+        raise RuntimeError("ordinary JSON retry is down")
+
+
 def test_gateway_converts_provider_structured_result_into_requested_agent_decision() -> None:
     """A provider response must be parsed before it can drive a real Agent loop."""
     model = RecordingModel(
@@ -124,6 +138,16 @@ def test_gateway_retries_one_invalid_structured_response_with_local_json_validat
     )
 
     assert result.action == "need_user"
+
+
+def test_gateway_preserves_provider_failure_after_an_invalid_structured_result() -> None:
+    with pytest.raises(AgentModelGatewayError, match="model_request_failed"):
+        LangChainModelGateway(InvalidStructuredThenFailureModel()).decide(
+            role=AgentRole.planner,
+            instruction="形成计划",
+            state={"goal": "找岗位"},
+            response_model=PlannerDecision,
+        )
 
 
 def test_gateway_falls_back_to_locally_validated_json_when_provider_rejects_response_format() -> None:
