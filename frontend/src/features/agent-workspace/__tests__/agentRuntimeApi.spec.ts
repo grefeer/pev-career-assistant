@@ -9,6 +9,7 @@ import {
   fetchAgentRuns,
   recoverAgentRun,
   resumeAgentRun,
+  streamAgentRunEvents,
 } from "../agentRuntimeApi"
 
 describe("agent runtime API", () => {
@@ -111,5 +112,24 @@ describe("agent runtime API", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run-1/recover")
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({})
+  })
+
+  it("consumes the authenticated durable SSE stream from its last event cursor", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        'id: 3\nevent: plan_created\ndata: {"sequence":3,"event_type":"plan_created","payload":{"revision":1},"created_at":"2026-08-02T00:00:00Z"}\n\n',
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      ),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+    const received: unknown[] = []
+
+    await streamAgentRunEvents("student-token", "run/1", 2, undefined, (event) => received.push(event))
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run%2F1/events/stream?after_sequence=2")
+    expect(new Headers(fetchMock.mock.calls[0][1].headers).get("Authorization")).toBe("Bearer student-token")
+    expect(received).toEqual([{
+      sequence: 3, event_type: "plan_created", payload: { revision: 1 }, created_at: "2026-08-02T00:00:00Z",
+    }])
   })
 })

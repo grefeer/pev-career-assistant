@@ -49,4 +49,15 @@ describe("auth state", () => {
     auth.logout();
     expect(auth.user.value).toBeNull();
   });
+
+  it("uses default errors for incomplete registration and supports an empty bootstrap", async () => {
+    const { useAuth } = await import("./auth");
+    const auth = useAuth();
+    await auth.bootstrap();
+    expect(auth.token.value).toBeNull();
+    expect(auth.loading.value).toBe(false);
+
+    api.register.mockResolvedValue({ ok: false });
+    await expect(auth.register("b", "B", "p")).rejects.toThrow("注册失败");
+  });
 });

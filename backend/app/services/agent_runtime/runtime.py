@@ -79,6 +79,7 @@ class AgentRuntime:
                 budget_json=task.budget.model_dump(mode="json"),
                 agent_version=self._agent_version,
             )
+        if run.status is RunStatus.queued:
             run_repository.start_run(db, run)
             run_repository.append_event(
                 db,
@@ -217,6 +218,20 @@ class AgentRuntime:
                 payload_json={"summary": final_summary},
             )
             return AgentRunResult(run.id, RunStatus.succeeded, final_summary)
+
+    def create_queued_run(
+        self, db: Session, *, user_id: str, task: AgentTaskRequest
+    ) -> AgentRun:
+        """Persist a run before scheduling it, so SSE has a durable target immediately."""
+        return run_repository.create_run(
+            db,
+            user_id=user_id,
+            goal=task.goal,
+            allowed_skills=task.allowed_skills,
+            context_summary=task.context,
+            budget_json=task.budget.model_dump(mode="json"),
+            agent_version=self._agent_version,
+        )
 
     def resume(
         self,

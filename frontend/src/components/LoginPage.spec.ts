@@ -44,4 +44,24 @@ describe("login page", () => {
     await flushPromises();
     expect(wrapper.text()).toContain("账号已存在");
   });
+
+  it("registers successfully and falls back to a safe message for non-Error failures", async () => {
+    auth.register.mockResolvedValue(undefined);
+    const wrapper = mount(LoginPage);
+    await wrapper.findAll("button")[1].trigger("click");
+    const inputs = wrapper.findAll("input");
+    await inputs[0].setValue("student");
+    await inputs[1].setValue("Student");
+    await inputs[2].setValue("secret");
+    await wrapper.get(".primary-button").trigger("click");
+    await flushPromises();
+    expect(auth.register).toHaveBeenCalledWith("student", "Student", "secret");
+    expect(wrapper.text()).toContain("注册成功");
+
+    auth.login.mockRejectedValue({});
+    await wrapper.findAll("button")[0].trigger("click");
+    await wrapper.get(".primary-button").trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("认证失败");
+  });
 });

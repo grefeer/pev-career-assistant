@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from backend.app.api.agent_runtime_schemas import (
@@ -109,6 +112,34 @@ def _to_plan_response(plan) -> AgentPlanResponse:
     )
 
 
+def _sse_event(event) -> str:
+    """Serialize an already owner-filtered durable event as one SSE message."""
+    event_type = "".join(
+        character for character in event.event_type if character.isalnum() or character in "_-"
+    ) or "agent_event"
+    payload = json.dumps(
+        {
+            "sequence": event.sequence,
+            "event_type": event.event_type,
+            "payload": event.payload_json,
+            "created_at": event.created_at.isoformat(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return f"id: {event.sequence}\nevent: {event_type}\ndata: {payload}\n\n"
+
+
+def _effective_event_cursor(after_sequence: int, last_event_id: str | None) -> int:
+    """Prefer the durable SSE reconnect cursor when it is a valid sequence number."""
+    if last_event_id is None:
+        return after_sequence
+    try:
+        return max(after_sequence, int(last_event_id))
+    except ValueError:
+        return after_sequence
+
+
 @router.get("", response_model=AgentRunListResponse)
 def list_agent_runs(
     db: Annotated[Session, Depends(_get_db)],
@@ -128,6 +159,7 @@ def create_agent_run(
     current_user: Annotated[User, Depends(get_current_user)],
     service: Annotated[AgentRunService, Depends(get_agent_run_service)],
     request: Request,
+    background_tasks: BackgroundTasks,
 ) -> AgentRunCreatedResponse:
     """Start one bounded PEV run with server-enforced resource ceilings."""
     settings = request.app.state.settings
@@ -138,7 +170,7 @@ def create_agent_run(
         budget=build_adaptive_agent_budget(settings, request_body.allowed_skills),
     )
     try:
-        result = service.create_run(db, user_id=current_user.id, task=task)
+        result = service.queue_run(db, user_id=current_user.id, task=task)
     except AgentRuntimeDisabledError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -150,6 +182,12 @@ def create_agent_run(
             detail={"code": "agent_harness_unavailable"},
         ) from None
     db.commit()
+    background_tasks.add_task(
+        service.execute_queued_run,
+        request.app.state.session_factory,
+        user_id=current_user.id,
+        run_id=result.run_id,
+    )
     return AgentRunCreatedResponse(
         id=result.run_id,
         status=result.status.value,
@@ -235,6 +273,60 @@ def recover_agent_run(
         status=result.status.value,
         summary=result.summary,
         error_code=result.error_code,
+    )
+
+
+@router.get("/{run_id}/events/stream")
+def stream_agent_events(
+    run_id: str,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+    after_sequence: Annotated[int, Query(ge=0)] = 0,
+    follow: bool = True,
+    last_event_id: Annotated[str | None, Header()] = None,
+) -> StreamingResponse:
+    """Replay owner-safe durable progress events and optionally keep the SSE open.
+
+    MySQL remains authoritative: a reconnect starts from the last persisted event
+    sequence and can never rely on a transient browser-only cursor.  The compact
+    polling loop also works after Redis restart, while Redis remains free to be
+    used as a short-lived notification accelerator by deployment infrastructure.
+    """
+    cursor = _effective_event_cursor(after_sequence, last_event_id)
+    try:
+        initial_events = service.list_events(
+            db, user_id=current_user.id, run_id=run_id
+        )
+    except AgentRunNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
+
+    def event_stream():
+        nonlocal cursor, initial_events
+        while True:
+            events = initial_events
+            initial_events = None
+            if events is None:
+                try:
+                    events = service.list_events(
+                        db, user_id=current_user.id, run_id=run_id
+                    )
+                except AgentRunNotFoundError:
+                    return
+            for event in events:
+                if event.sequence <= cursor:
+                    continue
+                cursor = event.sequence
+                yield _sse_event(event)
+            if not follow:
+                return
+            yield ": keep-alive\n\n"
+            time.sleep(1)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

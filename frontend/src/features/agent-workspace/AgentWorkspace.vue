@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue"
+import { computed, onBeforeUnmount, onMounted, ref } from "vue"
 
 import { ApiError } from "../../api"
 import {
@@ -11,6 +11,7 @@ import {
   fetchAgentRuns,
   recoverAgentRun,
   resumeAgentRun,
+  streamAgentRunEvents,
 } from "./agentRuntimeApi"
 import type {
   AgentArtifactResponse,
@@ -44,6 +45,7 @@ const resuming = ref(false)
 const recovering = ref(false)
 const errorMessage = ref<string | null>(null)
 const userResponse = ref("")
+let eventStreamController: AbortController | null = null
 
 interface ResumeDiffPreview {
   section: string
@@ -66,6 +68,10 @@ const canSubmit = computed(() => Boolean(
 
 onMounted(async () => {
   await loadHistory()
+})
+
+onBeforeUnmount(() => {
+  eventStreamController?.abort()
 })
 
 function candidateUrls(): string[] {
@@ -106,11 +112,27 @@ async function selectRun(runId: string): Promise<void> {
     events.value = eventResponse.items
     plans.value = planResponse.items
     artifacts.value = artifactResponse.items
+    startEventStream(runId, events.value.at(-1)?.sequence ?? 0)
   } catch (error: unknown) {
     errorMessage.value = userFacingError(error)
   } finally {
     loadingRun.value = false
   }
+}
+
+function startEventStream(runId: string, afterSequence: number): void {
+  eventStreamController?.abort()
+  if (!props.token) return
+  const controller = new AbortController()
+  eventStreamController = controller
+  void streamAgentRunEvents(props.token, runId, afterSequence, controller.signal, (event) => {
+    if (activeRun.value?.id !== runId) return
+    events.value = [...events.value.filter((item) => item.sequence !== event.sequence), event]
+      .sort((left, right) => left.sequence - right.sequence)
+  }).catch((error: unknown) => {
+    if (controller.signal.aborted) return
+    errorMessage.value = userFacingError(error)
+  })
 }
 
 async function submit(): Promise<void> {

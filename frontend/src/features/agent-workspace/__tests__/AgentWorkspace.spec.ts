@@ -13,6 +13,7 @@ const api = vi.hoisted(() => ({
   recoverAgentRun: vi.fn(),
   fetchAgentRuns: vi.fn(),
   resumeAgentRun: vi.fn(),
+  streamAgentRunEvents: vi.fn(),
 }))
 vi.mock("../agentRuntimeApi", () => api)
 
@@ -43,6 +44,7 @@ beforeEach(() => {
   api.recoverAgentRun.mockResolvedValue({
     id: "run-1", status: "succeeded", summary: "恢复完成", error_code: null,
   })
+  api.streamAgentRunEvents.mockResolvedValue(undefined)
 })
 
 describe("AgentWorkspace", () => {
@@ -52,6 +54,23 @@ describe("AgentWorkspace", () => {
 
     expect(api.fetchAgentRuns).not.toHaveBeenCalled()
     expect(wrapper.text()).toContain("还没有任务")
+  })
+
+  it("requires both an authenticated token and at least one explicit Skill authority", async () => {
+    const signedOut = mount(AgentWorkspace)
+    await signedOut.get('textarea[name="goal"]').setValue("找岗位")
+    await signedOut.get("form").trigger("submit.prevent")
+    expect(api.createAgentRun).not.toHaveBeenCalled()
+
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+    await wrapper.get('textarea[name="goal"]').setValue("找岗位")
+    for (const checkbox of wrapper.findAll('input[type="checkbox"]')) {
+      await checkbox.setValue(false)
+    }
+    expect(wrapper.get(".composer-footer button").attributes("disabled")).toBeDefined()
+    await wrapper.get("form").trigger("submit.prevent")
+    expect(api.createAgentRun).not.toHaveBeenCalled()
   })
 
   it("surfaces history and run-detail loading failures without leaking technical context", async () => {
@@ -110,6 +129,23 @@ describe("AgentWorkspace", () => {
     expect(wrapper.text()).toContain("AI Agent 开发工程师")
     expect(wrapper.find('a[href="https://jobs.example/1"]').exists()).toBe(true)
     expect(wrapper.text()).not.toContain("private_context")
+  })
+
+  it("subscribes from the durable event cursor and renders live owner-safe progress", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.streamAgentRunEvents.mockImplementation(
+      (_token: string, _runId: string, _cursor: number, _signal: AbortSignal, onEvent: (event: unknown) => void) => {
+        onEvent({ sequence: 2, event_type: "plan_created", payload: { revision: 1 }, created_at: run.created_at })
+        return Promise.resolve()
+      },
+    )
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    expect(api.streamAgentRunEvents).toHaveBeenCalledWith(
+      "student-token", "run-1", 0, expect.any(AbortSignal), expect.any(Function),
+    )
+    expect(wrapper.text()).toContain("Planner 已生成计划")
   })
 
   it("renders the safe Planner step projection without task-private context", async () => {

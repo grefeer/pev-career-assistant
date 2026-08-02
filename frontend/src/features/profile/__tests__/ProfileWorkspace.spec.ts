@@ -160,6 +160,44 @@ describe("ProfileWorkspace", () => {
     expect(wrapper.text()).toContain("解析完成");
   });
 
+  it("keeps decision toggles local and reports an import failure", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.startResumeImport).mockRejectedValue(new Error("解析服务不可用"));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    const ignore = wrapper.findAll("button").find((button) => button.text() === "忽略")!;
+    await ignore.trigger("click");
+    expect(wrapper.get('[data-test="save-decisions"]').attributes("disabled")).toBeUndefined();
+    await ignore.trigger("click");
+    expect(wrapper.get('[data-test="save-decisions"]').attributes("disabled")).toBeDefined();
+    await wrapper.findAll("button").find((button) => button.text() === "解析")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("解析服务不可用");
+  });
+
+  it("reports a resume-asset synchronization failure", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.reconcileResumeAsset).mockRejectedValue(new Error("同步服务不可用"));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.findAll("button").find((button) => button.text() === "同步")!.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("同步服务不可用");
+  });
+
   it("requires persisted decisions for every candidate before creating a version", async () => {
     const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
     await flushPromises();
@@ -245,6 +283,19 @@ describe("ProfileWorkspace", () => {
     await wrapper.get('[data-test="create-version"]').trigger("click");
     await flushPromises();
     expect(wrapper.text()).toContain("档案已被其他操作更新，请重新检查差异。");
+  });
+
+  it("shows an ordinary confirmed-version failure", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [{ ...mockProfile.evidence[0], status: "confirmed" }],
+    });
+    vi.mocked(profileApi.createProfileVersion).mockRejectedValue(new Error("版本服务不可用"));
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    await wrapper.get('[data-test="create-version"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("版本服务不可用");
   });
 
   it("shows a profile loading error and upload error without leaving stale loading state", async () => {

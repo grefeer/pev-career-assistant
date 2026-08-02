@@ -1,4 +1,4 @@
-import { request } from "../../api"
+import { ApiError, request } from "../../api"
 import type {
   AgentArtifactListResponse,
   AgentEventListResponse,
@@ -7,6 +7,7 @@ import type {
   AgentRunListResponse,
   AgentRunResponse,
   CreateAgentRunPayload,
+  AgentEventResponse,
 } from "./agentRuntimeTypes"
 
 const BASE = "/agent-runs"
@@ -78,6 +79,65 @@ export function fetchAgentRunEvents(
     {},
     token,
   )
+}
+
+function parseSseEvent(block: string): AgentEventResponse | null {
+  const lines = block.split(/\r?\n/)
+  const data = lines.find((line) => line.startsWith("data: "))?.slice(6)
+  if (!data) return null
+  try {
+    const parsed: unknown = JSON.parse(data)
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+    const event = parsed as Record<string, unknown>
+    if (
+      typeof event.sequence !== "number"
+      || typeof event.event_type !== "string"
+      || !event.payload
+      || typeof event.payload !== "object"
+      || Array.isArray(event.payload)
+      || typeof event.created_at !== "string"
+    ) return null
+    return event as AgentEventResponse
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Consume an authenticated, replayable SSE response with an explicit durable
+ * cursor. Browser EventSource cannot send our Bearer token, so this uses fetch.
+ */
+export async function streamAgentRunEvents(
+  token: string,
+  runId: string,
+  afterSequence: number,
+  signal: AbortSignal | undefined,
+  onEvent: (event: AgentEventResponse) => void,
+): Promise<void> {
+  const response = await fetch(
+    `/api${BASE}/${encodeURIComponent(runId)}/events/stream?after_sequence=${afterSequence}`,
+    { headers: { Authorization: `Bearer ${token}` }, signal },
+  )
+  if (!response.ok) {
+    throw new ApiError(response.status, null, `请求失败：${response.status}`)
+  }
+  if (!response.body) {
+    throw new ApiError(response.status, null, "事件流不可用")
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  while (true) {
+    const { done, value } = await reader.read()
+    buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
+    const blocks = buffer.split(/\r?\n\r?\n/)
+    buffer = blocks.pop() ?? ""
+    for (const block of blocks) {
+      const event = parseSseEvent(block)
+      if (event) onEvent(event)
+    }
+    if (done) return
+  }
 }
 
 export function fetchAgentRunPlans(

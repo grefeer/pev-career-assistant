@@ -64,8 +64,8 @@ def _headers(app: FastAPI) -> dict[str, str]:
 def test_post_agent_run_returns_only_safe_run_summary() -> None:
     """Create endpoint must not expose raw context, prompts or internal budget."""
     service = MagicMock()
-    service.create_run.return_value = AgentRunResult(
-        run_id="run-1", status=RunStatus.succeeded, summary="找到 2 个岗位"
+    service.queue_run.return_value = AgentRunResult(
+        run_id="run-1", status=RunStatus.queued, summary=None
     )
     app = _build_app(service)
 
@@ -82,18 +82,18 @@ def test_post_agent_run_returns_only_safe_run_summary() -> None:
     assert response.status_code == 201
     assert response.json() == {
         "id": "run-1",
-        "status": "succeeded",
-        "summary": "找到 2 个岗位",
+        "status": "queued",
+        "summary": None,
         "error_code": None,
     }
-    assert service.create_run.call_args.kwargs["user_id"] == "user-a"
-    assert service.create_run.call_args.kwargs["task"].budget.max_agent_turns == 12
+    assert service.queue_run.call_args.kwargs["user_id"] == "user-a"
+    assert service.queue_run.call_args.kwargs["task"].budget.max_agent_turns == 12
 
 
 def test_post_agent_run_scales_hard_turn_ceiling_for_multi_skill_work() -> None:
     service = MagicMock()
-    service.create_run.return_value = AgentRunResult(
-        run_id="run-1", status=RunStatus.succeeded, summary="完成"
+    service.queue_run.return_value = AgentRunResult(
+        run_id="run-1", status=RunStatus.queued, summary=None
     )
     app = _build_app(service)
 
@@ -112,7 +112,7 @@ def test_post_agent_run_scales_hard_turn_ceiling_for_multi_skill_work() -> None:
     )
 
     assert response.status_code == 201
-    assert service.create_run.call_args.kwargs["task"].budget.max_agent_turns == 36
+    assert service.queue_run.call_args.kwargs["task"].budget.max_agent_turns == 36
 
 
 def test_post_agent_run_rejects_unknown_input_and_disabled_harness() -> None:
@@ -127,7 +127,7 @@ def test_post_agent_run_rejects_unknown_input_and_disabled_harness() -> None:
     )
     assert invalid.status_code == 422
 
-    service.create_run.side_effect = AgentRuntimeDisabledError("agent_harness_disabled")
+    service.queue_run.side_effect = AgentRuntimeDisabledError("agent_harness_disabled")
     disabled = client.post(
         "/api/agent-runs",
         headers=_headers(app),
@@ -225,6 +225,30 @@ def test_get_agent_run_and_events_project_owner_safe_fields() -> None:
     }
     assert events.status_code == 200
     assert events.json()["items"][0]["event_type"] == "run_started"
+
+
+def test_agent_event_stream_replays_only_owner_safe_events_after_a_cursor() -> None:
+    """SSE reconnects from a durable sequence cursor rather than client context."""
+    service = MagicMock()
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    service.list_events.return_value = [
+        SimpleNamespace(sequence=1, event_type="run_started", payload_json={"safe": True}, created_at=now),
+        SimpleNamespace(sequence=2, event_type="plan_created", payload_json={"revision": 1}, created_at=now),
+    ]
+    app = _build_app(service)
+
+    response = TestClient(app).get(
+        "/api/agent-runs/run-1/events/stream?after_sequence=1&follow=false",
+        headers=_headers(app),
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "id: 2" in response.text
+    assert "event: plan_created" in response.text
+    assert '"revision":1' in response.text
+    assert "run_started" not in response.text
+    assert service.list_events.call_args.kwargs == {"user_id": "user-a", "run_id": "run-1"}
 
 
 def test_list_agent_runs_projects_only_safe_owner_history_fields() -> None:
@@ -351,7 +375,7 @@ def test_serializers_drop_malformed_plan_values_and_default_missing_enums() -> N
 
 def test_create_run_reports_unavailable_model_gateway() -> None:
     service = MagicMock()
-    service.create_run.side_effect = AgentRuntimeUnavailableError("agent_harness_unavailable")
+    service.queue_run.side_effect = AgentRuntimeUnavailableError("agent_harness_unavailable")
     app = _build_app(service)
 
     response = TestClient(app).post(

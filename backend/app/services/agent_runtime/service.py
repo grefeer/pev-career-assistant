@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from backend.app.config import Settings
@@ -11,6 +13,9 @@ from backend.app.repositories import agent_runtime as run_repository
 from backend.app.repositories import profiles as profile_repository
 from backend.app.services.agent_runtime.runtime import AgentRunResult, AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRuntimeDisabledError(RuntimeError):
@@ -73,6 +78,50 @@ class AgentRunService:
             user_id=user_id,
             task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
         )
+
+    def queue_run(
+        self, db: Session, *, user_id: str, task: AgentTaskRequest
+    ) -> AgentRunResult:
+        """Create a durable queued run before returning its SSE address to the browser."""
+        if not self._settings.agent_harness_enabled:
+            raise AgentRuntimeDisabledError("agent_harness_disabled")
+        if self._runtime is None:
+            raise AgentRuntimeUnavailableError("agent_harness_unavailable")
+        run = self._runtime.create_queued_run(db, user_id=user_id, task=task)
+        return AgentRunResult(run.id, RunStatus.queued, None)
+
+    def execute_queued_run(self, session_factory, *, user_id: str, run_id: str) -> None:
+        """Run a previously committed queue item in an isolated request-free session."""
+        if self._runtime is None:
+            return
+        with session_factory() as db:
+            run = run_repository.get_run_for_owner(db, run_id, user_id)
+            if run is None or run.status is not RunStatus.queued:
+                return
+            task = AgentTaskRequest(
+                goal=run.goal,
+                allowed_skills=run.allowed_skills_json,
+                context=run.context_summary_json,
+                budget=AgentBudget.model_validate(run.budget_json),
+            )
+            try:
+                self._runtime.run(
+                    db,
+                    user_id=user_id,
+                    task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
+                    existing_run=run,
+                )
+                db.commit()
+            except Exception:
+                logger.exception("queued PEV run failed", extra={"run_id": run_id})
+                db.rollback()
+                run = run_repository.get_run_for_owner(db, run_id, user_id)
+                if run is not None:
+                    run_repository.finish_run(db, run, status=RunStatus.failed, error_code="runtime_error")
+                    run_repository.append_event(
+                        db, run_id=run.id, event_type="run_failed", payload_json={"error_code": "runtime_error"}
+                    )
+                    db.commit()
 
     @staticmethod
     def _with_confirmed_profile_facts(
