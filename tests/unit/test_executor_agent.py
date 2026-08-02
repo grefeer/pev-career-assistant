@@ -7,11 +7,15 @@ from typing import Any
 from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
-from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.executor_agent import (
+    ExecutorAgent,
+    _observation_for_decision,
+)
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
     PlanStep,
+    ToolObservation,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
@@ -232,6 +236,22 @@ def test_executor_exposes_every_page_from_a_batch_observation_to_the_next_tool()
 
     assert result.observations[1].output == {"title": "岗位 A,岗位 B"}
     assert len(gateway.states[1]["observations"][0]["output"]["pages"][0]["visible_text"]) == 1_200
+
+
+def test_executor_projects_batch_details_to_identifiers_and_titles_only() -> None:
+    projected = _observation_for_decision(ToolObservation(
+        tool_name="extract-observed-job-details-batch", status="succeeded",
+        output={"details": [{
+            "source_artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+            "content_hash": "a" * 64,
+            "candidates": [{"title": "岗位 A", "responsibilities": "x" * 5_000}],
+        }]},
+    ))
+
+    assert projected["output"]["details"] == [{
+        "source_artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+        "content_hash": "a" * 64, "candidate_titles": ["岗位 A"],
+    }]
 
 
 def test_executor_returns_need_user_and_honors_hard_budgets() -> None:

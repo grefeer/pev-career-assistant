@@ -37,6 +37,8 @@ _EXECUTOR_INSTRUCTION = (
     "Once all supplied candidates have been observed, choose extraction, matching, "
     "tailoring, planning, verification, or a truthful limitation; do not keep "
     "fetching pages. "
+    "When candidate_urls is non-empty, do not call public search: the candidate "
+    "set is already user-provided evidence to process. "
     "When multiple observed public-page artifacts need detailed JD normalization, "
     "prefer extract-observed-job-details-batch so one evidence-bound tool result "
     "covers the finite set. "
@@ -216,6 +218,13 @@ def _observation_for_decision(observation: ToolObservation) -> dict[str, object]
         projected["pages"] = [
             _page_for_decision(page) for page in pages[:10] if isinstance(page, dict)
         ]
+    details = projected.get("details")
+    if isinstance(details, list):
+        projected["details"] = [
+            _detail_for_decision(detail)
+            for detail in details[:10]
+            if isinstance(detail, dict)
+        ]
     payload["output"] = projected
     return payload
 
@@ -227,3 +236,18 @@ def _page_for_decision(page: dict[str, object]) -> dict[str, object]:
     if isinstance(visible_text, str):
         projected["visible_text"] = visible_text[:1_200]
     return projected
+
+
+def _detail_for_decision(detail: dict[str, object]) -> dict[str, object]:
+    """Keep a batch detail trace actionable without copying all JD sections again."""
+    candidates = detail.get("candidates")
+    titles = [
+        candidate.get("title")
+        for candidate in candidates
+        if isinstance(candidate, dict) and isinstance(candidate.get("title"), str)
+    ] if isinstance(candidates, list) else []
+    return {
+        key: detail[key]
+        for key in ("source_artifact_id", "source_url", "content_hash")
+        if key in detail
+    } | {"candidate_titles": titles}
