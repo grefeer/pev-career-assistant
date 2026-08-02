@@ -94,6 +94,53 @@ class InvalidStructuredThenFailureModel:
         raise RuntimeError("ordinary JSON retry is down")
 
 
+class InvalidStructuredTwiceThenJsonModel:
+    """A provider can recover on the one extra bounded JSON retry."""
+
+    def __init__(self) -> None:
+        self.json_attempts = 0
+
+    def with_structured_output(
+        self, _schema: type[BaseModel]
+    ) -> "InvalidStructuredTwiceThenJsonModel":
+        self.structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        if getattr(self, "structured", False):
+            self.structured = False
+            return {"action": "not-valid"}
+        self.json_attempts += 1
+        content = (
+            '{"action":"not-valid"}'
+            if self.json_attempts == 1
+            else '{"action":"need_user","user_question":"请确认城市。"}'
+        )
+        return type("RawResponse", (), {"content": content})()
+
+
+class InvalidStructuredThenRetryFailureModel:
+    """The second protocol retry must preserve a provider outage code."""
+
+    def __init__(self) -> None:
+        self.json_attempts = 0
+
+    def with_structured_output(
+        self, _schema: type[BaseModel]
+    ) -> "InvalidStructuredThenRetryFailureModel":
+        self.structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        if getattr(self, "structured", False):
+            self.structured = False
+            return {"action": "not-valid"}
+        self.json_attempts += 1
+        if self.json_attempts == 1:
+            return type("RawResponse", (), {"content": '{"action":"not-valid"}'})()
+        raise RuntimeError("retry is down")
+
+
 def test_gateway_converts_provider_structured_result_into_requested_agent_decision() -> None:
     """A provider response must be parsed before it can drive a real Agent loop."""
     model = RecordingModel(
@@ -143,6 +190,30 @@ def test_gateway_retries_one_invalid_structured_response_with_local_json_validat
 def test_gateway_preserves_provider_failure_after_an_invalid_structured_result() -> None:
     with pytest.raises(AgentModelGatewayError, match="model_request_failed"):
         LangChainModelGateway(InvalidStructuredThenFailureModel()).decide(
+            role=AgentRole.planner,
+            instruction="形成计划",
+            state={"goal": "找岗位"},
+            response_model=PlannerDecision,
+        )
+
+
+def test_gateway_retries_one_malformed_ordinary_json_completion() -> None:
+    model = InvalidStructuredTwiceThenJsonModel()
+
+    result = LangChainModelGateway(model).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert model.json_attempts == 2
+
+
+def test_gateway_preserves_provider_failure_after_a_malformed_json_retry() -> None:
+    with pytest.raises(AgentModelGatewayError, match="model_request_failed"):
+        LangChainModelGateway(InvalidStructuredThenRetryFailureModel()).decide(
             role=AgentRole.planner,
             instruction="形成计划",
             state={"goal": "找岗位"},

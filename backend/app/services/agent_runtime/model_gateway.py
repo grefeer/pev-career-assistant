@@ -69,7 +69,13 @@ class LangChainModelGateway:
         corresponding Agent loop validates and performs it through ToolRegistry.
         """
         messages = [
-            SystemMessage(content=f"Role: {role.value}. {instruction}"),
+            SystemMessage(
+                content=(
+                    f"Role: {role.value}. {instruction} "
+                    "Return exactly one decision matching the requested schema. "
+                    f"{_role_action_contract(role)}"
+                )
+            ),
             HumanMessage(
                 content=json.dumps(
                     state, ensure_ascii=False, separators=(",", ":"), default=str
@@ -103,6 +109,20 @@ class LangChainModelGateway:
             except AgentModelGatewayError as fallback_error:
                 if fallback_error.code == "model_request_failed":
                     raise fallback_error from exc
+                # A few OpenAI-compatible endpoints occasionally emit one
+                # malformed ordinary-JSON completion after accepting the
+                # schema request. Retry the transport protocol once more;
+                # this remains a bounded schema-validation recovery, never an
+                # Agent decision or a tool-selection retry.
+                try:
+                    return self._decide_with_local_json_validation(
+                        messages=messages,
+                        role=role,
+                        response_model=response_model,
+                    )
+                except AgentModelGatewayError as retry_error:
+                    if retry_error.code == "model_request_failed":
+                        raise retry_error from exc
                 raise AgentModelGatewayError("invalid_model_response") from exc
 
     def _decide_with_local_json_validation(
