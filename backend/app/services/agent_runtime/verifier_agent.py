@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.schemas import (
@@ -45,10 +47,18 @@ class VerifierAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        deadline: float | None = None,
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
         for _turn in range(task.budget.max_agent_turns):
+            if deadline is not None and time.monotonic() >= deadline:
+                return VerifierResult(
+                    decision=VerificationDecision.FAIL,
+                    feedback="Wall-clock budget exhausted before verification.",
+                    observations=observations,
+                    error_code="wall_clock_budget_exhausted",
+                )
             if turn_budget is not None and not turn_budget.try_consume():
                 return VerifierResult(
                     decision=VerificationDecision.FAIL,

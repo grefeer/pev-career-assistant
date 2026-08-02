@@ -84,7 +84,12 @@ def test_natural_language_agent_workflow_uses_real_model_and_real_public_jds(db_
         ],
         context={"candidate_urls": list(OFFICIAL_AI_AGENT_JOB_URLS)},
         private_context={"confirmed_profile_facts": confirmed_facts},
-        budget=AgentBudget(max_agent_turns=80, max_tool_calls=64, max_replans=1),
+        budget=AgentBudget(
+            max_agent_turns=24,
+            max_tool_calls=16,
+            max_replans=1,
+            max_wall_clock_seconds=240,
+        ),
     )
 
     result = runtime.run(db_session, user_id=user.id, task=task)

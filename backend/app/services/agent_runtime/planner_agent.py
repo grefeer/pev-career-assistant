@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.schemas import (
@@ -54,6 +56,7 @@ class PlannerAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        deadline: float | None = None,
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
@@ -64,6 +67,12 @@ class PlannerAgent:
             else []
         )
         for _turn in range(task.budget.max_agent_turns):
+            if deadline is not None and time.monotonic() >= deadline:
+                return PlannerResult(
+                    status="failed",
+                    observations=observations,
+                    error_code="wall_clock_budget_exhausted",
+                )
             if turn_budget is not None and not turn_budget.try_consume():
                 return PlannerResult(
                     status="failed",

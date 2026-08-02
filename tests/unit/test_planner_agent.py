@@ -106,6 +106,7 @@ def test_planner_enforces_shared_turn_and_tool_budgets_and_reports_loop_exhausti
 
     assert agent.run(task=task, context=context, turn_budget=AgentTurnBudget(1, used=1)).error_code == "agent_turn_budget_exhausted"
     assert agent.run(task=task, context=context, tool_budget=ToolCallBudget(1, used=1)).error_code == "tool_budget_exhausted"
+    assert agent.run(task=task, context=context, deadline=0).error_code == "wall_clock_budget_exhausted"
 
     exhausted = PlannerAgent(
         gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()

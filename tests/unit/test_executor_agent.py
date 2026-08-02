@@ -259,4 +259,7 @@ def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
     )
     assert tool_limited.error_code == "tool_budget_exhausted"
     assert turn_limited.error_code == "agent_turn_budget_exhausted"
+    assert ExecutorAgent(gateway=ScriptedGateway([]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], context=context, deadline=0,
+    ).error_code == "wall_clock_budget_exhausted"
     assert exhausted.status == "failed"

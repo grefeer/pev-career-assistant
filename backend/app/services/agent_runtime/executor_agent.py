@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.schemas import (
@@ -67,11 +69,19 @@ class ExecutorAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        deadline: float | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
         tool_context = context
         for _turn in range(task.budget.max_agent_turns):
+            if deadline is not None and time.monotonic() >= deadline:
+                return ExecutorResult(
+                    status="failed",
+                    summary="Wall-clock budget exhausted before the next decision.",
+                    observations=observations,
+                    error_code="wall_clock_budget_exhausted",
+                )
             if turn_budget is not None and not turn_budget.try_consume():
                 return ExecutorResult(
                     status="failed",

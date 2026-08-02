@@ -29,6 +29,7 @@ class AgentBudget(BaseModel):
     max_agent_turns: int = Field(default=12, ge=1, le=100)
     max_tool_calls: int = Field(default=24, ge=1, le=200)
     max_replans: int = Field(default=2, ge=0, le=10)
+    max_wall_clock_seconds: int = Field(default=300, ge=10, le=3_600)
 
 
 class AgentTaskRequest(BaseModel):

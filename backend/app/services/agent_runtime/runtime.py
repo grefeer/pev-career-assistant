@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import time
 
 from sqlalchemy.orm import Session
 
@@ -101,6 +102,7 @@ class AgentRuntime:
         turn_budget = AgentTurnBudget(
             task.budget.max_agent_turns, used=consumed_turns
         )
+        deadline = time.monotonic() + task.budget.max_wall_clock_seconds
         planning_task = task
         replans = 0
         trace = self._build_decision_trace(
@@ -116,6 +118,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    deadline=deadline,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_run(db, run.id, error.code)
@@ -166,6 +169,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    deadline=deadline,
                 )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
@@ -273,6 +277,7 @@ class AgentRuntime:
         trace,
         tool_budget: ToolCallBudget,
         turn_budget: AgentTurnBudget,
+        deadline: float | None = None,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
@@ -287,6 +292,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    deadline=deadline,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
@@ -339,6 +345,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    deadline=deadline,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(

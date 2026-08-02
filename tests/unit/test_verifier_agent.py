@@ -146,4 +146,8 @@ def test_verifier_enforces_budgets_and_reports_exhausted_tool_loop() -> None:
     )
     assert tool_limited.error_code == "tool_budget_exhausted"
     assert turn_limited.error_code == "agent_turn_budget_exhausted"
+    assert VerifierAgent(gateway=ScriptedGateway([]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], execution=execution,
+        context=context, deadline=0,
+    ).error_code == "wall_clock_budget_exhausted"
     assert exhausted.feedback.startswith("Verifier turn budget exhausted")
