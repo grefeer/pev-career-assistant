@@ -32,3 +32,18 @@ def test_registry_exposes_public_job_evidence_tool_to_executor(monkeypatch) -> N
     assert result.status == "succeeded"
     assert result.output is not None
     assert result.output["title"] == "AI 应用开发工程师"
+
+
+def test_registry_exposes_public_web_search_as_part_of_job_discovery_skill() -> None:
+    """Executor can discover candidate URLs without promoting search into a fourth Agent."""
+    registry = build_career_tool_registry()
+
+    names = {
+        tool["name"]
+        for tool in registry.tool_catalog(
+            role=AgentRole.executor,
+            allowed_skills=frozenset({"job-discovery"}),
+        )
+    }
+
+    assert "search-public-job-pages" in names

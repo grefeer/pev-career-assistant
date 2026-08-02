@@ -10,8 +10,10 @@ from backend.app.services.career_skills.job_discovery import (
     ExtractObservedJobDetailsInput,
     FetchPublicJobPageInput,
     PublicJobFetchError,
+    SearchPublicJobPagesInput,
     extract_observed_job_details,
     fetch_public_job_page,
+    search_public_job_pages,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
@@ -41,6 +43,47 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     assert result.artifact_id.startswith("observed:")
     assert result.title == "AI Agent 开发工程师"
     assert "职责：构建智能体。" in result.visible_text
+    assert len(result.content_hash) == 64
+
+
+def test_search_public_job_pages_returns_only_safe_direct_result_urls(monkeypatch) -> None:
+    """Natural-language discovery receives public result links, never a browser redirect or private URL."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class=\"b_algo\"><h2><a href=\"https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9jYXJlZXJzLmV4YW1wbGUvYWdlbnQ=\">Agent 应用开发工程师</a></h2><p>负责 AI Agent 应用。</p></li>
+              <li class=\"b_algo\"><h2><a href=\"http://127.0.0.1/private\">private</a></h2><p>must not escape</p></li>
+            </body></html>
+            """,
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+
+    def assert_only_public(url: str) -> None:
+        if "127.0.0.1" in url:
+            raise PublicJobFetchError("unsafe_public_url")
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        assert_only_public,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+    )
+
+    assert result.query == "AI Agent 应用开发 官方招聘"
+    assert result.source_url.startswith("https://www.bing.com/search?")
+    assert [item.model_dump() for item in result.results] == [{
+        "title": "Agent 应用开发工程师",
+        "url": "https://careers.example/agent",
+        "snippet": "负责 AI Agent 应用。",
+    }]
     assert len(result.content_hash) == 64
 
 

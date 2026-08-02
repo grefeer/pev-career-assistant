@@ -209,9 +209,19 @@ class AgentRuntime:
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
+            self._record_failed_executor_observations(
+                db, run_id, persisted_step, execution
+            )
+            observed_artifact_refs = self._persist_observed_evidence(
+                db, run_id, persisted_step, execution
+            )
             if execution.status == "needs_user":
                 return self._wait_for_user(
-                    db, run_id, persisted_step, execution.user_question
+                    db,
+                    run_id,
+                    persisted_step,
+                    execution.user_question,
+                    output_artifact_refs=observed_artifact_refs,
                 )
             if execution.status != "succeeded":
                 return self._fail_step(
@@ -219,16 +229,10 @@ class AgentRuntime:
                     run_id,
                     persisted_step,
                     execution.error_code or "executor_failed",
+                    output_artifact_refs=observed_artifact_refs,
                 )
-            self._record_failed_executor_observations(
-                db, run_id, persisted_step, execution
-            )
             execution = execution.model_copy(
-                update={
-                    "artifact_refs": self._persist_observed_evidence(
-                        db, run_id, persisted_step, execution
-                    )
-                }
+                update={"artifact_refs": observed_artifact_refs}
             )
             if not self._requires_verification(plan, plan_step):
                 run_repository.finish_step(
@@ -255,10 +259,20 @@ class AgentRuntime:
                     tool_budget=tool_budget,
                 )
             except AgentModelGatewayError as error:
-                return self._fail_step(db, run_id, persisted_step, error.code)
+                return self._fail_step(
+                    db,
+                    run_id,
+                    persisted_step,
+                    error.code,
+                    output_artifact_refs=execution.artifact_refs,
+                )
             if verification.error_code:
                 return self._fail_step(
-                    db, run_id, persisted_step, verification.error_code
+                    db,
+                    run_id,
+                    persisted_step,
+                    verification.error_code,
+                    output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.PASS:
                 run_repository.finish_step(
@@ -302,16 +316,25 @@ class AgentRuntime:
                     )
                     continue
                 return self._fail_step(
-                    db, run_id, persisted_step, "executor_retry_budget_exhausted"
+                    db,
+                    run_id,
+                    persisted_step,
+                    "executor_retry_budget_exhausted",
+                    output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.NEED_USER:
                 return self._wait_for_user(
-                    db, run_id, persisted_step, verification.feedback
+                    db,
+                    run_id,
+                    persisted_step,
+                    verification.feedback,
+                    output_artifact_refs=execution.artifact_refs,
                 )
             run_repository.finish_step(
                 db,
                 persisted_step,
                 status=StepStatus.skipped,
+                output_artifact_refs=execution.artifact_refs,
                 error_code="replan_required",
             )
             run_repository.append_event(
@@ -453,6 +476,45 @@ class AgentRuntime:
             output = observation.output or {}
             source_url = output.get("source_url")
             content_hash = output.get("content_hash")
+            results = output.get("results")
+            if not (
+                isinstance(source_url, str)
+                and isinstance(content_hash, str)
+                and isinstance(results, list)
+            ):
+                continue
+            artifact = run_repository.create_artifact(
+                db,
+                run_id=run_id,
+                step_id=step.id,
+                artifact_type="job_search_results",
+                source_url=source_url,
+                content_hash=content_hash,
+                content_json={"query": output.get("query"), "results": results},
+            )
+            artifact_refs.append(
+                {
+                    "artifact_id": artifact.id,
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                }
+            )
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="executor_search_artifact",
+                payload_json={
+                    "sequence": step.sequence,
+                    "tool": observation.tool_name,
+                    "artifact_id": artifact.id,
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                },
+            )
+        for observation in execution.observations:
+            output = observation.output or {}
+            source_url = output.get("source_url")
+            content_hash = output.get("content_hash")
             candidates = output.get("candidates")
             if not (
                 isinstance(source_url, str)
@@ -551,11 +613,19 @@ class AgentRuntime:
         run_id: str,
         step: AgentStep,
         question: str | None,
+        *,
+        output_artifact_refs: list[dict[str, str]] | None = None,
     ) -> AgentRunResult:
         run = db.get(AgentRun, run_id)
         if run is None:  # defensive: foreign-key integrity normally prevents this.
             raise RuntimeError("Agent run disappeared during execution")
-        run_repository.finish_step(db, step, status=StepStatus.failed, error_code="need_user")
+        run_repository.finish_step(
+            db,
+            step,
+            status=StepStatus.failed,
+            output_artifact_refs=output_artifact_refs,
+            error_code="need_user",
+        )
         run_repository.finish_run(
             db,
             run,
@@ -571,10 +641,20 @@ class AgentRuntime:
         return AgentRunResult(run_id, RunStatus.waiting_user, question)
 
     def _fail_step(
-        self, db: Session, run_id: str, step: AgentStep, error_code: str
+        self,
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        error_code: str,
+        *,
+        output_artifact_refs: list[dict[str, str]] | None = None,
     ) -> AgentRunResult:
         run_repository.finish_step(
-            db, step, status=StepStatus.failed, error_code=error_code
+            db,
+            step,
+            status=StepStatus.failed,
+            output_artifact_refs=output_artifact_refs,
+            error_code=error_code,
         )
         return self._fail_run(db, run_id, error_code)
 

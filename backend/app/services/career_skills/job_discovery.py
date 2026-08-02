@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 from html.parser import HTMLParser
 import hashlib
 import ipaddress
 import re
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 import requests
@@ -44,6 +45,38 @@ class FetchPublicJobPageOutput(BaseModel):
     title: str | None
     visible_text: str
     content_hash: str
+
+
+class SearchPublicJobPagesInput(BaseModel):
+    """A bounded public-web query selected by the Executor from the user's goal."""
+
+    query: str = Field(min_length=2, max_length=400)
+    max_results: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        cleaned = " ".join(value.split())
+        if not cleaned:
+            raise ValueError("query must not be empty")
+        return cleaned
+
+
+class PublicJobSearchResult(BaseModel):
+    """One direct public career link observed in a fixed search-provider response."""
+
+    title: str
+    url: str
+    snippet: str | None = None
+
+
+class SearchPublicJobPagesOutput(BaseModel):
+    """Search evidence that lets the Executor choose a public page to inspect next."""
+
+    query: str
+    source_url: str
+    content_hash: str
+    results: list[PublicJobSearchResult]
 
 
 class ExtractObservedJobDetailsInput(BaseModel):
@@ -108,6 +141,68 @@ class _VisibleTextParser(HTMLParser):
         self.text_parts.append(normalized)
 
 
+class _BingSearchResultParser(HTMLParser):
+    """Small HTML parser for direct links in Bing's public result cards."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._current: dict[str, list[str] | str] | None = None
+        self._in_heading = False
+        self._in_snippet = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        attributes = dict(attrs)
+        if tag == "li" and self._current is None and "b_algo" in attributes.get("class", ""):
+            self._current = {"title": [], "snippet": []}
+            return
+        if self._current is None:
+            return
+        if tag == "h2":
+            self._in_heading = True
+        elif tag == "p":
+            self._in_snippet = True
+        elif tag == "a" and self._in_heading:
+            href = attributes.get("href")
+            if href:
+                self._current["url"] = href
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._current is None:
+            return
+        if tag == "h2":
+            self._in_heading = False
+        elif tag == "p":
+            self._in_snippet = False
+        elif tag == "li":
+            title = " ".join(self._current.get("title", []))
+            url = self._current.get("url")
+            snippet = " ".join(self._current.get("snippet", []))
+            if isinstance(url, str) and title:
+                item = {"title": title, "url": url}
+                if snippet:
+                    item["snippet"] = snippet
+                self.results.append(item)
+            self._current = None
+            self._in_heading = False
+            self._in_snippet = False
+
+    def handle_data(self, data: str) -> None:
+        if self._current is None:
+            return
+        normalized = " ".join(data.split())
+        if not normalized:
+            return
+        if self._in_heading:
+            title_parts = self._current["title"]
+            assert isinstance(title_parts, list)
+            title_parts.append(normalized)
+        elif self._in_snippet:
+            snippet_parts = self._current["snippet"]
+            assert isinstance(snippet_parts, list)
+            snippet_parts.append(normalized)
+
+
 def _assert_public_url(url: str) -> None:
     parsed = urlsplit(url)
     if (
@@ -159,6 +254,81 @@ def fetch_public_job_page(
         visible_text=visible_text,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
     )
+
+
+def search_public_job_pages(
+    context: ToolContext, payload: SearchPublicJobPagesInput
+) -> SearchPublicJobPagesOutput:
+    """Search a fixed public provider and return only direct, safe career URLs."""
+    del context
+    source_url = f"https://www.bing.com/search?{urlencode({'q': payload.query})}"
+    try:
+        response = requests.get(
+            source_url,
+            timeout=20,
+            headers={"User-Agent": "CareerAssistantPEV/1.0 (+public-job-search)"},
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise PublicJobFetchError("public_search_failed") from exc
+    html = response.text
+    parser = _BingSearchResultParser()
+    parser.feed(html)
+    results: list[PublicJobSearchResult] = []
+    seen_urls: set[str] = set()
+    for raw_result in parser.results:
+        result_url = _direct_bing_result_url(raw_result["url"])
+        if result_url is None:
+            continue
+        parsed = urlsplit(result_url)
+        if (
+            result_url in seen_urls
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.hostname.endswith("bing.com")
+        ):
+            continue
+        try:
+            _assert_public_url(result_url)
+        except PublicJobFetchError:
+            continue
+        seen_urls.add(result_url)
+        results.append(PublicJobSearchResult(
+            title=raw_result["title"],
+            url=result_url,
+            snippet=raw_result.get("snippet"),
+        ))
+        if len(results) >= payload.max_results:
+            break
+    return SearchPublicJobPagesOutput(
+        query=payload.query,
+        source_url=source_url,
+        content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
+        results=results,
+    )
+
+
+def _direct_bing_result_url(url: str) -> str | None:
+    """Decode Bing's documented URL-safe ``u`` redirect value before safety checks."""
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").lower()
+    if not hostname.endswith("bing.com"):
+        return url
+    if not parsed.path.startswith("/ck/"):
+        return None
+    encoded = parse_qs(parsed.query).get("u", [None])[0]
+    if not isinstance(encoded, str) or not encoded.startswith("a1"):
+        return None
+    try:
+        payload = encoded[2:]
+        padding = "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload + padding).decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    decoded_url = urlsplit(decoded)
+    if decoded_url.scheme not in {"http", "https"} or not decoded_url.hostname:
+        return None
+    return decoded
 
 
 def extract_observed_job_details(

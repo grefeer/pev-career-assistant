@@ -21,7 +21,16 @@ _EXECUTOR_INSTRUCTION = (
     "You are the Executor Agent. Work toward the current planned outcome using "
     "only its permitted Skills. Observe every tool result, including failures, "
     "and independently select the next allowed action. Do not claim an artifact "
-    "that is absent from observations; ask the user if the goal cannot proceed."
+    "that is absent from observations; ask the user if the goal cannot proceed. "
+    "When a job-discovery task has no supplied URL, you may first use the "
+    "public-job search tool, then independently select a returned direct URL "
+    "for evidence capture. Use the user's language and role terms when forming "
+    "a search query (Chinese goals need Chinese recruitment terms). After one "
+    "search observation, prefer fetching a plausible returned result; retry a "
+    "search at most once only when no plausible public career URL was returned. "
+    "Do not loop through search-provider or job-board domain variations without "
+    "capturing evidence. If the second search is still insufficient, complete "
+    "with the supported limitation or ask the user for a source or constraint."
 )
 
 

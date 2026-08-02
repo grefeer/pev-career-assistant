@@ -44,6 +44,13 @@ class StructuredJobOutput(BaseModel):
     candidates: list[dict[str, object]]
 
 
+class SearchResultsOutput(BaseModel):
+    query: str
+    source_url: str
+    content_hash: str
+    results: list[dict[str, str]]
+
+
 class RoleScriptedGateway:
     """Controlled model boundary; real PEV roles and tool handlers execute."""
 
@@ -559,6 +566,57 @@ def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_s
     ]
 
 
+def test_runtime_persists_public_search_results_as_discovery_evidence(db_session) -> None:
+    """A URL-discovery decision remains traceable after its Executor context is released."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
+            "steps": [{"step_id": "search", "objective": "搜索岗位页面", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {}},
+            {"action": "complete", "summary": "已找到公开岗位页面"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="search-jobs", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=SearchResultsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "query": "AI Agent 开发 官方招聘", "source_url": "https://www.bing.com/search?q=agent",
+            "content_hash": "e" * 64,
+            "results": [{"title": "Agent 工程师", "url": "https://jobs.example/agent", "snippet": "公开 JD"}],
+        },
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"]),
+    )
+
+    artifacts = list(db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+    ))
+    assert [(artifact.artifact_type, artifact.content_json) for artifact in artifacts] == [
+        ("job_search_results", {
+            "query": "AI Agent 开发 官方招聘",
+            "results": [{"title": "Agent 工程师", "url": "https://jobs.example/agent", "snippet": "公开 JD"}],
+        }),
+    ]
+
+
 def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_code(db_session) -> None:
     """A real Agent retry must be explainable from persisted tool observations."""
     user = User(
@@ -595,3 +653,93 @@ def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_c
         "executor_tool_failed",
         {"sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool"},
     )
+
+
+def test_runtime_audits_failed_executor_observations_before_terminal_failure(db_session) -> None:
+    """A turn-budget or budget failure must not erase the tool error that caused it."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["调用工具"],
+            "steps": [{"step_id": "discover", "objective": "发现岗位", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [{
+            "action": "call_tool", "tool_name": "missing-tool", "tool_input": {},
+        }],
+        AgentRole.verifier: [],
+    })
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
+        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
+        verifier=VerifierAgent(gateway=gateway, tools=ToolRegistry()), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找岗位", allowed_skills=["job-discovery"],
+            budget={"max_agent_turns": 1, "max_tool_calls": 2, "max_replans": 0},
+        ),
+    )
+
+    events = run_repository.list_events(db_session, result.run_id)
+    failures = [event for event in events if event.event_type == "executor_tool_failed"]
+    assert (result.status, result.error_code) == (RunStatus.failed, "executor_failed")
+    assert [event.payload_json for event in failures] == [{
+        "sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool",
+    }]
+
+
+def test_runtime_retains_successful_evidence_when_executor_later_hits_turn_limit(db_session) -> None:
+    """A failed run still preserves the public JD evidence it safely captured before stopping."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["抓取公开 JD"],
+            "steps": [{"step_id": "discover", "objective": "抓取岗位", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [{
+            "action": "call_tool", "tool_name": "fetch-job", "tool_input": {},
+        }],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=FetchedJobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "title": "AI Agent 开发工程师", "source_url": "https://jobs.example/agent",
+            "content_hash": "f" * 64, "visible_text": "岗位职责：开发 Agent。",
+        },
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找岗位", allowed_skills=["job-discovery"],
+            budget={"max_agent_turns": 1, "max_tool_calls": 2, "max_replans": 0},
+        ),
+    )
+
+    artifacts = list(db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+    ))
+    assert (result.status, result.error_code) == (RunStatus.failed, "executor_failed")
+    assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
+        ("public_job_page", "https://jobs.example/agent"),
+    ]

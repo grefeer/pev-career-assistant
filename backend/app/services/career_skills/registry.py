@@ -17,6 +17,16 @@ def build_career_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
+            name="search-public-job-pages",
+            skill_name="job-discovery",
+            input_model=job_discovery.SearchPublicJobPagesInput,
+            output_model=job_discovery.SearchPublicJobPagesOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=job_discovery.search_public_job_pages,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="fetch-public-job-page",
             skill_name="job-discovery",
             input_model=job_discovery.FetchPublicJobPageInput,
