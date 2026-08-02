@@ -37,6 +37,12 @@ class CapturingRuntime:
         self.task = task
         return AgentRunResult("run-a", status=RunStatus.succeeded, summary=user_id)
 
+    def resume(
+        self, _db, *, user_id: str, run_id: str, task: AgentTaskRequest
+    ) -> AgentRunResult:
+        self.task = task
+        return AgentRunResult(run_id, status=RunStatus.succeeded, summary=user_id)
+
 
 def test_service_fails_closed_when_adaptive_harness_is_disabled(db_session) -> None:
     """Legacy deployments cannot accidentally activate a partly configured Agent."""
@@ -125,3 +131,42 @@ def test_service_injects_only_the_owners_latest_confirmed_profile_into_private_t
     assert runtime.task.private_context == {
         "confirmed_profile_facts": {"skills": ["Python", "RAG"]}
     }
+
+
+def test_service_resumes_only_an_owner_waiting_run_and_preserves_their_reply(db_session) -> None:
+    """Human-in-the-loop replies become safe task context, never a second Run."""
+    user = _user("user-a", "user-a@example.test")
+    other = _user("user-b", "user-b@example.test")
+    db_session.add_all([user, other])
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session,
+        user_id=user.id,
+        goal="找岗位",
+        allowed_skills=["job-discovery"],
+        context_summary={"candidate_urls": ["https://jobs.example/1"]},
+        budget_json={"max_agent_turns": 3, "max_tool_calls": 3, "max_replans": 0},
+        agent_version="pev-test",
+    )
+    run_repository.start_run(db_session, run)
+    run_repository.finish_run(
+        db_session, run, status=RunStatus.waiting_user, final_summary="请确认城市"
+    )
+    runtime = CapturingRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+
+    result = service.resume_run(
+        db_session, user_id=user.id, run_id=run.id, user_response="北京"
+    )
+
+    assert result.run_id == run.id
+    assert runtime.task is not None
+    assert runtime.task.context == {
+        "candidate_urls": ["https://jobs.example/1"],
+        "user_responses": ["北京"],
+    }
+    assert run.context_summary_json["user_responses"] == ["北京"]
+    with pytest.raises(AgentRunNotFoundError):
+        service.resume_run(
+            db_session, user_id=other.id, run_id=run.id, user_response="上海"
+        )

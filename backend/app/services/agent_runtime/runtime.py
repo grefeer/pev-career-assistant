@@ -56,31 +56,55 @@ class AgentRuntime:
         self._verifier = verifier
         self._agent_version = agent_version
 
-    def run(self, db: Session, *, user_id: str, task: AgentTaskRequest) -> AgentRunResult:
+    def run(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        task: AgentTaskRequest,
+        existing_run: AgentRun | None = None,
+    ) -> AgentRunResult:
         """Run bounded PEV lifecycle; agents retain all semantic tool decisions."""
-        run = run_repository.create_run(
-            db,
-            user_id=user_id,
-            goal=task.goal,
-            allowed_skills=task.allowed_skills,
-            context_summary=task.context,
-            budget_json=task.budget.model_dump(mode="json"),
-            agent_version=self._agent_version,
-        )
+        run = existing_run
+        if run is None:
+            run = run_repository.create_run(
+                db,
+                user_id=user_id,
+                goal=task.goal,
+                allowed_skills=task.allowed_skills,
+                context_summary=task.context,
+                budget_json=task.budget.model_dump(mode="json"),
+                agent_version=self._agent_version,
+            )
+            run_repository.start_run(db, run)
+            run_repository.append_event(
+                db,
+                run_id=run.id,
+                event_type="run_started",
+                payload_json={"agent_version": self._agent_version},
+            )
+            revision = 0
+            consumed_turns = 0
+            consumed_tool_calls = 0
+        else:
+            revision = run_repository.count_plans(db, run.id)
+            consumed_turns = run_repository.count_turns(db, run.id)
+            consumed_tool_calls = run_repository.count_tool_decisions(db, run.id)
+            task = self._with_observed_public_evidence(db, task, run.id)
         context = self._tool_context(user_id=user_id, run_id=run.id, task=task)
-        tool_budget = ToolCallBudget(task.budget.max_tool_calls)
-        turn_budget = AgentTurnBudget(task.budget.max_agent_turns)
-        run_repository.start_run(db, run)
-        run_repository.append_event(
-            db,
-            run_id=run.id,
-            event_type="run_started",
-            payload_json={"agent_version": self._agent_version},
+        tool_budget = ToolCallBudget(
+            task.budget.max_tool_calls, used=consumed_tool_calls
+        )
+        turn_budget = AgentTurnBudget(
+            task.budget.max_agent_turns, used=consumed_turns
         )
         planning_task = task
-        revision = 0
         replans = 0
-        trace = self._build_decision_trace(db, run.id)
+        trace = self._build_decision_trace(
+            db,
+            run.id,
+            initial_turn_indices=run_repository.turn_indices_by_role(db, run.id),
+        )
         while True:
             try:
                 planner_result = self._planner.run(
@@ -184,6 +208,29 @@ class AgentRuntime:
                 payload_json={"summary": final_summary},
             )
             return AgentRunResult(run.id, RunStatus.succeeded, final_summary)
+
+    def resume(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        run_id: str,
+        task: AgentTaskRequest,
+    ) -> AgentRunResult:
+        """Continue a paused Run without resetting its durable operational budget."""
+        run = run_repository.get_run_for_owner(db, run_id, user_id)
+        if run is None:
+            raise ValueError("agent_run_not_found")
+        if run.status is not RunStatus.waiting_user:
+            raise ValueError("agent_run_not_waiting_user")
+        run_repository.start_run(db, run)
+        run_repository.append_event(
+            db,
+            run_id=run.id,
+            event_type="run_resumed",
+            payload_json={"user_response_received": True},
+        )
+        return self.run(db, user_id=user_id, task=task, existing_run=run)
 
     def _run_step(
         self,
@@ -365,9 +412,14 @@ class AgentRuntime:
         return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
 
     @staticmethod
-    def _build_decision_trace(db: Session, run_id: str):
+    def _build_decision_trace(
+        db: Session,
+        run_id: str,
+        *,
+        initial_turn_indices: dict[AgentRole, int] | None = None,
+    ):
         """Return a run-local, role-indexed callback for safe decision summaries."""
-        turn_indices = {role: 0 for role in AgentRole}
+        turn_indices = dict(initial_turn_indices or {role: 0 for role in AgentRole})
 
         def trace(role: AgentRole, decision_json: dict[str, str]) -> None:
             turn_indices[role] += 1

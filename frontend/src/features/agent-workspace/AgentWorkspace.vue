@@ -8,6 +8,7 @@ import {
   fetchAgentRunArtifacts,
   fetchAgentRunEvents,
   fetchAgentRuns,
+  resumeAgentRun,
 } from "./agentRuntimeApi"
 import type {
   AgentArtifactResponse,
@@ -35,7 +36,9 @@ const artifacts = ref<AgentArtifactResponse[]>([])
 const loadingHistory = ref(false)
 const loadingRun = ref(false)
 const submitting = ref(false)
+const resuming = ref(false)
 const errorMessage = ref<string | null>(null)
+const userResponse = ref("")
 
 const canSubmit = computed(() => Boolean(
   props.token && goal.value.trim() && selectedSkills.value.length && !submitting.value,
@@ -107,6 +110,22 @@ async function submit(): Promise<void> {
   }
 }
 
+async function resumeActiveRun(): Promise<void> {
+  if (!props.token || !activeRun.value || !userResponse.value.trim() || resuming.value) return
+  resuming.value = true
+  errorMessage.value = null
+  try {
+    await resumeAgentRun(props.token, activeRun.value.id, userResponse.value)
+    userResponse.value = ""
+    await loadHistory()
+    await selectRun(activeRun.value.id)
+  } catch (error: unknown) {
+    errorMessage.value = userFacingError(error)
+  } finally {
+    resuming.value = false
+  }
+}
+
 function userFacingError(error: unknown): string {
   if (error instanceof ApiError && (
     error.message === "agent_harness_unavailable"
@@ -121,6 +140,9 @@ function userFacingError(error: unknown): string {
 function eventLabel(event: AgentEventResponse): string {
   const labels: Record<string, string> = {
     run_started: "任务已启动",
+    run_resumed: "已收到你的补充，任务继续执行",
+    planner_needs_user: "Planner 需要补充信息",
+    run_needs_user: "任务等待你的补充",
     plan_created: "Planner 已生成计划",
     executor_tool_observation: "Executor 获取了岗位证据",
     executor_structured_artifact: "Executor 已结构化 JD",
@@ -227,6 +249,16 @@ function formatDate(value: string): string {
             <h2 id="detail-heading">{{ activeRun.goal }}</h2>
             <p>{{ activeRun.summary ?? "任务仍在处理，完成后将在这里显示安全摘要。" }}</p>
             <span class="status-pill" :class="activeRun.status">{{ activeRun.status }}</span>
+            <form
+              v-if="activeRun.status === 'waiting_user'"
+              name="resume-run"
+              class="resume-form"
+              @submit.prevent="resumeActiveRun"
+            >
+              <label class="field-label" for="user-response">补充信息后继续</label>
+              <textarea id="user-response" v-model="userResponse" name="user-response" rows="2" placeholder="例如：优先北京，接受上海；只看正式岗位。" />
+              <button type="submit" :disabled="resuming || !userResponse.trim()">{{ resuming ? "正在继续…" : "继续任务" }}</button>
+            </form>
           </header>
 
           <div class="detail-columns">
@@ -298,6 +330,7 @@ button { border: 0; cursor: pointer; }
 .detail-header { position: relative; padding-right: 100px; border-bottom: 1px solid #dfd6c7; }
 .detail-header h2 { margin: .25rem 0 .7rem; font: 700 clamp(1.55rem, 3vw, 2.4rem)/1 Georgia, "Songti SC", serif; }.detail-header > p:not(.section-index) { color: #625d52; }
 .status-pill { position: absolute; top: .2rem; right: 0; padding: .3rem .55rem; background: #e9e3d8; color: #514c42; font: 700 .7rem/1 monospace; text-transform: uppercase; }.status-pill.succeeded { background: #dbece0; color: #24533d; }.status-pill.failed { background: #f7dedd; color: #84221d; }
+.resume-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .55rem .75rem; align-items: end; margin: 1rem 0; padding: .85rem; border: 1px solid #dcc07b; background: #fff7dc; }.resume-form .field-label { grid-column: 1 / -1; margin: 0; }.resume-form textarea { min-height: 70px; }.resume-form button { align-self: stretch; padding: .7rem .85rem; background: #8b5a16; color: #fffaf0; font-weight: 700; }.resume-form button:disabled { cursor: not-allowed; opacity: .45; }
 .detail-columns { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(260px, 1.2fr); gap: 1.5rem; padding-top: 1.2rem; }.detail-columns h3 { margin-bottom: .8rem; font: 700 1.12rem/1 Georgia, serif; }
 .timeline { margin: 0; padding: 0; list-style: none; }.timeline li { display: flex; gap: .65rem; padding: .65rem 0; border-bottom: 1px solid #eee7db; }.timeline-number { color: #a44b23; font: 700 .75rem/1.4 monospace; }.timeline strong, .timeline small { display: block; }.timeline strong { font-size: .88rem; }.timeline small { color: #80786d; font-size: .72rem; }
 .artifact-card { margin-bottom: .75rem; padding: .9rem; border: 1px solid #ded3c0; background: #fbf6ed; }.artifact-card h4 { margin: .25rem 0 .45rem; font: 700 1rem/1.1 Georgia, serif; }.artifact-card > p:not(.artifact-type) { margin-bottom: .6rem; color: #5f584d; font-size: .83rem; }.artifact-card a { color: #8d3c1c; font-size: .82rem; font-weight: 700; }

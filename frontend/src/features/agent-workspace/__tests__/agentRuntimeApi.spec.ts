@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { createAgentRun, fetchAgentRuns } from "../agentRuntimeApi"
+import { createAgentRun, fetchAgentRuns, resumeAgentRun } from "../agentRuntimeApi"
 
 describe("agent runtime API", () => {
   afterEach(() => {
@@ -44,5 +44,19 @@ describe("agent runtime API", () => {
     await fetchAgentRuns("student-token", 12)
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs?limit=12")
+  })
+
+  it("resumes a waiting run with only the human clarification", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        id: "run-1", status: "running", summary: null, error_code: null,
+      }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await resumeAgentRun("student-token", "run-1", "北京")
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run-1/resume")
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ user_response: "北京" })
   })
 })

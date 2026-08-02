@@ -33,6 +33,22 @@ class AgentRunCreatedResponse(BaseModel):
     error_code: str | None
 
 
+class ResumeAgentRunRequest(BaseModel):
+    """One human reply used to continue a paused owner-scoped Run."""
+
+    model_config = {"extra": "forbid"}
+
+    user_response: str = Field(min_length=1, max_length=8_000)
+
+    @field_validator("user_response")
+    @classmethod
+    def normalize_user_response(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("user_response must not be empty")
+        return cleaned
+
+
 class AgentRunResponse(BaseModel):
     id: str
     goal: str

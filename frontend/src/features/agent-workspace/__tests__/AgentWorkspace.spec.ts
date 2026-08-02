@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   fetchAgentRunArtifacts: vi.fn(),
   fetchAgentRunEvents: vi.fn(),
   fetchAgentRuns: vi.fn(),
+  resumeAgentRun: vi.fn(),
 }))
 vi.mock("../agentRuntimeApi", () => api)
 
@@ -32,6 +33,9 @@ beforeEach(() => {
   api.fetchAgentRunArtifacts.mockResolvedValue({ items: [] })
   api.createAgentRun.mockResolvedValue({
     id: "run-1", status: "succeeded", summary: "已找到岗位", error_code: null,
+  })
+  api.resumeAgentRun.mockResolvedValue({
+    id: "run-1", status: "succeeded", summary: "已按北京筛选", error_code: null,
   })
 })
 
@@ -91,5 +95,19 @@ describe("AgentWorkspace", () => {
     await flushPromises()
 
     expect(wrapper.text()).toContain("智能求职助手暂不可用，请稍后重试。")
+  })
+
+  it("lets the owner provide a clarification for a waiting run", async () => {
+    const waitingRun = { ...run, status: "waiting_user", summary: "请确认目标城市" }
+    api.fetchAgentRuns.mockResolvedValue({ items: [waitingRun] })
+    api.fetchAgentRun.mockResolvedValue(waitingRun)
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    await wrapper.get('textarea[name="user-response"]').setValue("北京")
+    await wrapper.get('form[name="resume-run"]').trigger("submit.prevent")
+    await flushPromises()
+
+    expect(api.resumeAgentRun).toHaveBeenCalledWith("student-token", "run-1", "北京")
   })
 })

@@ -6,10 +6,11 @@ from sqlalchemy.orm import Session
 
 from backend.app.config import Settings
 from backend.app.db.models import AgentArtifact, AgentEvent, AgentRun
+from backend.app.domain.agent_runtime import RunStatus
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.repositories import profiles as profile_repository
 from backend.app.services.agent_runtime.runtime import AgentRunResult, AgentRuntime
-from backend.app.services.agent_runtime.schemas import AgentTaskRequest
+from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
 
 
 class AgentRuntimeDisabledError(RuntimeError):
@@ -22,6 +23,10 @@ class AgentRuntimeUnavailableError(RuntimeError):
 
 class AgentRunNotFoundError(LookupError):
     """Owner-scoped run lookup intentionally returned no record."""
+
+
+class AgentRunNotResumableError(RuntimeError):
+    """Raised when a user tries to continue a non-paused Agent run."""
 
 
 class AgentRunService:
@@ -67,6 +72,39 @@ class AgentRunService:
         if run is None:
             raise AgentRunNotFoundError(run_id)
         return run
+
+    def resume_run(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        run_id: str,
+        user_response: str,
+    ) -> AgentRunResult:
+        """Add a human reply and resume exactly one owner-scoped paused Run."""
+        if not self._settings.agent_harness_enabled:
+            raise AgentRuntimeDisabledError("agent_harness_disabled")
+        if self._runtime is None:
+            raise AgentRuntimeUnavailableError("agent_harness_unavailable")
+        run = self.get_run(db, user_id=user_id, run_id=run_id)
+        if run.status is not RunStatus.waiting_user:
+            raise AgentRunNotResumableError("agent_run_not_waiting_user")
+        cleaned_response = user_response.strip()
+        if not cleaned_response:
+            raise ValueError("user_response_empty")
+        context = run_repository.append_user_response(db, run, cleaned_response)
+        task = AgentTaskRequest(
+            goal=run.goal,
+            allowed_skills=run.allowed_skills_json,
+            context=context,
+            budget=AgentBudget.model_validate(run.budget_json),
+        )
+        return self._runtime.resume(
+            db,
+            user_id=user_id,
+            run_id=run.id,
+            task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
+        )
 
     def list_runs(self, db: Session, *, user_id: str, limit: int) -> list[AgentRun]:
         """List recent task summaries within the requesting user's ownership boundary."""

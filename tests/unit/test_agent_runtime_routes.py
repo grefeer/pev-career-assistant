@@ -106,6 +106,39 @@ def test_post_agent_run_rejects_unknown_input_and_disabled_harness() -> None:
     assert disabled.json()["detail"]["code"] == "agent_harness_disabled"
 
 
+def test_post_agent_run_resume_accepts_only_a_human_reply() -> None:
+    """The browser resumes a durable Run without supplying budgets or private context."""
+    service = MagicMock()
+    service.resume_run.return_value = AgentRunResult(
+        run_id="run-1", status=RunStatus.succeeded, summary="已按北京筛选"
+    )
+    app = _build_app(service)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/agent-runs/run-1/resume",
+        headers=_headers(app),
+        json={"user_response": "北京"},
+    )
+    invalid = client.post(
+        "/api/agent-runs/run-1/resume",
+        headers=_headers(app),
+        json={"user_response": "北京", "budget": {"max_agent_turns": 99}},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": "run-1",
+        "status": "succeeded",
+        "summary": "已按北京筛选",
+        "error_code": None,
+    }
+    assert invalid.status_code == 422
+    assert service.resume_run.call_args.kwargs == {
+        "user_id": "user-a", "run_id": "run-1", "user_response": "北京"
+    }
+
+
 def test_get_agent_run_and_events_project_owner_safe_fields() -> None:
     """Trace API exposes evidence summaries but never hidden run context."""
     service = MagicMock()

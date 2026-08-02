@@ -190,6 +190,66 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
     ]
 
 
+def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session) -> None:
+    """A user reply resumes one durable Run instead of opening a fresh budget."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [
+            {"action": "need_user", "user_question": "请确认目标城市。"},
+            {
+                "action": "plan", "complexity": "L1", "success_criteria": ["answer"],
+                "steps": [{
+                    "step_id": "answer", "objective": "return the constrained result",
+                    "allowed_skills": ["job-discovery"],
+                }],
+            },
+        ],
+        AgentRole.executor: [{"action": "complete", "summary": "completed with user constraint"}],
+        AgentRole.verifier: [],
+    })
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
+        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
+        verifier=VerifierAgent(gateway=gateway, tools=ToolRegistry()),
+        agent_version="pev-test",
+    )
+    original_task = AgentTaskRequest(
+        goal="find suitable roles", allowed_skills=["job-discovery"],
+        budget={"max_agent_turns": 3, "max_tool_calls": 3, "max_replans": 0},
+    )
+
+    waiting = runtime.run(db_session, user_id=user.id, task=original_task)
+    resumed = runtime.resume(
+        db_session,
+        user_id=user.id,
+        run_id=waiting.run_id,
+        task=original_task.model_copy(
+            update={"context": {"user_responses": ["北京"]}}
+        ),
+    )
+    db_session.commit()
+
+    assert waiting.status is RunStatus.waiting_user
+    assert resumed.run_id == waiting.run_id
+    assert resumed.status is RunStatus.succeeded
+    assert gateway.states[AgentRole.planner][1]["context"]["user_responses"] == ["北京"]
+    assert "private_context" not in gateway.states[AgentRole.planner][1]
+    assert gateway.states[AgentRole.planner][1]["remaining_agent_turns"] == 1
+    assert [event.event_type for event in run_repository.list_events(db_session, waiting.run_id)] == [
+        "run_started",
+        "planner_needs_user",
+        "run_resumed",
+        "plan_created",
+        "step_succeeded",
+        "run_succeeded",
+    ]
+
+
 def test_runtime_enforces_one_global_model_turn_budget_across_pev_roles(db_session) -> None:
     """A complex run cannot spend a fresh model-turn allowance per Agent."""
     user = User(

@@ -16,6 +16,7 @@ from backend.app.api.agent_runtime_schemas import (
     AgentRunListResponse,
     AgentRunResponse,
     CreateAgentRunRequest,
+    ResumeAgentRunRequest,
 )
 from backend.app.api.dependencies import (
     _get_db,
@@ -26,6 +27,7 @@ from backend.app.db.models import User
 from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
 from backend.app.services.agent_runtime.service import (
     AgentRunNotFoundError,
+    AgentRunNotResumableError,
     AgentRunService,
     AgentRuntimeDisabledError,
     AgentRuntimeUnavailableError,
@@ -87,6 +89,48 @@ def create_agent_run(
     )
     try:
         result = service.create_run(db, user_id=current_user.id, task=task)
+    except AgentRuntimeDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "agent_harness_disabled"},
+        ) from None
+    except AgentRuntimeUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "agent_harness_unavailable"},
+        ) from None
+    db.commit()
+    return AgentRunCreatedResponse(
+        id=result.run_id,
+        status=result.status.value,
+        summary=result.summary,
+        error_code=result.error_code,
+    )
+
+
+@router.post("/{run_id}/resume", response_model=AgentRunCreatedResponse)
+def resume_agent_run(
+    run_id: str,
+    request_body: ResumeAgentRunRequest,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+) -> AgentRunCreatedResponse:
+    """Continue one paused personal task with a user-supplied clarification."""
+    try:
+        result = service.resume_run(
+            db,
+            user_id=current_user.id,
+            run_id=run_id,
+            user_response=request_body.user_response,
+        )
+    except AgentRunNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
+    except AgentRunNotResumableError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "agent_run_not_waiting_user"},
+        ) from None
     except AgentRuntimeDisabledError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

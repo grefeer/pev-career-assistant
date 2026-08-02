@@ -31,6 +31,21 @@ export function createAgentRun(
   )
 }
 
+export function resumeAgentRun(
+  token: string,
+  runId: string,
+  userResponse: string,
+): Promise<AgentRunCreatedResponse> {
+  return request<AgentRunCreatedResponse>(
+    `${BASE}/${encodeURIComponent(runId)}/resume`,
+    {
+      method: "POST",
+      body: JSON.stringify({ user_response: userResponse.trim() }),
+    },
+    token,
+  )
+}
+
 export function fetchAgentRuns(token: string, limit = 20): Promise<AgentRunListResponse> {
   return request<AgentRunListResponse>(`${BASE}?limit=${limit}`, {}, token)
 }

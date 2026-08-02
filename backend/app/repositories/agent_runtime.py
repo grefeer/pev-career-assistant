@@ -83,6 +83,19 @@ def start_run(db: Session, run: AgentRun) -> AgentRun:
     return run
 
 
+def append_user_response(db: Session, run: AgentRun, user_response: str) -> dict[str, Any]:
+    """Append a bounded human reply to the Run's private task context."""
+    context = dict(run.context_summary_json)
+    responses = context.get("user_responses", [])
+    safe_responses = list(responses) if isinstance(responses, list) else []
+    safe_responses.append(user_response)
+    context["user_responses"] = safe_responses[-10:]
+    run.context_summary_json = context
+    run.state_version += 1
+    db.flush()
+    return context
+
+
 def set_run_complexity(
     db: Session, run: AgentRun, complexity: ComplexityLevel
 ) -> AgentRun:
@@ -316,3 +329,29 @@ def list_events(db: Session, run_id: str) -> list[AgentEvent]:
             .order_by(AgentEvent.sequence.asc(), AgentEvent.id.asc())
         )
     )
+
+
+def count_plans(db: Session, run_id: str) -> int:
+    """Count persisted revisions so a resumed Run keeps unique plan numbers."""
+    return int(db.scalar(select(func.count()).where(AgentPlan.run_id == run_id)) or 0)
+
+
+def count_turns(db: Session, run_id: str) -> int:
+    """Count durable model decisions already consumed by one Run."""
+    return int(db.scalar(select(func.count()).where(AgentTurn.run_id == run_id)) or 0)
+
+
+def count_tool_decisions(db: Session, run_id: str) -> int:
+    """Count persisted Agent-selected tool calls without database-specific JSON SQL."""
+    return sum(
+        turn.decision_json.get("action") == "call_tool"
+        for turn in db.scalars(select(AgentTurn).where(AgentTurn.run_id == run_id))
+    )
+
+
+def turn_indices_by_role(db: Session, run_id: str) -> dict[AgentRole, int]:
+    """Return the latest durable sequence number for each PEV role."""
+    indices = {role: 0 for role in AgentRole}
+    for turn in db.scalars(select(AgentTurn).where(AgentTurn.run_id == run_id)):
+        indices[turn.role] = max(indices[turn.role], turn.turn_index)
+    return indices
