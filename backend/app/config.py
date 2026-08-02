@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     readiness_timeout_seconds: int = Field(default=2, ge=1, le=30)
     checkpoint_backend: Literal["sqlite", "redis"] = "sqlite"
     checkpoint_sqlite_path: Path = (
-        ROOT_DIR / "checkpoints" / "langgraph_checkpoints.sqlite"
+        ROOT_DIR / "checkpoints" / "legacy_checkpoints.sqlite"
     )
     object_store_endpoint: str = "http://localhost:9000"
     object_store_region: str = "us-east-1"
