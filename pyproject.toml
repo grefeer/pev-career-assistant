@@ -9,4 +9,4 @@ ignore = ["E501"]
 "tests/manual/*.py" = ["E402"]
 
 [tool.pytest.ini_options]
-norecursedirs = ["archive", ".worktrees"]
+norecursedirs = ["archive", ".worktrees", "manual"]
