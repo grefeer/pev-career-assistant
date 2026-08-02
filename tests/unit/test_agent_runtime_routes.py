@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -265,6 +267,24 @@ def test_agent_event_stream_honors_last_event_id_and_hides_missing_runs() -> Non
 
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "not_found"
+
+
+def test_following_sse_stream_heartbeats_then_stops_when_owner_run_disappears(monkeypatch) -> None:
+    service = MagicMock()
+    service.list_events.side_effect = [[], AgentRunNotFoundError("run-1")]
+    monkeypatch.setattr(routes_module.time, "sleep", lambda _seconds: None)
+    response = routes_module.stream_agent_events(
+        "run-1", MagicMock(), SimpleNamespace(id="user-a"), service, follow=True
+    )
+
+    async def consume() -> list[str]:
+        iterator = response.body_iterator
+        first = await anext(iterator)
+        with pytest.raises(StopAsyncIteration):
+            await anext(iterator)
+        return [first]
+
+    assert asyncio.run(consume()) == [": keep-alive\n\n"]
 
 
 def test_list_agent_runs_projects_only_safe_owner_history_fields() -> None:

@@ -73,6 +73,10 @@ def test_service_fails_closed_when_adaptive_harness_is_disabled(db_session) -> N
         service.create_run(db_session, user_id="user-a", task=None)
     with pytest.raises(AgentRuntimeDisabledError):
         service.queue_run(db_session, user_id="user-a", task=None)
+    with pytest.raises(AgentRuntimeUnavailableError):
+        AgentRunService(settings_override(agent_harness_enabled=True), runtime=None).queue_run(
+            db_session, user_id="user-a", task=None
+        )
 
 
 def test_service_queues_then_executes_a_durable_run_in_an_isolated_session(db_session) -> None:
