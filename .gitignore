@@ -31,6 +31,7 @@ env/
 .coverage-report.json
 coverage.xml
 htmlcov/
+frontend/coverage/
 .npm-cache/
 .npm-tmp/
 
@@ -50,6 +51,7 @@ executor-data/chrome-profile/
 test-results/
 playwright-report/
 frontend/node_modules/
+node_modules/
 frontend/dist/
 
 # Local app secrets
