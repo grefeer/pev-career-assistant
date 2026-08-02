@@ -66,6 +66,24 @@ class FallbackResponseModel:
         return type("RawResponse", (), {"content": self.content})()
 
 
+class LocalJsonPreferredModel:
+    """A provider that must never receive LangChain response_format wiring."""
+
+    def __init__(self) -> None:
+        self.structured_requested = False
+
+    def with_structured_output(self, _schema: type[BaseModel]) -> "LocalJsonPreferredModel":
+        self.structured_requested = True
+        raise AssertionError("structured protocol must not be requested")
+
+    def invoke(self, _messages: list[object]) -> object:
+        return type(
+            "RawResponse",
+            (),
+            {"content": '{"action":"need_user","user_question":"请确认城市。"}'},
+        )()
+
+
 class InvalidStructuredThenJsonModel:
     """Provider returns an invalid structured object but supports ordinary JSON retry."""
 
@@ -234,6 +252,20 @@ def test_gateway_falls_back_to_locally_validated_json_when_provider_rejects_resp
     assert result.user_question == "请确认城市。"
 
 
+def test_gateway_can_prefer_locally_validated_json_without_requesting_response_format() -> None:
+    model = LocalJsonPreferredModel()
+
+    result = LangChainModelGateway(model, prefer_local_json_validation=True).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert model.structured_requested is False
+
+
 def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:
     """An enabled harness must not fall back to a fabricated model decision."""
     monkeypatch.setattr("src.utils.get_api_key", lambda: None)
@@ -292,3 +324,4 @@ def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
 
     assert isinstance(gateway, LangChainModelGateway)
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert gateway._prefer_local_json_validation is True

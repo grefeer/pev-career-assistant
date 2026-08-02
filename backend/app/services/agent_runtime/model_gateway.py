@@ -52,8 +52,13 @@ class AgentModelGatewayConfigError(RuntimeError):
 class LangChainModelGateway:
     """Schema-first gateway for any LangChain OpenAI-compatible chat model."""
 
-    def __init__(self, model: Any) -> None:
+    def __init__(self, model: Any, *, prefer_local_json_validation: bool = False) -> None:
         self._model = model
+        # Some otherwise compatible providers accept response_format but do
+        # not reliably honour it.  They still make a real autonomous decision;
+        # this flag changes only the wire protocol used to validate that one
+        # decision locally.
+        self._prefer_local_json_validation = prefer_local_json_validation
 
     def decide(
         self,
@@ -82,6 +87,12 @@ class LangChainModelGateway:
                 )
             ),
         ]
+        if self._prefer_local_json_validation:
+            return self._decide_with_local_json_retry(
+                messages=messages,
+                role=role,
+                response_model=response_model,
+            )
         try:
             structured_model = self._model.with_structured_output(response_model)
             raw_result = structured_model.invoke(messages)
@@ -124,6 +135,34 @@ class LangChainModelGateway:
                     if retry_error.code == "model_request_failed":
                         raise retry_error from exc
                 raise AgentModelGatewayError("invalid_model_response") from exc
+
+    def _decide_with_local_json_retry(
+        self,
+        *,
+        messages: list[SystemMessage | HumanMessage],
+        role: AgentRole,
+        response_model: type[ResponseT],
+    ) -> ResponseT:
+        """Allow one malformed-completion retry for a JSON-only provider."""
+        try:
+            return self._decide_with_local_json_validation(
+                messages=messages,
+                role=role,
+                response_model=response_model,
+            )
+        except AgentModelGatewayError as first_error:
+            if first_error.code == "model_request_failed":
+                raise
+            try:
+                return self._decide_with_local_json_validation(
+                    messages=messages,
+                    role=role,
+                    response_model=response_model,
+                )
+            except AgentModelGatewayError as retry_error:
+                if retry_error.code == "model_request_failed":
+                    raise retry_error from first_error
+                raise AgentModelGatewayError("invalid_model_response") from first_error
 
     def _decide_with_local_json_validation(
         self,
@@ -213,4 +252,9 @@ def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
         "deepseek-v4"
     ):
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    return LangChainModelGateway(ChatOpenAI(**kwargs))
+    prefers_local_json = "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
+        "deepseek-v4"
+    )
+    return LangChainModelGateway(
+        ChatOpenAI(**kwargs), prefer_local_json_validation=prefers_local_json
+    )
