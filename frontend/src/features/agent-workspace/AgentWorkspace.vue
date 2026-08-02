@@ -7,12 +7,14 @@ import {
   fetchAgentRun,
   fetchAgentRunArtifacts,
   fetchAgentRunEvents,
+  fetchAgentRunPlans,
   fetchAgentRuns,
   resumeAgentRun,
 } from "./agentRuntimeApi"
 import type {
   AgentArtifactResponse,
   AgentEventResponse,
+  AgentPlanResponse,
   AgentRunResponse,
   CareerSkillName,
 } from "./agentRuntimeTypes"
@@ -32,6 +34,7 @@ const selectedSkills = ref<CareerSkillName[]>(skills.map((skill) => skill.name))
 const runs = ref<AgentRunResponse[]>([])
 const activeRun = ref<AgentRunResponse | null>(null)
 const events = ref<AgentEventResponse[]>([])
+const plans = ref<AgentPlanResponse[]>([])
 const artifacts = ref<AgentArtifactResponse[]>([])
 const loadingHistory = ref(false)
 const loadingRun = ref(false)
@@ -90,13 +93,15 @@ async function selectRun(runId: string): Promise<void> {
   loadingRun.value = true
   errorMessage.value = null
   try {
-    const [run, eventResponse, artifactResponse] = await Promise.all([
+    const [run, eventResponse, planResponse, artifactResponse] = await Promise.all([
       fetchAgentRun(props.token, runId),
       fetchAgentRunEvents(props.token, runId),
+      fetchAgentRunPlans(props.token, runId),
       fetchAgentRunArtifacts(props.token, runId),
     ])
     activeRun.value = run
     events.value = eventResponse.items
+    plans.value = planResponse.items
     artifacts.value = artifactResponse.items
   } catch (error: unknown) {
     errorMessage.value = userFacingError(error)
@@ -329,6 +334,20 @@ function formatDate(value: string): string {
 
           <div class="detail-columns">
             <section class="activity-panel">
+              <h3>Planner 计划</h3>
+              <div v-if="plans.length" class="plan-revisions">
+                <article v-for="plan in plans" :key="plan.id" class="plan-card">
+                  <p>版本 {{ plan.revision }} · {{ plan.complexity }}</p>
+                  <ol>
+                    <li v-for="step in plan.steps" :key="step.id">
+                      <strong>{{ step.objective }}</strong>
+                      <small>{{ step.allowed_skills.join("、") }} · {{ step.requires_verification ? "需 Verifier 核验" : "确定性校验" }}</small>
+                    </li>
+                  </ol>
+                </article>
+              </div>
+              <p v-else class="muted">Planner 尚未生成可展示的计划。</p>
+
               <h3>Agent 活动</h3>
               <ol v-if="events.length" class="timeline">
                 <li v-for="event in events" :key="event.sequence">
@@ -411,7 +430,7 @@ button { border: 0; cursor: pointer; }
 .status-pill { position: absolute; top: .2rem; right: 0; padding: .3rem .55rem; background: #e9e3d8; color: #514c42; font: 700 .7rem/1 monospace; text-transform: uppercase; }.status-pill.succeeded { background: #dbece0; color: #24533d; }.status-pill.failed { background: #f7dedd; color: #84221d; }
 .resume-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .55rem .75rem; align-items: end; margin: 1rem 0; padding: .85rem; border: 1px solid #dcc07b; background: #fff7dc; }.resume-form .field-label { grid-column: 1 / -1; margin: 0; }.resume-form textarea { min-height: 70px; }.resume-form button { align-self: stretch; padding: .7rem .85rem; background: #8b5a16; color: #fffaf0; font-weight: 700; }.resume-form button:disabled { cursor: not-allowed; opacity: .45; }
 .detail-columns { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(260px, 1.2fr); gap: 1.5rem; padding-top: 1.2rem; }.detail-columns h3 { margin-bottom: .8rem; font: 700 1.12rem/1 Georgia, serif; }
-.timeline { margin: 0; padding: 0; list-style: none; }.timeline li { display: flex; gap: .65rem; padding: .65rem 0; border-bottom: 1px solid #eee7db; }.timeline-number { color: #a44b23; font: 700 .75rem/1.4 monospace; }.timeline strong, .timeline small { display: block; }.timeline strong { font-size: .88rem; }.timeline small { color: #80786d; font-size: .72rem; }
+.plan-revisions { margin-bottom: 1.1rem; }.plan-card { margin: .55rem 0; padding: .65rem; border: 1px solid #e1d5c2; background: #fffaf2; }.plan-card > p { margin-bottom: .45rem; color: #8d3c1c; font: 700 .72rem/1 monospace; }.plan-card ol { margin: 0; padding-left: 1.2rem; }.plan-card li { margin-top: .4rem; }.plan-card strong, .plan-card small { display: block; }.plan-card strong { font-size: .84rem; }.plan-card small { margin-top: .15rem; color: #71695e; font-size: .72rem; }.timeline { margin: 0; padding: 0; list-style: none; }.timeline li { display: flex; gap: .65rem; padding: .65rem 0; border-bottom: 1px solid #eee7db; }.timeline-number { color: #a44b23; font: 700 .75rem/1.4 monospace; }.timeline strong, .timeline small { display: block; }.timeline strong { font-size: .88rem; }.timeline small { color: #80786d; font-size: .72rem; }
 .artifact-card { margin-bottom: .75rem; padding: .9rem; border: 1px solid #ded3c0; background: #fbf6ed; }.artifact-card h4 { margin: .25rem 0 .45rem; font: 700 1rem/1.1 Georgia, serif; }.artifact-card > p:not(.artifact-type) { margin-bottom: .6rem; color: #5f584d; font-size: .83rem; }.artifact-card a { color: #8d3c1c; font-size: .82rem; font-weight: 700; }.artifact-actions { margin: .65rem 0; padding: 0; list-style: none; }.artifact-actions li { margin-top: .45rem; padding: .55rem .6rem; border-left: 3px solid #a44b23; background: rgba(255, 255, 255, .55); }.artifact-actions strong, .artifact-actions small { display: block; }.artifact-actions strong { font-size: .8rem; line-height: 1.4; }.artifact-actions small { margin-top: .16rem; color: #6d665b; font-size: .74rem; line-height: 1.35; }
 .muted, .empty-detail { color: #756d61; }.empty-detail { display: grid; min-height: 330px; place-items: center; font: 1.1rem Georgia, serif; text-align: center; }
 @media (max-width: 900px) { .skill-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.workspace-grid, .detail-columns { grid-template-columns: 1fr; }.run-history { max-height: 260px; overflow: auto; }.composer-footer { align-items: flex-start; flex-direction: column; }.detail-header { padding-right: 0; }.status-pill { position: static; display: inline-block; margin-bottom: .75rem; } }

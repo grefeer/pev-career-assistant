@@ -228,3 +228,36 @@ def test_list_agent_artifacts_projects_only_owner_safe_artifact_fields() -> None
         "content": {"title": "AI Agent 开发工程师", "visible_text": "岗位职责"},
         "created_at": "2026-08-01T00:00:00Z",
     }]}
+
+
+def test_list_agent_plans_projects_only_owner_safe_plan_fields() -> None:
+    service = MagicMock()
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    service.list_plans.return_value = [
+        SimpleNamespace(
+            id="plan-1", revision=2, complexity=SimpleNamespace(value="L3"),
+            plan_json={
+                "task": {"private_context": {"skills": ["secret"]}},
+                "success_criteria": ["输出可核验匹配"],
+                "steps": [{
+                    "step_id": "match", "objective": "匹配", "allowed_skills": ["job-matching"],
+                    "success_criteria": ["给出证据"], "requires_verification": True,
+                }],
+            },
+            created_at=now,
+        )
+    ]
+    app = _build_app(service)
+
+    response = TestClient(app).get("/api/agent-runs/run-1/plans", headers=_headers(app))
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [{
+        "id": "plan-1", "revision": 2, "complexity": "L3",
+        "success_criteria": ["输出可核验匹配"],
+        "steps": [{
+            "id": "match", "objective": "匹配", "allowed_skills": ["job-matching"],
+            "success_criteria": ["给出证据"], "requires_verification": True,
+        }],
+        "created_at": "2026-08-01T00:00:00Z",
+    }]}

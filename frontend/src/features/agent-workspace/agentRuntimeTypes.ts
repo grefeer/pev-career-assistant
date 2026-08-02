@@ -43,6 +43,27 @@ export interface AgentEventListResponse {
   items: AgentEventResponse[]
 }
 
+export interface AgentPlanStepResponse {
+  id: string
+  objective: string
+  allowed_skills: string[]
+  success_criteria: string[]
+  requires_verification: boolean
+}
+
+export interface AgentPlanResponse {
+  id: string
+  revision: number
+  complexity: string
+  success_criteria: string[]
+  steps: AgentPlanStepResponse[]
+  created_at: string
+}
+
+export interface AgentPlanListResponse {
+  items: AgentPlanResponse[]
+}
+
 export interface AgentArtifactResponse {
   id: string
   artifact_type: string

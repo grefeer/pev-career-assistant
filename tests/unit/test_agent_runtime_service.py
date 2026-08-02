@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from backend.app.db.models import ConfirmedProfileVersion, Profile, User, UserRole
-from backend.app.domain.agent_runtime import RunStatus
+from backend.app.domain.agent_runtime import ComplexityLevel, RunStatus
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.runtime import AgentRunResult
 from backend.app.services.agent_runtime.schemas import AgentTaskRequest
@@ -102,6 +102,26 @@ def test_service_lists_only_the_callers_persisted_runs(db_session) -> None:
     runs = service.list_runs(db_session, user_id=owner.id, limit=20)
 
     assert [run.goal for run in runs] == ["我的任务"]
+
+
+def test_service_lists_plans_only_after_owner_check(db_session) -> None:
+    owner = _user("user-a", "user-a@example.test")
+    other = _user("user-b", "user-b@example.test")
+    db_session.add_all([owner, other])
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=owner.id, goal="我的任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    run_repository.create_plan(
+        db_session, run_id=run.id, revision=1, complexity=ComplexityLevel.L2,
+        plan_json={"goal": "我的任务", "steps": []},
+    )
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=None)
+
+    assert len(service.list_plans(db_session, user_id=owner.id, run_id=run.id)) == 1
+    with pytest.raises(AgentRunNotFoundError):
+        service.list_plans(db_session, user_id=other.id, run_id=run.id)
 
 
 def test_service_injects_only_the_owners_latest_confirmed_profile_into_private_task_context(db_session) -> None:

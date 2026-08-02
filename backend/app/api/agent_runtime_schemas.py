@@ -77,6 +77,31 @@ class AgentEventListResponse(BaseModel):
     items: list[AgentEventResponse]
 
 
+class AgentPlanStepResponse(BaseModel):
+    """Safe, user-facing projection of one Planner-created outcome."""
+
+    id: str
+    objective: str
+    allowed_skills: list[str]
+    success_criteria: list[str]
+    requires_verification: bool
+
+
+class AgentPlanResponse(BaseModel):
+    """Plan view excludes task/private context and raw model payloads."""
+
+    id: str
+    revision: int
+    complexity: str
+    success_criteria: list[str]
+    steps: list[AgentPlanStepResponse]
+    created_at: datetime
+
+
+class AgentPlanListResponse(BaseModel):
+    items: list[AgentPlanResponse]
+
+
 class AgentArtifactResponse(BaseModel):
     """Public, owner-safe projection of a persisted PEV output artifact."""
 

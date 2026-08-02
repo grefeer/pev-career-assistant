@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { createAgentRun, fetchAgentRuns, resumeAgentRun } from "../agentRuntimeApi"
+import { createAgentRun, fetchAgentRunPlans, fetchAgentRuns, resumeAgentRun } from "../agentRuntimeApi"
 
 describe("agent runtime API", () => {
   afterEach(() => {
@@ -44,6 +44,19 @@ describe("agent runtime API", () => {
     await fetchAgentRuns("student-token", 12)
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs?limit=12")
+  })
+
+  it("loads only the safe plan projection for one owner-scoped run", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ items: [] }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await fetchAgentRunPlans("student-token", "run/1")
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run%2F1/plans")
   })
 
   it("resumes a waiting run with only the human clarification", async () => {

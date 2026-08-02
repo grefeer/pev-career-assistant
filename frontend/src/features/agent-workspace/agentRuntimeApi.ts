@@ -2,6 +2,7 @@ import { request } from "../../api"
 import type {
   AgentArtifactListResponse,
   AgentEventListResponse,
+  AgentPlanListResponse,
   AgentRunCreatedResponse,
   AgentRunListResponse,
   AgentRunResponse,
@@ -60,6 +61,17 @@ export function fetchAgentRunEvents(
 ): Promise<AgentEventListResponse> {
   return request<AgentEventListResponse>(
     `${BASE}/${encodeURIComponent(runId)}/events`,
+    {},
+    token,
+  )
+}
+
+export function fetchAgentRunPlans(
+  token: string,
+  runId: string,
+): Promise<AgentPlanListResponse> {
+  return request<AgentPlanListResponse>(
+    `${BASE}/${encodeURIComponent(runId)}/plans`,
     {},
     token,
   )

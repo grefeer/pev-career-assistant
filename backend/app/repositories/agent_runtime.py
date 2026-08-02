@@ -336,6 +336,17 @@ def count_plans(db: Session, run_id: str) -> int:
     return int(db.scalar(select(func.count()).where(AgentPlan.run_id == run_id)) or 0)
 
 
+def list_plans(db: Session, run_id: str) -> list[AgentPlan]:
+    """Return a Run's immutable Planner revisions in ascending order."""
+    return list(
+        db.scalars(
+            select(AgentPlan)
+            .where(AgentPlan.run_id == run_id)
+            .order_by(AgentPlan.revision.asc(), AgentPlan.id.asc())
+        )
+    )
+
+
 def count_turns(db: Session, run_id: str) -> int:
     """Count durable model decisions already consumed by one Run."""
     return int(db.scalar(select(func.count()).where(AgentTurn.run_id == run_id)) or 0)

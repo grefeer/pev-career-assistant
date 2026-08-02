@@ -12,6 +12,9 @@ from backend.app.api.agent_runtime_schemas import (
     AgentArtifactResponse,
     AgentEventListResponse,
     AgentEventResponse,
+    AgentPlanListResponse,
+    AgentPlanResponse,
+    AgentPlanStepResponse,
     AgentRunCreatedResponse,
     AgentRunListResponse,
     AgentRunResponse,
@@ -52,6 +55,55 @@ def _to_run_response(run) -> AgentRunResponse:
         error_code=run.error_code,
         created_at=run.created_at,
         updated_at=run.updated_at,
+    )
+
+
+def _to_plan_response(plan) -> AgentPlanResponse:
+    """Project a persisted plan without returning task/context or raw model JSON."""
+    payload = plan.plan_json if isinstance(plan.plan_json, dict) else {}
+    raw_steps = payload.get("steps")
+    steps: list[AgentPlanStepResponse] = []
+    if isinstance(raw_steps, list):
+        for item in raw_steps:
+            if not isinstance(item, dict):
+                continue
+            step_id = item.get("step_id")
+            objective = item.get("objective")
+            allowed_skills = item.get("allowed_skills")
+            success_criteria = item.get("success_criteria", [])
+            if not isinstance(step_id, str) or not isinstance(objective, str):
+                continue
+            if not isinstance(allowed_skills, list) or not all(
+                isinstance(skill, str) for skill in allowed_skills
+            ):
+                continue
+            if not isinstance(success_criteria, list) or not all(
+                isinstance(criterion, str) for criterion in success_criteria
+            ):
+                continue
+            steps.append(
+                AgentPlanStepResponse(
+                    id=step_id,
+                    objective=objective,
+                    allowed_skills=allowed_skills,
+                    success_criteria=success_criteria,
+                    requires_verification=bool(item.get("requires_verification", False)),
+                )
+            )
+    raw_success_criteria = payload.get("success_criteria", [])
+    success_criteria = (
+        raw_success_criteria
+        if isinstance(raw_success_criteria, list)
+        and all(isinstance(criterion, str) for criterion in raw_success_criteria)
+        else []
+    )
+    return AgentPlanResponse(
+        id=str(plan.id),
+        revision=plan.revision,
+        complexity=_value(plan.complexity) or "L1",
+        success_criteria=success_criteria,
+        steps=steps,
+        created_at=plan.created_at,
     )
 
 
@@ -185,6 +237,21 @@ def list_agent_events(
             for event in events
         ]
     )
+
+
+@router.get("/{run_id}/plans", response_model=AgentPlanListResponse)
+def list_agent_plans(
+    run_id: str,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+) -> AgentPlanListResponse:
+    """Return only safe Planner outcome fields for the Run owner."""
+    try:
+        plans = service.list_plans(db, user_id=current_user.id, run_id=run_id)
+    except AgentRunNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
+    return AgentPlanListResponse(items=[_to_plan_response(plan) for plan in plans])
 
 
 @router.get("/{run_id}/artifacts", response_model=AgentArtifactListResponse)

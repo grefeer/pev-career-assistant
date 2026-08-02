@@ -9,6 +9,7 @@ const api = vi.hoisted(() => ({
   fetchAgentRun: vi.fn(),
   fetchAgentRunArtifacts: vi.fn(),
   fetchAgentRunEvents: vi.fn(),
+  fetchAgentRunPlans: vi.fn(),
   fetchAgentRuns: vi.fn(),
   resumeAgentRun: vi.fn(),
 }))
@@ -30,6 +31,7 @@ beforeEach(() => {
   api.fetchAgentRuns.mockResolvedValue({ items: [] })
   api.fetchAgentRun.mockResolvedValue(run)
   api.fetchAgentRunEvents.mockResolvedValue({ items: [] })
+  api.fetchAgentRunPlans.mockResolvedValue({ items: [] })
   api.fetchAgentRunArtifacts.mockResolvedValue({ items: [] })
   api.createAgentRun.mockResolvedValue({
     id: "run-1", status: "succeeded", summary: "已找到岗位", error_code: null,
@@ -80,6 +82,26 @@ describe("AgentWorkspace", () => {
     expect(wrapper.text()).toContain("来源证据")
     expect(wrapper.text()).toContain("AI Agent 开发工程师")
     expect(wrapper.find('a[href="https://jobs.example/1"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain("private_context")
+  })
+
+  it("renders the safe Planner step projection without task-private context", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.fetchAgentRunPlans.mockResolvedValue({
+      items: [{
+        id: "plan-1", revision: 1, complexity: "L3", success_criteria: ["输出可核验匹配"],
+        steps: [{
+          id: "match", objective: "基于证据匹配", allowed_skills: ["job-matching"],
+          success_criteria: ["给出理由"], requires_verification: true,
+        }], created_at: run.created_at,
+      }],
+    })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain("Planner 计划")
+    expect(wrapper.text()).toContain("基于证据匹配")
+    expect(wrapper.text()).toContain("需 Verifier 核验")
     expect(wrapper.text()).not.toContain("private_context")
   })
 

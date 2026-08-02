@@ -123,6 +123,26 @@ def test_repository_lists_only_owner_runs_in_newest_first_order(db_session) -> N
     assert [run.id for run in runs] == [newest.id, oldest.id]
 
 
+def test_repository_lists_plan_revisions_in_execution_order(db_session) -> None:
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = agent_runtime.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    first = agent_runtime.create_plan(
+        db_session, run_id=run.id, revision=1, complexity=ComplexityLevel.L2,
+        plan_json={"goal": "找岗位", "steps": [{"id": "discover"}]},
+    )
+    second = agent_runtime.create_plan(
+        db_session, run_id=run.id, revision=2, complexity=ComplexityLevel.L3,
+        plan_json={"goal": "找岗位", "steps": [{"id": "match"}]},
+    )
+
+    assert [plan.id for plan in agent_runtime.list_plans(db_session, run.id)] == [first.id, second.id]
+
+
 def test_repository_keeps_distinct_artifact_types_for_one_source_and_deduplicates_each_type(db_session) -> None:
     """A page snapshot and its parsed JD share a hash but are distinct immutable products."""
     user = _user("user-a", "user-a@example.test")
