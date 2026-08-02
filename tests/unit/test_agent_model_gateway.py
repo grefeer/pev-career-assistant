@@ -84,6 +84,20 @@ class LocalJsonPreferredModel:
         )()
 
 
+class SequencedLocalJsonModel(LocalJsonPreferredModel):
+    """JSON-only provider whose bounded recovery responses are controllable."""
+
+    def __init__(self, responses: list[str | Exception]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def invoke(self, _messages: list[object]) -> object:
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return type("RawResponse", (), {"content": response})()
+
+
 class InvalidStructuredThenJsonModel:
     """Provider returns an invalid structured object but supports ordinary JSON retry."""
 
@@ -264,6 +278,45 @@ def test_gateway_can_prefer_locally_validated_json_without_requesting_response_f
 
     assert result.action == "need_user"
     assert model.structured_requested is False
+
+
+def test_gateway_retries_one_malformed_preferred_local_json_completion() -> None:
+    model = SequencedLocalJsonModel([
+        '{"action":"not-valid"}',
+        '{"action":"need_user","user_question":"请确认城市。"}',
+    ])
+
+    result = LangChainModelGateway(model, prefer_local_json_validation=True).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert model.responses == []
+
+
+@pytest.mark.parametrize(
+    "responses, error_code",
+    [
+        ([RuntimeError("provider down")], "model_request_failed"),
+        (['{"action":"not-valid"}', RuntimeError("provider down")], "model_request_failed"),
+        (['{"action":"not-valid"}', '{"action":"not-valid"}'], "invalid_model_response"),
+    ],
+)
+def test_gateway_fails_safely_when_preferred_local_json_retry_cannot_recover(
+    responses: list[str | Exception], error_code: str
+) -> None:
+    with pytest.raises(AgentModelGatewayError, match=error_code):
+        LangChainModelGateway(
+            SequencedLocalJsonModel(responses), prefer_local_json_validation=True
+        ).decide(
+            role=AgentRole.planner,
+            instruction="形成计划",
+            state={"goal": "找岗位"},
+            response_model=PlannerDecision,
+        )
 
 
 def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:

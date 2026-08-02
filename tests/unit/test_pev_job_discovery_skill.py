@@ -65,6 +65,8 @@ def test_job_discovery_input_normalizers_reject_blank_values() -> None:
         SearchPublicJobPagesInput(query="   ")
     with pytest.raises(ValueError, match="duplicates"):
         FetchPublicJobPagesInput(urls=["https://jobs.example/a", "https://jobs.example/a"])
+    with pytest.raises(ValueError, match="unique"):
+        ExtractObservedJobDetailsBatchInput(artifact_ids=["observed:a", "observed:a"])
 
 
 def test_batch_fetch_preserves_successful_pages_and_explicit_per_url_failures(monkeypatch) -> None:

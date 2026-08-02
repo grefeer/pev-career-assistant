@@ -18,7 +18,7 @@ from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
-from backend.app.services.agent_runtime.runtime import AgentRuntime
+from backend.app.services.agent_runtime.runtime import AgentRuntime, _skill_artifact_source_url
 from backend.app.services.agent_runtime.schemas import (
     AgentBudget,
     AgentTaskRequest,
@@ -658,6 +658,8 @@ def test_runtime_persists_multi_source_job_matching_report_with_observed_provena
     assert [match["source_url"] for match in artifacts[0].content_json["matches"]] == [
         "https://jobs.example/a", "https://jobs.example/b"
     ]
+    assert _skill_artifact_source_url("job_matching_report", {"matches": "invalid"}) is None
+    assert _skill_artifact_source_url("job_matching_report", {"matches": [{}]}) is None
 
 
 def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session) -> None:
