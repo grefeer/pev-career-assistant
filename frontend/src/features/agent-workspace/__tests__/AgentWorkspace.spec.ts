@@ -89,7 +89,12 @@ describe("AgentWorkspace", () => {
       items: [{
         id: "artifact-resume", artifact_type: "resume_tailoring_brief",
         source_url: "https://jobs.example/1", content_hash: "b".repeat(64),
-        content: { proposed_diffs: [{ fact_ref: "skills" }] }, created_at: run.created_at,
+        content: {
+          proposed_diffs: [{
+            section: "skills", fact_ref: "skills", target_evidence_ref: "jd-1",
+            change_summary: "将已确认的 Agent 事实前置到技能部分。",
+          }],
+        }, created_at: run.created_at,
       }],
     })
     const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
@@ -97,6 +102,29 @@ describe("AgentWorkspace", () => {
 
     expect(wrapper.text()).toContain("简历定制修改建议")
     expect(wrapper.text()).toContain("1 条可审核的简历修改操作")
+    expect(wrapper.text()).toContain("将已确认的 Agent 事实前置到技能部分。")
+    expect(wrapper.text()).toContain("事实字段：skills")
+  })
+
+  it("renders a prioritized, reviewable preparation plan instead of only a count", async () => {
+    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
+    api.fetchAgentRunArtifacts.mockResolvedValue({
+      items: [{
+        id: "artifact-plan", artifact_type: "career_preparation_plan",
+        source_url: "https://jobs.example/1", content_hash: "c".repeat(64),
+        content: { plan_items: [{
+          topic: "agent", priority: "P0", time_budget_hours: 3,
+          completion_criteria: "准备一个可核验项目案例。",
+          review_checkpoint: "按 JD 的 Agent 要求复盘。",
+        }] }, created_at: run.created_at,
+      }],
+    })
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    expect(wrapper.text()).toContain("P0 · agent · 3 小时")
+    expect(wrapper.text()).toContain("准备一个可核验项目案例。")
+    expect(wrapper.text()).toContain("按 JD 的 Agent 要求复盘。")
   })
 
   it("maps an unavailable runtime to a user-readable safe error", async () => {

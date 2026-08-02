@@ -40,6 +40,20 @@ const resuming = ref(false)
 const errorMessage = ref<string | null>(null)
 const userResponse = ref("")
 
+interface ResumeDiffPreview {
+  section: string
+  fact_ref: string
+  change_summary: string
+}
+
+interface PreparationPlanItemPreview {
+  topic: string
+  priority: string
+  time_budget_hours: number
+  completion_criteria: string
+  review_checkpoint: string
+}
+
 const canSubmit = computed(() => Boolean(
   props.token && goal.value.trim() && selectedSkills.value.length && !submitting.value,
 ))
@@ -190,6 +204,44 @@ function artifactDetail(artifact: AgentArtifactResponse): string {
   return "该工件没有可展示的文本摘要。"
 }
 
+function resumeDiffs(artifact: AgentArtifactResponse): ResumeDiffPreview[] {
+  const rawDiffs = artifact.content.proposed_diffs
+  if (!Array.isArray(rawDiffs)) return []
+  return rawDiffs.flatMap((item) => {
+    if (!item || typeof item !== "object") return []
+    const diff = item as Record<string, unknown>
+    if (
+      typeof diff.section !== "string"
+      || typeof diff.fact_ref !== "string"
+      || typeof diff.change_summary !== "string"
+    ) return []
+    return [{ section: diff.section, fact_ref: diff.fact_ref, change_summary: diff.change_summary }]
+  })
+}
+
+function preparationPlanItems(artifact: AgentArtifactResponse): PreparationPlanItemPreview[] {
+  const rawItems = artifact.content.plan_items
+  if (!Array.isArray(rawItems)) return []
+  return rawItems.flatMap((item) => {
+    if (!item || typeof item !== "object") return []
+    const planItem = item as Record<string, unknown>
+    if (
+      typeof planItem.topic !== "string"
+      || typeof planItem.priority !== "string"
+      || typeof planItem.time_budget_hours !== "number"
+      || typeof planItem.completion_criteria !== "string"
+      || typeof planItem.review_checkpoint !== "string"
+    ) return []
+    return [{
+      topic: planItem.topic,
+      priority: planItem.priority,
+      time_budget_hours: planItem.time_budget_hours,
+      completion_criteria: planItem.completion_criteria,
+      review_checkpoint: planItem.review_checkpoint,
+    }]
+  })
+}
+
 function formatDate(value: string): string {
   return new Date(value).toLocaleString("zh-CN", { dateStyle: "medium", timeStyle: "short" })
 }
@@ -293,6 +345,19 @@ function formatDate(value: string): string {
                 <p class="artifact-type">{{ artifact.artifact_type }}</p>
                 <h4>{{ artifactTitle(artifact) }}</h4>
                 <p>{{ artifactDetail(artifact) }}</p>
+                <ul v-if="resumeDiffs(artifact).length" class="artifact-actions" aria-label="可审核的简历修改">
+                  <li v-for="(diff, index) in resumeDiffs(artifact)" :key="`${diff.fact_ref}-${index}`">
+                    <strong>{{ diff.change_summary }}</strong>
+                    <small>事实字段：{{ diff.fact_ref }} · 修改位置：{{ diff.section }}</small>
+                  </li>
+                </ul>
+                <ul v-if="preparationPlanItems(artifact).length" class="artifact-actions" aria-label="带复盘的准备计划">
+                  <li v-for="(item, index) in preparationPlanItems(artifact)" :key="`${item.topic}-${index}`">
+                    <strong>{{ item.priority }} · {{ item.topic }} · {{ item.time_budget_hours }} 小时</strong>
+                    <small>完成：{{ item.completion_criteria }}</small>
+                    <small>复盘：{{ item.review_checkpoint }}</small>
+                  </li>
+                </ul>
                 <a :href="artifact.source_url" target="_blank" rel="noreferrer">查看来源证据 ↗</a>
               </article>
               <p v-if="!artifacts.length" class="muted">完成后，岗位证据、结构化 JD 和建议工件会显示在这里。</p>
@@ -347,7 +412,7 @@ button { border: 0; cursor: pointer; }
 .resume-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .55rem .75rem; align-items: end; margin: 1rem 0; padding: .85rem; border: 1px solid #dcc07b; background: #fff7dc; }.resume-form .field-label { grid-column: 1 / -1; margin: 0; }.resume-form textarea { min-height: 70px; }.resume-form button { align-self: stretch; padding: .7rem .85rem; background: #8b5a16; color: #fffaf0; font-weight: 700; }.resume-form button:disabled { cursor: not-allowed; opacity: .45; }
 .detail-columns { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(260px, 1.2fr); gap: 1.5rem; padding-top: 1.2rem; }.detail-columns h3 { margin-bottom: .8rem; font: 700 1.12rem/1 Georgia, serif; }
 .timeline { margin: 0; padding: 0; list-style: none; }.timeline li { display: flex; gap: .65rem; padding: .65rem 0; border-bottom: 1px solid #eee7db; }.timeline-number { color: #a44b23; font: 700 .75rem/1.4 monospace; }.timeline strong, .timeline small { display: block; }.timeline strong { font-size: .88rem; }.timeline small { color: #80786d; font-size: .72rem; }
-.artifact-card { margin-bottom: .75rem; padding: .9rem; border: 1px solid #ded3c0; background: #fbf6ed; }.artifact-card h4 { margin: .25rem 0 .45rem; font: 700 1rem/1.1 Georgia, serif; }.artifact-card > p:not(.artifact-type) { margin-bottom: .6rem; color: #5f584d; font-size: .83rem; }.artifact-card a { color: #8d3c1c; font-size: .82rem; font-weight: 700; }
+.artifact-card { margin-bottom: .75rem; padding: .9rem; border: 1px solid #ded3c0; background: #fbf6ed; }.artifact-card h4 { margin: .25rem 0 .45rem; font: 700 1rem/1.1 Georgia, serif; }.artifact-card > p:not(.artifact-type) { margin-bottom: .6rem; color: #5f584d; font-size: .83rem; }.artifact-card a { color: #8d3c1c; font-size: .82rem; font-weight: 700; }.artifact-actions { margin: .65rem 0; padding: 0; list-style: none; }.artifact-actions li { margin-top: .45rem; padding: .55rem .6rem; border-left: 3px solid #a44b23; background: rgba(255, 255, 255, .55); }.artifact-actions strong, .artifact-actions small { display: block; }.artifact-actions strong { font-size: .8rem; line-height: 1.4; }.artifact-actions small { margin-top: .16rem; color: #6d665b; font-size: .74rem; line-height: 1.35; }
 .muted, .empty-detail { color: #756d61; }.empty-detail { display: grid; min-height: 330px; place-items: center; font: 1.1rem Georgia, serif; text-align: center; }
 @media (max-width: 900px) { .skill-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.workspace-grid, .detail-columns { grid-template-columns: 1fr; }.run-history { max-height: 260px; overflow: auto; }.composer-footer { align-items: flex-start; flex-direction: column; }.detail-header { padding-right: 0; }.status-pill { position: static; display: inline-block; margin-bottom: .75rem; } }
 @media (max-width: 520px) { .skill-grid { grid-template-columns: 1fr; }.masthead { padding-top: 1rem; }.task-composer, .run-detail, .run-history { padding: 1rem; } }
