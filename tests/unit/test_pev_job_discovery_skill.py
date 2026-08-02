@@ -17,6 +17,9 @@ from backend.app.services.career_skills.job_discovery import (
     _assert_public_url,
     _direct_bing_result_url,
     _extract_jd_section,
+    _find_observed_evidence,
+    _infer_official_page_locations,
+    _infer_official_page_title,
     _infer_recruitment_types,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
@@ -254,6 +257,39 @@ def test_job_discovery_helpers_only_accept_safe_bing_urls_and_known_recruitment_
     assert _infer_recruitment_types("https://talent.example/INTERN/1", ["fallback"]) == ["internship"]
     assert _infer_recruitment_types("https://talent.example/other", ["fallback"]) == ["fallback"]
     assert _extract_jd_section("没有标签", labels=("岗位职责",)) == ""
+
+
+def test_job_discovery_helper_fallbacks_do_not_infer_missing_header_values() -> None:
+    assert _find_observed_evidence(ToolContext(user_id="u", run_id="r", metadata={"observed_public_evidence": []}), "missing") is None
+    assert _infer_official_page_title("首页\n申请职位\n普通文本") is None
+    assert _infer_official_page_locations("标题\n岗位职责", None) == []
+    assert _infer_official_page_locations("标题\n岗位职责", "不存在") == []
+    assert _infer_official_page_locations("标题\n上海市\n岗位职责", "标题") == ["上海市"]
+    assert _infer_official_page_locations("标题\n岗位职责\n北京市", "标题") == []
+    assert _direct_bing_result_url("https://www.bing.com/ck/a?u=a1____") is None
+
+
+def test_search_skips_redirects_and_unsafe_results_and_honors_result_limit(monkeypatch) -> None:
+    html = """
+    <li class='b_algo'><h2><a href='https://www.bing.com/not-a-redirect'>ignored</a></h2></li>
+    <li class='b_algo'><h2><a href='https://unsafe.example/jobs/agent'>unsafe job</a></h2></li>
+    <li class='b_algo'><h2><a href='https://careers.example/jobs/agent'>safe job</a></h2></li>
+    <li class='b_algo'><h2><a href='https://careers.example/jobs/second'>second job</a></h2></li>
+    """
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(text=html, encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None),
+    )
+    def only_safe(url: str) -> None:
+        if url.startswith("https://unsafe"):
+            raise PublicJobFetchError("unsafe_public_url")
+    monkeypatch.setattr("backend.app.services.career_skills.job_discovery._assert_public_url", only_safe)
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"), SearchPublicJobPagesInput(query="Agent 招聘", max_results=1)
+    )
+
+    assert [item.url for item in result.results] == ["https://careers.example/jobs/agent"]
 
 
 def test_extract_input_accepts_the_ephemeral_id_emitted_by_public_page_fetch() -> None:

@@ -581,10 +581,10 @@ def _infer_official_page_locations(text: str, title: str | None) -> list[str]:
     except ValueError:
         return []
     for line in lines[title_index + 1 :]:
-        if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:市|省)?", line):
-            return [line]
         if re.search(r"(?:岗位职责|工作职责|职位描述)", line):
             break
+        if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:市|省)?", line):
+            return [line]
     return []
 
 
