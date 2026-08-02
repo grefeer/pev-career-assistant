@@ -10,7 +10,7 @@ from sqlalchemy.pool import StaticPool
 from backend.app.api import dependencies
 from backend.app.config import Settings
 from backend.app.db.base import Base
-from backend.app.db.models import AnalysisSession, User, UserRole
+from backend.app.db.models import User, UserRole
 from backend.app.services.auth import AuthService
 
 os.environ.setdefault("APP_ENV", "test")
@@ -67,38 +67,30 @@ def register(client: TestClient, account: str = "alice") -> dict[str, object]:
     return response.json()
 
 
-def test_register_returns_compatible_profile_and_creates_student_default_session(
+def test_register_returns_minimal_profile_without_legacy_graph_session(
     client: TestClient,
 ) -> None:
     body = register(client)
 
     assert body["ok"] is True
-    assert body["message"] == "注册成功，已为你创建默认分析空间。"
+    assert body["message"] == "注册成功。"
     assert isinstance(body["token"], str)
     profile = body["profile"]
     assert profile["account"] == "alice"
     assert profile["nickname"] == "Alice"
     assert profile["role"] == "student"
-    assert profile["active_thread_id"] == profile["sessions"][0]["thread_id"]
-    assert profile["sessions"][0]["label"] == "分析会话 1"
     assert set(profile) == {
         "account",
         "nickname",
         "role",
         "created_at",
         "last_login_at",
-        "active_thread_id",
-        "sessions",
     }
 
     session_factory = client.session_factory  # type: ignore[attr-defined]
     with session_factory() as db:
         user = db.scalar(select(User).where(User.account == "alice"))
         assert user is not None and user.role is UserRole.STUDENT
-        assert (
-            db.scalar(select(AnalysisSession).where(AnalysisSession.user_id == user.id))
-            is not None
-        )
 
 
 def test_public_registration_cannot_choose_admin_role(client: TestClient) -> None:

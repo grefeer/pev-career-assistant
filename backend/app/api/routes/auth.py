@@ -7,8 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import _get_db, get_current_user
-from backend.app.db.models import AnalysisSession, User
-from backend.app.repositories.sessions import create_for_user, list_for_user
+from backend.app.db.models import User
 from backend.app.schemas import AuthRequest, AuthResponse, RegisterRequest, UserProfile
 from backend.app.services.auth import AccountExistsError, AuthService
 from backend.app.services.rate_limit import (
@@ -67,24 +66,14 @@ def _enforce_auth_rate_limit(
         raise HTTPException(status_code=503, detail="认证保护服务暂不可用。") from None
 
 
-def serialize_profile(user: User, sessions: list[AnalysisSession]) -> dict[str, object]:
-    ordered = sorted(sessions, key=lambda item: item.activated_at, reverse=True)
+def serialize_profile(user: User) -> dict[str, object]:
+    """Return account metadata without recreating a legacy graph session."""
     return {
         "account": user.account,
         "nickname": user.nickname,
         "role": user.role.value,
         "created_at": user.created_at.isoformat(),
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else "",
-        "active_thread_id": ordered[0].thread_id if ordered else "",
-        "sessions": [
-            {
-                "thread_id": item.thread_id,
-                "label": item.label,
-                "created_at": item.created_at.isoformat(),
-                "updated_at": item.updated_at.isoformat(),
-            }
-            for item in ordered
-        ],
     }
 
 
@@ -103,7 +92,6 @@ def register(
             nickname=payload.nickname,
             password=payload.password,
         )
-        create_for_user(db, user.id)
         db.commit()
     except AccountExistsError as error:
         db.rollback()
@@ -112,12 +100,11 @@ def register(
             status_code=status.HTTP_409_CONFLICT, detail=str(error)
         ) from None
 
-    sessions = list_for_user(db, user.id)
     return AuthResponse(
         ok=True,
-        message="注册成功，已为你创建默认分析空间。",
+        message="注册成功。",
         token=service.issue_user_token(user),
-        profile=UserProfile(**serialize_profile(user, sessions)),
+        profile=UserProfile(**serialize_profile(user)),
     )
 
 
@@ -138,12 +125,11 @@ def login(
             detail="账号或密码不正确。",
         )
     db.commit()
-    sessions = list_for_user(db, user.id)
     return AuthResponse(
         ok=True,
         message="登录成功。",
         token=service.issue_user_token(user),
-        profile=UserProfile(**serialize_profile(user, sessions)),
+        profile=UserProfile(**serialize_profile(user)),
     )
 
 
@@ -153,5 +139,5 @@ def me(
     db: Annotated[Session, Depends(_get_db)],
 ) -> UserProfile:
     return UserProfile(
-        **serialize_profile(current_user, list_for_user(db, current_user.id))
+        **serialize_profile(current_user)
     )
