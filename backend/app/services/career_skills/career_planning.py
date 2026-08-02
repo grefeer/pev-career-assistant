@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -15,6 +16,7 @@ class BuildPreparationPlanInput(BaseModel):
     target_artifact_id: str = Field(min_length=1, max_length=80)
     focus_keywords: list[str] = Field(min_length=1, max_length=30)
     time_budget_hours: int = Field(default=6, ge=1, le=80)
+    target_date: date | None = None
 
     @field_validator("focus_keywords")
     @classmethod
@@ -39,6 +41,7 @@ class PreparationPlanOutput(BaseModel):
     source_url: str
     jd_topics: list[str]
     actions: list[str]
+    schedule_assumption: str
     plan_items: list["PreparationPlanItem"]
 
 
@@ -48,6 +51,7 @@ class PreparationPlanItem(BaseModel):
     topic: str
     priority: str
     time_budget_hours: int
+    due_date: date
     completion_criteria: str
     review_checkpoint: str
 
@@ -78,11 +82,13 @@ def build_preparation_plan(
             f"围绕 JD 中的 {topic_text} 做一次 30 分钟技术讲解演练，准备架构取舍与故障排查追问。",
         ]
     base_hours, remaining_hours = divmod(payload.time_budget_hours, len(topics)) if topics else (0, 0)
+    due_date, schedule_assumption = _resolve_due_date(payload.target_date)
     plan_items = [
         PreparationPlanItem(
             topic=normalized,
             priority="P0" if index == 0 else "P1",
             time_budget_hours=base_hours + (1 if index < remaining_hours else 0),
+            due_date=due_date,
             completion_criteria=(
                 f"准备一个 {display} 相关项目案例，说明你的具体贡献和可核验结果。"
             ),
@@ -97,6 +103,7 @@ def build_preparation_plan(
         source_url=source_url,
         jd_topics=topics,
         actions=actions,
+        schedule_assumption=schedule_assumption,
         plan_items=plan_items,
     )
 
@@ -108,3 +115,13 @@ def _find_target(raw_evidence: object, artifact_id: str) -> dict[str, Any] | Non
         if isinstance(item, dict) and item.get("artifact_id") == artifact_id:
             return item
     return None
+
+
+def _resolve_due_date(target_date: date | None) -> tuple[date, str]:
+    """Use a disclosed short planning window only when the user gave no deadline."""
+    if target_date is not None:
+        return target_date, "使用用户指定的目标日期。"
+    return (
+        date.today() + timedelta(days=7),
+        "未提供目标日期；使用运行日后 7 天作为可修改的默认截止时间。",
+    )

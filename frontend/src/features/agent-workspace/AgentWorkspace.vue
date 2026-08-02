@@ -53,6 +53,7 @@ interface PreparationPlanItemPreview {
   topic: string
   priority: string
   time_budget_hours: number
+  due_date: string
   completion_criteria: string
   review_checkpoint: string
 }
@@ -234,6 +235,7 @@ function preparationPlanItems(artifact: AgentArtifactResponse): PreparationPlanI
       typeof planItem.topic !== "string"
       || typeof planItem.priority !== "string"
       || typeof planItem.time_budget_hours !== "number"
+      || typeof planItem.due_date !== "string"
       || typeof planItem.completion_criteria !== "string"
       || typeof planItem.review_checkpoint !== "string"
     ) return []
@@ -241,6 +243,7 @@ function preparationPlanItems(artifact: AgentArtifactResponse): PreparationPlanI
       topic: planItem.topic,
       priority: planItem.priority,
       time_budget_hours: planItem.time_budget_hours,
+      due_date: planItem.due_date,
       completion_criteria: planItem.completion_criteria,
       review_checkpoint: planItem.review_checkpoint,
     }]
@@ -372,7 +375,7 @@ function formatDate(value: string): string {
                 </ul>
                 <ul v-if="preparationPlanItems(artifact).length" class="artifact-actions" aria-label="带复盘的准备计划">
                   <li v-for="(item, index) in preparationPlanItems(artifact)" :key="`${item.topic}-${index}`">
-                    <strong>{{ item.priority }} · {{ item.topic }} · {{ item.time_budget_hours }} 小时</strong>
+                    <strong>{{ item.priority }} · {{ item.topic }} · {{ item.time_budget_hours }} 小时 · 截止 {{ item.due_date }}</strong>
                     <small>完成：{{ item.completion_criteria }}</small>
                     <small>复盘：{{ item.review_checkpoint }}</small>
                   </li>

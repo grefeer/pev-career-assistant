@@ -136,6 +136,7 @@ describe("AgentWorkspace", () => {
         source_url: "https://jobs.example/1", content_hash: "c".repeat(64),
         content: { plan_items: [{
           topic: "agent", priority: "P0", time_budget_hours: 3,
+          due_date: "2026-08-09",
           completion_criteria: "准备一个可核验项目案例。",
           review_checkpoint: "按 JD 的 Agent 要求复盘。",
         }] }, created_at: run.created_at,
@@ -144,7 +145,7 @@ describe("AgentWorkspace", () => {
     const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
     await flushPromises()
 
-    expect(wrapper.text()).toContain("P0 · agent · 3 小时")
+    expect(wrapper.text()).toContain("P0 · agent · 3 小时 · 截止 2026-08-09")
     expect(wrapper.text()).toContain("准备一个可核验项目案例。")
     expect(wrapper.text()).toContain("按 JD 的 Agent 要求复盘。")
   })

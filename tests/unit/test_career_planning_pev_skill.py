@@ -1,5 +1,7 @@
 """JD-grounded preparation plan behavior for the PEV career-planning Skill."""
 
+from datetime import date
+
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.career_planning import (
     BuildPreparationPlanInput,
@@ -26,6 +28,7 @@ def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
         BuildPreparationPlanInput(
             target_artifact_id="artifact-agent",
             focus_keywords=["Python", "RAG", "Agent", "Kubernetes"],
+            target_date=date(2026, 8, 9),
         ),
     )
 
@@ -34,11 +37,13 @@ def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
         "为 Python、RAG、Agent 各准备一个可量化的项目案例，并标明你的具体贡献。",
         "围绕 JD 中的 Python、RAG、Agent 做一次 30 分钟技术讲解演练，准备架构取舍与故障排查追问。",
     ]
+    assert result.schedule_assumption == "使用用户指定的目标日期。"
     assert [item.model_dump() for item in result.plan_items] == [
         {
             "topic": "python",
             "priority": "P0",
             "time_budget_hours": 2,
+            "due_date": date(2026, 8, 9),
             "completion_criteria": "准备一个 Python 相关项目案例，说明你的具体贡献和可核验结果。",
             "review_checkpoint": "完成后用 JD 的 Python 要求复盘：案例是否覆盖职责、取舍和追问。",
         },
@@ -46,6 +51,7 @@ def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
             "topic": "rag",
             "priority": "P1",
             "time_budget_hours": 2,
+            "due_date": date(2026, 8, 9),
             "completion_criteria": "准备一个 RAG 相关项目案例，说明你的具体贡献和可核验结果。",
             "review_checkpoint": "完成后用 JD 的 RAG 要求复盘：案例是否覆盖职责、取舍和追问。",
         },
@@ -53,6 +59,7 @@ def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
             "topic": "agent",
             "priority": "P1",
             "time_budget_hours": 2,
+            "due_date": date(2026, 8, 9),
             "completion_criteria": "准备一个 Agent 相关项目案例，说明你的具体贡献和可核验结果。",
             "review_checkpoint": "完成后用 JD 的 Agent 要求复盘：案例是否覆盖职责、取舍和追问。",
         },
@@ -82,3 +89,5 @@ def test_preparation_plan_accepts_the_observed_page_artifact_identifier() -> Non
     )
 
     assert result.target_artifact_id == artifact_id
+    assert result.plan_items[0].due_date >= date.today()
+    assert result.schedule_assumption.startswith("未提供目标日期")
