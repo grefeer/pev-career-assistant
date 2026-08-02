@@ -96,4 +96,3 @@ def test_settings_override_uses_test_defaults_and_applies_values() -> None:
     assert settings.checkpoint_backend == "sqlite"
     assert settings.jwt_audience == "test-client"
 
-
