@@ -1,8 +1,14 @@
 """Evidence and confirmed-fact tests for PEV resume tailoring."""
 
+import pytest
+from pydantic import ValidationError
+
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.resume_tailoring import (
     BuildResumeTailoringBriefInput,
+    _find_fact_ref_for_keyword,
+    _find_target,
+    _flatten_text,
     build_resume_tailoring_brief,
 )
 
@@ -86,3 +92,56 @@ def test_resume_brief_accepts_the_observed_page_artifact_identifier() -> None:
     )
 
     assert result.target_artifact_id == artifact_id
+
+
+def test_resume_brief_rejects_missing_or_incomplete_evidence_and_empty_keywords() -> None:
+    with pytest.raises(ValidationError):
+        BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=[" "])
+    no_target = ToolContext(user_id="user-a", run_id="run-a", metadata={"observed_public_evidence": []})
+    with pytest.raises(ValueError, match="target_evidence_not_found"):
+        build_resume_tailoring_brief(
+            no_target,
+            BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=["Python"]),
+        )
+    incomplete = ToolContext(
+        user_id="user-a", run_id="run-a",
+        metadata={"observed_public_evidence": [{"artifact_id": "jd", "source_url": "https://jobs.example"}]},
+    )
+    with pytest.raises(ValueError, match="target_evidence_incomplete"):
+        build_resume_tailoring_brief(
+            incomplete,
+            BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=["Python"]),
+        )
+
+
+def test_resume_brief_maps_project_and_general_facts_to_reviewable_sections() -> None:
+    context = ToolContext(
+        user_id="user-a", run_id="run-a",
+        metadata={
+            "observed_public_evidence": [{
+                "artifact_id": "jd", "source_url": "https://jobs.example",
+                "title": 9, "visible_text": "需要 Docker、沟通能力。",
+            }],
+            "confirmed_profile_facts": {"projects": ["Docker 部署"], "basics": "沟通能力"},
+        },
+    )
+
+    result = build_resume_tailoring_brief(
+        context,
+        BuildResumeTailoringBriefInput(
+            target_artifact_id="jd", target_keywords=[" Docker ", "docker", "沟通"],
+        ),
+    )
+
+    assert result.target_title is None
+    assert result.supported_keywords == ["docker", "沟通"]
+    assert [(diff.fact_ref, diff.section) for diff in result.proposed_diffs] == [
+        ("projects", "projects"), ("basics", "summary"),
+    ]
+
+
+def test_resume_tailoring_fact_helpers_only_use_dict_backed_confirmed_facts() -> None:
+    assert _find_target("not-a-list", "jd") is None
+    assert _flatten_text(("Python", {"nested": [1, None, "RAG"]})) == "Python\n\n\nRAG"
+    assert _find_fact_ref_for_keyword(["Python"], "python") is None
+    assert _find_fact_ref_for_keyword({"skills": ["Python"]}, "rag") is None

@@ -92,7 +92,7 @@ def match_observed_jobs(
             location for location in payload.preferred_locations if location.lower() in searchable
         ]
         compensation_match = _COMPENSATION_RE.search(visible_text)
-        compensation_text = compensation_match.group(0) if compensation_match else None
+        compensation_text = compensation_match.group(0).strip() if compensation_match else None
         observed_company_types = [label for label in _COMPANY_TYPE_LABELS if label in visible_text]
         unverified = _unverified_criteria(
             payload.ranking_criteria,

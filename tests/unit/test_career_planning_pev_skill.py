@@ -5,8 +5,11 @@ from datetime import date
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.career_planning import (
     BuildPreparationPlanInput,
+    _find_target,
     build_preparation_plan,
 )
+from pydantic import ValidationError
+import pytest
 
 
 def test_preparation_plan_uses_only_topics_present_in_the_selected_jd() -> None:
@@ -91,3 +94,24 @@ def test_preparation_plan_accepts_the_observed_page_artifact_identifier() -> Non
     assert result.target_artifact_id == artifact_id
     assert result.plan_items[0].due_date >= date.today()
     assert result.schedule_assumption.startswith("未提供目标日期")
+
+
+def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence() -> None:
+    with pytest.raises(ValidationError):
+        BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=[" "])
+    assert _find_target("not-a-list", "jd") is None
+    missing_context = ToolContext(user_id="user-a", run_id="run-a", metadata={})
+    with pytest.raises(ValueError, match="target_evidence_not_found"):
+        build_preparation_plan(
+            missing_context,
+            BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=["Python"]),
+        )
+    incomplete_context = ToolContext(
+        user_id="user-a", run_id="run-a",
+        metadata={"observed_public_evidence": [{"artifact_id": "jd", "visible_text": "Python"}]},
+    )
+    with pytest.raises(ValueError, match="target_evidence_incomplete"):
+        build_preparation_plan(
+            incomplete_context,
+            BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=["Python"]),
+        )
