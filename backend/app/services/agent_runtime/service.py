@@ -68,6 +68,10 @@ class AgentRunService:
             raise AgentRunNotFoundError(run_id)
         return run
 
+    def list_runs(self, db: Session, *, user_id: str, limit: int) -> list[AgentRun]:
+        """List recent task summaries within the requesting user's ownership boundary."""
+        return run_repository.list_runs_for_owner(db, user_id, limit=limit)
+
     def list_events(
         self, db: Session, *, user_id: str, run_id: str
     ) -> list[AgentEvent]:

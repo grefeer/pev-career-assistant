@@ -44,6 +44,12 @@ class AgentRunResponse(BaseModel):
     updated_at: datetime
 
 
+class AgentRunListResponse(BaseModel):
+    """Recent owner-safe task summaries for the personal workspace."""
+
+    items: list[AgentRunResponse]
+
+
 class AgentEventResponse(BaseModel):
     sequence: int
     event_type: str

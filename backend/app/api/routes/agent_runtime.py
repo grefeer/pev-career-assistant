@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from backend.app.api.agent_runtime_schemas import (
@@ -13,6 +13,7 @@ from backend.app.api.agent_runtime_schemas import (
     AgentEventListResponse,
     AgentEventResponse,
     AgentRunCreatedResponse,
+    AgentRunListResponse,
     AgentRunResponse,
     CreateAgentRunRequest,
 )
@@ -50,6 +51,18 @@ def _to_run_response(run) -> AgentRunResponse:
         created_at=run.created_at,
         updated_at=run.updated_at,
     )
+
+
+@router.get("", response_model=AgentRunListResponse)
+def list_agent_runs(
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> AgentRunListResponse:
+    """List recent personal task summaries without exposing their private context."""
+    runs = service.list_runs(db, user_id=current_user.id, limit=limit)
+    return AgentRunListResponse(items=[_to_run_response(run) for run in runs])
 
 
 @router.post("", response_model=AgentRunCreatedResponse, status_code=status.HTTP_201_CREATED)

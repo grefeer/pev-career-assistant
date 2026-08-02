@@ -77,6 +77,27 @@ def test_service_hides_other_users_persisted_run_and_events(db_session) -> None:
     assert len(service.list_events(db_session, user_id=owner.id, run_id=run.id)) == 1
 
 
+def test_service_lists_only_the_callers_persisted_runs(db_session) -> None:
+    """The personal task workspace receives no cross-user run history."""
+    owner = _user("user-a", "user-a@example.test")
+    other = _user("user-b", "user-b@example.test")
+    db_session.add_all([owner, other])
+    db_session.commit()
+    run_repository.create_run(
+        db_session, user_id=owner.id, goal="我的任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    run_repository.create_run(
+        db_session, user_id=other.id, goal="他人任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=None)
+
+    runs = service.list_runs(db_session, user_id=owner.id, limit=20)
+
+    assert [run.goal for run in runs] == ["我的任务"]
+
+
 def test_service_injects_only_the_owners_latest_confirmed_profile_into_private_task_context(db_session) -> None:
     """Resume tailoring must source facts from server-owned confirmed profile data."""
     user = _user("user-a", "user-a@example.test")

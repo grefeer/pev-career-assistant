@@ -99,6 +99,30 @@ def test_repository_owner_lookup_does_not_leak_another_users_run(db_session) -> 
     assert agent_runtime.get_run_for_owner(db_session, run.id, first_user.id) is not None
 
 
+def test_repository_lists_only_owner_runs_in_newest_first_order(db_session) -> None:
+    """The workspace history never includes another user's potentially sensitive goal."""
+    first_user = _user("user-a", "user-a@example.test")
+    second_user = _user("user-b", "user-b@example.test")
+    db_session.add_all([first_user, second_user])
+    db_session.commit()
+    oldest = agent_runtime.create_run(
+        db_session, user_id=first_user.id, goal="旧任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-1",
+    )
+    newest = agent_runtime.create_run(
+        db_session, user_id=first_user.id, goal="新任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-1",
+    )
+    agent_runtime.create_run(
+        db_session, user_id=second_user.id, goal="其他用户任务", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-1",
+    )
+
+    runs = agent_runtime.list_runs_for_owner(db_session, first_user.id, limit=20)
+
+    assert [run.id for run in runs] == [newest.id, oldest.id]
+
+
 def test_repository_keeps_distinct_artifact_types_for_one_source_and_deduplicates_each_type(db_session) -> None:
     """A page snapshot and its parsed JD share a hash but are distinct immutable products."""
     user = _user("user-a", "user-a@example.test")

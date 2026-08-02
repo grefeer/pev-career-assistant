@@ -142,6 +142,30 @@ def test_get_agent_run_and_events_project_owner_safe_fields() -> None:
     assert events.json()["items"][0]["event_type"] == "run_started"
 
 
+def test_list_agent_runs_projects_only_safe_owner_history_fields() -> None:
+    """Workspace history exposes safe summaries, never context or model messages."""
+    service = MagicMock()
+    now = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    service.list_runs.return_value = [
+        SimpleNamespace(
+            id="run-1", goal="找岗位", status=RunStatus.succeeded,
+            complexity=SimpleNamespace(value="L2"), final_summary="完成", error_code=None,
+            created_at=now, updated_at=now,
+        )
+    ]
+    app = _build_app(service)
+
+    response = TestClient(app).get("/api/agent-runs?limit=20", headers=_headers(app))
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [{
+        "id": "run-1", "goal": "找岗位", "status": "succeeded", "complexity": "L2",
+        "summary": "完成", "error_code": None,
+        "created_at": "2026-08-01T00:00:00Z", "updated_at": "2026-08-01T00:00:00Z",
+    }]}
+    assert service.list_runs.call_args.kwargs == {"user_id": "user-a", "limit": 20}
+
+
 def test_list_agent_artifacts_projects_only_owner_safe_artifact_fields() -> None:
     """JD evidence is readable by its owner without exposing run context or prompts."""
     service = MagicMock()

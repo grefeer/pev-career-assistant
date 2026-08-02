@@ -62,6 +62,18 @@ def get_run_for_owner(db: Session, run_id: str, user_id: str) -> AgentRun | None
     )
 
 
+def list_runs_for_owner(db: Session, user_id: str, *, limit: int) -> list[AgentRun]:
+    """Return one owner's recent runs without widening the ownership boundary."""
+    return list(
+        db.scalars(
+            select(AgentRun)
+            .where(AgentRun.user_id == user_id)
+            .order_by(AgentRun.created_at.desc(), AgentRun.id.desc())
+            .limit(limit)
+        )
+    )
+
+
 def start_run(db: Session, run: AgentRun) -> AgentRun:
     """Persist a service-approved transition into active execution."""
     run.status = RunStatus.running
