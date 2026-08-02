@@ -93,4 +93,3 @@ def require_admin(current_user: Annotated[User, Depends(get_current_user)]) -> U
             detail="需要管理员权限。",
         )
     return current_user
-
