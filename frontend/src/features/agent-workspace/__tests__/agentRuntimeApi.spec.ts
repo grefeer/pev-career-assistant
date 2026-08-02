@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { createAgentRun, fetchAgentRunPlans, fetchAgentRuns, resumeAgentRun } from "../agentRuntimeApi"
+import {
+  createAgentRun,
+  fetchAgentRunPlans,
+  fetchAgentRuns,
+  recoverAgentRun,
+  resumeAgentRun,
+} from "../agentRuntimeApi"
 
 describe("agent runtime API", () => {
   afterEach(() => {
@@ -71,5 +77,19 @@ describe("agent runtime API", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run-1/resume")
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ user_response: "北京" })
+  })
+
+  it("recovers a running run with an explicitly empty body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({
+        id: "run-1", status: "succeeded", summary: "恢复完成", error_code: null,
+      }), { status: 200, headers: { "Content-Type": "application/json" } }),
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await recoverAgentRun("student-token", "run-1")
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run-1/recover")
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({})
   })
 })

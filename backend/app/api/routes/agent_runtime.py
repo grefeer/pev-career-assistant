@@ -19,6 +19,7 @@ from backend.app.api.agent_runtime_schemas import (
     AgentRunListResponse,
     AgentRunResponse,
     CreateAgentRunRequest,
+    RecoverAgentRunRequest,
     ResumeAgentRunRequest,
 )
 from backend.app.api.dependencies import (
@@ -182,6 +183,44 @@ def resume_agent_run(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "agent_run_not_waiting_user"},
+        ) from None
+    except AgentRuntimeDisabledError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "agent_harness_disabled"},
+        ) from None
+    except AgentRuntimeUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "agent_harness_unavailable"},
+        ) from None
+    db.commit()
+    return AgentRunCreatedResponse(
+        id=result.run_id,
+        status=result.status.value,
+        summary=result.summary,
+        error_code=result.error_code,
+    )
+
+
+@router.post("/{run_id}/recover", response_model=AgentRunCreatedResponse)
+def recover_agent_run(
+    run_id: str,
+    request_body: RecoverAgentRunRequest,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    service: Annotated[AgentRunService, Depends(get_agent_run_service)],
+) -> AgentRunCreatedResponse:
+    """Recover only a server-known running Run; client state is never accepted."""
+    del request_body
+    try:
+        result = service.recover_run(db, user_id=current_user.id, run_id=run_id)
+    except AgentRunNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
+    except AgentRunNotResumableError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "agent_run_not_running"},
         ) from None
     except AgentRuntimeDisabledError:
         raise HTTPException(

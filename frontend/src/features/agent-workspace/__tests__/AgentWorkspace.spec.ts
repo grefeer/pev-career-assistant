@@ -10,6 +10,7 @@ const api = vi.hoisted(() => ({
   fetchAgentRunArtifacts: vi.fn(),
   fetchAgentRunEvents: vi.fn(),
   fetchAgentRunPlans: vi.fn(),
+  recoverAgentRun: vi.fn(),
   fetchAgentRuns: vi.fn(),
   resumeAgentRun: vi.fn(),
 }))
@@ -38,6 +39,9 @@ beforeEach(() => {
   })
   api.resumeAgentRun.mockResolvedValue({
     id: "run-1", status: "succeeded", summary: "已按北京筛选", error_code: null,
+  })
+  api.recoverAgentRun.mockResolvedValue({
+    id: "run-1", status: "succeeded", summary: "恢复完成", error_code: null,
   })
 })
 
@@ -176,5 +180,18 @@ describe("AgentWorkspace", () => {
     await flushPromises()
 
     expect(api.resumeAgentRun).toHaveBeenCalledWith("student-token", "run-1", "北京")
+  })
+
+  it("lets the owner recover an interrupted running run without client context", async () => {
+    const interruptedRun = { ...run, status: "running", summary: null }
+    api.fetchAgentRuns.mockResolvedValue({ items: [interruptedRun] })
+    api.fetchAgentRun.mockResolvedValue(interruptedRun)
+    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
+    await flushPromises()
+
+    await wrapper.get('button[name="recover-run"]').trigger("click")
+    await flushPromises()
+
+    expect(api.recoverAgentRun).toHaveBeenCalledWith("student-token", "run-1")
   })
 })

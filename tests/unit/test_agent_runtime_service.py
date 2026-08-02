@@ -12,6 +12,7 @@ from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.service import (
     AgentRuntimeDisabledError,
     AgentRunNotFoundError,
+    AgentRunNotResumableError,
     AgentRunService,
 )
 from tests.conftest import settings_override
@@ -38,6 +39,12 @@ class CapturingRuntime:
         return AgentRunResult("run-a", status=RunStatus.succeeded, summary=user_id)
 
     def resume(
+        self, _db, *, user_id: str, run_id: str, task: AgentTaskRequest
+    ) -> AgentRunResult:
+        self.task = task
+        return AgentRunResult(run_id, status=RunStatus.succeeded, summary=user_id)
+
+    def recover(
         self, _db, *, user_id: str, run_id: str, task: AgentTaskRequest
     ) -> AgentRunResult:
         self.task = task
@@ -190,3 +197,30 @@ def test_service_resumes_only_an_owner_waiting_run_and_preserves_their_reply(db_
         service.resume_run(
             db_session, user_id=other.id, run_id=run.id, user_response="上海"
         )
+
+
+def test_service_recovers_only_an_owner_running_run_from_durable_context(db_session) -> None:
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session,
+        user_id=user.id,
+        goal="找岗位",
+        allowed_skills=["job-discovery"],
+        context_summary={"candidate_urls": ["https://jobs.example/1"]},
+        budget_json={"max_agent_turns": 3, "max_tool_calls": 3, "max_replans": 0},
+        agent_version="pev-test",
+    )
+    run_repository.start_run(db_session, run)
+    runtime = CapturingRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+
+    result = service.recover_run(db_session, user_id=user.id, run_id=run.id)
+
+    assert result.run_id == run.id
+    assert runtime.task is not None
+    assert runtime.task.context == {"candidate_urls": ["https://jobs.example/1"]}
+    run_repository.finish_run(db_session, run, status=RunStatus.succeeded)
+    with pytest.raises(AgentRunNotResumableError):
+        service.recover_run(db_session, user_id=user.id, run_id=run.id)

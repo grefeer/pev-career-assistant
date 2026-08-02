@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel
+import pytest
 from sqlalchemy import select
 
-from backend.app.db.models import AgentArtifact, AgentStep, AgentTurn, User, UserRole
+from backend.app.db.models import AgentArtifact, AgentPlan, AgentRun, AgentStep, AgentTurn, User, UserRole
 from backend.app.domain.agent_runtime import AgentRole, RunStatus
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
@@ -88,6 +89,31 @@ class FailingGateway:
 
     def decide(self, **_kwargs):  # noqa: ANN003
         raise AgentModelGatewayError("model_request_failed")
+
+
+class CrashAfterFirstExecutorDecisionGateway:
+    """Simulate process loss after a persisted Executor decision checkpoint."""
+
+    def __init__(self) -> None:
+        self._executor_decisions = 0
+
+    def decide(self, *, role: AgentRole, response_model: type[BaseModel], **_kwargs) -> BaseModel:
+        if role is AgentRole.planner:
+            return response_model.model_validate({
+                "action": "plan", "complexity": "L2", "success_criteria": ["完成"],
+                "steps": [{
+                    "step_id": "discover", "objective": "获取公开 JD",
+                    "allowed_skills": ["job-discovery"], "requires_verification": False,
+                }],
+            })
+        if role is AgentRole.executor:
+            self._executor_decisions += 1
+            if self._executor_decisions == 1:
+                return response_model.model_validate({
+                    "action": "call_tool", "tool_name": "fetch-job", "tool_input": {},
+                })
+            raise RuntimeError("simulated_process_loss")
+        raise AssertionError("Verifier should not run for an L2 step")
 
 
 def test_runtime_persists_planner_executor_verifier_success_trace(db_session) -> None:
@@ -197,6 +223,70 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         (AgentRole.executor, "complete"),
         (AgentRole.verifier, "call_tool"),
         (AgentRole.verifier, "decide"),
+    ]
+
+
+def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
+            output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {"title": "AI Agent 开发工程师"},
+        )
+    )
+    crashing_gateway = CrashAfterFirstExecutorDecisionGateway()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=crashing_gateway, tools=registry),
+        executor=ExecutorAgent(gateway=crashing_gateway, tools=registry),
+        verifier=VerifierAgent(gateway=crashing_gateway, tools=registry),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"])
+
+    with pytest.raises(RuntimeError, match="simulated_process_loss"):
+        runtime.run(db_session, user_id=user.id, task=task)
+
+    interrupted = db_session.scalar(select(AgentRun))
+    assert interrupted is not None
+    assert interrupted.status is RunStatus.running
+    assert db_session.scalar(select(AgentPlan).where(AgentPlan.run_id == interrupted.id)) is not None
+    assert [(turn.role, turn.decision_json["action"]) for turn in db_session.scalars(
+        select(AgentTurn).where(AgentTurn.run_id == interrupted.id)
+    )] == [(AgentRole.planner, "plan"), (AgentRole.executor, "call_tool")]
+
+    recovery_gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["完成"],
+            "steps": [{
+                "step_id": "discover", "objective": "重新确认公开 JD",
+                "allowed_skills": ["job-discovery"], "requires_verification": False,
+            }],
+        }],
+        AgentRole.executor: [{"action": "complete", "summary": "恢复完成", "artifact_refs": []}],
+        AgentRole.verifier: [],
+    })
+    recovery_runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=recovery_gateway, tools=registry),
+        executor=ExecutorAgent(gateway=recovery_gateway, tools=registry),
+        verifier=VerifierAgent(gateway=recovery_gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = recovery_runtime.recover(
+        db_session, user_id=user.id, run_id=interrupted.id, task=task
+    )
+
+    assert result.status is RunStatus.succeeded
+    assert run_repository.count_plans(db_session, interrupted.id) == 2
+    assert "run_recovery_started" in [
+        event.event_type for event in run_repository.list_events(db_session, interrupted.id)
     ]
 
 

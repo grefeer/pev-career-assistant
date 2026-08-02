@@ -106,6 +106,30 @@ class AgentRunService:
             task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
         )
 
+    def recover_run(
+        self, db: Session, *, user_id: str, run_id: str
+    ) -> AgentRunResult:
+        """Restart a nonterminal interrupted run from durable context and budgets only."""
+        if not self._settings.agent_harness_enabled:
+            raise AgentRuntimeDisabledError("agent_harness_disabled")
+        if self._runtime is None:
+            raise AgentRuntimeUnavailableError("agent_harness_unavailable")
+        run = self.get_run(db, user_id=user_id, run_id=run_id)
+        if run.status is not RunStatus.running:
+            raise AgentRunNotResumableError("agent_run_not_running")
+        task = AgentTaskRequest(
+            goal=run.goal,
+            allowed_skills=run.allowed_skills_json,
+            context=run.context_summary_json,
+            budget=AgentBudget.model_validate(run.budget_json),
+        )
+        return self._runtime.recover(
+            db,
+            user_id=user_id,
+            run_id=run.id,
+            task=self._with_confirmed_profile_facts(db, user_id=user_id, task=task),
+        )
+
     def list_runs(self, db: Session, *, user_id: str, limit: int) -> list[AgentRun]:
         """List recent task summaries within the requesting user's ownership boundary."""
         return run_repository.list_runs_for_owner(db, user_id, limit=limit)

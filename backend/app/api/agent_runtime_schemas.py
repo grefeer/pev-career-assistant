@@ -49,6 +49,12 @@ class ResumeAgentRunRequest(BaseModel):
         return cleaned
 
 
+class RecoverAgentRunRequest(BaseModel):
+    """Explicitly empty body: recovery can never accept browser-supplied context."""
+
+    model_config = {"extra": "forbid"}
+
+
 class AgentRunResponse(BaseModel):
     id: str
     goal: str

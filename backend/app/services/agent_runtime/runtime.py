@@ -85,6 +85,7 @@ class AgentRuntime:
                 event_type="run_started",
                 payload_json={"agent_version": self._agent_version},
             )
+            self._checkpoint(db)
             revision = 0
             consumed_turns = 0
             consumed_tool_calls = 0
@@ -141,6 +142,7 @@ class AgentRuntime:
                     "step_count": len(plan.steps),
                 },
             )
+            self._checkpoint(db)
             final_summary: str | None = None
             replan_feedback: str | None = None
             for sequence, plan_step in enumerate(plan.steps, start=1):
@@ -152,6 +154,7 @@ class AgentRuntime:
                     objective=plan_step.objective,
                     allowed_skills=plan_step.allowed_skills,
                 )
+                self._checkpoint(db)
                 outcome = self._run_step(
                     db=db,
                     run_id=run.id,
@@ -232,6 +235,29 @@ class AgentRuntime:
             event_type="run_resumed",
             payload_json={"user_response_received": True},
         )
+        return self.run(db, user_id=user_id, task=task, existing_run=run)
+
+    def recover(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        run_id: str,
+        task: AgentTaskRequest,
+    ) -> AgentRunResult:
+        """Replan a process-interrupted running Run from committed evidence only."""
+        run = run_repository.get_run_for_owner(db, run_id, user_id)
+        if run is None:
+            raise ValueError("agent_run_not_found")
+        if run.status is not RunStatus.running:
+            raise ValueError("agent_run_not_running")
+        run_repository.append_event(
+            db,
+            run_id=run.id,
+            event_type="run_recovery_started",
+            payload_json={"strategy": "replan_from_durable_evidence"},
+        )
+        self._checkpoint(db)
         return self.run(db, user_id=user_id, task=task, existing_run=run)
 
     def _run_step(
@@ -432,8 +458,17 @@ class AgentRuntime:
                 turn_index=turn_indices[role],
                 decision_json=decision_json,
             )
+            # A completed model decision is a recovery checkpoint. Tool output
+            # remains evidence-bound and is replay-safe if a process stops before
+            # the next decision persists its outcome.
+            db.commit()
 
         return trace
+
+    @staticmethod
+    def _checkpoint(db: Session) -> None:
+        """Commit a lifecycle boundary before entering an external model/tool turn."""
+        db.commit()
 
     @staticmethod
     def _with_observed_public_evidence(

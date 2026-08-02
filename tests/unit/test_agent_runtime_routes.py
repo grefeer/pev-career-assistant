@@ -139,6 +139,27 @@ def test_post_agent_run_resume_accepts_only_a_human_reply() -> None:
     }
 
 
+def test_post_agent_run_recover_accepts_no_client_context_or_budget() -> None:
+    service = MagicMock()
+    service.recover_run.return_value = AgentRunResult(
+        run_id="run-1", status=RunStatus.running, summary="正在从已持久化检查点恢复"
+    )
+    app = _build_app(service)
+    client = TestClient(app)
+
+    response = client.post("/api/agent-runs/run-1/recover", headers=_headers(app), json={})
+    invalid = client.post(
+        "/api/agent-runs/run-1/recover",
+        headers=_headers(app),
+        json={"context": {"unsafe": True}},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert invalid.status_code == 422
+    assert service.recover_run.call_args.kwargs == {"user_id": "user-a", "run_id": "run-1"}
+
+
 def test_get_agent_run_and_events_project_owner_safe_fields() -> None:
     """Trace API exposes evidence summaries but never hidden run context."""
     service = MagicMock()
