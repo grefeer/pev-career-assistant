@@ -14,6 +14,10 @@ from backend.app.services.career_skills.job_discovery import (
     extract_observed_job_details,
     fetch_public_job_page,
     search_public_job_pages,
+    _assert_public_url,
+    _direct_bing_result_url,
+    _extract_jd_section,
+    _infer_recruitment_types,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
@@ -44,6 +48,13 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     assert result.title == "AI Agent 开发工程师"
     assert "职责：构建智能体。" in result.visible_text
     assert len(result.content_hash) == 64
+
+
+def test_job_discovery_input_normalizers_reject_blank_values() -> None:
+    with pytest.raises(ValueError):
+        FetchPublicJobPageInput(url=" ")
+    with pytest.raises(ValueError):
+        SearchPublicJobPagesInput(query="   ")
 
 
 def test_search_public_job_pages_returns_only_safe_direct_result_urls(monkeypatch) -> None:
@@ -180,6 +191,69 @@ def test_fetch_public_job_page_rejects_a_short_login_or_soft_block_page(monkeypa
             ToolContext(user_id="user-a", run_id="run-a"),
             FetchPublicJobPageInput(url="https://jobs.example/login"),
         )
+
+
+def test_public_fetch_handles_network_encoding_and_empty_page_failures(monkeypatch) -> None:
+    monkeypatch.setattr("backend.app.services.career_skills.job_discovery._assert_public_url", lambda _url: None)
+    import requests
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.RequestException("down")),
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        fetch_public_job_page(ToolContext(user_id="u", run_id="r"), FetchPublicJobPageInput(url="https://jobs.example"))
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="<html><body></body></html>", encoding="latin-1", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+    with pytest.raises(PublicJobFetchError, match="empty_public_page"):
+        fetch_public_job_page(ToolContext(user_id="u", run_id="r"), FetchPublicJobPageInput(url="https://jobs.example"))
+
+
+def test_search_and_extraction_reject_missing_or_malformed_public_evidence(monkeypatch) -> None:
+    import requests
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(requests.RequestException("down")),
+    )
+    with pytest.raises(PublicJobFetchError, match="public_search_failed"):
+        search_public_job_pages(
+            ToolContext(user_id="u", run_id="r"), SearchPublicJobPagesInput(query="AI Agent")
+        )
+    with pytest.raises(PublicJobFetchError, match="observed_evidence_not_found"):
+        extract_observed_job_details(
+            ToolContext(user_id="u", run_id="r", metadata={}),
+            ExtractObservedJobDetailsInput(artifact_id="missing"),
+        )
+    with pytest.raises(PublicJobFetchError, match="observed_evidence_incomplete"):
+        extract_observed_job_details(
+            ToolContext(user_id="u", run_id="r", metadata={"observed_public_evidence": [{"artifact_id": "bad"}]}),
+            ExtractObservedJobDetailsInput(artifact_id="bad"),
+        )
+
+
+def test_job_discovery_helpers_only_accept_safe_bing_urls_and_known_recruitment_paths(monkeypatch) -> None:
+    with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
+        _assert_public_url("ftp://jobs.example/file")
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.socket.getaddrinfo",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("dns")),
+    )
+    with pytest.raises(PublicJobFetchError, match="unresolvable"):
+        _assert_public_url("https://jobs.example")
+    assert _direct_bing_result_url("https://www.bing.com/not-a-redirect") is None
+    assert _direct_bing_result_url("https://www.bing.com/ck/a?u=bad") is None
+    assert _direct_bing_result_url("https://example.com/jobs/1") == "https://example.com/jobs/1"
+    assert _infer_recruitment_types("https://talent.example/GRADUATE/1", ["fallback"]) == ["campus"]
+    assert _infer_recruitment_types("https://talent.example/INTERN/1", ["fallback"]) == ["internship"]
+    assert _infer_recruitment_types("https://talent.example/other", ["fallback"]) == ["fallback"]
+    assert _extract_jd_section("没有标签", labels=("岗位职责",)) == ""
 
 
 def test_extract_input_accepts_the_ephemeral_id_emitted_by_public_page_fetch() -> None:

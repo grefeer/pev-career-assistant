@@ -482,8 +482,6 @@ class AgentRuntime:
             if not isinstance(visible_text, str) or not visible_text:
                 continue
             text = visible_text[:remaining_characters]
-            if not text:
-                break
             item = {
                 "artifact_id": artifact.id,
                 "source_url": artifact.source_url,

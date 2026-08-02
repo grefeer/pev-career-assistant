@@ -268,3 +268,28 @@ def test_service_preserves_task_private_context_when_no_profile_version_exists(d
     )
 
     assert projected is task
+
+
+def test_service_blocks_resume_and_recovery_when_harness_is_disabled(db_session) -> None:
+    service = AgentRunService(settings_override(agent_harness_enabled=False), runtime=CapturingRuntime())
+
+    with pytest.raises(AgentRuntimeDisabledError):
+        service.resume_run(db_session, user_id="user-a", run_id="run-a", user_response="北京")
+    with pytest.raises(AgentRuntimeDisabledError):
+        service.recover_run(db_session, user_id="user-a", run_id="run-a")
+
+
+def test_service_lists_artifacts_only_for_the_run_owner(db_session) -> None:
+    owner = _user("user-a", "user-a@example.test")
+    other = _user("user-b", "user-b@example.test")
+    db_session.add_all([owner, other])
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=owner.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=None)
+
+    assert service.list_artifacts(db_session, user_id=owner.id, run_id=run.id) == []
+    with pytest.raises(AgentRunNotFoundError):
+        service.list_artifacts(db_session, user_id=other.id, run_id=run.id)
