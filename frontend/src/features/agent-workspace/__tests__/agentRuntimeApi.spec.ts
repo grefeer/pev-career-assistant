@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   createAgentRun,
+  fetchAgentRun,
+  fetchAgentRunArtifacts,
+  fetchAgentRunEvents,
   fetchAgentRunPlans,
   fetchAgentRuns,
   recoverAgentRun,
@@ -63,6 +66,23 @@ describe("agent runtime API", () => {
     await fetchAgentRunPlans("student-token", "run/1")
 
     expect(fetchMock.mock.calls[0][0]).toBe("/api/agent-runs/run%2F1/plans")
+  })
+
+  it("encodes an owner run identifier for run, events, and artifacts", async () => {
+    const fetchMock = vi.fn().mockImplementation(() => new Response(JSON.stringify({ items: [] }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    await fetchAgentRun("student-token", "run/1")
+    await fetchAgentRunEvents("student-token", "run/1")
+    await fetchAgentRunArtifacts("student-token", "run/1")
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/agent-runs/run%2F1",
+      "/api/agent-runs/run%2F1/events",
+      "/api/agent-runs/run%2F1/artifacts",
+    ])
   })
 
   it("resumes a waiting run with only the human clarification", async () => {

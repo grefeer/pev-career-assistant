@@ -52,10 +52,10 @@ async function handleAuth() {
 <template>
   <main class="auth-layout">
     <section class="hero-card">
-      <p class="eyebrow">Vue + FastAPI Upgrade</p>
-      <h1>把 LangGraph 多智能体求职助手升级成前后端分离项目。</h1>
+      <p class="eyebrow">Personal Career Agent</p>
+      <h1>以公开证据和已确认简历事实驱动你的求职决策。</h1>
       <p class="subtitle">
-        现在前端负责账户、会话、上传和展示，后端负责 LangGraph 工作流、SQLite checkpoint 和分析接口。
+        Planner、Executor、Verifier 三个 Agent 在预算和事实边界内协作，帮助你找到岗位、修改简历并制定准备计划。
       </p>
       <div class="hero-grid">
         <div class="metric-card">
@@ -67,12 +67,12 @@ async function handleAuth() {
           <strong>Vue 3 + Vite</strong>
         </div>
         <div class="metric-card">
-          <span>状态持久化</span>
-          <strong>SQLite checkpoint</strong>
+          <span>任务运行时</span>
+          <strong>可恢复 PEV Run</strong>
         </div>
         <div class="metric-card">
           <span>核心能力</span>
-          <strong>Command / Send / 子图</strong>
+          <strong>岗位、简历与面试准备</strong>
         </div>
       </div>
     </section>
