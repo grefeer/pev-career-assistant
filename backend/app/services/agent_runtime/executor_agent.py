@@ -115,7 +115,7 @@ class ExecutorAgent:
                         allowed_skills=frozenset(step.allowed_skills),
                     ),
                     "observations": [
-                        observation.model_dump(mode="json")
+                        _observation_for_decision(observation)
                         for observation in observations
                     ],
                 },
@@ -200,3 +200,30 @@ def _with_observed_page(
     metadata = dict(context.metadata)
     metadata["observed_public_evidence"] = evidence
     return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)
+
+
+def _observation_for_decision(observation: ToolObservation) -> dict[str, object]:
+    """Give the Agent identifiers and bounded evidence excerpts, never full page bodies."""
+    payload = observation.model_dump(mode="json")
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return payload
+    projected = dict(output)
+    if isinstance(projected.get("visible_text"), str):
+        projected["visible_text"] = projected["visible_text"][:1_200]
+    pages = projected.get("pages")
+    if isinstance(pages, list):
+        projected["pages"] = [
+            _page_for_decision(page) for page in pages[:10] if isinstance(page, dict)
+        ]
+    payload["output"] = projected
+    return payload
+
+
+def _page_for_decision(page: dict[str, object]) -> dict[str, object]:
+    """Project one page's traceable identity and a small visible-text excerpt."""
+    projected = dict(page)
+    visible_text = projected.get("visible_text")
+    if isinstance(visible_text, str):
+        projected["visible_text"] = visible_text[:1_200]
+    return projected

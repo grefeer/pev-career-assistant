@@ -194,7 +194,7 @@ def test_executor_exposes_every_page_from_a_batch_observation_to_the_next_tool()
         handler=lambda _context, _payload: {"pages": [
             {
                 "artifact_id": "observed:a", "source_url": "https://jobs.example/a",
-                "title": "岗位 A", "visible_text": "JD A", "content_hash": "a" * 64,
+                "title": "岗位 A", "visible_text": "x" * 1_201, "content_hash": "a" * 64,
             },
             {
                 "artifact_id": "observed:b", "source_url": "https://jobs.example/b",
@@ -231,6 +231,7 @@ def test_executor_exposes_every_page_from_a_batch_observation_to_the_next_tool()
     )
 
     assert result.observations[1].output == {"title": "岗位 A,岗位 B"}
+    assert len(gateway.states[1]["observations"][0]["output"]["pages"][0]["visible_text"]) == 1_200
 
 
 def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
