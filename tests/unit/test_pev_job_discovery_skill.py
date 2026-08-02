@@ -87,6 +87,34 @@ def test_search_public_job_pages_returns_only_safe_direct_result_urls(monkeypatc
     assert len(result.content_hash) == 64
 
 
+def test_search_public_job_pages_filters_safe_links_that_are_not_job_results(monkeypatch) -> None:
+    """A generic article is not usable evidence merely because its URL is public."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class=\"b_algo\"><h2><a href=\"https://example.com/ai-agent-guide\">AI Agent 技术指南</a></h2><p>介绍智能体技术趋势。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+    )
+
+    assert result.results == []
+
+
 def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:
     """An Agent cannot use a public-web tool to probe private infrastructure."""
     with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):

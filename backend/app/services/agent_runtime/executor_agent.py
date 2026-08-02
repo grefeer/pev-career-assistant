@@ -30,8 +30,11 @@ _EXECUTOR_INSTRUCTION = (
     "search observation, prefer fetching a plausible returned result; retry a "
     "search at most once only when no plausible public career URL was returned. "
     "Do not loop through search-provider or job-board domain variations without "
-    "capturing evidence. If the second search is still insufficient, complete "
-    "with the supported limitation or ask the user for a source or constraint."
+    "capturing evidence. A search observation with an empty results list is a "
+    "verified provider limitation: do not search again; immediately ask the user "
+    "for an official careers URL or relax the source constraint. If a fetched "
+    "page does not contain a usable JD, state that evidence limitation and choose "
+    "a different returned direct URL at most once before asking the user."
 )
 
 

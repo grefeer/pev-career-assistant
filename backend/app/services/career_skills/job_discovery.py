@@ -17,6 +17,26 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.job_discovery.tools.jd_extraction import extract_jd_candidates
 
 
+_JOB_RESULT_URL_TOKENS = (
+    "career",
+    "job",
+    "jobs",
+    "talent",
+    "recruit",
+    "zhaopin",
+    "position",
+    "campus",
+    "greenhouse",
+    "lever.co",
+    "workday",
+)
+_JOB_RESULT_TEXT_RE = re.compile(
+    r"(?:招聘|职位|岗位|校招|社招|实习|工程师|开发|算法|researcher|"
+    r"engineer|developer|intern|hiring|career|job)",
+    re.IGNORECASE,
+)
+
+
 class PublicJobFetchError(RuntimeError):
     """Stable, non-sensitive public-web fetch failure."""
 
@@ -261,7 +281,13 @@ def search_public_job_pages(
 ) -> SearchPublicJobPagesOutput:
     """Search a fixed public provider and return only direct, safe career URLs."""
     del context
-    source_url = f"https://www.bing.com/search?{urlencode({'q': payload.query})}"
+    search_parameters = {
+        "q": payload.query,
+        "mkt": "zh-CN",
+        "setlang": "zh-hans",
+        "cc": "CN",
+    }
+    source_url = "https://www.bing.com/search?" + urlencode(search_parameters)
     try:
         response = requests.get(
             source_url,
@@ -286,6 +312,7 @@ def search_public_job_pages(
             or parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.hostname.endswith("bing.com")
+            or not _is_plausible_public_job_result(raw_result, result_url)
         ):
             continue
         try:
@@ -305,6 +332,21 @@ def search_public_job_pages(
         source_url=source_url,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
         results=results,
+    )
+
+
+def _is_plausible_public_job_result(
+    result: dict[str, str], result_url: str
+) -> bool:
+    """Keep search evidence useful for job discovery without trusting generic pages."""
+    searchable_text = " ".join(
+        value for value in (result.get("title"), result.get("snippet"))
+        if isinstance(value, str)
+    )
+    lowered_url = result_url.lower()
+    return (
+        any(token in lowered_url for token in _JOB_RESULT_URL_TOKENS)
+        or _JOB_RESULT_TEXT_RE.search(searchable_text) is not None
     )
 
 
