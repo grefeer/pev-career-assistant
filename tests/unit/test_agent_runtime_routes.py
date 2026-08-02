@@ -82,6 +82,32 @@ def test_post_agent_run_returns_only_safe_run_summary() -> None:
         "error_code": None,
     }
     assert service.create_run.call_args.kwargs["user_id"] == "user-a"
+    assert service.create_run.call_args.kwargs["task"].budget.max_agent_turns == 12
+
+
+def test_post_agent_run_scales_hard_turn_ceiling_for_multi_skill_work() -> None:
+    service = MagicMock()
+    service.create_run.return_value = AgentRunResult(
+        run_id="run-1", status=RunStatus.succeeded, summary="完成"
+    )
+    app = _build_app(service)
+
+    response = TestClient(app).post(
+        "/api/agent-runs",
+        headers=_headers(app),
+        json={
+            "goal": "找岗位并完成匹配、简历优化和面试计划",
+            "allowed_skills": [
+                "job-discovery",
+                "job-matching",
+                "resume-tailoring",
+                "career-planning",
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert service.create_run.call_args.kwargs["task"].budget.max_agent_turns == 36
 
 
 def test_post_agent_run_rejects_unknown_input_and_disabled_harness() -> None:

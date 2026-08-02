@@ -28,13 +28,14 @@ from backend.app.api.dependencies import (
     get_current_user,
 )
 from backend.app.db.models import User
-from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
+from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.service import (
     AgentRunNotFoundError,
     AgentRunNotResumableError,
     AgentRunService,
     AgentRuntimeDisabledError,
     AgentRuntimeUnavailableError,
+    build_adaptive_agent_budget,
 )
 
 router = APIRouter(prefix="/agent-runs", tags=["agent_runtime"])
@@ -134,11 +135,7 @@ def create_agent_run(
         goal=request_body.goal,
         allowed_skills=request_body.allowed_skills,
         context=request_body.context,
-        budget=AgentBudget(
-            max_agent_turns=settings.agent_harness_max_agent_turns,
-            max_tool_calls=settings.agent_harness_max_tool_calls,
-            max_replans=settings.agent_harness_max_replans,
-        ),
+        budget=build_adaptive_agent_budget(settings, request_body.allowed_skills),
     )
     try:
         result = service.create_run(db, user_id=current_user.id, task=task)

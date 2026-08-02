@@ -29,6 +29,26 @@ class AgentRunNotResumableError(RuntimeError):
     """Raised when a user tries to continue a non-paused Agent run."""
 
 
+def build_adaptive_agent_budget(settings: Settings, allowed_skills: list[str]) -> AgentBudget:
+    """Set a hard, request-scoped ceiling without prescribing Agent actions.
+
+    A single-skill question keeps the configured fast-path ceiling.  Every
+    additional permitted Skill can require an execution decision plus an
+    independent verification/retry decision, so a multi-deliverable request is
+    given room to finish rather than being incorrectly cut off mid-workflow.
+    The Planner, Executor and Verifier still choose every actual turn.
+    """
+    unique_skill_count = len(set(allowed_skills))
+    adaptive_turn_ceiling = settings.agent_harness_max_agent_turns + 8 * max(
+        0, unique_skill_count - 1
+    )
+    return AgentBudget(
+        max_agent_turns=min(100, adaptive_turn_ceiling),
+        max_tool_calls=settings.agent_harness_max_tool_calls,
+        max_replans=settings.agent_harness_max_replans,
+    )
+
+
 class AgentRunService:
     """Apply feature gating and ownership around the lower-level PEV runtime."""
 
