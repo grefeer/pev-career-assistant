@@ -52,12 +52,64 @@ class CapturingRuntime:
         return AgentRunResult(run_id, status=RunStatus.succeeded, summary=user_id)
 
 
+class QueuedRuntime(CapturingRuntime):
+    def create_queued_run(self, db_session, *, user_id: str, task: AgentTaskRequest):
+        return run_repository.create_run(
+            db_session, user_id=user_id, goal=task.goal, allowed_skills=task.allowed_skills,
+            context_summary=task.context, budget_json=task.budget.model_dump(mode="json"),
+            agent_version="pev-test",
+        )
+
+    def run(self, _db, *, user_id: str, task: AgentTaskRequest, existing_run=None) -> AgentRunResult:
+        self.task = task
+        return AgentRunResult(existing_run.id, status=RunStatus.succeeded, summary=user_id)
+
+
 def test_service_fails_closed_when_adaptive_harness_is_disabled(db_session) -> None:
     """Legacy deployments cannot accidentally activate a partly configured Agent."""
     service = AgentRunService(settings_override(agent_harness_enabled=False), runtime=None)
 
     with pytest.raises(AgentRuntimeDisabledError):
         service.create_run(db_session, user_id="user-a", task=None)
+    with pytest.raises(AgentRuntimeDisabledError):
+        service.queue_run(db_session, user_id="user-a", task=None)
+
+
+def test_service_queues_then_executes_a_durable_run_in_an_isolated_session(db_session) -> None:
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    runtime = QueuedRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+    task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+
+    queued = service.queue_run(db_session, user_id=user.id, task=task)
+    db_session.commit()
+    assert queued.status is RunStatus.queued
+    service.execute_queued_run(lambda: db_session, user_id=user.id, run_id=queued.run_id)
+
+    assert runtime.task is not None
+    assert runtime.task.goal == "找岗位"
+
+
+def test_queued_execution_ignores_missing_or_nonqueued_runs_and_persists_unexpected_failure(db_session) -> None:
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    runtime = QueuedRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+    service.execute_queued_run(lambda: db_session, user_id=user.id, run_id="missing")
+    run = runtime.create_queued_run(
+        db_session, user_id=user.id, task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+    )
+    run_id = run.id
+    db_session.commit()
+    runtime.run = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+    service.execute_queued_run(lambda: db_session, user_id=user.id, run_id=run_id)
+
+    persisted = run_repository.get_run_for_owner(db_session, run_id, user.id)
+    assert persisted is not None and persisted.status is RunStatus.failed
+    assert run_repository.list_events(db_session, run_id)[-1].event_type == "run_failed"
 
 
 def test_service_hides_other_users_persisted_run_and_events(db_session) -> None:
