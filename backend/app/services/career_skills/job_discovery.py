@@ -301,6 +301,10 @@ def fetch_public_job_page(
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
+    short_page_markers = ("登录", "login", "验证", "verify", "captcha", "安全检查")
+    page_summary = f"{title or ''}\n{visible_text}".lower()
+    if len(visible_text) < 160 and any(marker in page_summary for marker in short_page_markers):
+        raise PublicJobFetchError("public_page_content_insufficient")
     return FetchPublicJobPageOutput(
         artifact_id=f"observed:{hashlib.sha256(html.encode('utf-8', errors='replace')).hexdigest()}",
         source_url=payload.url,

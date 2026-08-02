@@ -160,6 +160,28 @@ def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:
         )
 
 
+def test_fetch_public_job_page_rejects_a_short_login_or_soft_block_page(monkeypatch) -> None:
+    """An accessible login shell is not usable job evidence."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="<html><title>登录</title><body>请先登录后查看</body></html>",
+            encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+
+    with pytest.raises(PublicJobFetchError, match="public_page_content_insufficient"):
+        fetch_public_job_page(
+            ToolContext(user_id="user-a", run_id="run-a"),
+            FetchPublicJobPageInput(url="https://jobs.example/login"),
+        )
+
+
 def test_extract_input_accepts_the_ephemeral_id_emitted_by_public_page_fetch() -> None:
     """One Executor step can pass the exact fetch observation into detail extraction."""
     payload = ExtractObservedJobDetailsInput(artifact_id="observed:" + "a" * 64)
