@@ -13,6 +13,7 @@ from backend.app.services.agent_runtime.service import (
     AgentRuntimeDisabledError,
     AgentRunNotFoundError,
     AgentRunNotResumableError,
+    AgentRuntimeUnavailableError,
     AgentRunService,
 )
 from tests.conftest import settings_override
@@ -224,3 +225,46 @@ def test_service_recovers_only_an_owner_running_run_from_durable_context(db_sess
     run_repository.finish_run(db_session, run, status=RunStatus.succeeded)
     with pytest.raises(AgentRunNotResumableError):
         service.recover_run(db_session, user_id=user.id, run_id=run.id)
+
+
+def test_service_fails_closed_when_enabled_but_runtime_is_unavailable(db_session) -> None:
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=None)
+
+    with pytest.raises(AgentRuntimeUnavailableError):
+        service.create_run(
+            db_session, user_id="user-a", task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+        )
+
+
+def test_service_resume_and_recovery_enforce_lifecycle_and_nonempty_reply(db_session) -> None:
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={"max_agent_turns": 3, "max_tool_calls": 3, "max_replans": 0},
+        agent_version="pev-test",
+    )
+    runtime = CapturingRuntime()
+    service = AgentRunService(settings_override(agent_harness_enabled=True), runtime=runtime)
+
+    with pytest.raises(AgentRunNotResumableError):
+        service.resume_run(db_session, user_id=user.id, run_id=run.id, user_response="北京")
+    run_repository.start_run(db_session, run)
+    run_repository.finish_run(db_session, run, status=RunStatus.waiting_user)
+    with pytest.raises(ValueError, match="empty"):
+        service.resume_run(db_session, user_id=user.id, run_id=run.id, user_response=" ")
+    with pytest.raises(AgentRunNotResumableError):
+        service.recover_run(db_session, user_id=user.id, run_id=run.id)
+
+
+def test_service_preserves_task_private_context_when_no_profile_version_exists(db_session) -> None:
+    task = AgentTaskRequest(
+        goal="找岗位", allowed_skills=["job-discovery"], private_context={"other": "kept"}
+    )
+
+    projected = AgentRunService._with_confirmed_profile_facts(
+        db_session, user_id="no-profile", task=task
+    )
+
+    assert projected is task

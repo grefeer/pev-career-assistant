@@ -6,6 +6,8 @@ import pytest
 from pydantic import ValidationError
 
 from tests.conftest import settings_override
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 
 def test_harness_is_the_default_personal_assistant_path_and_has_positive_budgets() -> None:
@@ -22,3 +24,14 @@ def test_harness_rejects_an_unexecutable_turn_budget() -> None:
     """A configuration error cannot reduce real Agents to zero-turn placeholders."""
     with pytest.raises(ValidationError):
         settings_override(agent_harness_max_agent_turns=0)
+
+
+@pytest.mark.parametrize("budget_type", [ToolCallBudget, AgentTurnBudget])
+def test_shared_budgets_reject_invalid_maximum_and_stop_at_the_exact_cap(budget_type) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        budget_type(0)
+    budget = budget_type(2, used=1)
+    assert budget.remaining == 1
+    assert budget.try_consume() is True
+    assert budget.remaining == 0
+    assert budget.try_consume() is False

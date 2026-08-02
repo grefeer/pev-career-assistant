@@ -100,6 +100,7 @@ def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence()
     with pytest.raises(ValidationError):
         BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=[" "])
     assert _find_target("not-a-list", "jd") is None
+    assert _find_target([], "jd") is None
     missing_context = ToolContext(user_id="user-a", run_id="run-a", metadata={})
     with pytest.raises(ValueError, match="target_evidence_not_found"):
         build_preparation_plan(

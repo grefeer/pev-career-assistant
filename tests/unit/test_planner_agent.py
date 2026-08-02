@@ -11,6 +11,8 @@ from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 
 class PreferenceInput(BaseModel):
@@ -94,3 +96,22 @@ def test_planner_uses_context_tool_observation_before_creating_a_plan() -> None:
             "error_code": None,
         }
     ]
+
+
+def test_planner_enforces_shared_turn_and_tool_budgets_and_reports_loop_exhaustion() -> None:
+    task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+    call_tool = {"action": "call_tool", "tool_name": "missing", "tool_input": {}}
+    agent = PlannerAgent(gateway=ScriptedGateway([call_tool]), tools=ToolRegistry())
+    context = ToolContext(user_id="user-a", run_id="run-a")
+
+    assert agent.run(task=task, context=context, turn_budget=AgentTurnBudget(1, used=1)).error_code == "agent_turn_budget_exhausted"
+    assert agent.run(task=task, context=context, tool_budget=ToolCallBudget(1, used=1)).error_code == "tool_budget_exhausted"
+
+    exhausted = PlannerAgent(
+        gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()
+    ).run(
+        task=task.model_copy(update={"budget": task.budget.model_copy(update={"max_agent_turns": 1})}),
+        context=context,
+    )
+    assert exhausted.status == "failed"
+    assert exhausted.user_question is not None

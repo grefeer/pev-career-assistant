@@ -20,6 +20,8 @@ from backend.app.services.agent_runtime.schemas import (
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 
 class EvidenceInput(BaseModel):
@@ -118,3 +120,30 @@ def test_verifier_calls_evidence_tool_then_routes_executor_retry() -> None:
         "missing_fields": ["岗位职责", "任职要求"],
     }
     assert gateway.states[1]["observations"][0]["tool_name"] == "verify-job-evidence"
+
+
+def test_verifier_enforces_budgets_and_reports_exhausted_tool_loop() -> None:
+    task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L3,
+        success_criteria=["完整 JD"],
+        steps=[PlanStep(step_id="discover", objective="提取", allowed_skills=["job-discovery"])],
+    )
+    execution = ExecutorResult(status="succeeded", summary="完成")
+    context = ToolContext(user_id="user-a", run_id="run-a")
+    call_tool = {"action": "call_tool", "tool_name": "missing", "tool_input": {}}
+    tool_limited = VerifierAgent(gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], execution=execution, context=context,
+        tool_budget=ToolCallBudget(1, used=1),
+    )
+    turn_limited = VerifierAgent(gateway=ScriptedGateway([]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], execution=execution, context=context,
+        turn_budget=AgentTurnBudget(1, used=1),
+    )
+    exhausted = VerifierAgent(gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()).run(
+        task=task.model_copy(update={"budget": task.budget.model_copy(update={"max_agent_turns": 1})}),
+        plan=plan, step=plan.steps[0], execution=execution, context=context,
+    )
+    assert tool_limited.error_code == "tool_budget_exhausted"
+    assert turn_limited.error_code == "agent_turn_budget_exhausted"
+    assert exhausted.feedback.startswith("Verifier turn budget exhausted")

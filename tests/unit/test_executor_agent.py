@@ -15,6 +15,8 @@ from backend.app.services.agent_runtime.schemas import (
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 
 class FetchInput(BaseModel):
@@ -177,3 +179,32 @@ def test_executor_makes_a_fresh_public_page_observation_available_to_its_next_to
 
     assert result.status == "succeeded"
     assert result.observations[1].output == {"title": "AI Agent 开发工程师"}
+
+
+def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
+    task = AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["完整 JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+    context = ToolContext(user_id="user-a", run_id="run-a")
+    need_user = ExecutorAgent(
+        gateway=ScriptedGateway([{"action": "need_user", "user_question": "请给 URL"}]),
+        tools=ToolRegistry(),
+    ).run(task=task, plan=plan, step=plan.steps[0], context=context)
+    assert need_user.status == "needs_user"
+    call_tool = {"action": "call_tool", "tool_name": "missing", "tool_input": {}}
+    tool_limited = ExecutorAgent(gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], context=context, tool_budget=ToolCallBudget(1, used=1),
+    )
+    turn_limited = ExecutorAgent(gateway=ScriptedGateway([]), tools=ToolRegistry()).run(
+        task=task, plan=plan, step=plan.steps[0], context=context, turn_budget=AgentTurnBudget(1, used=1),
+    )
+    exhausted = ExecutorAgent(gateway=ScriptedGateway([call_tool]), tools=ToolRegistry()).run(
+        task=task.model_copy(update={"budget": task.budget.model_copy(update={"max_agent_turns": 1})}),
+        plan=plan, step=plan.steps[0], context=context,
+    )
+    assert tool_limited.error_code == "tool_budget_exhausted"
+    assert turn_limited.error_code == "agent_turn_budget_exhausted"
+    assert exhausted.status == "failed"

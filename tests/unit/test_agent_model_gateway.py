@@ -11,6 +11,8 @@ from backend.app.services.agent_runtime.model_gateway import (
     AgentModelGatewayError,
     LangChainModelGateway,
     build_agent_model_gateway,
+    _role_action_contract,
+    _strip_json_fence,
 )
 from tests.conftest import settings_override
 from backend.app.services.agent_runtime.schemas import PlannerDecision
@@ -44,6 +46,24 @@ class JsonOnlyModel:
             self.rejected = True
             raise RuntimeError("response_format type is unavailable now")
         return type("RawResponse", (), {"content": '{"action":"need_user","user_question":"请确认城市。"}'})()
+
+
+class RaisingModel:
+    def with_structured_output(self, _schema: type[BaseModel]) -> "RaisingModel":
+        raise RuntimeError("provider is down")
+
+
+class FallbackResponseModel:
+    def with_structured_output(self, _schema: type[BaseModel]) -> "FallbackResponseModel":
+        raise RuntimeError("response_format not supported")
+
+    def __init__(self, content: object | Exception) -> None:
+        self.content = content
+
+    def invoke(self, _messages: list[object]) -> object:
+        if isinstance(self.content, Exception):
+            raise self.content
+        return type("RawResponse", (), {"content": self.content})()
 
 
 def test_gateway_converts_provider_structured_result_into_requested_agent_decision() -> None:
@@ -100,3 +120,55 @@ def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:
 
     with pytest.raises(AgentModelGatewayConfigError, match="missing_api_key"):
         build_agent_model_gateway(settings_override(agent_harness_enabled=True))
+
+
+@pytest.mark.parametrize(
+    "model",
+    [RaisingModel(), FallbackResponseModel(RuntimeError("fallback down"))],
+)
+def test_gateway_maps_provider_failures_to_a_stable_error(model: object) -> None:
+    with pytest.raises(AgentModelGatewayError, match="model_request_failed"):
+        LangChainModelGateway(model).decide(
+            role=AgentRole.planner, instruction="形成计划", state={}, response_model=PlannerDecision
+        )
+
+
+@pytest.mark.parametrize("content", [None, "not json", '{"action":"bad"}'])
+def test_gateway_rejects_non_schema_json_fallback_output(content: object) -> None:
+    with pytest.raises(AgentModelGatewayError, match="invalid_model_response"):
+        LangChainModelGateway(FallbackResponseModel(content)).decide(
+            role=AgentRole.planner, instruction="形成计划", state={}, response_model=PlannerDecision
+        )
+
+
+def test_gateway_accepts_fenced_json_and_describes_every_role_contract() -> None:
+    result = LangChainModelGateway(
+        FallbackResponseModel('```json\n{"action":"need_user","user_question":"北京？"}\n```')
+    ).decide(role=AgentRole.planner, instruction="形成计划", state={}, response_model=PlannerDecision)
+
+    assert result.user_question == "北京？"
+    assert _strip_json_fence("```\n{}\n```") == "{}"
+    assert _strip_json_fence("{}") == "{}"
+    assert "complete" in _role_action_contract(AgentRole.executor)
+    assert "REPLAN" in _role_action_contract(AgentRole.verifier)
+
+
+def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingChatModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("src.utils.get_api_key", lambda: "key")
+    monkeypatch.setattr("src.utils.get_base_url", lambda: "https://api.deepseek.example")
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.model_gateway.ChatOpenAI", CapturingChatModel
+    )
+
+    gateway = build_agent_model_gateway(
+        settings_override(agent_harness_model="deepseek-v4-chat")
+    )
+
+    assert isinstance(gateway, LangChainModelGateway)
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
