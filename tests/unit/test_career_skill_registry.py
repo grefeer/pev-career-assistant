@@ -47,3 +47,10 @@ def test_registry_exposes_public_web_search_as_part_of_job_discovery_skill() -> 
     }
 
     assert "search-public-job-pages" in names
+    catalog = registry.tool_catalog(
+        role=AgentRole.executor,
+        allowed_skills=frozenset({"job-discovery", "job-matching"}),
+    )
+    matching = next(tool for tool in catalog if tool["name"] == "match-observed-jobs")
+    assert "推荐任务必须调用" in matching["description"]
+    assert "matches" in matching["output_schema"]["properties"]

@@ -23,6 +23,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.ExtractObservedJobDetailsBatchOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.extract_observed_job_details_batch,
+            description="批量把已观察页面证据规范化为详细 JD；不接受模型生成的正文。",
         )
     )
     registry.register(
@@ -33,6 +34,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.FetchPublicJobPagesOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.fetch_public_job_pages,
+            description="批量抓取用户给出的有限官方 URL，返回每页可追溯正文或明确失败原因。",
         )
     )
     registry.register(
@@ -43,6 +45,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.SearchPublicJobPagesOutput,
             allowed_roles=frozenset({AgentRole.executor}),
             handler=job_discovery.search_public_job_pages,
+            description="搜索公开招聘页；仅在用户没有提供候选 URL 时用于发现直接招聘链接。",
         )
     )
     registry.register(
@@ -53,6 +56,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.FetchPublicJobPageOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.fetch_public_job_page,
+            description="抓取一页公开招聘页面并生成带来源和内容哈希的证据。",
         )
     )
     registry.register(
@@ -63,6 +67,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.ExtractObservedJobDetailsOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.extract_observed_job_details,
+            description="把一份已观察页面证据规范化为详细 JD。",
         )
     )
     registry.register(
@@ -73,6 +78,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_matching.MatchObservedJobsOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_matching.match_observed_jobs,
+            description="对已观察 JD 按已确认能力、地点和可验证待遇/公司属性做透明匹配排序；推荐任务必须调用。",
         )
     )
     registry.register(
@@ -83,6 +89,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=resume_tailoring.ResumeTailoringBriefOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=resume_tailoring.build_resume_tailoring_brief,
+            description="基于已确认简历事实与一个 JD 生成不可虚构、可审阅的简历修改建议。",
         )
     )
     registry.register(
@@ -93,6 +100,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=career_planning.PreparationPlanOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=career_planning.build_preparation_plan,
+            description="基于一个 JD 生成带截止日期和复盘点的面试准备计划。",
         )
     )
     return registry

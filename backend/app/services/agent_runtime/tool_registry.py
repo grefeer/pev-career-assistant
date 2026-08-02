@@ -25,6 +25,7 @@ class ToolDefinition:
     allowed_roles: frozenset[AgentRole]
     handler: ToolHandler
     skill_name: str | None = None
+    description: str = ""
 
 
 class ToolRegistry:
@@ -64,7 +65,9 @@ class ToolRegistry:
                 {
                     "name": definition.name,
                     "skill_name": definition.skill_name,
+                    "description": definition.description,
                     "input_schema": definition.input_model.model_json_schema(),
+                    "output_schema": definition.output_model.model_json_schema(),
                 }
             )
         return catalog

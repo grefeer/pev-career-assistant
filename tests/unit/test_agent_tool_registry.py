@@ -133,7 +133,12 @@ def test_registry_rejects_invalid_registration_and_catalog_filters_skill_authori
 
     assert registry.tool_catalog(role=AgentRole.planner) == []
     assert registry.tool_catalog(role=AgentRole.executor, allowed_skills=frozenset({"resume-tailoring"})) == []
-    assert registry.tool_catalog(role=AgentRole.executor, allowed_skills=frozenset({"job-discovery"}))[0]["name"] == "read-job"
+    catalog = registry.tool_catalog(
+        role=AgentRole.executor, allowed_skills=frozenset({"job-discovery"})
+    )
+    assert catalog[0]["name"] == "read-job"
+    assert catalog[0]["description"] == ""
+    assert catalog[0]["output_schema"]["properties"]["owner_id"]["type"] == "string"
 
 
 def test_registry_reports_skill_forbidden_invalid_output_and_handler_failure() -> None:
