@@ -8,11 +8,11 @@ from pydantic import ValidationError
 from tests.conftest import settings_override
 
 
-def test_harness_is_explicitly_opt_in_and_has_positive_hard_budgets() -> None:
-    """Existing deployments must not silently switch from their legacy runtime."""
+def test_harness_is_the_default_personal_assistant_path_and_has_positive_budgets() -> None:
+    """A new personal-assistant deployment defaults to its only PEV runtime path."""
     settings = settings_override()
 
-    assert settings.agent_harness_enabled is False
+    assert settings.agent_harness_enabled is True
     assert settings.agent_harness_max_agent_turns >= 1
     assert settings.agent_harness_max_tool_calls >= 1
     assert settings.agent_harness_max_replans >= 0

@@ -135,10 +135,12 @@ class Settings(BaseSettings):
 
     # Adaptive Planner–Executor–Verifier runtime. This deliberately starts
     # opt-in so an existing deployment cannot silently move a production job
-    # discovery flow from its certified legacy path to a new agent harness.
+    # The personal assistant's default execution path is the adaptive PEV
+    # harness. Deployments may explicitly disable it for maintenance, but a
+    # missing model key then degrades safely to ``agent_harness_unavailable``.
     # The limits are hard operational ceilings; Agents, rather than Settings,
     # choose their plans, Skills, retries and verifier decisions.
-    agent_harness_enabled: bool = False
+    agent_harness_enabled: bool = True
     agent_harness_model: str = "deepseek-v4-flash"
     agent_harness_max_agent_turns: int = Field(default=12, ge=1, le=100)
     agent_harness_max_tool_calls: int = Field(default=24, ge=1, le=200)
