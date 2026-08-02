@@ -35,11 +35,15 @@ pytestmark = pytest.mark.skipif(
 OFFICIAL_AI_AGENT_JOB_URLS = (
     "https://talent.baidu.com/jobs/detail/GRADUATE/4f1cbc80-8332-4a92-b8fa-c0132b17d47e",
     "https://talent.baidu.com/jobs/detail/GRADUATE/74d83772-1bd0-42b9-8cc5-69eb45696b62",
+    "https://talent.baidu.com/jobs/detail/SOCIAL/75d3af47-7f79-4d71-862b-6fbca577bb19",
+    "https://talent.baidu.com/jobs/detail/GRADUATE/3287bb6a-8c27-4648-a3c2-b3cac16c3d36",
     "https://talent.baidu.com/jobs/detail/GRADUATE/6f9c3a86-6557-409d-8fa7-e6f4c68d6765",
+    "https://talent.baidu.com/jobs/detail/SOCIAL/5bb42582-10ab-4f49-94a6-7ee296885d8f",
+    "https://talent.baidu.com/jobs/detail/INTERN/cd423c1c-7a35-4672-b0a7-2857308efe43",
 )
 
 
-def test_local_resume_has_only_fact_grounded_tailoring_for_three_real_jds() -> None:
+def test_local_resume_has_only_fact_grounded_tailoring_for_seven_real_jds() -> None:
     """The local PDF is read in-memory and never copied into the repository."""
     resume_path = Path(os.environ["LIVE_RESUME_PDF"])
     parsed = extract_resume_document(resume_path.name, resume_path.read_bytes())

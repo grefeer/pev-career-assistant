@@ -74,7 +74,7 @@ services:
       REDIS_PORT: "6379"
       REDIS_DB: "0"
       CHECKPOINT_BACKEND: redis
-      TRUSTED_PROXY_CIDRS: 172.30.250.0/28
+      TRUSTED_PROXY_CIDRS: 172.30.251.0/28
       OBJECT_STORE_ENDPOINT: http://minio:9000
       OBJECT_STORE_REGION: us-east-1
       OBJECT_STORE_BUCKET: career-assistant
@@ -139,4 +139,4 @@ networks:
   proxy:
     ipam:
       config:
-        - subnet: 172.30.250.0/28
+        - subnet: 172.30.251.0/28

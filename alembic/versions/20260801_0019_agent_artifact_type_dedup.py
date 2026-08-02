@@ -22,6 +22,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Allow one artifact of each type for a source snapshot in a step."""
+    # MySQL may use the old unique index as the supporting index for the
+    # ``step_id`` foreign key. Create an explicit non-unique support index
+    # before replacing that uniqueness invariant.
+    op.create_index(
+        "ix_agent_artifacts_step_id",
+        "agent_artifacts",
+        ["step_id"],
+        unique=False,
+    )
     op.drop_constraint(
         "uq_agent_artifacts_step_content_hash",
         "agent_artifacts",
@@ -46,3 +55,4 @@ def downgrade() -> None:
         "agent_artifacts",
         ["step_id", "content_hash"],
     )
+    op.drop_index("ix_agent_artifacts_step_id", table_name="agent_artifacts")
