@@ -218,15 +218,14 @@ def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
         )
         assert (
             custom_client.get(
-                "/api/sessions", headers={"Authorization": f"Bearer {token}"}
+                "/api/agent-runs", headers={"Authorization": f"Bearer {token}"}
             ).status_code
             == 200
         )
         assert (
-            custom_client.post(
-                "/api/analysis/run",
+            custom_client.get(
+                "/api/agent-runs/00000000-0000-0000-0000-000000000000",
                 headers={"Authorization": f"Bearer {token}"},
-                data={"thread_id": "not-owned"},
             ).status_code
             == 404
         )
@@ -245,7 +244,7 @@ def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
         )
         assert (
             custom_client.get(
-                "/api/sessions", headers={"Authorization": f"Bearer {login_token}"}
+                "/api/agent-runs", headers={"Authorization": f"Bearer {login_token}"}
             ).status_code
             == 200
         )
@@ -334,7 +333,7 @@ def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
         def ensure_bucket(self):
             return None
 
-    app = create_app(custom_settings, graph=object(), blob_store=Blob())
+    app = create_app(custom_settings, blob_store=Blob())
     app.state.redis = object()
     with TestClient(app) as custom_client:
         response = custom_client.post(
