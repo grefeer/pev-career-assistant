@@ -622,6 +622,44 @@ def test_runtime_persists_resume_tailoring_as_a_reviewable_skill_artifact(db_ses
     assert artifacts[0].content_json["proposed_diffs"][0]["fact_ref"] == "skills"
 
 
+def test_runtime_persists_multi_source_job_matching_report_with_observed_provenance(db_session) -> None:
+    """A match report has many JD sources but must not be dropped for lacking one root URL."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    execution = ExecutorResult(
+        status="succeeded",
+        summary="已完成透明匹配",
+        observations=[ToolObservation(
+            tool_name="match-observed-jobs",
+            status="succeeded",
+            output={"matches": [
+                {"artifact_id": "observed:a", "source_url": "https://jobs.example/a", "score": 80},
+                {"artifact_id": "observed:b", "source_url": "https://jobs.example/b", "score": 70},
+            ], "unresolved_ranking_criteria": ["salary"]},
+        )],
+    )
+
+    refs = AgentRuntime._persist_observed_evidence(db_session, run.id, step, execution)
+
+    artifacts = list(db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == run.id)
+    ))
+    assert len(refs) == 1
+    assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
+        ("job_matching_report", "https://jobs.example/a")
+    ]
+    assert [match["source_url"] for match in artifacts[0].content_json["matches"]] == [
+        "https://jobs.example/a", "https://jobs.example/b"
+    ]
+
+
 def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session) -> None:
     """A user reply resumes one durable Run instead of opening a fresh budget."""
     user = User(

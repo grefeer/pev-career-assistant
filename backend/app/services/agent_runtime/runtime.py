@@ -684,8 +684,8 @@ class AgentRuntime:
         for observation in execution.observations:
             artifact_type = skill_artifact_types.get(observation.tool_name)
             output = observation.output or {}
-            source_url = output.get("source_url")
-            if artifact_type is None or not isinstance(source_url, str):
+            source_url = _skill_artifact_source_url(artifact_type, output)
+            if artifact_type is None or source_url is None:
                 continue
             content_json = dict(output)
             content_hash = hashlib.sha256(
@@ -848,3 +848,28 @@ class AgentRuntime:
             payload_json={"error_code": error_code},
         )
         return AgentRunResult(run_id, RunStatus.failed, None, error_code)
+
+
+def _skill_artifact_source_url(
+    artifact_type: str | None, output: dict[str, object]
+) -> str | None:
+    """Keep a multi-JD report traceable without inventing a synthetic source.
+
+    A matching report is derived from several immutable job pages, so it has no
+    single top-level ``source_url``. Its individual match rows retain every
+    source; use the first observed source only as the artifact's index field.
+    """
+    direct_source = output.get("source_url")
+    if isinstance(direct_source, str) and direct_source:
+        return direct_source
+    if artifact_type != "job_matching_report":
+        return None
+    matches = output.get("matches")
+    if not isinstance(matches, list):
+        return None
+    for match in matches:
+        if isinstance(match, dict):
+            source_url = match.get("source_url")
+            if isinstance(source_url, str) and source_url:
+                return source_url
+    return None
