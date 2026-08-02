@@ -67,6 +67,34 @@ class FetchPublicJobPageOutput(BaseModel):
     content_hash: str
 
 
+class FetchPublicJobPagesInput(BaseModel):
+    """A finite Agent-selected set of official public pages to capture at once."""
+
+    urls: list[str] = Field(min_length=1, max_length=10)
+
+    @field_validator("urls")
+    @classmethod
+    def normalize_urls(cls, values: list[str]) -> list[str]:
+        cleaned = [FetchPublicJobPageInput.normalize_url(value) for value in values]
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("urls must not contain duplicates")
+        return cleaned
+
+
+class PublicJobPageFetchFailure(BaseModel):
+    """One transparent per-page failure; successful evidence remains usable."""
+
+    source_url: str
+    error_code: str
+
+
+class FetchPublicJobPagesOutput(BaseModel):
+    """All successfully captured pages plus explicit failures from one bounded batch."""
+
+    pages: list[FetchPublicJobPageOutput]
+    failures: list[PublicJobPageFetchFailure] = Field(default_factory=list)
+
+
 class SearchPublicJobPagesInput(BaseModel):
     """A bounded public-web query selected by the Executor from the user's goal."""
 
@@ -312,6 +340,20 @@ def fetch_public_job_page(
         visible_text=visible_text,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
     )
+
+
+def fetch_public_job_pages(
+    context: ToolContext, payload: FetchPublicJobPagesInput
+) -> FetchPublicJobPagesOutput:
+    """Capture a bounded candidate set without hiding individual public-page errors."""
+    pages: list[FetchPublicJobPageOutput] = []
+    failures: list[PublicJobPageFetchFailure] = []
+    for url in payload.urls:
+        try:
+            pages.append(fetch_public_job_page(context, FetchPublicJobPageInput(url=url)))
+        except PublicJobFetchError as error:
+            failures.append(PublicJobPageFetchFailure(source_url=url, error_code=error.code))
+    return FetchPublicJobPagesOutput(pages=pages, failures=failures)
 
 
 def search_public_job_pages(

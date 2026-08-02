@@ -528,44 +528,48 @@ class AgentRuntime:
         artifact_refs: list[dict[str, str]] = []
         for observation in execution.observations:
             output = observation.output or {}
-            source_url = output.get("source_url")
-            content_hash = output.get("content_hash")
-            visible_text = output.get("visible_text")
-            if not all(
-                isinstance(value, str)
-                for value in (source_url, content_hash, visible_text)
-            ):
-                continue
-            artifact = run_repository.create_evidence_artifact(
-                db,
-                run_id=run_id,
-                step_id=step.id,
-                source_url=source_url,
-                content_hash=content_hash,
-                content_json={
-                    "title": output.get("title"),
-                    "visible_text": visible_text,
-                },
-            )
-            artifact_ref = {
-                "artifact_id": artifact.id,
-                "source_url": source_url,
-                "content_hash": content_hash,
-            }
-            artifact_refs.append(artifact_ref)
-            run_repository.append_event(
-                db,
-                run_id=run_id,
-                event_type="executor_tool_observation",
-                payload_json={
-                    "sequence": step.sequence,
-                    "tool": observation.tool_name,
+            raw_pages = output.get("pages")
+            pages = raw_pages if isinstance(raw_pages, list) else [output]
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                source_url = page.get("source_url")
+                content_hash = page.get("content_hash")
+                visible_text = page.get("visible_text")
+                if not all(
+                    isinstance(value, str)
+                    for value in (source_url, content_hash, visible_text)
+                ):
+                    continue
+                artifact = run_repository.create_evidence_artifact(
+                    db,
+                    run_id=run_id,
+                    step_id=step.id,
+                    source_url=source_url,
+                    content_hash=content_hash,
+                    content_json={
+                        "title": page.get("title"),
+                        "visible_text": visible_text,
+                    },
+                )
+                artifact_ref = {
                     "artifact_id": artifact.id,
                     "source_url": source_url,
                     "content_hash": content_hash,
-                },
-            )
-            continue
+                }
+                artifact_refs.append(artifact_ref)
+                run_repository.append_event(
+                    db,
+                    run_id=run_id,
+                    event_type="executor_tool_observation",
+                    payload_json={
+                        "sequence": step.sequence,
+                        "tool": observation.tool_name,
+                        "artifact_id": artifact.id,
+                        "source_url": source_url,
+                        "content_hash": content_hash,
+                    },
+                )
         for observation in execution.observations:
             output = observation.output or {}
             source_url = output.get("source_url")

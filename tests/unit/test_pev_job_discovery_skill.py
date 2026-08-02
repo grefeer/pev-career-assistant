@@ -9,10 +9,13 @@ import pytest
 from backend.app.services.career_skills.job_discovery import (
     ExtractObservedJobDetailsInput,
     FetchPublicJobPageInput,
+    FetchPublicJobPageOutput,
+    FetchPublicJobPagesInput,
     PublicJobFetchError,
     SearchPublicJobPagesInput,
     extract_observed_job_details,
     fetch_public_job_page,
+    fetch_public_job_pages,
     search_public_job_pages,
     _assert_public_url,
     _direct_bing_result_url,
@@ -58,6 +61,36 @@ def test_job_discovery_input_normalizers_reject_blank_values() -> None:
         FetchPublicJobPageInput(url=" ")
     with pytest.raises(ValueError):
         SearchPublicJobPagesInput(query="   ")
+    with pytest.raises(ValueError, match="duplicates"):
+        FetchPublicJobPagesInput(urls=["https://jobs.example/a", "https://jobs.example/a"])
+
+
+def test_batch_fetch_preserves_successful_pages_and_explicit_per_url_failures(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.fetch_public_job_page",
+        lambda _context, payload: (
+            (_ for _ in ()).throw(PublicJobFetchError("public_fetch_failed"))
+            if payload.url.endswith("bad")
+            else FetchPublicJobPageOutput(
+                artifact_id=f"observed:{payload.url[-1]}", source_url=payload.url,
+                title="AI Agent 开发", visible_text="岗位职责和任职要求。",
+                content_hash=payload.url[-1] * 64,
+            )
+        ),
+    )
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(
+            urls=["https://jobs.example/a", "https://jobs.example/bad"]
+        ),
+    )
+
+    assert [page.source_url for page in result.pages] == ["https://jobs.example/a"]
+    assert [failure.model_dump() for failure in result.failures] == [{
+        "source_url": "https://jobs.example/bad",
+        "error_code": "public_fetch_failed",
+    }]
 
 
 def test_search_public_job_pages_returns_only_safe_direct_result_urls(monkeypatch) -> None:

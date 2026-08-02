@@ -28,7 +28,8 @@ _EXECUTOR_INSTRUCTION = (
     "if evidence cannot support one, state the limitation rather than silently "
     "omitting it. "
     "When context supplies candidate_urls, treat them as a finite candidate set: "
-    "fetch each unique URL at most once, then use the observed artifact IDs to "
+    "prefer fetch-public-job-pages to capture the set in one bounded observation; "
+    "otherwise fetch each unique URL at most once, then use the observed artifact IDs to "
     "extract structured details and move to the next requested Skill. Never "
     "re-fetch a URL that is already represented by a successful observation. "
     "Once all supplied candidates have been observed, choose extraction, matching, "
@@ -156,22 +157,33 @@ def _with_observed_page(
 ) -> ToolContext:
     """Expose a successful page fetch to the next Executor-selected tool call."""
     output = observation.output or {}
-    if not all(
-        isinstance(output.get(key), str) and output[key]
-        for key in ("artifact_id", "source_url", "content_hash", "visible_text")
-    ):
-        return context
+    raw_pages = output.get("pages")
+    pages = raw_pages if isinstance(raw_pages, list) else [output]
     existing = context.metadata.get("observed_public_evidence", [])
     evidence = list(existing) if isinstance(existing, list) else []
-    evidence.append(
-        {
-            "artifact_id": output["artifact_id"],
-            "source_url": output["source_url"],
-            "content_hash": output["content_hash"],
-            "visible_text": output["visible_text"],
-            "title": output.get("title"),
-        }
-    )
+    seen_artifact_ids = {
+        item.get("artifact_id") for item in evidence if isinstance(item, dict)
+    }
+    for page in pages:
+        if not isinstance(page, dict) or not all(
+            isinstance(page.get(key), str) and page[key]
+            for key in ("artifact_id", "source_url", "content_hash", "visible_text")
+        ):
+            continue
+        if page["artifact_id"] in seen_artifact_ids:
+            continue
+        evidence.append(
+            {
+                "artifact_id": page["artifact_id"],
+                "source_url": page["source_url"],
+                "content_hash": page["content_hash"],
+                "visible_text": page["visible_text"],
+                "title": page.get("title"),
+            }
+        )
+        seen_artifact_ids.add(page["artifact_id"])
+    if not evidence:
+        return context
     metadata = dict(context.metadata)
     metadata["observed_public_evidence"] = evidence
     return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)

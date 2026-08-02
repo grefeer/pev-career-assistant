@@ -23,8 +23,10 @@ from backend.app.services.agent_runtime.schemas import (
     AgentBudget,
     AgentTaskRequest,
     ExecutionPlan,
+    ExecutorResult,
     PlanStep,
     PlannerResult,
+    ToolObservation,
 )
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_context import ToolContext
@@ -1052,6 +1054,44 @@ def test_runtime_bounds_public_evidence_context_to_the_configured_character_limi
 
     evidence = projected.context["observed_public_evidence"]
     assert evidence[0]["visible_text"] == "x" * 48_000
+
+
+def test_runtime_persists_every_page_from_one_batch_fetch_observation(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    execution = ExecutorResult(
+        status="succeeded",
+        summary="已抓取两页",
+        observations=[ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={"pages": [
+                {
+                    "artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+                    "title": "岗位 A", "visible_text": "职责 A", "content_hash": "a" * 64,
+                },
+                {
+                    "artifact_id": "observed:b", "source_url": "https://jobs.example/b",
+                    "title": "岗位 B", "visible_text": "职责 B", "content_hash": "b" * 64,
+                },
+                "malformed-page",
+            ]},
+        )],
+    )
+
+    refs = AgentRuntime._persist_observed_evidence(db_session, run.id, step, execution)
+
+    assert len(refs) == 2
+    assert [artifact.content_json["title"] for artifact in db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == run.id)
+    )] == ["岗位 A", "岗位 B"]
 
 
 def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session) -> None:

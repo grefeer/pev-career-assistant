@@ -36,6 +36,11 @@ class EvidenceOutput(BaseModel):
     content_hash: str
 
 
+class BatchEvidenceOutput(BaseModel):
+    pages: list[EvidenceOutput]
+    failures: list[dict[str, str]] = []
+
+
 class DetailsOutput(BaseModel):
     title: str
 
@@ -179,6 +184,53 @@ def test_executor_makes_a_fresh_public_page_observation_available_to_its_next_to
 
     assert result.status == "succeeded"
     assert result.observations[1].output == {"title": "AI Agent 开发工程师"}
+
+
+def test_executor_exposes_every_page_from_a_batch_observation_to_the_next_tool() -> None:
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-pages", skill_name="job-discovery", input_model=FetchInput,
+        output_model=BatchEvidenceOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {"pages": [
+            {
+                "artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+                "title": "岗位 A", "visible_text": "JD A", "content_hash": "a" * 64,
+            },
+            {
+                "artifact_id": "observed:b", "source_url": "https://jobs.example/b",
+                "title": "岗位 B", "visible_text": "JD B", "content_hash": "b" * 64,
+            },
+            {
+                "artifact_id": "observed:a", "source_url": "https://jobs.example/a",
+                "title": "岗位 A", "visible_text": "JD A", "content_hash": "a" * 64,
+            },
+        ]},
+    ))
+    registry.register(ToolDefinition(
+        name="inspect-pages", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda context, _payload: {
+            "title": ",".join(item["title"] for item in context.metadata["observed_public_evidence"])
+        },
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-pages", "tool_input": {"url": "unused"}},
+        {"action": "call_tool", "tool_name": "inspect-pages", "tool_input": {"url": "unused"}},
+        {"action": "complete", "summary": "已检查批量 JD"},
+    ])
+    task = AgentTaskRequest(goal="提取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["完整 JD"],
+        steps=[PlanStep(step_id="discover", objective="批量抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.observations[1].output == {"title": "岗位 A,岗位 B"}
 
 
 def test_executor_returns_need_user_and_honors_hard_budgets() -> None:
