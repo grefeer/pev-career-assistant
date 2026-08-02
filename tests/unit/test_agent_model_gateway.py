@@ -321,7 +321,9 @@ def test_gateway_fails_safely_when_preferred_local_json_retry_cannot_recover(
 
 def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:
     """An enabled harness must not fall back to a fabricated model decision."""
-    monkeypatch.setattr("src.utils.get_api_key", lambda: None)
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: None
+    )
 
     with pytest.raises(AgentModelGatewayConfigError, match="missing_api_key"):
         build_agent_model_gateway(settings_override(agent_harness_enabled=True))
@@ -365,8 +367,13 @@ def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
         def __init__(self, **kwargs: object) -> None:
             captured.update(kwargs)
 
-    monkeypatch.setattr("src.utils.get_api_key", lambda: "key")
-    monkeypatch.setattr("src.utils.get_base_url", lambda: "https://api.deepseek.example")
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: "key"
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.deepseek.example",
+    )
     monkeypatch.setattr(
         "backend.app.services.agent_runtime.model_gateway.ChatOpenAI", CapturingChatModel
     )

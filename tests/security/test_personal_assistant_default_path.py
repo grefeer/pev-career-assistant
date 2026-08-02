@@ -37,10 +37,15 @@ def test_default_api_exposes_only_personal_assistant_routes() -> None:
 def test_default_app_and_dependency_manifest_do_not_import_retired_graph_frameworks() -> None:
     """The custom PEV harness, rather than a hidden LangGraph fallback, owns production."""
     main_source = (_ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+    gateway_source = (
+        _ROOT / "backend" / "app" / "services" / "agent_runtime" / "model_gateway.py"
+    ).read_text(encoding="utf-8")
     requirements = (_ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
 
     assert "src.graph" not in main_source
     assert "src.checkpointing" not in main_source
     assert "build_graph" not in main_source
+    assert "from src." not in main_source
+    assert "from src." not in gateway_source
     assert "langgraph" not in requirements
     assert "deepagents" not in requirements

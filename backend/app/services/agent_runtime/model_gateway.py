@@ -234,7 +234,7 @@ def _role_action_contract(role: AgentRole) -> str:
 
 def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
     """Build the live OpenAI-compatible decision provider for all three roles."""
-    from src.utils import get_api_key, get_base_url
+    from backend.app.services.agent_runtime.provider_config import get_api_key, get_base_url
 
     api_key = get_api_key()
     if not api_key:

@@ -16,10 +16,10 @@ from backend.app.api.router import api_router
 from backend.app.config import Settings, get_settings
 from backend.app.middleware import CorrelationIdMiddleware
 from backend.app.services.storage import EncryptedObjectStore, S3BlobStore
-from src.utils import load_env
+from backend.app.services.agent_runtime.provider_config import load_project_env
 
 
-load_env()
+load_project_env()
 
 
 logger = logging.getLogger(__name__)
