@@ -1,8 +1,5 @@
 import type {
   AuthResponse,
-  HistoryItem,
-  SessionItem,
-  SessionStateResponse,
   UserProfile,
 } from "./types";
 
@@ -96,34 +93,4 @@ export function login(payload: {
 
 export function fetchMe(token: string): Promise<UserProfile> {
   return request<UserProfile>("/auth/me", {}, token);
-}
-
-export async function fetchSessions(token: string): Promise<{
-  active_thread_id: string;
-  sessions: SessionItem[];
-}> {
-  return request("/sessions", {}, token);
-}
-
-export async function createSession(token: string): Promise<{ ok: boolean; active_thread_id: string }> {
-  return request("/sessions", { method: "POST" }, token);
-}
-
-export async function activateSession(
-  token: string,
-  threadId: string,
-): Promise<{ ok: boolean; active_thread_id: string }> {
-  return request(`/sessions/${threadId}/activate`, { method: "POST" }, token);
-}
-
-export function fetchSessionState(token: string, threadId: string): Promise<SessionStateResponse> {
-  return request<SessionStateResponse>(`/sessions/${threadId}`, {}, token);
-}
-
-export function fetchSessionHistory(
-  token: string,
-  threadId: string,
-  limit = 10,
-): Promise<HistoryItem[]> {
-  return request<HistoryItem[]>(`/sessions/${threadId}/history?limit=${limit}`, {}, token);
 }
