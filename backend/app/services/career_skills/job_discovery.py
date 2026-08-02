@@ -223,6 +223,40 @@ class _BingSearchResultParser(HTMLParser):
             snippet_parts.append(normalized)
 
 
+class _SoSearchResultParser(HTMLParser):
+    """Read 360's public result anchors that expose their direct target URL."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._url: str | None = None
+        self._title_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag != "a" or self._url is not None:
+            return
+        direct_url = dict(attrs).get("data-mdurl")
+        if isinstance(direct_url, str) and direct_url:
+            self._url = direct_url
+            self._title_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._url is None:
+            return
+        normalized = " ".join(data.split())
+        if normalized:
+            self._title_parts.append(normalized)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._url is None:
+            return
+        title = " ".join(self._title_parts)
+        if title:
+            self.results.append({"title": title, "url": self._url})
+        self._url = None
+        self._title_parts = []
+
+
 def _assert_public_url(url: str) -> None:
     parsed = urlsplit(url)
     if (
@@ -302,10 +336,9 @@ def search_public_job_pages(
     parser.feed(html)
     results: list[PublicJobSearchResult] = []
     seen_urls: set[str] = set()
-    for raw_result in parser.results:
-        result_url = _direct_bing_result_url(raw_result["url"])
+    def add_result(raw_result: dict[str, str], result_url: str | None) -> None:
         if result_url is None:
-            continue
+            return
         parsed = urlsplit(result_url)
         if (
             result_url in seen_urls
@@ -314,19 +347,40 @@ def search_public_job_pages(
             or parsed.hostname.endswith("bing.com")
             or not _is_plausible_public_job_result(raw_result, result_url)
         ):
-            continue
+            return
         try:
             _assert_public_url(result_url)
         except PublicJobFetchError:
-            continue
+            return
         seen_urls.add(result_url)
         results.append(PublicJobSearchResult(
             title=raw_result["title"],
             url=result_url,
             snippet=raw_result.get("snippet"),
         ))
+    for raw_result in parser.results:
+        add_result(raw_result, _direct_bing_result_url(raw_result["url"]))
         if len(results) >= payload.max_results:
             break
+    if not results:
+        fallback_source_url = "https://www.so.com/s?" + urlencode({"q": payload.query})
+        try:
+            fallback_response = requests.get(
+                fallback_source_url,
+                timeout=20,
+                headers={"User-Agent": "CareerAssistantPEV/1.0 (+public-job-search)"},
+            )
+            fallback_response.raise_for_status()
+        except requests.RequestException as exc:
+            raise PublicJobFetchError("public_search_failed") from exc
+        html = fallback_response.text
+        source_url = fallback_source_url
+        fallback_parser = _SoSearchResultParser()
+        fallback_parser.feed(html)
+        for raw_result in fallback_parser.results:
+            add_result(raw_result, raw_result["url"])
+            if len(results) >= payload.max_results:
+                break
     return SearchPublicJobPagesOutput(
         query=payload.query,
         source_url=source_url,

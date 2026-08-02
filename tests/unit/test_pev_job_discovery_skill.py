@@ -115,6 +115,42 @@ def test_search_public_job_pages_filters_safe_links_that_are_not_job_results(mon
     assert result.results == []
 
 
+def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job_result(monkeypatch) -> None:
+    """A provider fallback preserves direct provenance instead of inventing URLs."""
+    responses = iter([
+        SimpleNamespace(
+            text="<html><body></body></html>", encoding="utf-8",
+            apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+        SimpleNamespace(
+            text="""
+            <html><body><a data-mdurl="https://careers.example/jobs/agent">AI Agent 开发工程师招聘</a></body></html>
+            """, encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    ])
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+    )
+
+    assert result.source_url.startswith("https://www.so.com/s?")
+    assert [item.model_dump() for item in result.results] == [{
+        "title": "AI Agent 开发工程师招聘",
+        "url": "https://careers.example/jobs/agent",
+        "snippet": None,
+    }]
+
+
 def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:
     """An Agent cannot use a public-web tool to probe private infrastructure."""
     with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
