@@ -10,11 +10,7 @@ from tests.conftest import settings_override
 
 def test_lifespan_exposes_disabled_agent_service_without_constructing_live_model() -> None:
     """Disabled installations retain a service boundary but never contact an LLM."""
-    app = create_app(settings_override(agent_harness_enabled=False), graph=object())
-    app.state.match_service = object()
-    app.state.draft_service = object()
-    app.state.interview_prep_service = object()
-    app.state.application_tracking_service = object()
+    app = create_app(settings_override(agent_harness_enabled=False))
 
     with TestClient(app):
         assert app.state.agent_run_service is not None

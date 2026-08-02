@@ -2,16 +2,7 @@
   <div class="app-shell">
     <nav v-if="isAuthenticated" class="shell-nav">
       <router-link to="/assistant">Assistant</router-link>
-      <router-link to="/matching">Match</router-link>
-      <router-link to="/jobs">Jobs</router-link>
       <router-link to="/profile">Profile</router-link>
-      <router-link to="/snapshots">Snapshots</router-link>
-      <router-link to="/devices">Devices</router-link>
-      <template v-if="isAdmin">
-        <router-link to="/admin/jobs">Admin Jobs</router-link>
-        <router-link to="/admin/submissions">Admin Submissions</router-link>
-        <router-link to="/admin/feedbacks">Admin Feedback</router-link>
-      </template>
       <span class="spacer" />
       <span v-if="user">{{ user.nickname }} ({{ user.role }})</span>
       <button @click="handleLogout">Logout</button>
@@ -29,7 +20,7 @@ import { useRouter } from 'vue-router'
 import { useAuth } from '../state/auth'
 
 const router = useRouter()
-const { user, token, isAuthenticated, isAdmin, logout } = useAuth()
+const { user, token, isAuthenticated, logout } = useAuth()
 
 function handleLogout() {
   logout()

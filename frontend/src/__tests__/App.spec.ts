@@ -32,6 +32,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchSessionState: vi.fn(),
   fetchSessions: vi.fn(),
   login: vi.fn(),
+  ApiError: class ApiError extends Error {},
   register: vi.fn(),
   request: vi.fn(),
 }));
@@ -51,7 +52,9 @@ describe("App root renders AppShell", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
-    apiMocks.request.mockResolvedValue({ total: 0, jobs: [] });
+    apiMocks.request.mockImplementation((path: string) => (
+      path.startsWith("/agent-runs") ? Promise.resolve({ items: [] }) : Promise.resolve({})
+    ));
     apiMocks.login.mockResolvedValue({
       ok: true,
       message: "登录成功",
@@ -68,7 +71,7 @@ describe("App root renders AppShell", () => {
     expect(auth.loading.value).toBe(false);
 
     const router = createRouterForTest();
-    await router.push("/matching");
+    await router.push("/assistant");
     await flushPromises();
 
     expect(router.currentRoute.value.path).toBe("/login");
@@ -85,15 +88,14 @@ describe("App root renders AppShell", () => {
     const auth = useAuth();
     await auth.bootstrap();
     const router = createRouterForTest();
-    await router.push("/matching");
+    await router.push("/assistant");
 
     const wrapper = mount(App, {
       global: { plugins: [router] },
     });
     await flushPromises();
 
-    expect(wrapper.text()).toContain("Match");
-    expect(wrapper.text()).toContain("Jobs");
+    expect(wrapper.text()).toContain("Assistant");
     expect(wrapper.text()).toContain("Profile");
     expect(wrapper.text()).toContain("同学");
     expect(wrapper.text()).toContain("student");
@@ -130,7 +132,7 @@ describe("App root renders AppShell", () => {
     expect(apiMocks.request).toHaveBeenCalledWith("/profile-versions", {}, "student-token");
   });
 
-  it("shows admin links only for admin users", async () => {
+  it("keeps the same personal-assistant navigation for admin users", async () => {
     localStorage.setItem("job_assistant_token", "admin-token");
     apiMocks.fetchMe.mockResolvedValue(adminProfile);
     apiMocks.fetchSessions.mockResolvedValue({
@@ -141,16 +143,16 @@ describe("App root renders AppShell", () => {
     const auth = useAuth();
     await auth.bootstrap();
     const router = createRouterForTest();
-    await router.push("/matching");
+    await router.push("/assistant");
 
     const wrapper = mount(App, {
       global: { plugins: [router] },
     });
     await flushPromises();
 
-    expect(wrapper.text()).toContain("Admin Jobs");
-    expect(wrapper.text()).toContain("Admin Submissions");
-    expect(wrapper.text()).toContain("Admin Feedback");
+    expect(wrapper.text()).toContain("Assistant");
+    expect(wrapper.text()).toContain("Profile");
+    expect(wrapper.text()).not.toContain("Admin Jobs");
   });
 
   it("does not show admin links for non-admin users", async () => {
@@ -164,7 +166,7 @@ describe("App root renders AppShell", () => {
     const auth = useAuth();
     await auth.bootstrap();
     const router = createRouterForTest();
-    await router.push("/matching");
+    await router.push("/assistant");
 
     const wrapper = mount(App, {
       global: { plugins: [router] },
@@ -204,7 +206,7 @@ describe("App root renders AppShell", () => {
     const auth = useAuth();
     await auth.bootstrap();
     const router = createRouterForTest();
-    await router.push("/matching");
+    await router.push("/assistant");
 
     const wrapper = mount(App, {
       global: { plugins: [router] },
@@ -218,7 +220,7 @@ describe("App root renders AppShell", () => {
     expect(auth.user.value).toBeNull();
 
     // Re-navigate to a different auth-required route to trigger guard redirect
-    await router.push("/jobs").catch(() => {});
+    await router.push("/profile").catch(() => {});
     await flushPromises();
     await new Promise((r) => setTimeout(r, 100));
     await flushPromises();
@@ -227,8 +229,7 @@ describe("App root renders AppShell", () => {
     expect(router.currentRoute.value.path).toBe("/login");
     expect(wrapper.text()).toContain("登录");
     expect(wrapper.text()).toContain("进入工作台");
-    expect(wrapper.text()).not.toContain("Match");
-    expect(wrapper.text()).not.toContain("Jobs");
+    expect(wrapper.text()).not.toContain("Assistant");
     expect(wrapper.text()).not.toContain("Logout");
   });
 
