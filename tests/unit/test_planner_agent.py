@@ -115,3 +115,20 @@ def test_planner_enforces_shared_turn_and_tool_budgets_and_reports_loop_exhausti
     )
     assert exhausted.status == "failed"
     assert exhausted.user_question is not None
+
+
+def test_planner_can_sense_confirmed_profile_field_availability_without_fact_values() -> None:
+    gateway = ScriptedGateway([{
+        "action": "need_user", "user_question": "请确认目标城市。",
+    }])
+    task = AgentTaskRequest(
+        goal="按简历匹配岗位", allowed_skills=["job-matching"],
+        private_context={"confirmed_profile_facts": {"skills": ["Python"], "projects": ["秘密项目"]}},
+    )
+
+    PlannerAgent(gateway=gateway, tools=ToolRegistry()).run(
+        task=task, context=ToolContext(user_id="user-a", run_id="run-a")
+    )
+
+    assert gateway.states[0]["confirmed_profile_fact_fields"] == ["projects", "skills"]
+    assert "秘密项目" not in str(gateway.states[0])

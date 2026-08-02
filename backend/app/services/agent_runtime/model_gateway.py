@@ -90,7 +90,20 @@ class LangChainModelGateway:
         try:
             return response_model.model_validate(raw_result)
         except Exception as exc:  # noqa: BLE001 - invalid JSON/model output is recoverable.
-            raise AgentModelGatewayError("invalid_model_response") from exc
+            # Some OpenAI-compatible providers accept the structured request
+            # but occasionally return an object that violates it. One bounded
+            # ordinary-JSON retry is a transport compatibility recovery, not a
+            # business retry or an Agent-selected action.
+            try:
+                return self._decide_with_local_json_validation(
+                    messages=messages,
+                    role=role,
+                    response_model=response_model,
+                )
+            except AgentModelGatewayError as fallback_error:
+                if fallback_error.code == "model_request_failed":
+                    raise fallback_error from exc
+                raise AgentModelGatewayError("invalid_model_response") from exc
 
     def _decide_with_local_json_validation(
         self,

@@ -26,6 +26,10 @@ _PLANNER_INSTRUCTION = (
     "itself missing context: the Executor can safely search public pages before "
     "capturing evidence. Ask only for genuinely personal constraints or facts "
     "that cannot be observed from public sources."
+    "When confirmed profile fact fields are supplied, those facts already exist "
+    "on the server: plan the matching/tailoring work instead of asking the user "
+    "to upload the same resume again. The Executor can inspect the fact values "
+    "through its private, scoped context."
 )
 
 
@@ -47,6 +51,12 @@ class PlannerAgent:
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
+        confirmed_facts = task.private_context.get("confirmed_profile_facts")
+        fact_fields = (
+            sorted(field for field in confirmed_facts if isinstance(field, str))
+            if isinstance(confirmed_facts, dict)
+            else []
+        )
         for _turn in range(task.budget.max_agent_turns):
             if turn_budget is not None and not turn_budget.try_consume():
                 return PlannerResult(
@@ -65,6 +75,7 @@ class PlannerAgent:
                         allowed_skills=frozenset(task.allowed_skills),
                     ),
                     "context": task.context,
+                    "confirmed_profile_fact_fields": fact_fields,
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None
                         else task.budget.max_tool_calls - len(observations)
