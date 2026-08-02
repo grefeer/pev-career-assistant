@@ -16,6 +16,7 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 _EXECUTOR_INSTRUCTION = (
     "You are the Executor Agent. Work toward the current planned outcome using "
@@ -50,11 +51,19 @@ class ExecutorAgent:
         context: ToolContext,
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
+        turn_budget: AgentTurnBudget | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
         tool_context = context
         for _turn in range(task.budget.max_agent_turns):
+            if turn_budget is not None and not turn_budget.try_consume():
+                return ExecutorResult(
+                    status="failed",
+                    summary="Agent-turn budget exhausted before the next decision.",
+                    observations=observations,
+                    error_code="agent_turn_budget_exhausted",
+                )
             decision = self._gateway.decide(
                 role=AgentRole.executor,
                 instruction=_EXECUTOR_INSTRUCTION,
@@ -65,6 +74,11 @@ class ExecutorAgent:
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None
                         else task.budget.max_tool_calls - len(observations)
+                    ),
+                    "remaining_agent_turns": (
+                        turn_budget.remaining
+                        if turn_budget is not None
+                        else task.budget.max_agent_turns - _turn - 1
                     ),
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),

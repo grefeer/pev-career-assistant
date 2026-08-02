@@ -190,6 +190,54 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
     ]
 
 
+def test_runtime_enforces_one_global_model_turn_budget_across_pev_roles(db_session) -> None:
+    """A complex run cannot spend a fresh model-turn allowance per Agent."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L3", "success_criteria": ["complete"],
+            "steps": [{
+                "step_id": "one", "objective": "produce an observed result",
+                "allowed_skills": ["job-discovery"], "requires_verification": True,
+            }],
+        }],
+        AgentRole.executor: [{"action": "complete", "summary": "result ready"}],
+        AgentRole.verifier: [{"action": "decide", "verification_decision": "PASS"}],
+    })
+    registry = ToolRegistry()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="execute a verified job task",
+            allowed_skills=["job-discovery"],
+            budget={"max_agent_turns": 2, "max_tool_calls": 4, "max_replans": 0},
+        ),
+    )
+    db_session.commit()
+
+    assert result.status is RunStatus.failed
+    assert result.error_code == "agent_turn_budget_exhausted"
+    assert len(gateway.states[AgentRole.planner]) == 1
+    assert len(gateway.states[AgentRole.executor]) == 1
+    assert gateway.states[AgentRole.verifier] == []
+    assert len(list(db_session.scalars(
+        select(AgentTurn).where(AgentTurn.run_id == result.run_id)
+    ))) == 2
+
+
 def test_runtime_enforces_one_global_tool_budget_across_planner_and_executor(db_session) -> None:
     """A Planner context read consumes the same hard tool budget as an Executor Skill call."""
     user = User(
@@ -683,13 +731,16 @@ def test_runtime_audits_failed_executor_observations_before_terminal_failure(db_
         db_session, user_id=user.id,
         task=AgentTaskRequest(
             goal="找岗位", allowed_skills=["job-discovery"],
-            budget={"max_agent_turns": 1, "max_tool_calls": 2, "max_replans": 0},
+                budget={"max_agent_turns": 2, "max_tool_calls": 2, "max_replans": 0},
         ),
     )
 
     events = run_repository.list_events(db_session, result.run_id)
     failures = [event for event in events if event.event_type == "executor_tool_failed"]
-    assert (result.status, result.error_code) == (RunStatus.failed, "executor_failed")
+    assert (result.status, result.error_code) == (
+        RunStatus.failed,
+        "agent_turn_budget_exhausted",
+    )
     assert [event.payload_json for event in failures] == [{
         "sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool",
     }]
@@ -732,14 +783,17 @@ def test_runtime_retains_successful_evidence_when_executor_later_hits_turn_limit
         db_session, user_id=user.id,
         task=AgentTaskRequest(
             goal="找岗位", allowed_skills=["job-discovery"],
-            budget={"max_agent_turns": 1, "max_tool_calls": 2, "max_replans": 0},
+                budget={"max_agent_turns": 2, "max_tool_calls": 2, "max_replans": 0},
         ),
     )
 
     artifacts = list(db_session.scalars(
         select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
     ))
-    assert (result.status, result.error_code) == (RunStatus.failed, "executor_failed")
+    assert (result.status, result.error_code) == (
+        RunStatus.failed,
+        "agent_turn_budget_exhausted",
+    )
     assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
         ("public_job_page", "https://jobs.example/agent"),
     ]

@@ -15,6 +15,7 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 _PLANNER_INSTRUCTION = (
     "You are the Planner Agent. Observe only the supplied user-scoped context "
@@ -42,10 +43,17 @@ class PlannerAgent:
         context: ToolContext,
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
+        turn_budget: AgentTurnBudget | None = None,
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
         for _turn in range(task.budget.max_agent_turns):
+            if turn_budget is not None and not turn_budget.try_consume():
+                return PlannerResult(
+                    status="failed",
+                    observations=observations,
+                    error_code="agent_turn_budget_exhausted",
+                )
             decision = self._gateway.decide(
                 role=AgentRole.planner,
                 instruction=_PLANNER_INSTRUCTION,
@@ -60,6 +68,11 @@ class PlannerAgent:
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None
                         else task.budget.max_tool_calls - len(observations)
+                    ),
+                    "remaining_agent_turns": (
+                        turn_budget.remaining
+                        if turn_budget is not None
+                        else task.budget.max_agent_turns - _turn - 1
                     ),
                     "observations": [
                         observation.model_dump(mode="json")

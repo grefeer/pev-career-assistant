@@ -26,6 +26,7 @@ from backend.app.services.agent_runtime.schemas import (
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
+from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
 
@@ -68,6 +69,7 @@ class AgentRuntime:
         )
         context = self._tool_context(user_id=user_id, run_id=run.id, task=task)
         tool_budget = ToolCallBudget(task.budget.max_tool_calls)
+        turn_budget = AgentTurnBudget(task.budget.max_agent_turns)
         run_repository.start_run(db, run)
         run_repository.append_event(
             db,
@@ -86,6 +88,7 @@ class AgentRuntime:
                     context=context,
                     trace=trace,
                     tool_budget=tool_budget,
+                    turn_budget=turn_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_run(db, run.id, error.code)
@@ -133,6 +136,7 @@ class AgentRuntime:
                     context=context,
                     trace=trace,
                     tool_budget=tool_budget,
+                    turn_budget=turn_budget,
                 )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
@@ -193,6 +197,7 @@ class AgentRuntime:
         context: ToolContext,
         trace,
         tool_budget: ToolCallBudget,
+        turn_budget: AgentTurnBudget,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
@@ -206,6 +211,7 @@ class AgentRuntime:
                     context=context,
                     trace=trace,
                     tool_budget=tool_budget,
+                    turn_budget=turn_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
@@ -257,6 +263,7 @@ class AgentRuntime:
                     context=context,
                     trace=trace,
                     tool_budget=tool_budget,
+                    turn_budget=turn_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(
