@@ -12,6 +12,7 @@ from backend.app.services.agent_runtime.schemas import (
     ToolObservation,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
@@ -36,6 +37,7 @@ class PlannerAgent:
         task: AgentTaskRequest,
         context: ToolContext,
         trace: DecisionTrace | None = None,
+        tool_budget: ToolCallBudget | None = None,
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
@@ -51,6 +53,10 @@ class PlannerAgent:
                         allowed_skills=frozenset(task.allowed_skills),
                     ),
                     "context": task.context,
+                    "remaining_tool_calls": (
+                        tool_budget.remaining if tool_budget is not None
+                        else task.budget.max_tool_calls - len(observations)
+                    ),
                     "observations": [
                         observation.model_dump(mode="json")
                         for observation in observations
@@ -66,6 +72,12 @@ class PlannerAgent:
                     ),
                 )
             if decision.action == "call_tool":
+                if tool_budget is not None and not tool_budget.try_consume():
+                    return PlannerResult(
+                        status="failed",
+                        observations=observations,
+                        error_code="tool_budget_exhausted",
+                    )
                 observations.append(
                     self._tools.invoke(
                         role=AgentRole.planner,

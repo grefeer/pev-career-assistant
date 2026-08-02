@@ -183,6 +183,62 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
     ]
 
 
+def test_runtime_enforces_one_global_tool_budget_across_planner_and_executor(db_session) -> None:
+    """A Planner context read consumes the same hard tool budget as an Executor Skill call."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    execution_count = 0
+
+    def inspect_context(_context, _payload):  # noqa: ANN001
+        nonlocal execution_count
+        execution_count += 1
+        return {"title": "上下文已读取"}
+
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [
+            {"action": "call_tool", "tool_name": "inspect-context", "tool_input": {}},
+            {
+                "action": "plan", "complexity": "L2", "success_criteria": ["已读取上下文"],
+                "steps": [{"step_id": "execute", "objective": "执行岗位 Skill", "allowed_skills": ["job-discovery"]}],
+            },
+        ],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "inspect-context", "tool_input": {}},
+            {"action": "complete", "summary": "执行完成"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="inspect-context", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.planner, AgentRole.executor}),
+        handler=inspect_context,
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="先读上下文再执行", allowed_skills=["job-discovery"],
+            budget={"max_agent_turns": 4, "max_tool_calls": 1, "max_replans": 0},
+        ),
+    )
+
+    assert (result.status, result.error_code) == (RunStatus.failed, "tool_budget_exhausted")
+    assert execution_count == 1
+    events = run_repository.list_events(db_session, result.run_id)
+    assert events[-1].payload_json == {"error_code": "tool_budget_exhausted"}
+
+
 def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session) -> None:
     """Retry is a real feedback loop, not merely a second identical call."""
     user = User(

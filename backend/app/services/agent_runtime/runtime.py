@@ -25,6 +25,7 @@ from backend.app.services.agent_runtime.schemas import (
     PlannerResult,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
 
@@ -66,6 +67,7 @@ class AgentRuntime:
             agent_version=self._agent_version,
         )
         context = self._tool_context(user_id=user_id, run_id=run.id, task=task)
+        tool_budget = ToolCallBudget(task.budget.max_tool_calls)
         run_repository.start_run(db, run)
         run_repository.append_event(
             db,
@@ -80,7 +82,10 @@ class AgentRuntime:
         while True:
             try:
                 planner_result = self._planner.run(
-                    task=planning_task, context=context, trace=trace
+                    task=planning_task,
+                    context=context,
+                    trace=trace,
+                    tool_budget=tool_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_run(db, run.id, error.code)
@@ -127,6 +132,7 @@ class AgentRuntime:
                     persisted_step=step,
                     context=context,
                     trace=trace,
+                    tool_budget=tool_budget,
                 )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
@@ -186,6 +192,7 @@ class AgentRuntime:
         persisted_step: AgentStep,
         context: ToolContext,
         trace,
+        tool_budget: ToolCallBudget,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
@@ -198,6 +205,7 @@ class AgentRuntime:
                     step=plan_step,
                     context=context,
                     trace=trace,
+                    tool_budget=tool_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
@@ -206,7 +214,12 @@ class AgentRuntime:
                     db, run_id, persisted_step, execution.user_question
                 )
             if execution.status != "succeeded":
-                return self._fail_step(db, run_id, persisted_step, "executor_failed")
+                return self._fail_step(
+                    db,
+                    run_id,
+                    persisted_step,
+                    execution.error_code or "executor_failed",
+                )
             self._record_failed_executor_observations(
                 db, run_id, persisted_step, execution
             )
@@ -239,9 +252,14 @@ class AgentRuntime:
                     execution=execution,
                     context=context,
                     trace=trace,
+                    tool_budget=tool_budget,
                 )
             except AgentModelGatewayError as error:
                 return self._fail_step(db, run_id, persisted_step, error.code)
+            if verification.error_code:
+                return self._fail_step(
+                    db, run_id, persisted_step, verification.error_code
+                )
             if verification.decision is VerificationDecision.PASS:
                 run_repository.finish_step(
                     db,
@@ -517,16 +535,15 @@ class AgentRuntime:
             return AgentRunResult(
                 run_id, RunStatus.waiting_user, planner_result.user_question
             )
-        run_repository.finish_run(
-            db, run, status=RunStatus.failed, error_code="planner_failed"
-        )
+        error_code = planner_result.error_code or "planner_failed"
+        run_repository.finish_run(db, run, status=RunStatus.failed, error_code=error_code)
         run_repository.append_event(
             db,
             run_id=run_id,
             event_type="run_failed",
-            payload_json={"error_code": "planner_failed"},
+            payload_json={"error_code": error_code},
         )
-        return AgentRunResult(run_id, RunStatus.failed, None, "planner_failed")
+        return AgentRunResult(run_id, RunStatus.failed, None, error_code)
 
     def _wait_for_user(
         self,

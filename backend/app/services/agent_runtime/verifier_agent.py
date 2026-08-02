@@ -14,6 +14,7 @@ from backend.app.services.agent_runtime.schemas import (
     VerifierResult,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
@@ -41,6 +42,7 @@ class VerifierAgent:
         execution: ExecutorResult,
         context: ToolContext,
         trace: DecisionTrace | None = None,
+        tool_budget: ToolCallBudget | None = None,
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
@@ -57,6 +59,10 @@ class VerifierAgent:
                         allowed_skills=frozenset(step.allowed_skills),
                     ),
                     "execution": execution.model_dump(mode="json"),
+                    "remaining_tool_calls": (
+                        tool_budget.remaining if tool_budget is not None
+                        else task.budget.max_tool_calls - len(observations)
+                    ),
                     "observations": [
                         observation.model_dump(mode="json")
                         for observation in observations
@@ -72,6 +78,13 @@ class VerifierAgent:
                     ),
                 )
             if decision.action == "call_tool":
+                if tool_budget is not None and not tool_budget.try_consume():
+                    return VerifierResult(
+                        decision=VerificationDecision.FAIL,
+                        feedback="Tool-call budget exhausted before verification.",
+                        observations=observations,
+                        error_code="tool_budget_exhausted",
+                    )
                 observations.append(
                     self._tools.invoke(
                         role=AgentRole.verifier,

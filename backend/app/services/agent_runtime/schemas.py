@@ -195,6 +195,7 @@ class PlannerResult(BaseModel):
     plan: ExecutionPlan | None = None
     observations: list[ToolObservation] = Field(default_factory=list)
     user_question: str | None = None
+    error_code: str | None = None
 
     @model_validator(mode="after")
     def validate_result_shape(self) -> "PlannerResult":
@@ -242,6 +243,7 @@ class ExecutorResult(BaseModel):
     artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
     observations: list[ToolObservation] = Field(default_factory=list)
     user_question: str | None = None
+    error_code: str | None = None
 
     @model_validator(mode="after")
     def validate_result_shape(self) -> "ExecutorResult":
@@ -290,6 +292,7 @@ class VerifierResult(BaseModel):
     decision: VerificationDecision
     feedback: str | None = None
     observations: list[ToolObservation] = Field(default_factory=list)
+    error_code: str | None = None
 
     @model_validator(mode="after")
     def validate_result_shape(self) -> "VerifierResult":

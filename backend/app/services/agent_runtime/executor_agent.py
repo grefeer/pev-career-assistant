@@ -13,6 +13,7 @@ from backend.app.services.agent_runtime.schemas import (
     ToolObservation,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 
@@ -39,6 +40,7 @@ class ExecutorAgent:
         step: PlanStep,
         context: ToolContext,
         trace: DecisionTrace | None = None,
+        tool_budget: ToolCallBudget | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
@@ -51,6 +53,10 @@ class ExecutorAgent:
                     "goal": task.goal,
                     "context": task.context,
                     "private_context": task.private_context,
+                    "remaining_tool_calls": (
+                        tool_budget.remaining if tool_budget is not None
+                        else task.budget.max_tool_calls - len(observations)
+                    ),
                     "plan": plan.model_dump(mode="json"),
                     "step": step.model_dump(mode="json"),
                     "available_tools": self._tools.tool_catalog(
@@ -72,6 +78,13 @@ class ExecutorAgent:
                     ),
                 )
             if decision.action == "call_tool":
+                if tool_budget is not None and not tool_budget.try_consume():
+                    return ExecutorResult(
+                        status="failed",
+                        summary="Tool-call budget exhausted before executing the next action.",
+                        observations=observations,
+                        error_code="tool_budget_exhausted",
+                    )
                 observation = self._tools.invoke(
                     role=AgentRole.executor,
                     name=decision.tool_name or "",
