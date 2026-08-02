@@ -1,6 +1,7 @@
 <template>
   <div class="app-shell">
     <nav v-if="isAuthenticated" class="shell-nav">
+      <router-link to="/assistant">Assistant</router-link>
       <router-link to="/matching">Match</router-link>
       <router-link to="/jobs">Jobs</router-link>
       <router-link to="/profile">Profile</router-link>

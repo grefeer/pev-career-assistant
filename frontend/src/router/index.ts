@@ -6,7 +6,13 @@ export const routes = [
     name: 'login',
     component: () => import('../components/LoginPage.vue'),
   },
-  { path: '/', redirect: '/matching' },
+  { path: '/', redirect: '/assistant' },
+  {
+    path: '/assistant',
+    name: 'assistant',
+    component: () => import('../features/agent-workspace/AgentWorkspace.vue'),
+    meta: { requiresAuth: true },
+  },
   {
     path: '/matching',
     name: 'matching',
