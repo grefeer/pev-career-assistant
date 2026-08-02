@@ -58,7 +58,7 @@ def test_lifespan_dependency_clients_use_configured_short_timeouts(
 
     monkeypatch.setattr("backend.app.main.redis.Redis.from_url", build_redis)
     monkeypatch.setattr("backend.app.main.boto3.client", build_s3)
-    app = create_app(_settings(readiness_timeout_seconds=3), graph=object())
+    app = create_app(_settings(readiness_timeout_seconds=3))
 
     with TestClient(app):
         pass
