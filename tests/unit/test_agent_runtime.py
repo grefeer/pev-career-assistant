@@ -815,6 +815,7 @@ def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session
                 }
             ],
             AgentRole.executor: [
+                {"action": "call_tool", "tool_name": "fetch-job", "tool_input": {}},
                 {"action": "complete", "summary": "信息不完整"},
                 {"action": "complete", "summary": "信息已补齐"},
             ],
@@ -829,6 +830,14 @@ def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session
         }
     )
     registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=FetchedJobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "title": "AI Agent 开发工程师", "source_url": "https://jobs.example/retry",
+            "content_hash": "e" * 64, "visible_text": "负责 Agent 应用开发。",
+        },
+    ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
         executor=ExecutorAgent(gateway=gateway, tools=registry),
@@ -843,9 +852,15 @@ def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session
     )
 
     assert result.status is RunStatus.succeeded
-    assert gateway.states[AgentRole.executor][1]["context"]["verifier_feedback"] == [
+    assert gateway.states[AgentRole.executor][2]["context"]["verifier_feedback"] == [
         "补充职责和任职要求。"
     ]
+    assert gateway.states[AgentRole.executor][2]["context"]["observed_public_evidence"][0][
+        "source_url"
+    ] == "https://jobs.example/retry"
+    assert [observation["tool_name"] for observation in gateway.states[AgentRole.verifier][1][
+        "execution"
+    ]["observations"]] == ["fetch-job"]
 
 
 def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_session) -> None:

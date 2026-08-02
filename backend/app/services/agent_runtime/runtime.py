@@ -282,6 +282,8 @@ class AgentRuntime:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
         execution_task = task
+        prior_observations = []
+        prior_artifact_refs: list[dict[str, str]] = []
         while True:
             try:
                 execution = self._executor.run(
@@ -302,6 +304,15 @@ class AgentRuntime:
             observed_artifact_refs = self._persist_observed_evidence(
                 db, run_id, persisted_step, execution
             )
+            # A verifier retry continues the same planned outcome. Keep prior
+            # tool-backed observations for independent verification, but persist
+            # only the new observation set from this Executor invocation.
+            execution = execution.model_copy(
+                update={
+                    "observations": [*prior_observations, *execution.observations],
+                    "artifact_refs": [*prior_artifact_refs, *observed_artifact_refs],
+                }
+            )
             if execution.status == "needs_user":
                 return self._wait_for_user(
                     db,
@@ -318,9 +329,6 @@ class AgentRuntime:
                     execution.error_code or "executor_failed",
                     output_artifact_refs=observed_artifact_refs,
                 )
-            execution = execution.model_copy(
-                update={"artifact_refs": observed_artifact_refs}
-            )
             if not self._requires_verification(plan, plan_step):
                 run_repository.finish_step(
                     db,
@@ -395,13 +403,21 @@ class AgentRuntime:
                     },
                 )
                 if retries <= task.budget.max_replans:
-                    retry_context = dict(task.context)
+                    prior_observations = execution.observations
+                    prior_artifact_refs = execution.artifact_refs
+                    retry_context = dict(execution_task.context)
                     feedback = list(retry_context.get("verifier_feedback", []))
                     if verification.feedback:
                         feedback.append(verification.feedback)
                     retry_context["verifier_feedback"] = feedback
-                    execution_task = task.model_copy(
+                    execution_task = execution_task.model_copy(
                         update={"context": retry_context}
+                    )
+                    execution_task = self._with_observed_public_evidence(
+                        db, execution_task, run_id
+                    )
+                    context = self._tool_context(
+                        user_id=context.user_id, run_id=run_id, task=execution_task
                     )
                     continue
                 return self._fail_step(
