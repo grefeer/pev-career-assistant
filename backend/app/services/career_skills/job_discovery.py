@@ -8,13 +8,17 @@ import hashlib
 import ipaddress
 import re
 import socket
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 import requests
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.job_discovery.tools.jd_extraction import extract_jd_candidates
+
+
+_MAX_PUBLIC_REDIRECTS = 5
+_PUBLIC_FETCH_HEADERS = {"User-Agent": "CareerAssistantPEV/1.0 (+public-job-fetch)"}
 
 
 _JOB_RESULT_URL_TOKENS = (
@@ -324,6 +328,35 @@ def _assert_public_url(url: str) -> None:
             raise PublicJobFetchError("unsafe_public_url")
 
 
+def _fetch_validated(url: str) -> requests.Response:
+    """GET ``url`` following redirects manually, re-checking every hop is public.
+
+    ``requests`` follows 3xx redirects automatically, but it never re-runs
+    ``_assert_public_url`` against the ``Location`` target -- so a public URL
+    that redirects to an internal address (loopback, link-local, RFC1918, or a
+    cloud metadata endpoint) would let an Agent read private network state. We
+    disable auto-redirect and walk each hop ourselves, re-validating the scheme,
+    absence of userinfo, and global-IP rule on every resolved target.
+    """
+    current = url
+    for _ in range(_MAX_PUBLIC_REDIRECTS + 1):
+        response = requests.get(
+            current,
+            timeout=20,
+            allow_redirects=False,
+            headers=_PUBLIC_FETCH_HEADERS,
+        )
+        if not response.is_redirect:
+            return response
+        target = response.headers.get("Location")
+        if not target:
+            return response
+        target = urljoin(current, target)
+        _assert_public_url(target)
+        current = target
+    raise PublicJobFetchError("unsafe_public_url")
+
+
 def fetch_public_job_page(
     context: ToolContext, payload: FetchPublicJobPageInput
 ) -> FetchPublicJobPageOutput:
@@ -331,13 +364,10 @@ def fetch_public_job_page(
     del context
     _assert_public_url(payload.url)
     try:
-        response = requests.get(
-            payload.url,
-            timeout=20,
-            allow_redirects=True,
-            headers={"User-Agent": "CareerAssistantPEV/1.0 (+public-job-fetch)"},
-        )
+        response = _fetch_validated(payload.url)
         response.raise_for_status()
+    except PublicJobFetchError:
+        raise
     except requests.RequestException as exc:
         raise PublicJobFetchError("public_fetch_failed") from exc
     if response.encoding is None or response.encoding.lower() in {"iso-8859-1", "latin-1"}:

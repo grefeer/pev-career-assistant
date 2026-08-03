@@ -171,3 +171,51 @@ def test_registry_reports_skill_forbidden_invalid_output_and_handler_failure() -
     assert forbidden.error_code == "tool_skill_forbidden"
     assert invalid.error_code == "invalid_tool_output"
     assert failed.error_code == "tool_execution_failed"
+
+
+def test_scoped_catalog_excludes_unaffiliated_tools_to_match_invoke_scope() -> None:
+    """A tool with no skill affiliation is hidden from a scoped catalog.
+
+    ``invoke`` rejects such tools as ``tool_skill_forbidden`` whenever a scope is
+    active (``None`` is never in ``allowed_skills``), so advertising them in the
+    catalog would only bait the Executor toward a guaranteed rejection. The
+    unscoped catalog (planner / unscoped verifier) still sees every tool.
+    """
+    registry = ToolRegistry()
+    unaffiliated = ToolDefinition(
+        name="system-probe", input_model=JobInput, output_model=JobOutput,
+        allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda context, payload: {
+            "job_id": payload.job_id, "owner_id": context.user_id,
+        },
+    )
+    scoped = ToolDefinition(
+        name="read-job", skill_name="job-discovery", input_model=JobInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda context, payload: {
+            "job_id": payload.job_id, "owner_id": context.user_id,
+        },
+    )
+    registry.register(unaffiliated)
+    registry.register(scoped)
+    context = ToolContext(user_id="user-a", run_id="run-a")
+
+    scoped_catalog = registry.tool_catalog(
+        role=AgentRole.executor, allowed_skills=frozenset({"job-discovery"})
+    )
+    assert [tool["name"] for tool in scoped_catalog] == ["read-job"]
+
+    unscoped_catalog = registry.tool_catalog(role=AgentRole.executor)
+    assert [tool["name"] for tool in unscoped_catalog] == ["read-job", "system-probe"]
+
+    forbidden = registry.invoke(
+        role=AgentRole.executor, name="system-probe", context=context,
+        payload={"job_id": "1"}, allowed_skills=frozenset({"job-discovery"}),
+    )
+    assert forbidden.error_code == "tool_skill_forbidden"
+
+    open_call = registry.invoke(
+        role=AgentRole.executor, name="system-probe", context=context,
+        payload={"job_id": "1"},
+    )
+    assert open_call.status == "succeeded"

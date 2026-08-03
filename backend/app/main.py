@@ -120,6 +120,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     app.state.settings, runtime=runtime
                 )
                 app.state.agent_run_service = owned_agent_run_service
+                # Bound persisted event payloads so a runaway tool observation
+                # can never grow the event table / SSE stream unboundedly. The
+                # limit is a no-op in tests (left as ``None``) and only takes
+                # effect once the application lifespan configures it. The
+                # stack callback restores the no-op default on shutdown so one
+                # app's ceiling never leaks into another test's process state.
+                from backend.app.repositories import agent_runtime as run_repository
+
+                run_repository.set_event_payload_limit(
+                    app.state.settings.agent_harness_max_event_payload_bytes
+                )
+                stack.callback(run_repository.set_event_payload_limit, None)
             yield
     finally:
         if (

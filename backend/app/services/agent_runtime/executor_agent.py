@@ -7,6 +7,10 @@ from typing import Any
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.observation_projection import (
+    observation_for_decision,
+    record_observation,
+)
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -105,7 +109,7 @@ class ExecutorAgent:
             role=AgentRole.executor, allowed_skills=allowed_skills
         )
         prior_observations_for_decision = [
-            _observation_for_decision(observation)
+            observation_for_decision(observation)
             for observation in (prior_observations or [])
         ]
         # Decision projections are appended once per observation in lockstep
@@ -166,7 +170,7 @@ class ExecutorAgent:
                     decision.tool_name == "search-public-job-pages"
                     and _has_candidate_urls(task)
                 ):
-                    _record_observation(
+                    record_observation(
                         observations,
                         observations_for_decision,
                         ToolObservation(
@@ -181,7 +185,7 @@ class ExecutorAgent:
                     and decision.tool_name == last_tool_name
                     and decision.tool_input == last_tool_input
                 ):
-                    _record_observation(
+                    record_observation(
                         observations,
                         observations_for_decision,
                         ToolObservation(
@@ -205,7 +209,7 @@ class ExecutorAgent:
                     payload=decision.tool_input,
                     allowed_skills=allowed_skills,
                 )
-                _record_observation(observations, observations_for_decision, observation)
+                record_observation(observations, observations_for_decision, observation)
                 tool_context = _with_observed_page(tool_context, observation)
                 last_tool_name = decision.tool_name
                 last_tool_input = decision.tool_input
@@ -267,41 +271,6 @@ def _with_observed_page(
     return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)
 
 
-def _record_observation(
-    observations: list[ToolObservation],
-    observations_for_decision: list[dict[str, object]],
-    observation: ToolObservation,
-) -> None:
-    """Append a raw observation and its decision projection in lockstep."""
-    observations.append(observation)
-    observations_for_decision.append(_observation_for_decision(observation))
-
-
-def _observation_for_decision(observation: ToolObservation) -> dict[str, object]:
-    """Give the Agent identifiers and bounded evidence excerpts, never full page bodies."""
-    payload = observation.model_dump(mode="json")
-    output = payload.get("output")
-    if not isinstance(output, dict):
-        return payload
-    projected = dict(output)
-    if isinstance(projected.get("visible_text"), str):
-        projected["visible_text"] = projected["visible_text"][:1_200]
-    pages = projected.get("pages")
-    if isinstance(pages, list):
-        projected["pages"] = [
-            _page_for_decision(page) for page in pages[:10] if isinstance(page, dict)
-        ]
-    details = projected.get("details")
-    if isinstance(details, list):
-        projected["details"] = [
-            _detail_for_decision(detail)
-            for detail in details[:10]
-            if isinstance(detail, dict)
-        ]
-    payload["output"] = projected
-    return payload
-
-
 def _has_candidate_urls(task: AgentTaskRequest) -> bool:
     """Avoid redundant public search when the user already bounded the evidence set."""
     candidate_urls = task.context.get("candidate_urls")
@@ -309,26 +278,3 @@ def _has_candidate_urls(task: AgentTaskRequest) -> bool:
         isinstance(url, str) and url.strip() for url in candidate_urls
     )
 
-
-def _page_for_decision(page: dict[str, object]) -> dict[str, object]:
-    """Project one page's traceable identity and a small visible-text excerpt."""
-    projected = dict(page)
-    visible_text = projected.get("visible_text")
-    if isinstance(visible_text, str):
-        projected["visible_text"] = visible_text[:1_200]
-    return projected
-
-
-def _detail_for_decision(detail: dict[str, object]) -> dict[str, object]:
-    """Keep a batch detail trace actionable without copying all JD sections again."""
-    candidates = detail.get("candidates")
-    titles = [
-        candidate.get("title")
-        for candidate in candidates
-        if isinstance(candidate, dict) and isinstance(candidate.get("title"), str)
-    ] if isinstance(candidates, list) else []
-    return {
-        key: detail[key]
-        for key in ("source_artifact_id", "source_url", "content_hash")
-        if key in detail
-    } | {"candidate_titles": titles}

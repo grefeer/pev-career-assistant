@@ -5,7 +5,7 @@ Each test here targets a single partial branch reported as missing by
 
 * ``runtime.py:887->886`` - ``_skill_artifact_source_url`` skips a non-dict match.
 * ``service.py:119->exit`` - queued-run failure audit is skipped when the row vanished.
-* ``executor_agent.py:269->271`` - ``_page_for_decision`` keeps non-string visible_text.
+* ``observation_projection.py`` - ``page_for_decision`` keeps non-string visible_text.
 * ``domain/agent_runtime.py:108->exit`` - ``require_valid_run_transition`` permits a valid edge.
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 from backend.app.db.models import User, UserRole
 from backend.app.domain.agent_runtime import RunStatus, require_valid_run_transition
 from backend.app.repositories import agent_runtime as run_repository
-from backend.app.services.agent_runtime.executor_agent import _page_for_decision
+from backend.app.services.agent_runtime.observation_projection import page_for_decision
 from backend.app.services.agent_runtime.runtime import _skill_artifact_source_url
 from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.service import AgentRunService
@@ -42,7 +42,7 @@ def test_skill_artifact_source_url_skips_non_dict_match_entries() -> None:
 
 def test_page_for_decision_keeps_non_string_visible_text_unchanged() -> None:
     """A page without a string visible_text projects without truncation or crash."""
-    projected = _page_for_decision({"visible_text": None, "source_url": "https://jobs.example/x"})
+    projected = page_for_decision({"visible_text": None, "source_url": "https://jobs.example/x"})
     assert projected["visible_text"] is None
     assert projected["source_url"] == "https://jobs.example/x"
 

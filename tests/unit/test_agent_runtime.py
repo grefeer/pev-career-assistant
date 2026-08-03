@@ -389,6 +389,84 @@ def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(d
     ]
 
 
+def test_runtime_recovers_replan_budget_from_persisted_plans(db_session) -> None:
+    """A recovered run keeps its already-spent replan budget instead of resetting it.
+
+    A process-interrupted run that already consumed one replan (two plans
+    persisted) must resume with replans == 1, not 0. Otherwise the budget spent
+    before the crash becomes spendable again and ``max_replans`` is silently
+    doubled on every recovery.
+    """
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    registry = ToolRegistry()
+    # Recovery forces one more replan. With the budget correctly recovered
+    # (replans resumes at 1), that third replan must exhaust max_replans == 1.
+    plan_decision = {
+        "action": "plan", "complexity": "L2",
+        "success_criteria": ["完整 JD"],
+        "steps": [{
+            "step_id": "discover", "objective": "重新提取岗位",
+            "allowed_skills": ["job-discovery"], "requires_verification": True,
+        }],
+    }
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [plan_decision],
+        AgentRole.executor: [{"action": "complete", "summary": "恢复后结果", "artifact_refs": []}],
+        AgentRole.verifier: [{
+            "action": "decide", "verification_decision": "REPLAN",
+            "feedback": "来源改版，需要重新规划。",
+        }],
+    })
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="找岗位",
+        allowed_skills=["job-discovery"],
+        budget={"max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 1},
+    )
+    # Seed a run that already consumed one replan (two plans persisted, revision
+    # == count_plans == 2) before the process was interrupted mid-execution.
+    run = runtime.create_queued_run(db_session, user_id=user.id, task=task)
+    run_repository.start_run(db_session, run)
+    plan_json = {
+        "complexity": "L2",
+        "success_criteria": ["完整 JD"],
+        "steps": [{
+            "step_id": "discover", "objective": "提取岗位",
+            "allowed_skills": ["job-discovery"], "requires_verification": True,
+        }],
+    }
+    run_repository.create_plan(
+        db_session, run_id=run.id, revision=1,
+        complexity=ComplexityLevel.L2, plan_json=plan_json,
+    )
+    run_repository.create_plan(
+        db_session, run_id=run.id, revision=2,
+        complexity=ComplexityLevel.L2, plan_json=plan_json,
+    )
+    db_session.commit()
+    assert run.status is RunStatus.running
+    assert run_repository.count_plans(db_session, run.id) == 2
+
+    result = runtime.recover(
+        db_session, user_id=user.id, run_id=run.id, task=task
+    )
+
+    assert result.status is RunStatus.failed
+    assert result.error_code == "replan_budget_exhausted"
+    # Three plans now persisted: two seeded + one from the recovery replan.
+    assert run_repository.count_plans(db_session, run.id) == 3
+
+
 def test_runtime_rejects_resume_or_recovery_for_missing_or_wrong_state_runs(db_session) -> None:
     runtime = object.__new__(AgentRuntime)
     task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])

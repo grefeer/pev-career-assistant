@@ -105,7 +105,12 @@ class AgentRuntime:
         )
         deadline = time.monotonic() + task.budget.max_wall_clock_seconds
         planning_task = task
-        replans = 0
+        # `revision` tracks the number of plans persisted for this run: 0 for a
+        # fresh run, or count_plans on resume (revision == 1 after the initial
+        # plan). replans already consumed = plans beyond the first, i.e.
+        # max(0, revision - 1). Recovering a crashed run must NOT reset this to
+        # zero, or a budget already spent on replanning becomes spendable again.
+        replans = max(0, revision - 1)
         trace = self._build_decision_trace(
             db,
             run.id,

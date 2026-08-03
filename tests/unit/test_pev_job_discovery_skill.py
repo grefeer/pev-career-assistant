@@ -28,6 +28,8 @@ from backend.app.services.career_skills.job_discovery import (
     _infer_official_page_locations,
     _infer_official_page_title,
     _infer_recruitment_types,
+    _fetch_validated,
+    _MAX_PUBLIC_REDIRECTS,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
@@ -45,6 +47,8 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
             encoding="utf-8",
             apparent_encoding="utf-8",
             raise_for_status=lambda: None,
+            is_redirect=False,
+            headers={},
         ),
     )
 
@@ -228,6 +232,8 @@ def test_fetch_public_job_page_rejects_a_short_login_or_soft_block_page(monkeypa
             text="<html><title>登录</title><body>请先登录后查看</body></html>",
             encoding="utf-8", apparent_encoding="utf-8",
             raise_for_status=lambda: None,
+            is_redirect=False,
+            headers={},
         ),
     )
 
@@ -254,10 +260,118 @@ def test_public_fetch_handles_network_encoding_and_empty_page_failures(monkeypat
         lambda *args, **kwargs: SimpleNamespace(
             text="<html><body></body></html>", encoding="latin-1", apparent_encoding="utf-8",
             raise_for_status=lambda: None,
+            is_redirect=False,
+            headers={},
         ),
     )
     with pytest.raises(PublicJobFetchError, match="empty_public_page"):
         fetch_public_job_page(ToolContext(user_id="u", run_id="r"), FetchPublicJobPageInput(url="https://jobs.example"))
+
+
+def test_fetch_public_job_page_follows_redirect_to_a_revalidated_public_target(monkeypatch) -> None:
+    """A public->public redirect is re-validated per hop, then the final page is returned."""
+    validated: list[str] = []
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: validated.append(url),
+    )
+
+    def fake_get(url, *args, **kwargs):
+        if url == "https://jobs.example/redir":
+            return SimpleNamespace(
+                text="", encoding="utf-8", apparent_encoding="utf-8",
+                raise_for_status=lambda: None,
+                is_redirect=True, status_code=302,
+                headers={"Location": "https://jobs.example/agent"},
+            )
+        return SimpleNamespace(
+            text="<html><title>AI Agent 开发</title><body><p>岗位职责和任职要求详情描述。</p></body></html>",
+            encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False, status_code=200, headers={},
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get,
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        FetchPublicJobPageInput(url="https://jobs.example/redir"),
+    )
+
+    # The initial URL and the redirect target are both re-validated.
+    assert validated == ["https://jobs.example/redir", "https://jobs.example/agent"]
+    assert result.source_url == "https://jobs.example/redir"
+    assert "岗位职责" in result.visible_text
+
+
+def test_fetch_public_job_page_rejects_redirect_to_a_private_target(monkeypatch) -> None:
+    """A public page that 302-redirects to a private address must not be followed."""
+    def assert_public(url: str) -> None:
+        if "127.0.0.1" in url:
+            raise PublicJobFetchError("unsafe_public_url")
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url", assert_public,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="", encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=True, status_code=302,
+            headers={"Location": "http://127.0.0.1:8000/admin"},
+        ),
+    )
+
+    with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
+        fetch_public_job_page(
+            ToolContext(user_id="user-a", run_id="run-a"),
+            FetchPublicJobPageInput(url="https://jobs.example/redir"),
+        )
+
+
+def test_fetch_validated_returns_redirect_response_when_location_header_missing(monkeypatch) -> None:
+    """A 3xx without a Location header cannot be followed; it is returned as-is."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="", encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=True, status_code=302, headers={},
+        ),
+    )
+
+    response = _fetch_validated("https://jobs.example/orphan")
+
+    assert response.is_redirect is True
+
+
+def test_fetch_validated_rejects_redirect_loops_as_unsafe(monkeypatch) -> None:
+    """A redirect chain longer than the hop budget is treated as unsafe."""
+    calls = {"count": 0}
+
+    def fake_get(url, *args, **kwargs):
+        calls["count"] += 1
+        return SimpleNamespace(
+            text="", encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=True, status_code=302,
+            headers={"Location": "https://jobs.example/loop"},
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url", lambda _url: None,
+    )
+
+    with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
+        _fetch_validated("https://jobs.example/start")
+
+    assert calls["count"] == _MAX_PUBLIC_REDIRECTS + 1
 
 
 def test_search_and_extraction_reject_missing_or_malformed_public_evidence(monkeypatch) -> None:

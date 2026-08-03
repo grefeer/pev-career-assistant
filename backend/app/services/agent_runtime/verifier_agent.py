@@ -6,6 +6,7 @@ import time
 
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.observation_projection import record_observation
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -57,6 +58,7 @@ class VerifierAgent:
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
+        observations_for_decision: list[dict[str, object]] = []
         # Loop-invariant projections of the (immutable) plan/step/execution:
         # serialize once instead of re-dumping and re-building the tool catalog
         # every turn. The catalog is also memoized inside ToolRegistry.
@@ -100,10 +102,7 @@ class VerifierAgent:
                         if turn_budget is not None
                         else task.budget.max_agent_turns - _turn - 1
                     ),
-                    "observations": [
-                        observation.model_dump(mode="json")
-                        for observation in observations
-                    ],
+                    "observations": list(observations_for_decision),
                 },
                 response_model=VerifierDecision,
             )
@@ -122,14 +121,16 @@ class VerifierAgent:
                         observations=observations,
                         error_code="tool_budget_exhausted",
                     )
-                observations.append(
+                record_observation(
+                    observations,
+                    observations_for_decision,
                     self._tools.invoke(
                         role=AgentRole.verifier,
                         name=decision.tool_name or "",
                         context=context,
                         payload=decision.tool_input,
                         allowed_skills=allowed_skills,
-                    )
+                    ),
                 )
                 continue
             return VerifierResult(

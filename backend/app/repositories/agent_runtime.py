@@ -7,6 +7,7 @@ transaction; callers decide when to commit.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from sqlalchemy import func, select
@@ -28,6 +29,30 @@ from backend.app.domain.agent_runtime import (
     RunStatus,
     StepStatus,
 )
+
+# Ceiling on the serialized size of a single event payload, in bytes. ``None``
+# (the default in tests and any environment that never wires it) means events
+# are persisted verbatim. When set, an oversize payload is replaced with a
+# bounded stub so a runaway tool observation can never grow the event table or
+# the SSE stream unboundedly. Configured once at startup by the application
+# lifespan via ``set_event_payload_limit``; left as ``None`` in unit tests.
+_EVENT_PAYLOAD_LIMIT: int | None = None
+
+
+def set_event_payload_limit(limit: int | None) -> None:
+    """Configure the byte ceiling for persisted event payloads (startup only)."""
+    global _EVENT_PAYLOAD_LIMIT
+    _EVENT_PAYLOAD_LIMIT = limit
+
+
+def _bounded_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return ``payload`` unchanged, or a size-stub when it exceeds the ceiling."""
+    if _EVENT_PAYLOAD_LIMIT is None:
+        return payload
+    serialized = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+    if len(serialized) <= _EVENT_PAYLOAD_LIMIT:
+        return payload
+    return {"_payload_truncated": True, "original_bytes": len(serialized)}
 
 
 def create_run(
@@ -312,7 +337,7 @@ def append_event(
         run_id=run_id,
         sequence=int(latest or 0) + 1,
         event_type=event_type,
-        payload_json=payload_json,
+        payload_json=_bounded_payload(payload_json),
     )
     db.add(event)
     db.flush()

@@ -74,10 +74,15 @@ class ToolRegistry:
         for definition in sorted(self._definitions.values(), key=lambda item: item.name):
             if role not in definition.allowed_roles:
                 continue
-            if (
-                allowed_skills is not None
-                and definition.skill_name is not None
-                and definition.skill_name not in allowed_skills
+            # When a skill scope is in effect, exclude tools with no skill
+            # affiliation: they cannot satisfy ``invoke``'s scope check anyway
+            # (None is never in ``allowed_skills``), so advertising them only
+            # tempts the Executor to call a tool that would be rejected as
+            # ``tool_skill_forbidden``. ``allowed_skills is None`` (planner /
+            # unscoped verifier) keeps seeing every tool.
+            if allowed_skills is not None and (
+                definition.skill_name is None
+                or definition.skill_name not in allowed_skills
             ):
                 continue
             catalog.append(

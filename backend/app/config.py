@@ -246,6 +246,8 @@ class Settings(BaseSettings):
             raise ValueError("APP_AUTH_SECRET must be replaced in production")
         if self.is_production and self.checkpoint_backend != "redis":
             raise ValueError("production requires CHECKPOINT_BACKEND=redis")
+        if self.is_production and self.database_url.startswith("sqlite"):
+            raise ValueError("SQLite database_url is not permitted in production")
         object_credentials = (
             self.object_store_access_key,
             self.object_store_secret_key,

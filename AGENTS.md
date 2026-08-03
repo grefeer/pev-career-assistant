@@ -66,7 +66,7 @@ Tools are deterministic Python functions registered in the `ToolRegistry`. Each 
 5. Add unit coverage: tool determinism in `tests/unit/` plus the skill-level test (`test_*pev_skill.py` / `test_job_matching_skill.py`).
 6. Run: `.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q`
 
-Remember: `ToolRegistry.invoke` converts any handler exception into a `ToolObservation(status="failed", error_code=...)`; never raise across the agent boundary.
+Remember: `ToolRegistry.invoke` converts any handler exception into a `ToolObservation(status="failed", error_code=...)`; never raise across the agent boundary. Tools without a `skill_name` are excluded from scoped (per-step) catalogs - register every Executor/Verifier tool under a skill so it's reachable, or it will be invisible to the Executor.
 
 ### Adding a New API Endpoint
 
@@ -102,7 +102,7 @@ task = AgentTaskRequest(
 # - New tool = see "Adding a New Tool to a Career Skill" above.
 ```
 
-Key files: `runtime.py` (orchestrator), `planner_agent.py` / `executor_agent.py` / `verifier_agent.py`, `model_gateway.py` (DeepSeek, schema-first + local JSON retry), `tool_registry.py`, `schemas.py`, `service.py` (user-scoped business service).
+Key files: `runtime.py` (orchestrator), `planner_agent.py` / `executor_agent.py` / `verifier_agent.py`, `observation_projection.py` (shared bounded decision-state projection), `model_gateway.py` (DeepSeek, schema-first + local JSON retry), `tool_registry.py`, `schemas.py`, `service.py` (user-scoped business service).
 
 ### Model Gateway Notes
 
@@ -160,6 +160,7 @@ pytestmark = pytest.mark.skipif(
 - [ ] JobPosting completion/review/decision writes check `review_version` (409 on conflict)
 - [ ] No code path grants `task:submit` scope
 - [ ] No auto-skip of login/captcha/anti-bot
+- [ ] Public-page fetching follows redirects manually and re-validates each hop (`_fetch_validated` + `_assert_public_url`); no 302 to private/cloud-metadata addresses
 - [ ] API field whitelists in DTOs (never expose raw payloads or tokens)
 - [ ] Device actions validate task lease, not just device token
 - [ ] User A cannot read/modify User B's data (owner-scoped runs/events/artifacts)
@@ -176,7 +177,7 @@ pytestmark = pytest.mark.skipif(
 
 5. **Opt-in test gates**: Tests requiring external services use exact env-var names (`RUN_LIVE_PEV_E2E`, `ALLOW_DESTRUCTIVE_MYSQL_TESTS`). Don't rename them.
 
-6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `executor_retry_budget_exhausted`, etc.); agents cannot exceed them.
+6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `executor_retry_budget_exhausted`, etc.); agents cannot exceed them. `recover()`/`resume()` resume the replan count from the persisted plan count (`max(0, revision - 1)`), so a crashed run can't re-spend budget already used on replanning.
 
 7. **Frontend dirty state**: Admin/profile forms track dirty state. Navigating away shows a confirmation dialog. Don't disable this.
 

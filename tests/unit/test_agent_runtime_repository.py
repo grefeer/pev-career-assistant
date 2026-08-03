@@ -206,3 +206,49 @@ def test_repository_keeps_distinct_artifact_types_for_one_source_and_deduplicate
 
     assert page.id != structured.id
     assert repeated.id == structured.id
+
+
+def test_repository_append_event_truncates_oversized_payload(db_session, monkeypatch) -> None:
+    """An event payload exceeding the configured byte ceiling becomes a bounded stub."""
+    import json
+
+    monkeypatch.setattr(agent_runtime, "_EVENT_PAYLOAD_LIMIT", 32)
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = agent_runtime.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    oversized = {"blob": "x" * 200}
+    expected_bytes = len(json.dumps(oversized, ensure_ascii=False).encode("utf-8"))
+
+    agent_runtime.append_event(
+        db_session, run_id=run.id, event_type="tool_observation",
+        payload_json=oversized,
+    )
+    db_session.commit()
+
+    persisted = agent_runtime.list_events(db_session, run.id)[0]
+    assert persisted.payload_json == {"_payload_truncated": True, "original_bytes": expected_bytes}
+
+
+def test_repository_append_event_preserves_payload_under_the_ceiling(db_session, monkeypatch) -> None:
+    """A payload within the configured ceiling is persisted verbatim."""
+    monkeypatch.setattr(agent_runtime, "_EVENT_PAYLOAD_LIMIT", 4096)
+    user = _user("user-b", "user-b@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = agent_runtime.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    payload = {"tool": "fetch_public_job_page", "status": "succeeded"}
+
+    agent_runtime.append_event(
+        db_session, run_id=run.id, event_type="tool_call_finished", payload_json=payload,
+    )
+    db_session.commit()
+
+    persisted = agent_runtime.list_events(db_session, run.id)[0]
+    assert persisted.payload_json == payload

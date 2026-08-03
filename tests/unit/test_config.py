@@ -166,6 +166,12 @@ def test_production_requires_redis_checkpoint_backend() -> None:
         Settings(**_production_base(checkpoint_backend="sqlite"))
 
 
+def test_production_rejects_sqlite_database_url() -> None:
+    """SQLite must never be the production authority store (MySQL is source of truth)."""
+    with pytest.raises(ValidationError, match="SQLite database_url"):
+        Settings(**_production_base(database_url="sqlite+pysqlite:///:memory:"))
+
+
 def test_production_rejects_short_rate_limit_hmac_secret() -> None:
     """A present but too-short HMAC secret is rejected in production."""
     with pytest.raises(ValidationError, match="RATE_LIMIT_HMAC_SECRET"):

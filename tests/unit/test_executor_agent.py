@@ -7,9 +7,9 @@ from typing import Any
 from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
-from backend.app.services.agent_runtime.executor_agent import (
-    ExecutorAgent,
-    _observation_for_decision,
+from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.observation_projection import (
+    observation_for_decision,
 )
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
@@ -239,7 +239,7 @@ def test_executor_exposes_every_page_from_a_batch_observation_to_the_next_tool()
 
 
 def test_executor_projects_batch_details_to_identifiers_and_titles_only() -> None:
-    projected = _observation_for_decision(ToolObservation(
+    projected = observation_for_decision(ToolObservation(
         tool_name="extract-observed-job-details-batch", status="succeeded",
         output={"details": [{
             "source_artifact_id": "observed:a", "source_url": "https://jobs.example/a",

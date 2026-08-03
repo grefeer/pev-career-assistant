@@ -6,6 +6,7 @@ import time
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.observation_projection import record_observation
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -72,6 +73,7 @@ class PlannerAgent:
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
         observations: list[ToolObservation] = []
+        observations_for_decision: list[dict[str, object]] = []
         confirmed_facts = task.private_context.get("confirmed_profile_facts")
         fact_fields = (
             sorted(field for field in confirmed_facts if isinstance(field, str))
@@ -115,10 +117,7 @@ class PlannerAgent:
                         if turn_budget is not None
                         else task.budget.max_agent_turns - _turn - 1
                     ),
-                    "observations": [
-                        observation.model_dump(mode="json")
-                        for observation in observations
-                    ],
+                    "observations": list(observations_for_decision),
                 },
                 response_model=PlannerDecision,
             )
@@ -136,13 +135,15 @@ class PlannerAgent:
                         observations=observations,
                         error_code="tool_budget_exhausted",
                     )
-                observations.append(
+                record_observation(
+                    observations,
+                    observations_for_decision,
                     self._tools.invoke(
                         role=AgentRole.planner,
                         name=decision.tool_name or "",
                         context=context,
                         payload=decision.tool_input,
-                    )
+                    ),
                 )
                 continue
             if decision.action == "plan":

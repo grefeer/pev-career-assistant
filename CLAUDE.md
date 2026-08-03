@@ -133,6 +133,7 @@ Health-check SQL is an intentional infrastructure probe rather than business dat
 - **Agent**: LLM-in-the-loop, autonomous tool selection, plan-verify-replan. The current runtime has three: **Planner**, **Executor**, **Verifier** (see `backend/app/services/agent_runtime/`).
 - **Tool**: Agent-callable deterministic Python function with fixed input/output, registered in `ToolRegistry` with role + skill scoping. Examples: `fetch-public-job-pages`, `extract-observed-job-details-batch`, `match-observed-jobs`, `build-resume-tailoring-brief`, `build-preparation-plan`.
 - **Skill**: A coherent tool bundle exposed to the PEV runtime via `career_skills/registry.py` + `manifest.py`. Four skills: `job-discovery`, `job-matching`, `resume-tailoring`, `career-planning`. Each `PlanStep` allows exactly ONE skill; the Executor only sees that skill's tools.
+- **Catalog ↔ invoke consistency**: a scoped `tool_catalog` (one skill per step) omits tools with no `skill_name`, matching `invoke`'s `tool_skill_forbidden` rejection - the Executor is never advertised a tool it cannot call.
 
 ### Security Hard Gates
 
@@ -150,7 +151,7 @@ These are code-level restrictions, NOT conventions:
 
 - All settings live in `backend/app/config.py` -> `Settings` (pydantic-settings).
 - `agent_harness_enabled` gates the PEV runtime; a missing model key logs a warning and the API safely returns `agent_harness_unavailable` / `agent_harness_disabled` rather than crashing.
-- Rejects: demo keys, template credentials, SQLite in production.
+- Rejects: demo keys, template credentials, SQLite `database_url`/`checkpoint_backend` in production (enforced in `validate_production_settings`).
 - `OBJECT_ENCRYPTION_KEY` must be Base64-encoded 32 bytes.
 - `.env` file at project root for local overrides; never committed.
 
@@ -174,6 +175,9 @@ Key invariants enforced by the harness (not the agents):
 - **Tool exceptions never leak**: `ToolRegistry.invoke` converts any failure into a `ToolObservation(status=failed, error_code=...)`.
 - **Duplicate-call dedup**: a consecutive identical tool call after a success returns `duplicate_tool_call` without consuming budget (prevents executor thrash).
 - **MySQL authority**: Run/Plan/Step/Turn/Event/Artifact persist to MySQL; SSE polls MySQL every 1s; Redis is non-authoritative.
+- **Replan budget survives recovery**: `recover()`/`resume()` resume `replans` from the persisted plan count (`max(0, revision - 1)`), so a crashed run cannot re-spend budget already consumed on replanning.
+- **Incremental decision-state projection**: each agent appends a bounded projection of a tool observation once per call (visible_text excerpted to 1,200 chars; pages/details capped at 10) and reuses the accumulated list per turn, so decision context grows O(turns) not O(turns²) (shared logic in `observation_projection.py`).
+- **Bounded event payloads**: `append_event` caps serialized payload size at `agent_harness_max_event_payload_bytes` (wired in the lifespan); an oversize payload is replaced with a `{"_payload_truncated": True, "original_bytes": ...}` stub so a runaway observation can't grow the event table / SSE stream.
 
 ### Four Career Skills
 
@@ -247,6 +251,7 @@ queued -> running -> succeeded / partial_success / needs_manual_review / failed 
 ### WeChat / Public-Page Fetching
 - Public-page fetching lives in the `job-discovery` career skill (`career_skills/job_discovery.py`), driven by Playwright via the `skill/job-discovery/scripts/browse.py` runtime (invoked with `cwd=skill_dir`).
 - Blocked pages (login/captcha/anti-bot) are surfaced as failures -> `needs_manual_review`; the system never attempts to circumvent them.
+- HTTP redirects are followed manually (`_fetch_validated`), re-running `_assert_public_url` (scheme, no userinfo, global IP) on every `Location` hop (max 5); a public page that redirects to a private or cloud-metadata address is rejected as `unsafe_public_url` rather than followed.
 
 ## Database Migrations
 
