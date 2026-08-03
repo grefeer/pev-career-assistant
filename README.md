@@ -78,7 +78,7 @@ npm.cmd --prefix frontend run typecheck
 npm.cmd --prefix frontend run build
 ```
 
-完整架构要求、Agent 定义、安全边界和验收标准见 [自适应三 Agent PEV 设计](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md)。
+完整架构要求、Agent 定义、安全边界和验收标准见 [自适应三 Agent PEV 设计](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md)；结构图与时序图见 [PEV 架构文档](docs/pev-agent-architecture.zh-CN.md)。
 
 ## 项目结构
 
