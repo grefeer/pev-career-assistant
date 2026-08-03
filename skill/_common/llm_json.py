@@ -83,18 +83,13 @@ def try_parse_json(text: str) -> Any:
         return json.loads(stripped)
     except (ValueError, TypeError):
         pass
-    obj = slice_between(stripped, "{", "}")
-    if obj is not None:
-        try:
-            return json.loads(obj)
-        except (ValueError, TypeError):
-            pass
-    arr = slice_between(stripped, "[", "]")
-    if arr is not None:
-        try:
-            return json.loads(arr)
-        except (ValueError, TypeError):
-            pass
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        candidate = slice_between(stripped, open_ch, close_ch)
+        if candidate is not None:
+            try:
+                return json.loads(candidate)
+            except (ValueError, TypeError):
+                pass
     return None
 
 

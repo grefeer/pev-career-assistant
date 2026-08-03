@@ -108,6 +108,12 @@ class ExecutorAgent:
             _observation_for_decision(observation)
             for observation in (prior_observations or [])
         ]
+        # Decision projections are appended once per observation in lockstep
+        # with the raw list, instead of re-projecting every observation each
+        # turn (O(turns^2) ``model_dump`` calls on observations that may carry
+        # large page text). Each turn reads a fresh shallow copy (the gateway
+        # only serializes it).
+        observations_for_decision: list[dict[str, object]] = []
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return ExecutorResult(
@@ -142,10 +148,7 @@ class ExecutorAgent:
                     "plan": plan_json,
                     "step": step_json,
                     "available_tools": available_tools,
-                    "observations": [
-                        _observation_for_decision(observation)
-                        for observation in observations
-                    ],
+                    "observations": list(observations_for_decision),
                     "prior_observations": prior_observations_for_decision,
                     "verifier_feedback": task.context.get("verifier_feedback", []),
                 },
@@ -163,12 +166,14 @@ class ExecutorAgent:
                     decision.tool_name == "search-public-job-pages"
                     and _has_candidate_urls(task)
                 ):
-                    observations.append(
+                    _record_observation(
+                        observations,
+                        observations_for_decision,
                         ToolObservation(
                             tool_name=decision.tool_name,
                             status="failed",
                             error_code="candidate_urls_already_supplied",
-                        )
+                        ),
                     )
                     continue
                 if (
@@ -176,12 +181,14 @@ class ExecutorAgent:
                     and decision.tool_name == last_tool_name
                     and decision.tool_input == last_tool_input
                 ):
-                    observations.append(
+                    _record_observation(
+                        observations,
+                        observations_for_decision,
                         ToolObservation(
                             tool_name=decision.tool_name or "",
                             status="failed",
                             error_code="duplicate_tool_call",
-                        )
+                        ),
                     )
                     continue
                 if tool_budget is not None and not tool_budget.try_consume():
@@ -198,7 +205,7 @@ class ExecutorAgent:
                     payload=decision.tool_input,
                     allowed_skills=allowed_skills,
                 )
-                observations.append(observation)
+                _record_observation(observations, observations_for_decision, observation)
                 tool_context = _with_observed_page(tool_context, observation)
                 last_tool_name = decision.tool_name
                 last_tool_input = decision.tool_input
@@ -258,6 +265,16 @@ def _with_observed_page(
     metadata = dict(context.metadata)
     metadata["observed_public_evidence"] = evidence
     return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)
+
+
+def _record_observation(
+    observations: list[ToolObservation],
+    observations_for_decision: list[dict[str, object]],
+    observation: ToolObservation,
+) -> None:
+    """Append a raw observation and its decision projection in lockstep."""
+    observations.append(observation)
+    observations_for_decision.append(_observation_for_decision(observation))
 
 
 def _observation_for_decision(observation: ToolObservation) -> dict[str, object]:
