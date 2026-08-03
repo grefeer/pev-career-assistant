@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import _get_db, get_current_user
 from backend.app.db.models import User
-from backend.app.schemas import AuthRequest, AuthResponse, RegisterRequest, UserProfile
+from backend.app.api.auth_schemas import AuthRequest, AuthResponse, RegisterRequest, UserProfile
 from backend.app.services.auth import AccountExistsError, AuthService
 from backend.app.services.rate_limit import (
     RateLimitExceededError,

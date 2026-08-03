@@ -266,7 +266,7 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `001
 
 ## Coverage Policy
 
-`[tool.coverage.run]` in `pyproject.toml` measures **retained production packages** at 100% branch coverage (`fail_under = 100`). A set of `domain/*` and `services/job_sync`-style modules are omitted because they are pre-PEV paths retained for `db/models.py` enum imports pending proper retirement; they do not enter the coverage gate. The PEV runtime, career skills, repositories, API, config, and `main` remain measured and must stay at 100%.
+`[tool.coverage.run]` in `pyproject.toml` measures **retained production packages** at 100% branch coverage (`fail_under = 100`). A set of `domain/*` modules are omitted because they are pre-PEV paths retained for `db/models.py` enum imports pending proper retirement; they do not enter the coverage gate. The PEV runtime, career skills, repositories, API, config, and `main` remain measured and must stay at 100%.
 
 ## Important Docs
 
