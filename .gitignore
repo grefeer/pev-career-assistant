@@ -67,8 +67,10 @@ tests/manual/_ten_url_eval_*.json
 # Tool run artifacts
 .codex-run/
 .claude/
+.agents/
 # Local isolated development worktrees
 .worktrees/
+.superpowers/
 
 .playwright-cli/
 .playwright-mcp/

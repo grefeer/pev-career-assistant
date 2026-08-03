@@ -320,12 +320,24 @@ def append_event(
     return event
 
 
-def list_events(db: Session, run_id: str) -> list[AgentEvent]:
-    """Return a stable chronological run trace."""
+def list_events(
+    db: Session, run_id: str, *, after_sequence: int = 0
+) -> list[AgentEvent]:
+    """Return durable events with ``sequence > after_sequence`` in chronological order.
+
+    ``after_sequence`` defaults to 0 (all events, since sequences start at 1) so
+    callers that want the whole trace are unaffected. The SSE poll loop passes
+    its cursor so each poll returns only newly appended events instead of
+    re-reading the whole run trace; ``ix_agent_events_run_sequence`` covers the
+    ``(run_id, sequence)`` predicate.
+    """
     return list(
         db.scalars(
             select(AgentEvent)
-            .where(AgentEvent.run_id == run_id)
+            .where(
+                AgentEvent.run_id == run_id,
+                AgentEvent.sequence > after_sequence,
+            )
             .order_by(AgentEvent.sequence.asc(), AgentEvent.id.asc())
         )
     )

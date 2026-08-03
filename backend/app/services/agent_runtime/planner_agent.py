@@ -78,6 +78,12 @@ class PlannerAgent:
             if isinstance(confirmed_facts, dict)
             else []
         )
+        # The plan/allowed-skills are immutable for this run, so the tool
+        # catalog is a loop-invariant projection (also memoized in ToolRegistry).
+        allowed_skills = frozenset(task.allowed_skills)
+        available_tools = self._tools.tool_catalog(
+            role=AgentRole.planner, allowed_skills=allowed_skills
+        )
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return PlannerResult(
@@ -97,10 +103,7 @@ class PlannerAgent:
                 state={
                     "goal": task.goal,
                     "allowed_skills": task.allowed_skills,
-                    "available_tools": self._tools.tool_catalog(
-                        role=AgentRole.planner,
-                        allowed_skills=frozenset(task.allowed_skills),
-                    ),
+                    "available_tools": available_tools,
                     "context": task.context,
                     "confirmed_profile_fact_fields": fact_fields,
                     "remaining_tool_calls": (

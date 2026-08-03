@@ -57,6 +57,16 @@ class VerifierAgent:
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
+        # Loop-invariant projections of the (immutable) plan/step/execution:
+        # serialize once instead of re-dumping and re-building the tool catalog
+        # every turn. The catalog is also memoized inside ToolRegistry.
+        plan_json = plan.model_dump(mode="json")
+        step_json = step.model_dump(mode="json")
+        execution_json = execution.model_dump(mode="json")
+        allowed_skills = frozenset(step.allowed_skills)
+        available_tools = self._tools.tool_catalog(
+            role=AgentRole.verifier, allowed_skills=allowed_skills
+        )
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return VerifierResult(
@@ -77,13 +87,10 @@ class VerifierAgent:
                 instruction=_VERIFIER_INSTRUCTION,
                 state={
                     "goal": task.goal,
-                    "plan": plan.model_dump(mode="json"),
-                    "step": step.model_dump(mode="json"),
-                    "available_tools": self._tools.tool_catalog(
-                        role=AgentRole.verifier,
-                        allowed_skills=frozenset(step.allowed_skills),
-                    ),
-                    "execution": execution.model_dump(mode="json"),
+                    "plan": plan_json,
+                    "step": step_json,
+                    "available_tools": available_tools,
+                    "execution": execution_json,
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None
                         else task.budget.max_tool_calls - len(observations)
@@ -121,7 +128,7 @@ class VerifierAgent:
                         name=decision.tool_name or "",
                         context=context,
                         payload=decision.tool_input,
-                        allowed_skills=frozenset(step.allowed_skills),
+                        allowed_skills=allowed_skills,
                     )
                 )
                 continue

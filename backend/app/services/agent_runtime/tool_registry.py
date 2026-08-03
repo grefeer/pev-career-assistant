@@ -33,6 +33,9 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._definitions: dict[str, ToolDefinition] = {}
+        self._catalog_cache: dict[
+            tuple[AgentRole, frozenset[str] | None], list[dict[str, Any]]
+        ] = {}
 
     def register(self, definition: ToolDefinition) -> None:
         """Register a unique, non-empty tool name before runtime startup."""
@@ -43,6 +46,10 @@ class ToolRegistry:
         if definition.name in self._definitions:
             raise ValueError(f"tool already registered: {definition.name}")
         self._definitions[definition.name] = definition
+        # A new tool changes every role/skill projection, so cached catalogs
+        # are now stale. Registration only happens at startup, so this clear
+        # is free in the steady state.
+        self._catalog_cache.clear()
 
     def tool_catalog(
         self,
@@ -50,7 +57,19 @@ class ToolRegistry:
         role: AgentRole,
         allowed_skills: frozenset[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Describe only the tools an autonomous role may safely request."""
+        """Describe only the tools an autonomous role may safely request.
+
+        The registry is immutable after startup (``register`` clears this
+        cache), so a catalog is a pure projection of ``(role, allowed_skills)``
+        and is memoized: the first call per view pays the Pydantic
+        ``model_json_schema`` cost; every later turn that requests the same
+        view (across steps and runs) reuses it. Callers must not mutate the
+        returned list -- it is the cached object shared across PEV turns.
+        """
+        cache_key: tuple[AgentRole, frozenset[str] | None] = (role, allowed_skills)
+        cached = self._catalog_cache.get(cache_key)
+        if cached is not None:
+            return cached
         catalog: list[dict[str, Any]] = []
         for definition in sorted(self._definitions.values(), key=lambda item: item.name):
             if role not in definition.allowed_roles:
@@ -70,6 +89,7 @@ class ToolRegistry:
                     "output_schema": definition.output_model.model_json_schema(),
                 }
             )
+        self._catalog_cache[cache_key] = catalog
         return catalog
 
     def invoke(

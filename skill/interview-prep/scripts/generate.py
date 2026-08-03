@@ -29,8 +29,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
+from pathlib import Path
 from typing import Any
 
 # ═══════════════════════════════════════════════════════════════════
@@ -83,63 +83,13 @@ def agent_version() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Tolerant LLM JSON extraction (mirrors backend.app.services.common.llm_json)
+# Tolerant LLM JSON extraction (shared from skill/_common/llm_json.py)
 # ═══════════════════════════════════════════════════════════════════
-
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def extract_content(response: Any) -> str:
-    """Coerce an LLM response (``.content`` str / list / plain str) into text."""
-    if response is None:
-        return ""
-    content = getattr(response, "content", response)
-    if isinstance(content, list):
-        return "".join(
-            block.get("text", "") if isinstance(block, dict) else str(block)
-            for block in content
-        )
-    return content if isinstance(content, str) else str(content)
-
-
-def _slice_between(text: str, open_ch: str, close_ch: str) -> str | None:
-    start = text.find(open_ch)
-    if start == -1:
-        return None
-    end = text.rfind(close_ch)
-    if end <= start:
-        return None
-    return text[start : end + 1]
-
-
-def try_parse_json(text: str) -> Any:
-    stripped = text.strip()
-    if not stripped:
-        return None
-    try:
-        return json.loads(stripped)
-    except (ValueError, TypeError):
-        pass
-    for open_ch, close_ch in (("{", "}"), ("[", "]")):
-        obj = _slice_between(stripped, open_ch, close_ch)
-        if obj is not None:
-            try:
-                return json.loads(obj)
-            except (ValueError, TypeError):
-                pass
-    return None
-
-
-def extract_json(content: str) -> Any:
-    """Best-effort first-JSON-value extraction (fenced, whole, or bracket slice)."""
-    match = _FENCE_RE.search(content)
-    candidates = [match.group(1)] if match else []
-    candidates.append(content)
-    for candidate in candidates:
-        result = try_parse_json(candidate)
-        if result is not None:
-            return result
-    return None
+# Resolve the shared lib from this file's location so the import works whether
+# the script is run as ``python skill/interview-prep/scripts/generate.py`` or
+# ``python scripts/generate.py`` with cwd=skill/interview-prep.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_common"))
+from llm_json import extract_content, extract_json  # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════

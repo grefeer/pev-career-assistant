@@ -79,6 +79,34 @@ def test_repository_persists_ordered_plan_turn_and_event_trace(db_session) -> No
     ]
 
 
+def test_repository_list_events_filters_by_sequence_cursor(db_session) -> None:
+    """An SSE poll cursor returns only events appended after it, in order."""
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    run = agent_runtime.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    agent_runtime.append_event(
+        db_session, run_id=run.id, event_type="run_started", payload_json={},
+    )
+    agent_runtime.append_event(
+        db_session, run_id=run.id, event_type="plan_created", payload_json={},
+    )
+    agent_runtime.append_event(
+        db_session, run_id=run.id, event_type="step_started", payload_json={},
+    )
+    db_session.commit()
+
+    # default cursor (0) replays the whole trace; a durable cursor returns only
+    # events appended after it, backed by ix_agent_events_run_sequence.
+    assert [e.sequence for e in agent_runtime.list_events(db_session, run.id)] == [1, 2, 3]
+    assert [e.sequence for e in agent_runtime.list_events(db_session, run.id, after_sequence=1)] == [2, 3]
+    assert [e.sequence for e in agent_runtime.list_events(db_session, run.id, after_sequence=2)] == [3]
+    assert agent_runtime.list_events(db_session, run.id, after_sequence=3) == []
+
+
 def test_repository_owner_lookup_does_not_leak_another_users_run(db_session) -> None:
     """Owner filtering is a repository boundary, not an optional route choice."""
     first_user = _user("user-a", "user-a@example.test")

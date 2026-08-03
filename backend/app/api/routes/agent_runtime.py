@@ -296,7 +296,7 @@ def stream_agent_events(
     cursor = _effective_event_cursor(after_sequence, last_event_id)
     try:
         initial_events = service.list_events(
-            db, user_id=current_user.id, run_id=run_id
+            db, user_id=current_user.id, run_id=run_id, after_sequence=cursor
         )
     except AgentRunNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail={"code": "not_found"}) from None
@@ -309,13 +309,11 @@ def stream_agent_events(
             if events is None:
                 try:
                     events = service.list_events(
-                        db, user_id=current_user.id, run_id=run_id
+                        db, user_id=current_user.id, run_id=run_id, after_sequence=cursor
                     )
                 except AgentRunNotFoundError:
                     return
             for event in events:
-                if event.sequence <= cursor:
-                    continue
                 cursor = event.sequence
                 yield _sse_event(event)
             if not follow:

@@ -86,8 +86,8 @@ The Human message is the serialized input payload, augmented with
 
 ## The tolerant JSON parse
 
-LLMs do not always return clean JSON. `generate.py` mirrors
-`backend.app.services.common.llm_json` and tries, in order:
+LLMs do not always return clean JSON. `generate.py` imports the shared
+`skill/_common/llm_json.py` helpers and tries, in order:
 
 1. A fenced ```json ... ``` block (regex search).
 2. The whole content.

@@ -95,6 +95,19 @@ class ExecutorAgent:
         last_tool_name: str | None = None
         last_tool_input: dict[str, Any] | None = None
         last_tool_succeeded = False
+        # Loop-invariant projections of the (immutable) plan/step: serialize
+        # once instead of re-dumping and re-building the tool catalog every
+        # turn. The catalog is also memoized inside ToolRegistry.
+        plan_json = plan.model_dump(mode="json")
+        step_json = step.model_dump(mode="json")
+        allowed_skills = frozenset(step.allowed_skills)
+        available_tools = self._tools.tool_catalog(
+            role=AgentRole.executor, allowed_skills=allowed_skills
+        )
+        prior_observations_for_decision = [
+            _observation_for_decision(observation)
+            for observation in (prior_observations or [])
+        ]
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return ExecutorResult(
@@ -126,20 +139,14 @@ class ExecutorAgent:
                         if turn_budget is not None
                         else task.budget.max_agent_turns - _turn - 1
                     ),
-                    "plan": plan.model_dump(mode="json"),
-                    "step": step.model_dump(mode="json"),
-                    "available_tools": self._tools.tool_catalog(
-                        role=AgentRole.executor,
-                        allowed_skills=frozenset(step.allowed_skills),
-                    ),
+                    "plan": plan_json,
+                    "step": step_json,
+                    "available_tools": available_tools,
                     "observations": [
                         _observation_for_decision(observation)
                         for observation in observations
                     ],
-                    "prior_observations": [
-                        _observation_for_decision(observation)
-                        for observation in (prior_observations or [])
-                    ],
+                    "prior_observations": prior_observations_for_decision,
                     "verifier_feedback": task.context.get("verifier_feedback", []),
                 },
                 response_model=ExecutorDecision,
@@ -189,7 +196,7 @@ class ExecutorAgent:
                     name=decision.tool_name or "",
                     context=tool_context,
                     payload=decision.tool_input,
-                    allowed_skills=frozenset(step.allowed_skills),
+                    allowed_skills=allowed_skills,
                 )
                 observations.append(observation)
                 tool_context = _with_observed_page(tool_context, observation)

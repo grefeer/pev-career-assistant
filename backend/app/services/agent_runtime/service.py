@@ -204,11 +204,22 @@ class AgentRunService:
         return run_repository.list_runs_for_owner(db, user_id, limit=limit)
 
     def list_events(
-        self, db: Session, *, user_id: str, run_id: str
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        run_id: str,
+        after_sequence: int = 0,
     ) -> list[AgentEvent]:
-        """Return a trace only after an owner-scoped existence check."""
+        """Return events after a cursor, only after an owner-scoped check.
+
+        ``after_sequence`` is forwarded to the repository so an SSE poll returns
+        only newly appended events. The owner check stays per-call: it is a
+        single indexed lookup and preserves the service-layer ownership
+        invariant for every read.
+        """
         self.get_run(db, user_id=user_id, run_id=run_id)
-        return run_repository.list_events(db, run_id)
+        return run_repository.list_events(db, run_id, after_sequence=after_sequence)
 
     def list_plans(
         self, db: Session, *, user_id: str, run_id: str

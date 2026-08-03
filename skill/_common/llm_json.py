@@ -1,11 +1,20 @@
-"""Best-effort LLM JSON extraction shared by agent-driven skills.
+"""Best-effort LLM JSON extraction shared by agent-driven skill scripts.
 
-Agent-driven skills (resume tailoring, interview prep, ...) prompt a DeepSeek LLM
-for structured JSON.  LLMs occasionally wrap the payload in `` ```json ``` ``
-fences or surround it with prose, so extraction must be tolerant before
-``json.loads``.  The helpers here are deliberately generic (no skill-specific
-shape knowledge); each skill owns the coercion of the parsed value into its own
-contract (a diffs list, a prep-kit content object, ...).
+Each agent-driven skill (``resume-tailoring``, ``interview-prep``, ...) prompts a
+DeepSeek LLM for structured JSON.  LLMs occasionally wrap the payload in
+`` ```json ``` `` fences or surround it with prose, so extraction must be
+tolerant before ``json.loads``.  The helpers here are deliberately generic (no
+skill-specific shape knowledge); each skill owns the coercion of the parsed
+value into its own contract (a diffs list, a prep-kit content object, ...).
+
+This is the single source for the skill-side scripts.  It used to be mirrored as
+inline copies in each ``scripts/generate.py`` (and as the now-removed backend
+``backend.app.services.common.llm_json``); both have been consolidated here.
+
+A skill script imports it by resolving this file's location from its own
+``__file__`` (see ``scripts/generate.py``) so the import works whether the script
+is run as ``python skill/<skill>/scripts/generate.py`` or
+``python scripts/generate.py`` with ``cwd=skill/<skill>``.
 
 Public surface:
 

@@ -234,7 +234,6 @@ def test_agent_event_stream_replays_only_owner_safe_events_after_a_cursor() -> N
     service = MagicMock()
     now = datetime(2026, 8, 1, tzinfo=timezone.utc)
     service.list_events.return_value = [
-        SimpleNamespace(sequence=1, event_type="run_started", payload_json={"safe": True}, created_at=now),
         SimpleNamespace(sequence=2, event_type="plan_created", payload_json={"revision": 1}, created_at=now),
     ]
     app = _build_app(service)
@@ -250,7 +249,11 @@ def test_agent_event_stream_replays_only_owner_safe_events_after_a_cursor() -> N
     assert "event: plan_created" in response.text
     assert '"revision":1' in response.text
     assert "run_started" not in response.text
-    assert service.list_events.call_args.kwargs == {"user_id": "user-a", "run_id": "run-1"}
+    assert service.list_events.call_args.kwargs == {
+        "user_id": "user-a",
+        "run_id": "run-1",
+        "after_sequence": 1,
+    }
 
 
 def test_agent_event_stream_honors_last_event_id_and_hides_missing_runs() -> None:
