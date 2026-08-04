@@ -58,6 +58,7 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   ├── unit/                    # Primary deterministic/unit suite (100% branch coverage)
 │   ├── integration/             # Integration + live smoke tests
 │   ├── e2e/                     # E2E Playwright + fixture tests
+│   ├── question/                # 20-question PEV eval harness (eval_runner, merge/compare rounds)
 │   └── manual/                  # Standalone smoke/diagnostic scripts (excluded from pytest)
 ├── alembic/versions/            # Database migrations (0001 -> 0019)
 ├── scripts/                     # Admin/dev scripts (create_admin, seed_strategies, fixtures, etc.)
@@ -104,6 +105,9 @@ Invoke-RestMethod http://127.0.0.1:18000/api/health/ready
 
 # Live PEV end-to-end (requires env vars + LLM; resume PDF read in-memory only)
 $env:RUN_LIVE_PEV_E2E='1'; .\.venv\Scripts\python.exe -m pytest tests/integration/test_pev_live_end_to_end.py -v
+
+# 20-question eval loop (real DeepSeek + public fetch; per-question JSON under --out-dir)
+.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q001 Q002 --out-dir tests/question/eval_results/round_1
 ```
 
 ### Database
@@ -173,7 +177,8 @@ Key invariants enforced by the harness (not the agents):
 - **Evidence-bound tools**: only tool-produced public evidence (with `source_url` + `content_hash`) is persisted; model-proposed URIs are never trusted.
 - **Budgets**: `AgentBudget` (turns / tool_calls / replans / wall-clock), `ToolCallBudget`, `AgentTurnBudget` are hard ceilings enforced by the harness. `build_adaptive_agent_budget` scales turns by skill count.
 - **Tool exceptions never leak**: `ToolRegistry.invoke` converts any failure into a `ToolObservation(status=failed, error_code=...)`.
-- **Duplicate-call dedup**: a consecutive identical tool call after a success returns `duplicate_tool_call` without consuming budget (prevents executor thrash).
+- **Duplicate-call dedup + stall breaker**: a consecutive identical tool call after a success returns `duplicate_tool_call` without consuming budget (prevents executor thrash); after 3 consecutive no-progress decisions (deduped re-calls or a blocked public search) the Executor hands the step to the human (`needs_user`) instead of burning turns on a stuck loop.
+- **Safe degradation to `waiting_user`**: an `invalid_model_response` from any agent, or a Verifier `RETRY_EXECUTOR` past `max_replans`, ends the run as recoverable `waiting_user` with a human-readable question (never a crash or hard failure); `resume()`/`recover()` continue in the remaining budget.
 - **MySQL authority**: Run/Plan/Step/Turn/Event/Artifact persist to MySQL; SSE polls MySQL every 1s; Redis is non-authoritative.
 - **Replan budget survives recovery**: `recover()`/`resume()` resume `replans` from the persisted plan count (`max(0, revision - 1)`), so a crashed run cannot re-spend budget already consumed on replanning.
 - **Incremental decision-state projection**: each agent appends a bounded projection of a tool observation once per call (visible_text excerpted to 1,200 chars; pages/details capped at 10) and reuses the accumulated list per turn, so decision context grows O(turns) not O(turns²) (shared logic in `observation_projection.py`).

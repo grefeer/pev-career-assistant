@@ -107,6 +107,13 @@ class FailingGateway:
         raise AgentModelGatewayError("model_request_failed")
 
 
+class InvalidModelGateway:
+    """Provider double whose completions never parse into the response model."""
+
+    def decide(self, **_kwargs):  # noqa: ANN003
+        raise AgentModelGatewayError("invalid_model_response")
+
+
 class CrashAfterFirstExecutorDecisionGateway:
     """Simulate process loss after a persisted Executor decision checkpoint."""
 
@@ -555,7 +562,7 @@ def test_runtime_persists_an_executor_input_request_as_waiting_for_user(db_sessi
 @pytest.mark.parametrize(
     ("verdict", "feedback", "expected_status", "expected_error"),
     [
-        ("RETRY_EXECUTOR", "补充来源", RunStatus.failed, "executor_retry_budget_exhausted"),
+        ("RETRY_EXECUTOR", "补充来源", RunStatus.waiting_user, None),
         ("NEED_USER", "请确认城市", RunStatus.waiting_user, None),
     ],
 )
@@ -585,6 +592,42 @@ def test_runtime_routes_verifier_nonpass_outcomes_to_safe_terminal_state(
     )
     assert result.status is expected_status
     assert result.error_code == expected_error
+
+
+def test_runtime_retry_exhaustion_hands_a_stuck_step_to_the_human(db_session) -> None:
+    """Repeated verifier RETRY after the retry budget routes to waiting_user with feedback."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=True,
+        budget=AgentBudget(max_agent_turns=4, max_tool_calls=4, max_replans=1),
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
+        ],
+        AgentRole.verifier: [
+            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少来源标注"},
+            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少来源标注"},
+        ],
+    })
+    result = _runtime_for_gateway(gateway)._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    assert step.error_code == "need_user"
+    assert "缺少来源标注" in result.summary
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "run_needs_user"
 
 
 def test_runtime_private_terminal_helpers_reject_disappeared_runs_and_persist_waiting_state(db_session) -> None:
@@ -1272,6 +1315,88 @@ def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session
     assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
     events = run_repository.list_events(db_session, result.run_id)
     assert events[-1].payload_json == {"error_code": "model_request_failed"}
+
+
+def test_runtime_degrades_planner_invalid_model_to_waiting_for_user(db_session) -> None:
+    """Persistently invalid planner output waits for a human retry, never fails the run."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = InvalidModelGateway()
+    registry = ToolRegistry()
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"]),
+    )
+
+    assert (result.status, result.error_code) == (RunStatus.waiting_user, None)
+    assert "无法生成执行计划" in (result.summary or "")
+    events = run_repository.list_events(db_session, result.run_id)
+    assert events[-1].event_type == "planner_needs_user"
+
+
+def test_runtime_degrades_executor_invalid_model_to_waiting_for_user(db_session) -> None:
+    """Invalid executor completions pause the step for a human retry instead of failing."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+
+    result = _runtime_for_gateway(InvalidModelGateway())._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+
+    assert (result.status, result.error_code) == (RunStatus.waiting_user, None)
+    assert step.error_code == "need_user"
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "run_needs_user"
+
+
+def test_runtime_degrades_verifier_invalid_model_to_waiting_for_user(db_session) -> None:
+    """A verifier that cannot parse its own output routes the step to a human check."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=True
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.verifier: [],
+    })
+    runtime = _runtime_for_gateway(gateway)
+    runtime._verifier = VerifierAgent(gateway=InvalidModelGateway(), tools=ToolRegistry())
+
+    result = runtime._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+
+    assert (result.status, result.error_code) == (RunStatus.waiting_user, None)
+    assert "人工确认" in (result.summary or "")
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "run_needs_user"
 
 
 def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_session) -> None:

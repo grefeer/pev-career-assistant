@@ -41,7 +41,9 @@ _EXECUTOR_INSTRUCTION = (
     "re-fetch a URL that is already represented by a successful observation. "
     "Once all supplied candidates have been observed, choose extraction, matching, "
     "tailoring, planning, verification, or a truthful limitation; do not keep "
-    "fetching pages. "
+    "fetching pages. If the observed candidates contain no JD matching the goal, "
+    "do not fetch or expand to other pages: state the limitation and ask the user "
+    "for a more specific job-page URL. "
     "When candidate_urls is non-empty, do not call public search: the candidate "
     "set is already user-provided evidence to process. "
     "When multiple observed public-page artifacts need detailed JD normalization, "
@@ -69,8 +71,19 @@ _EXECUTOR_INSTRUCTION = (
     "A duplicate_tool_call observation means you just re-issued an identical "
     "tool call that already succeeded: that result is already in observations. "
     "Move to the next distinct action (extract, match, tailor, plan, verify, or "
-    "complete) instead of repeating the same call."
+    "complete) instead of repeating the same call. A repeated fetch or extract "
+    "cannot improve the evidence: if the observed pages contain no usable JD, "
+    "ask the user instead of re-running capture tools. If verifier_feedback "
+    "names a deliverable that this step's permitted Skills cannot produce, "
+    "state that limitation and ask the user for the specific missing input "
+    "rather than re-running capture tools."
 )
+
+# The executor is allowed a few identical re-issues before the harness
+# concludes the loop is stalled. Consecutive no-progress decisions (deduped
+# re-calls or blocked public search) consume turns but never produce new
+# evidence; after this cap the agent stops and hands control to the human.
+_MAX_CONSECUTIVE_STALLS = 3
 
 
 class ExecutorAgent:
@@ -96,9 +109,14 @@ class ExecutorAgent:
         """Execute a step without precomputing its tool sequence in the harness."""
         observations: list[ToolObservation] = []
         tool_context = context
-        last_tool_name: str | None = None
-        last_tool_input: dict[str, Any] | None = None
-        last_tool_succeeded = False
+        # Every (tool_name, tool_input) pair that already succeeded in this
+        # invocation. Tracked separately because ToolObservation carries no
+        # input; only succeeded calls are recorded so a failed call may be
+        # legitimately retried later (including after other calls).
+        succeeded_calls: list[tuple[str, dict[str, Any]]] = []
+        # Consecutive no-progress decisions (deduped re-calls / blocked search)
+        # reset on any real tool execution, complete, or needs_user.
+        consecutive_stalls = 0
         # Loop-invariant projections of the (immutable) plan/step: serialize
         # once instead of re-dumping and re-building the tool catalog every
         # turn. The catalog is also memoized inside ToolRegistry.
@@ -170,6 +188,16 @@ class ExecutorAgent:
                     decision.tool_name == "search-public-job-pages"
                     and _has_candidate_urls(task)
                 ):
+                    consecutive_stalls += 1
+                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=(
+                                "连续尝试无效工具调用仍未取得进展。请人工确认当前"
+                                "已收集的岗位产出，或提供更精确的岗位页面后重试。"
+                            ),
+                        )
                     record_observation(
                         observations,
                         observations_for_decision,
@@ -180,11 +208,21 @@ class ExecutorAgent:
                         ),
                     )
                     continue
-                if (
-                    last_tool_succeeded
-                    and decision.tool_name == last_tool_name
-                    and decision.tool_input == last_tool_input
+                if any(
+                    decision.tool_name == name and decision.tool_input == payload
+                    for name, payload in succeeded_calls
                 ):
+                    consecutive_stalls += 1
+                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=(
+                                "连续重复调用同一工具未产生新结果，无法继续自动完成"
+                                "该步骤。请人工确认当前产出，或补充缺失的岗位页面/"
+                                "信息后重试。"
+                            ),
+                        )
                     record_observation(
                         observations,
                         observations_for_decision,
@@ -195,6 +233,7 @@ class ExecutorAgent:
                         ),
                     )
                     continue
+                consecutive_stalls = 0
                 if tool_budget is not None and not tool_budget.try_consume():
                     return ExecutorResult(
                         status="failed",
@@ -211,9 +250,8 @@ class ExecutorAgent:
                 )
                 record_observation(observations, observations_for_decision, observation)
                 tool_context = _with_observed_page(tool_context, observation)
-                last_tool_name = decision.tool_name
-                last_tool_input = decision.tool_input
-                last_tool_succeeded = observation.status == "succeeded"
+                if observation.status == "succeeded":
+                    succeeded_calls.append((decision.tool_name, decision.tool_input))
                 continue
             if decision.action == "complete":
                 return ExecutorResult(

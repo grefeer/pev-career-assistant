@@ -26,6 +26,7 @@ from backend.app.services.agent_runtime.schemas import (
     ExecutorResult,
     PlanStep,
     PlannerResult,
+    VerifierResult,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
@@ -127,6 +128,8 @@ class AgentRuntime:
                     deadline=deadline,
                 )
             except AgentModelGatewayError as error:
+                if error.code == "invalid_model_response":
+                    return self._finish_planner_invalid_model(db, run.id, run)
                 return self._fail_run(db, run.id, error.code)
             if planner_result.status != "planned" or planner_result.plan is None:
                 return self._finish_planner_non_plan(db, run.id, run, planner_result)
@@ -318,6 +321,16 @@ class AgentRuntime:
                     prior_observations=prior_observations,
                 )
             except AgentModelGatewayError as error:
+                if error.code == "invalid_model_response":
+                    # A persistently invalid model completion is a transport
+                    # degradation, not a business failure: wait for a human
+                    # retry instead of failing the whole run.
+                    return self._wait_for_user(
+                        db,
+                        run_id,
+                        persisted_step,
+                        "模型输出格式异常，无法继续执行该步骤。请补充信息或重试。",
+                    )
                 return self._fail_step(db, run_id, persisted_step, error.code)
             self._record_failed_executor_observations(
                 db, run_id, persisted_step, execution
@@ -377,13 +390,21 @@ class AgentRuntime:
                     deadline=deadline,
                 )
             except AgentModelGatewayError as error:
-                return self._fail_step(
-                    db,
-                    run_id,
-                    persisted_step,
-                    error.code,
-                    output_artifact_refs=execution.artifact_refs,
-                )
+                if error.code == "invalid_model_response":
+                    # The verifier cannot produce a machine decision; route the
+                    # step to a human check rather than failing the run.
+                    verification = VerifierResult(
+                        decision=VerificationDecision.NEED_USER,
+                        feedback="核验模型输出格式异常，无法独立核验该步骤产出，请人工确认。",
+                    )
+                else:
+                    return self._fail_step(
+                        db,
+                        run_id,
+                        persisted_step,
+                        error.code,
+                        output_artifact_refs=execution.artifact_refs,
+                    )
             if verification.error_code:
                 return self._fail_step(
                     db,
@@ -443,11 +464,16 @@ class AgentRuntime:
                         user_id=context.user_id, run_id=run_id, task=execution_task
                     )
                     continue
-                return self._fail_step(
+                # Same-step retries cannot satisfy the verifier: more retries
+                # would only burn turns on a stuck loop, so hand the step to
+                # the human. The run stays recoverable (waiting_user -> resume)
+                # instead of failing outright, and the verifier feedback tells
+                # the human what the agents could not reconcile.
+                return self._wait_for_user(
                     db,
                     run_id,
                     persisted_step,
-                    "executor_retry_budget_exhausted",
+                    "多次重试后仍未通过核验：" + verification.feedback + "。请人工确认产出，或补充缺失信息后重试。",
                     output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.NEED_USER:
@@ -803,6 +829,25 @@ class AgentRuntime:
             payload_json={"error_code": error_code},
         )
         return AgentRunResult(run_id, RunStatus.failed, None, error_code)
+
+    def _finish_planner_invalid_model(
+        self,
+        db: Session,
+        run_id: str,
+        run: AgentRun,
+    ) -> AgentRunResult:
+        """A planner with persistently invalid output cannot plan safely: wait for a retry."""
+        question = "模型输出格式异常，无法生成执行计划。请重试，或补充岗位/条件信息后重新发起。"
+        run_repository.finish_run(
+            db, run, status=RunStatus.waiting_user, final_summary=question
+        )
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type="planner_needs_user",
+            payload_json={"question": question},
+        )
+        return AgentRunResult(run_id, RunStatus.waiting_user, question)
 
     def _wait_for_user(
         self,

@@ -106,7 +106,7 @@ Key files: `runtime.py` (orchestrator), `planner_agent.py` / `executor_agent.py`
 
 ### Model Gateway Notes
 
-- DeepSeek `deepseek-v4-*` models must use `temperature=0`, `extra_body={"thinking":{"type":"disabled"}}`, and `prefer_local_json_validation=True` (schema-first, then local JSON retry, then `invalid_model_response`).
+- DeepSeek `deepseek-v4-*` models must use `temperature=0`, `extra_body={"thinking":{"type":"disabled"}}`, and `prefer_local_json_validation=True` (schema-first, then local JSON retry, then `invalid_model_response`). A final `invalid_model_response` degrades the run to `waiting_user` (recoverable) — it does not fail the run.
 - The model key is read only from the environment (`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`); never hardcode or log it.
 
 ### Database Changes
@@ -173,11 +173,11 @@ pytestmark = pytest.mark.skipif(
 
 3. **Evidence-bound tools**: Only tool-produced evidence (with `source_url` + `content_hash`) is persisted. Never trust a model-proposed URI.
 
-4. **Duplicate tool calls**: A consecutive identical call after a success returns `duplicate_tool_call` without consuming budget. If a test expects a retry, make the first call fail (the dedup only suppresses repeats after success).
+4. **Duplicate tool calls**: A consecutive identical call after a success returns `duplicate_tool_call` without consuming budget. If a test expects a retry, make the first call fail (the dedup only suppresses repeats after success). Three consecutive no-progress decisions (deduped re-calls or a blocked search) are a stall: the executor stops and asks the user (`needs_user`, `_MAX_CONSECUTIVE_STALLS` in `executor_agent.py`) rather than burning turns.
 
 5. **Opt-in test gates**: Tests requiring external services use exact env-var names (`RUN_LIVE_PEV_E2E`, `ALLOW_DESTRUCTIVE_MYSQL_TESTS`). Don't rename them.
 
-6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `executor_retry_budget_exhausted`, etc.); agents cannot exceed them. `recover()`/`resume()` resume the replan count from the persisted plan count (`max(0, revision - 1)`), so a crashed run can't re-spend budget already used on replanning.
+6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `tool_budget_exhausted`, etc.); agents cannot exceed them. A verifier that keeps returning `RETRY_EXECUTOR` past the retry cap is a stuck loop, not a failure: the harness routes the step to `waiting_user` with the verifier feedback as the question (human-in-the-loop recovery), instead of failing the run. `recover()`/`resume()` resume the replan count from the persisted plan count (`max(0, revision - 1)`), so a crashed run can't re-spend budget already used on replanning.
 
 7. **Frontend dirty state**: Admin/profile forms track dirty state. Navigating away shows a confirmation dialog. Don't disable this.
 

@@ -87,3 +87,4 @@ skill/tmp/
 nul
 var/
 settings.json
+tests/question/eval_results/

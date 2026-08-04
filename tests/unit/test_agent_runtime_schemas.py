@@ -84,6 +84,82 @@ def test_execution_plan_keeps_a_simple_request_as_a_real_one_step_plan() -> None
     assert plan.complexity is ComplexityLevel.L1
 
 
+def test_execution_plan_rejects_discovery_only_plan_for_collected_goal_with_candidates() -> None:
+    """A goal over already-collected jobs must not plan re-capture of the same URLs."""
+    task = AgentTaskRequest(
+        goal="我已收集的候选岗位，帮我匹配最佳岗位",
+        allowed_skills=["job-discovery", "job-matching"],
+        context={"candidate_urls": ["https://www.liepin.com/zpjava/"]},
+    )
+    with pytest.raises(ValidationError, match="deliverable"):
+        ExecutionPlan(
+            task=task,
+            created_by=AgentRole.planner,
+            complexity=ComplexityLevel.L2,
+            success_criteria=["返回排名"],
+            steps=[
+                PlanStep(
+                    step_id="discover",
+                    objective="捕获候选岗位页面",
+                    allowed_skills=["job-discovery"],
+                )
+            ],
+        )
+
+
+def test_execution_plan_allows_deliverable_steps_after_discovery_for_collected_goal() -> None:
+    """Matching/tailoring/planning steps make a collected-goal plan executable."""
+    task = AgentTaskRequest(
+        goal="最近收集的岗位，帮我做简历定制",
+        allowed_skills=["job-discovery", "resume-tailoring"],
+        context={"candidate_urls": ["https://www.liepin.com/zpjava/"]},
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["输出定制后的简历修改"],
+        steps=[
+            PlanStep(
+                step_id="discover",
+                objective="捕获候选岗位页面",
+                allowed_skills=["job-discovery"],
+            ),
+            PlanStep(
+                step_id="tailor",
+                objective="按岗位定制简历",
+                allowed_skills=["resume-tailoring"],
+            ),
+        ],
+    )
+
+    assert len(plan.steps) == 2
+
+
+def test_execution_plan_allows_discovery_only_for_uncollected_goals() -> None:
+    """Without an already-collected marker, a discovery-only plan stays legal."""
+    task = AgentTaskRequest(
+        goal="找后端 Java 开发岗位",
+        allowed_skills=["job-discovery"],
+        context={"candidate_urls": ["https://www.liepin.com/zpjava/"]},
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["返回岗位来源"],
+        steps=[
+            PlanStep(
+                step_id="discover",
+                objective="从公开来源提取岗位",
+                allowed_skills=["job-discovery"],
+            )
+        ],
+    )
+
+    assert plan.steps[0].step_id == "discover"
+
+
 def test_task_private_context_is_excluded_from_persistable_dumps() -> None:
     """Confirmed resume facts must never be copied into run or plan audit JSON."""
     task = AgentTaskRequest(

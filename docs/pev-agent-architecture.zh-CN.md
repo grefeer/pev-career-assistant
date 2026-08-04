@@ -283,7 +283,7 @@ sequenceDiagram
             RT->>E: 重跑 (verifier_feedback + prior_observations)
             Note over RT,E: 同一 step 继续, 保留前次观察
         else RETRY_EXECUTOR (超限)
-            RT->>DB: fail_step(executor_retry_budget_exhausted)
+            RT->>DB: run=waiting_user (携带核验反馈, 人工确认可恢复)
         else REPLAN
             RT->>DB: step skipped=replan_required
             Note over RT: break → 重新走 Planner

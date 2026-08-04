@@ -102,6 +102,12 @@ class PlanStep(BaseModel):
         return cleaned
 
 
+# Goal phrasings over the user's already-collected jobs. Marker-keyed on
+# purpose: a discovery goal for a named site/portal carries no such marker and
+# stays legal as discovery-only.
+_ALREADY_COLLECTED_MARKERS = ("已收集", "最近收集", "候选岗位", "这些岗位", "收集的岗位")
+
+
 class ExecutionPlan(BaseModel):
     """Structured Planner result constrained by the run's original authority."""
 
@@ -134,7 +140,35 @@ class ExecutionPlan(BaseModel):
             if forbidden:
                 names = ", ".join(sorted(forbidden))
                 raise ValueError(f"plan Skill is not allowed for this task: {names}")
+        self._validate_collected_goal_deliverables()
         return self
+
+    def _validate_collected_goal_deliverables(self) -> None:
+        """Reject discovery-only plans for goals over user-supplied candidate URLs.
+
+        A goal phrased over already-collected jobs (已收集/最近收集/候选岗位) with
+        non-empty candidate_urls must produce at least one deliverable step: the
+        Executor's open-web search is hard-blocked while candidate URLs exist, so
+        a discovery-only plan can only re-capture the same pages and burn the
+        turn budget without ever producing the requested ranking/tailoring/plan.
+        """
+        candidate_urls = self.task.context.get("candidate_urls")
+        goal = self.task.goal or ""
+        if not (
+            isinstance(candidate_urls, list)
+            and any(isinstance(url, str) and url.strip() for url in candidate_urls)
+        ):
+            return
+        if not any(marker in goal for marker in _ALREADY_COLLECTED_MARKERS):
+            return
+        has_deliverable_step = any(
+            "job-discovery" not in set(step.allowed_skills) for step in self.steps
+        )
+        if not has_deliverable_step:
+            raise ValueError(
+                "already-collected goals with candidate URLs require a deliverable "
+                "step beyond job-discovery"
+            )
 
 
 class ToolObservation(BaseModel):

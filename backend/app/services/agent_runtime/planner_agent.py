@@ -50,7 +50,16 @@ _PLANNER_INSTRUCTION = (
     "When confirmed profile fact fields are supplied, those facts already exist "
     "on the server: plan the matching/tailoring work instead of asking the user "
     "to upload the same resume again. The Executor can inspect the fact values "
-    "through its private, scoped context."
+    "through its private, scoped context. "
+    "When context.candidate_urls is a non-empty list, those URLs are "
+    "already-collected candidate job pages supplied by the user. Plan an "
+    "evidence-capture step scoped to exactly those URLs (the Executor must not "
+    "search the open web; search is hard-blocked while candidate URLs exist) "
+    "followed by one separate step per requested deliverable (job-matching, "
+    "resume-tailoring, career-planning). Never emit a plan whose only step is "
+    "job-discovery when the goal asks for ranking, matching, tailoring, or "
+    "planning: every requested deliverable must have its own step, or the "
+    "Executor has no tool with which to produce it."
 )
 
 
