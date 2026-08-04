@@ -143,26 +143,25 @@ class LangChainModelGateway:
         role: AgentRole,
         response_model: type[ResponseT],
     ) -> ResponseT:
-        """Allow one malformed-completion retry for a JSON-only provider."""
-        try:
-            return self._decide_with_local_json_validation(
-                messages=messages,
-                role=role,
-                response_model=response_model,
-            )
-        except AgentModelGatewayError as first_error:
-            if first_error.code == "model_request_failed":
-                raise
+        """Allow two malformed-completion retries for a JSON-only provider.
+
+        This matches the ordinary-JSON recovery budget of the structured-output
+        path (three total attempts); each attempt is a bounded transport
+        recovery, never an Agent decision or a tool-selection retry.
+        """
+        last_error: AgentModelGatewayError | None = None
+        for _ in range(3):
             try:
                 return self._decide_with_local_json_validation(
                     messages=messages,
                     role=role,
                     response_model=response_model,
                 )
-            except AgentModelGatewayError as retry_error:
-                if retry_error.code == "model_request_failed":
-                    raise retry_error from first_error
-                raise AgentModelGatewayError("invalid_model_response") from first_error
+            except AgentModelGatewayError as error:
+                if error.code == "model_request_failed":
+                    raise
+                last_error = error
+        raise AgentModelGatewayError("invalid_model_response") from last_error
 
     def _decide_with_local_json_validation(
         self,

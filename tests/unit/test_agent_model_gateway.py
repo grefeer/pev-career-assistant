@@ -297,12 +297,41 @@ def test_gateway_retries_one_malformed_preferred_local_json_completion() -> None
     assert model.responses == []
 
 
+def test_gateway_retries_two_malformed_preferred_local_json_completions() -> None:
+    model = SequencedLocalJsonModel([
+        '{"action":"not-valid"}',
+        '{"action":"not-valid"}',
+        '{"action":"need_user","user_question":"请确认城市。"}',
+    ])
+
+    result = LangChainModelGateway(model, prefer_local_json_validation=True).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert model.responses == []
+
+
 @pytest.mark.parametrize(
     "responses, error_code",
     [
         ([RuntimeError("provider down")], "model_request_failed"),
         (['{"action":"not-valid"}', RuntimeError("provider down")], "model_request_failed"),
-        (['{"action":"not-valid"}', '{"action":"not-valid"}'], "invalid_model_response"),
+        (
+            ['{"action":"not-valid"}', '{"action":"not-valid"}', RuntimeError("provider down")],
+            "model_request_failed",
+        ),
+        (
+            [
+                '{"action":"not-valid"}',
+                '{"action":"not-valid"}',
+                '{"action":"not-valid"}',
+            ],
+            "invalid_model_response",
+        ),
     ],
 )
 def test_gateway_fails_safely_when_preferred_local_json_retry_cannot_recover(
