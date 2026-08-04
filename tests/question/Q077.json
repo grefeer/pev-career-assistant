@@ -1,0 +1,22 @@
+{
+  "id": "Q077",
+  "question": "根据 JD 内容，准备AI 应用开发工程师（应届生）岗位的自我介绍与项目阐述思路。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "career-planning"
+    ],
+    "site_types": [
+      "campus"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

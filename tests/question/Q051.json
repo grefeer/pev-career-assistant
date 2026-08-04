@@ -1,0 +1,22 @@
+{
+  "id": "Q051",
+  "question": "针对这个岗位，优化我简历中的技能描述，对齐 JD 要求。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

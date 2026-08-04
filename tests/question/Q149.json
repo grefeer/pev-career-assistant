@@ -1,0 +1,23 @@
+{
+  "id": "Q149",
+  "question": "收集V2EX 酷工作节点最近7天的AI 应用开发工程师（应届生）岗位，并规划面试准备。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "career-planning"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

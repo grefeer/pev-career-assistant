@@ -1,0 +1,22 @@
+{
+  "id": "Q093",
+  "question": "为投递“大模型应用开发工程师”，优化我的简历自我评价与项目部分。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,24 @@
+{
+  "id": "Q066",
+  "question": "适合我的Java 后端开发工程师（3 年经验）岗位有哪些（智联招聘，最近1天）？排序并给出每个岗位的面试要点。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

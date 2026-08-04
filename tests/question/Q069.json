@@ -1,0 +1,22 @@
+{
+  "id": "Q069",
+  "question": "这些岗位里哪些和我期望的北京与AI 应用开发工程师（应届生）方向一致？",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-matching"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

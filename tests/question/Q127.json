@@ -1,0 +1,24 @@
+{
+  "id": "Q127",
+  "question": "在拉勾网找一个适合我的前端开发工程师（2 年经验）岗位（最近3天），定制简历+面试准备。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

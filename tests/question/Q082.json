@@ -1,0 +1,25 @@
+{
+  "id": "Q082",
+  "question": "最近1天从字节跳动的官方招聘页（jobs.bytedance.com）收集的岗位值得投吗？如果适合，帮我定制简历并准备面试。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,24 @@
+{
+  "id": "Q050",
+  "question": "从最近收集的岗位中选出最适合我的，定制简历并准备面试。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-matching",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

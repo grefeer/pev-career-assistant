@@ -1,0 +1,22 @@
+{
+  "id": "Q059",
+  "question": "求职前端开发工程师（2 年经验）方向，请基于目标 JD 制定我的准备计划。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "career-planning"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

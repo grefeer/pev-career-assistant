@@ -1,0 +1,23 @@
+{
+  "id": "Q056",
+  "question": "在前程无忧找北京的AIGC 产品经理（应届生）岗位（最近30天），然后制定行动计划。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-30-days",
+    "time_window_text": "最近30天"
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,23 @@
+{
+  "id": "Q140",
+  "question": "基于已收集岗位的匹配排名，为最匹配的岗位定制简历。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-matching",
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "campus"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  },
+  "reference_answer": null
+}

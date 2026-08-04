@@ -1,0 +1,22 @@
+{
+  "id": "Q112",
+  "question": "已收集的岗位里，哪个与我的应届生（校招）背景最契合？给出理由。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-matching"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  },
+  "reference_answer": null
+}

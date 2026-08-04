@@ -1,0 +1,22 @@
+{
+  "id": "Q102",
+  "question": "对比这些候选岗位，我的Java、Spring Cloud、MySQL、Redis经验更适合哪个？",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-matching"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

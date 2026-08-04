@@ -1,0 +1,23 @@
+{
+  "id": "Q139",
+  "question": "收集学校就业网发布的宣讲会与双选会信息最近30天岗位，按我的背景匹配排序。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching"
+    ],
+    "site_types": [
+      "campus"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-30-days",
+    "time_window_text": "最近30天"
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,22 @@
+{
+  "id": "Q125",
+  "question": "我的简历如何调整才能匹配“大模型应用开发工程师”这个岗位？",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

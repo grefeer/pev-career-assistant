@@ -1,0 +1,23 @@
+{
+  "id": "Q014",
+  "question": "最近7天中粮集团招聘平台有哪些Java 后端开发工程师（3 年经验）岗位适合我？按匹配度排序。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

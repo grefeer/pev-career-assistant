@@ -1,0 +1,25 @@
+{
+  "id": "Q126",
+  "question": "最近7天Boss 直聘（综合招聘平台）上适合我的Java 后端开发工程师（3 年经验）岗位有哪些？选出最适合的 2 个，针对每个定制简历，并给出面试建议。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

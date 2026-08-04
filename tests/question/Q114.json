@@ -1,0 +1,22 @@
+{
+  "id": "Q114",
+  "question": "Java 后端开发工程师面试前我该如何准备？输出详细计划。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "career-planning"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,22 @@
+{
+  "id": "Q015",
+  "question": "基于该 JD 与我的社招（2 年经验）背景，定制一份针对性简历。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

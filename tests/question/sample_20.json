@@ -1,0 +1,50 @@
+{
+  "sample_size": 20,
+  "sampled": [
+    "tests\\question\\Q001.json",
+    "tests\\question\\Q002.json",
+    "tests\\question\\Q003.json",
+    "tests\\question\\Q004.json",
+    "tests\\question\\Q005.json",
+    "tests\\question\\Q006.json",
+    "tests\\question\\Q007.json",
+    "tests\\question\\Q009.json",
+    "tests\\question\\Q011.json",
+    "tests\\question\\Q013.json",
+    "tests\\question\\Q014.json",
+    "tests\\question\\Q016.json",
+    "tests\\question\\Q017.json",
+    "tests\\question\\Q018.json",
+    "tests\\question\\Q019.json",
+    "tests\\question\\Q028.json",
+    "tests\\question\\Q032.json",
+    "tests\\question\\Q050.json",
+    "tests\\question\\Q055.json",
+    "tests\\question\\Q060.json"
+  ],
+  "distribution": {
+    "complexity": {
+      "complex": 10,
+      "simple": 10
+    },
+    "site_types": {
+      "aggregator": 4,
+      "campus": 4,
+      "company-official": 4,
+      "state-owned": 4,
+      "tech-vertical": 4
+    },
+    "skills": {
+      "career-planning": 10,
+      "job-discovery": 10,
+      "job-matching": 10,
+      "resume-tailoring": 8
+    },
+    "profiles": {
+      "P1": 5,
+      "P2": 5,
+      "P3": 5,
+      "P4": 5
+    }
+  }
+}

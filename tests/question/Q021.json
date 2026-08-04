@@ -1,0 +1,22 @@
+{
+  "id": "Q021",
+  "question": "最近7天美团的官方招聘页有哪些AI 应用开发工程师（应届生）岗位？请列出岗位标题和链接。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

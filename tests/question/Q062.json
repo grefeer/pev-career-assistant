@@ -1,0 +1,25 @@
+{
+  "id": "Q062",
+  "question": "请执行：搜索Java后端 微服务岗位（百度招聘官网，最近7天）→匹配我的背景→针对最佳岗位定制简历→输出面试要点。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

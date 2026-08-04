@@ -1,0 +1,22 @@
+{
+  "id": "Q121",
+  "question": "帮我在Boss 直聘上找最近3天发布的AI 应用开发工程师（应届生）岗位，方向是AI应用开发 大模型 Agent，地点深圳。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

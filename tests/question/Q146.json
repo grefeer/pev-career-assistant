@@ -1,0 +1,25 @@
+{
+  "id": "Q146",
+  "question": "最近1天在技术社区招聘频道/开源项目招聘帖有哪些Java 后端开发工程师（3 年经验）岗位适合我？给出匹配排名、最优岗位的简历调整方案和面试准备计划。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

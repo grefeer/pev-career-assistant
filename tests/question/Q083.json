@@ -1,0 +1,22 @@
+{
+  "id": "Q083",
+  "question": "我要找前端开发工程师（2 年经验）工作，帮我从国家电网招聘平台抓取最近发布的岗位，关键词前端开发 Vue3。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,22 @@
+{
+  "id": "Q101",
+  "question": "对比这些候选岗位，我的Python、LangChain、RAG、Agent经验更适合哪个？",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-matching"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}

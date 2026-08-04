@@ -1,0 +1,22 @@
+{
+  "id": "Q142",
+  "question": "请到AI 行业垂直招聘渠道看看有没有适合社招（3 年经验）的岗位，方向Java后端 微服务，最好在杭州。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-30-days",
+    "time_window_text": "最近30天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

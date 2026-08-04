@@ -1,0 +1,23 @@
+{
+  "id": "Q036",
+  "question": "收集牛客网（校招笔试与招聘社区）最近3天的AIGC 产品经理（应届生）岗位，并规划面试准备。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  },
+  "reference_answer": null
+}

@@ -1,0 +1,23 @@
+{
+  "id": "Q130",
+  "question": "收集猎聘（中高端招聘平台）最近1天岗位，针对其中一个定制简历。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "accessibility": "gated",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  },
+  "reference_answer": null
+}

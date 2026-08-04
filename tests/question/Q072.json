@@ -1,0 +1,24 @@
+{
+  "id": "Q072",
+  "question": "帮我找最近30天的AIGC 产品经理（应届生）岗位（拼多多的官方招聘页），并为最佳选择做简历定制与面试计划。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "resume-tailoring",
+      "career-planning"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-30-days",
+    "time_window_text": "最近30天"
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  },
+  "reference_answer": null
+}

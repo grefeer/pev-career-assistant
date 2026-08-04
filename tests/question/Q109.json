@@ -1,0 +1,23 @@
+{
+  "id": "Q109",
+  "question": "在网易招聘官网找最近30天的AI 应用开发工程师（应届生）岗位，并为匹配度最高的定制简历。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-30-days",
+    "time_window_text": "最近30天"
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  },
+  "reference_answer": null
+}
