@@ -9,6 +9,29 @@ from __future__ import annotations
 import json
 
 
+def compute_evidence_chars(observed_public_evidence: list[dict] | None) -> int:
+    """Compute total character count of visible text in observed public evidence.
+
+    Only counts lengths, never the raw content itself. Returns 0 for empty/None.
+
+    Args:
+        observed_public_evidence: List of evidence dicts from context.metadata,
+            each optionally containing a "visible_text" string key.
+
+    Returns:
+        Sum of len(visible_text) across all evidence items.
+    """
+    if not observed_public_evidence:
+        return 0
+    total = 0
+    for item in observed_public_evidence:
+        if isinstance(item, dict):
+            visible_text = item.get("visible_text")
+            if isinstance(visible_text, str):
+                total += len(visible_text)
+    return total
+
+
 def build_context_manifest(
     *,
     instruction: str,

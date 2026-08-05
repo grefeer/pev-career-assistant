@@ -4,7 +4,38 @@ from __future__ import annotations
 
 import json
 
-from backend.app.services.agent_runtime.context_manifest import build_context_manifest
+from backend.app.services.agent_runtime.context_manifest import (
+    build_context_manifest,
+    compute_evidence_chars,
+)
+
+
+def test_compute_evidence_chars_sums_visible_text_lengths() -> None:
+    """Sum of len(visible_text) across all evidence items, no PII leaked."""
+    evidence = [
+        {"visible_text": "abc", "artifact_id": "a", "source_url": "..."},
+        {"visible_text": "xyz123", "artifact_id": "b", "source_url": "..."},
+        {"other_key": "ignored", "visible_text": None},
+    ]
+    assert compute_evidence_chars(evidence) == 3 + 6
+
+
+def test_compute_evidence_chars_handles_empty() -> None:
+    """None or empty lists return 0."""
+    assert compute_evidence_chars(None) == 0
+    assert compute_evidence_chars([]) == 0
+    assert compute_evidence_chars([{}]) == 0
+
+
+def test_compute_evidence_chars_ignores_non_string_visible_text() -> None:
+    """Non-string visible_text values are ignored."""
+    evidence = [
+        {"visible_text": "valid"},
+        {"visible_text": 123},
+        {"visible_text": ["a", "list"]},
+        {"visible_text": {"nested": "dict"}},
+    ]
+    assert compute_evidence_chars(evidence) == 5
 
 
 def test_build_context_manifest_counts_match_inputs() -> None:

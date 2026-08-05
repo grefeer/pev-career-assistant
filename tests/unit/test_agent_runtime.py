@@ -369,6 +369,9 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         assert isinstance(turn.context_manifest["tool_catalog_chars"], int)
         assert isinstance(turn.context_manifest["observation_count"], int)
         assert isinstance(turn.context_manifest["observation_chars"], int)
+        # evidence_chars is always an int (0 for no evidence, >0 otherwise)
+        assert isinstance(turn.context_manifest["evidence_chars"], int)
+        assert turn.context_manifest["evidence_chars"] >= 0
         # Planner has observations
         if turn.role is AgentRole.planner:
             assert turn.context_manifest["observation_count"] >= 0

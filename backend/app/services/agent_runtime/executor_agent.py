@@ -22,7 +22,10 @@ from backend.app.services.agent_runtime.schemas import (
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
-from backend.app.services.agent_runtime.context_manifest import build_context_manifest
+from backend.app.services.agent_runtime.context_manifest import (
+    build_context_manifest,
+    compute_evidence_chars,
+)
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
@@ -273,6 +276,9 @@ class ExecutorAgent:
                             *prior_observations_for_decision,
                             *observations_for_decision,
                         ],
+                        evidence_chars=compute_evidence_chars(
+                            context.metadata.get("observed_public_evidence")
+                        ),
                         model_name=usage.get("model_name"),
                     )
                 trace(
