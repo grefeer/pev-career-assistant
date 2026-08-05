@@ -974,3 +974,39 @@ def test_build_agent_model_gateway_deepseek_non_v4_model_uses_json_schema(monkey
     assert "extra_body" not in captured
     assert gateway._structured_method == "json_schema"
     assert gateway._prefer_local_json_validation is False
+
+
+def test_combined_catalog_in_system_prompt_and_json_mode_produces_coherent_messages() -> None:
+    """When both catalog_in_system_prompt and json_mode are enabled, messages are coherent.
+
+    This is the realistic production path for deepseek-v4 with the catalog flag enabled.
+    The SystemMessage must contain BOTH the json_mode hint and the tool catalog with
+    no hint duplication.  The HumanMessage must not contain the popped available_tools.
+    """
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(
+        model, catalog_in_system_prompt=True, structured_method="json_mode"
+    )
+
+    state = {"goal": "找岗位", "available_tools": [{"name": "tool1", "description": "desc"}]}
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state=state,
+        response_model=PlannerDecision,
+    )
+
+    assert len(model.messages) == 2
+    system_msg, human_msg = model.messages
+
+    # SystemMessage contains the json_mode hint
+    assert "Return one JSON object matching the requested schema." in system_msg.content
+    # SystemMessage contains the catalog
+    assert "Available tools (JSON):" in system_msg.content
+    assert "tool1" in system_msg.content
+    # The json_mode hint appears exactly once (no duplication)
+    assert system_msg.content.count("Return one JSON object matching the requested schema.") == 1
+
+    # HumanMessage must NOT contain available_tools (it was popped)
+    assert "available_tools" not in human_msg.content
+    assert "tool1" not in human_msg.content
