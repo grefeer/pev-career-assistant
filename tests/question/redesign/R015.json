@@ -1,0 +1,21 @@
+{
+  "id": "R015",
+  "question": "国家电网、中国移动等央国企有没有适合我的 Java 后端开发工程师岗位？请在国聘网等公开渠道查找并汇总岗位与投递链接。",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  }
+}

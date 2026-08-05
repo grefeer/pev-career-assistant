@@ -1,0 +1,21 @@
+{
+  "id": "Q113",
+  "question": "给出 AI 应用开发实习生岗位的面试建议，包括常见问题与回答要点。请先找到一份该岗位的公开 JD 作为依据。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "career-planning"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  }
+}

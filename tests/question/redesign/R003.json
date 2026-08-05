@@ -1,0 +1,22 @@
+{
+  "id": "R003",
+  "question": "最近7天在招聘数据源中更新过招聘信息的公司里，有没有发布适合我的AI 应用开发工程师（应届生）岗位？请从数据源出发逐公司核实并验证投递链接。",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "R1",
+    "role": "AI 算法工程师（应届生）",
+    "summary": "应届生（校招），方向：大模型应用 AI Agent 多模态算法，技能：Python、PyTorch、LangChain、RAG、大模型微调，城市：北京、深圳",
+    "resume_text": "高硕谦\n815733200@qq.com\n18931037861\n教育经历\n东北大学（985）控制科学与工程 硕士（2027届，学科评估A+），研究方向：基于深度学习的脑电解码；主修人工智能与机器学习、计算机视觉、图像处理分析与识别、最优控制理论、系统建模方法；研究生一等奖学金\n燕山大学 自动化 本科（2020-2024），主修自动控制、过程控制、PLC、单片机原理及应用、微机原理；蓝桥杯嵌入式大赛省级二等奖\n实习经历\n小米（2026.04-2026.06）AI 算法开发实习：项目1 基于 DINOv2 与多模态大模型的手机工件自动分类系统——构建\"规则召回+DINOv2多视图视觉精排+VLM精判+置信度校验\"流水线，56类工件分类，qwen-vl-max 精判 Top-1 准确率 99.46%，图片压缩与按需调用使 Qwen 调用费用降低约 84%；项目2 基于导航信息的增程式电动车预测性能量管理算法——分层能量管理架构（导航分段窗口规划+启停状态机+MPC功率平滑），融合终端SOC风险与NVH约束建模，平均启停次数由约11次降至约2次，平均油电转化比由3.212提升至3.285 kWh/L，方案被公司采用\n项目经历\n基于多 Agent 的智能求职助手（2026.06-至今，Python+FastAPI+MySQL+Redis+MinIO+DeepSeek+Playwright+Docker）：面向职位检索、岗位匹配、简历优化和面试规划，设计 Planner-Executor-Verifier 多智能体架构与状态机，自研 ToolRegistry 统一管理8类工具，角色与技能双层权限隔离、Pydantic Schema 校验、调用预算限制及重复调用检测；仅持久化工具返回的可追溯数据；编写484项自动化测试；论文1（Neurocomputing，JCR Q1，IF 6.5，已发表）脑电视觉感知解码；论文2（BSPC，JCR Q2，IF 4.9，已发表）ASD 脑区分类分析\n智能 AI 文档问答助手（Agentic RAG，2025.12-2026.02，Spring Boot+LangGraph4j+Milvus+Redis+RabbitMQ）：基于 Agentic RAG 多级检索工作流，朴素RAG/子问题分解/Self-RAG 模式切换，Milvus 向量+关键词混合检索与 RRF 重排，Write Behind 缓存与 RabbitMQ 异步削峰，RBAC 权限模型\n面向石化行业的 AI Agent 工作流设计（2025.07-2025.12，PyTorch+PEFT+LoRA+Ollama）：专业书籍到高质量问答对的自动化转换与清洗流程，基于 PEFT/LoRA 对 DeepSeek-r1(7B) 微调注入行业知识，INT8 量化 + Ollama 优化推理，Docker 封装交付\n技能\nPython、PyTorch、LangChain、RAG、Agent 工作流、Function Calling、LangGraph4j、大模型微调（PEFT/LoRA）、INT8 量化、FastAPI、Spring Boot、MyBatis-Plus、MySQL、Redis、Milvus、RabbitMQ、Docker、Git、SSE/WebSocket、Linux\n证书\nCET-4、CET-6、计算机二级（C语言）\n"
+  }
+}

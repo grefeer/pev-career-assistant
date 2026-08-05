@@ -1,0 +1,21 @@
+{
+  "id": "R014",
+  "question": "快手、小红书有没有适合我的 AI 产品经理（应届生）岗位？请核实岗位与投递链接。",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "company-official"
+    ],
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  }
+}

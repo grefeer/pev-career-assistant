@@ -132,6 +132,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     app.state.settings.agent_harness_max_event_payload_bytes
                 )
                 stack.callback(run_repository.set_event_payload_limit, None)
+                # Mirrored module-level toggles: the fetch fallback switches
+                # process-wide behavior, so the lifespan must opt it in from
+                # Settings (tests override the module seam directly instead).
+                from backend.app.services.career_skills import job_discovery as jd_skill
+
+                jd_skill.enable_playwright_fallback(
+                    app.state.settings.job_discovery_playwright_fallback_enabled
+                )
+                stack.callback(jd_skill.enable_playwright_fallback, False)
             yield
     finally:
         if (

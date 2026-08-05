@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from backend.app.services.career_skills.job_discovery import (
     FetchPublicJobPagesInput,
     PublicJobFetchError,
     SearchPublicJobPagesInput,
+    enable_playwright_fallback,
     extract_observed_job_details,
     extract_observed_job_details_batch,
     fetch_public_job_page,
@@ -28,6 +31,8 @@ from backend.app.services.career_skills.job_discovery import (
     _infer_official_page_locations,
     _infer_official_page_title,
     _infer_recruitment_types,
+    _is_public_url,
+    _render_with_playwright,
     _fetch_validated,
     _MAX_PUBLIC_REDIRECTS,
 )
@@ -43,7 +48,12 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     monkeypatch.setattr(
         "backend.app.services.career_skills.job_discovery.requests.get",
         lambda *args, **kwargs: SimpleNamespace(
-            text="<html><title>AI Agent 开发工程师</title><body><script>secret</script><style>.x{}</style><h1>AI Agent 开发工程师</h1><p>职责：构建智能体。</p></body></html>",
+            text=(
+                "<html><title>AI Agent 开发工程师</title><body>"
+                "<script>secret</script><style>.x{}</style>"
+                "<h1>AI Agent 开发工程师</h1>"
+                "<p>职责：构建智能体。" + "岗位职责与任职要求补充说明。" * 12 + "</p></body></html>"
+            ),
             encoding="utf-8",
             apparent_encoding="utf-8",
             raise_for_status=lambda: None,
@@ -285,7 +295,11 @@ def test_fetch_public_job_page_follows_redirect_to_a_revalidated_public_target(m
                 headers={"Location": "https://jobs.example/agent"},
             )
         return SimpleNamespace(
-            text="<html><title>AI Agent 开发</title><body><p>岗位职责和任职要求详情描述。</p></body></html>",
+            text=(
+                "<html><title>AI Agent 开发</title><body><p>岗位职责和任职要求详情描述。"
+                + "任职要求补充说明详情。" * 16
+                + "</p></body></html>"
+            ),
             encoding="utf-8", apparent_encoding="utf-8",
             raise_for_status=lambda: None,
             is_redirect=False, status_code=200, headers={},
@@ -698,3 +712,505 @@ def test_find_observed_evidence_skips_non_matching_items_before_a_match() -> Non
 def test_infer_official_page_locations_returns_empty_when_no_city_line_follows_title() -> None:
     """A non-city, non-responsibilities line after the title is skipped and the loop ends empty."""
     assert _infer_official_page_locations("标题\nabc", "标题") == []
+
+
+# ---------------------------------------------------------------- playwright fallback
+
+def _no_op_public_url(url: str) -> None:
+    pass
+
+
+def _sentinel_fallback(*args, **kwargs):
+    raise AssertionError("playwright fallback must not run")
+
+
+class _FakeRoute:
+    def __init__(self) -> None:
+        self.continued = False
+        self.aborted = False
+
+    def continue_(self) -> None:
+        self.continued = True
+
+    def abort(self) -> None:
+        self.aborted = True
+
+
+class _FakePage:
+    def __init__(
+        self,
+        *,
+        body: str = "",
+        title: str | None = None,
+        goto_result: object | None = ...,
+        goto_error: Exception | None = None,
+        inner_text_error: Exception | None = None,
+    ) -> None:
+        self._body = body
+        self._title = title
+        self._goto_result = goto_result
+        self._goto_error = goto_error
+        self._inner_text_error = inner_text_error
+        self.handler = None
+        self.closed = False
+
+    def route(self, pattern: str, handler) -> None:
+        self.handler = handler
+
+    def goto(self, url: str, **kwargs):
+        if self._goto_error is not None:
+            raise self._goto_error
+        return self._goto_result
+
+    def wait_for_timeout(self, ms: int) -> None:
+        pass
+
+    def inner_text(self, selector: str) -> str:
+        if self._inner_text_error is not None:
+            raise self._inner_text_error
+        return self._body
+
+    def title(self) -> str:
+        return self._title
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeBrowser:
+    def __init__(self, page) -> None:
+        self._page = page
+
+    def new_page(self):
+        return self._page
+
+
+class _FakeChromium:
+    def __init__(self, owner) -> None:
+        self._owner = owner
+
+    def launch(self, headless=True):
+        self._owner.launch_kwargs = {"headless": headless}
+        if self._owner._launch_error is not None:
+            raise self._owner._launch_error
+        if self._owner._browser is None:
+            raise RuntimeError("no browser")
+        return self._owner._browser
+
+
+class _FakePlaywright:
+    def __init__(
+        self,
+        browser=None,
+        *,
+        start_error: Exception | None = None,
+        launch_error: Exception | None = None,
+        stop_error: Exception | None = None,
+    ) -> None:
+        self._browser = browser
+        self._start_error = start_error
+        self._launch_error = launch_error
+        self._stop_error = stop_error
+        self.stopped = False
+        self.launch_kwargs = None
+
+    def start(self):
+        if self._start_error is not None:
+            raise self._start_error
+        return self
+
+    @property
+    def chromium(self):
+        return _FakeChromium(self)
+
+    def stop(self) -> None:
+        self.stopped = True
+        if self._stop_error is not None:
+            raise self._stop_error
+
+
+def _install_fake_playwright(monkeypatch, pw) -> None:
+    monkeypatch.setitem(
+        sys.modules, "playwright.sync_api", SimpleNamespace(sync_playwright=lambda: pw)
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_RUNTIME", None
+    )
+
+
+def test_enable_playwright_fallback_toggles_the_module_flag(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", False
+    )
+    enable_playwright_fallback(True)
+    assert (
+        __import__(
+            "backend.app.services.career_skills.job_discovery", fromlist=["x"]
+        )._PLAYWRIGHT_FALLBACK_ENABLED
+        is True
+    )
+    enable_playwright_fallback(False)
+    assert (
+        __import__(
+            "backend.app.services.career_skills.job_discovery", fromlist=["x"]
+        )._PLAYWRIGHT_FALLBACK_ENABLED
+        is False
+    )
+
+
+def test_fetch_falls_back_to_rendered_text_when_requests_fails(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("network down")
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    rendered = "渲染后的岗位正文\n工作职责：构建智能体。\n" + "任职要求补充说明。" * 16
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (rendered, "AI Agent 开发工程师"),
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        FetchPublicJobPageInput(url="https://jobs.example/spa"),
+    )
+
+    assert result.visible_text == rendered
+    assert result.title == "AI Agent 开发工程师"
+    expected_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    assert result.content_hash == expected_hash
+    assert result.artifact_id == f"observed:{expected_hash}"
+
+
+def test_fetch_falls_back_on_empty_shell_and_login_wall(monkeypatch) -> None:
+    for shell_text in ("<html></html>", "<html><body>登录</body></html>"):
+        monkeypatch.setattr(
+            "backend.app.services.career_skills.job_discovery._assert_public_url",
+            _no_op_public_url,
+        )
+        monkeypatch.setattr(
+            "backend.app.services.career_skills.job_discovery.requests.get",
+            lambda *args, **kwargs: SimpleNamespace(
+                text=shell_text,
+                encoding="utf-8",
+                apparent_encoding="utf-8",
+                raise_for_status=lambda: None,
+                is_redirect=False,
+            ),
+        )
+        monkeypatch.setattr(
+            "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+        )
+        rendered = "SPA 渲染后的岗位列表…\n" + "后端开发工程师 3 年经验 招聘中。" * 12
+        monkeypatch.setattr(
+            "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+            lambda url: (rendered, "招聘"),
+        )
+        result = fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://jobs.example/spa"),
+        )
+        assert result.visible_text == rendered
+
+
+def test_fetch_rejects_short_shell_text_without_login_markers(monkeypatch) -> None:
+    """A short SPA boot stub is not usable job evidence even without login markers."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="<html><title>腾讯招聘</title><body>首页</body></html>",
+            encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", False
+    )
+    with pytest.raises(PublicJobFetchError, match="public_page_content_insufficient"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://careers.example.com/"),
+        )
+
+
+def test_fetch_falls_back_when_requests_yields_a_short_shell(monkeypatch) -> None:
+    """A marker-free short shell still triggers the renderer; long rendered text wins."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="<html><title>搜索</title><body></body></html>",
+            encoding="utf-8", apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    rendered = "搜索 | 腾讯招聘\n" + "混元3D AIGC产品经理 深圳 职位详情。" * 12
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (rendered, "搜索 | 腾讯招聘"),
+    )
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://careers.example.com/search.html"),
+    )
+    assert result.visible_text == rendered
+
+
+def test_fetch_rejects_short_rendered_text_as_insufficient(monkeypatch) -> None:
+    """'Not Found' stubs and verification walls surfaced by the renderer are not evidence."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("network down")
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: ("Not Found", None),
+    )
+    with pytest.raises(PublicJobFetchError, match="public_page_content_insufficient"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://jobs.example/position"),
+        )
+
+
+def test_fetch_never_falls_back_when_flag_is_off(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("network down")
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", False
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", _sentinel_fallback
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://jobs.example/spa"),
+        )
+
+
+def test_fetch_never_falls_back_on_unsafe_url(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", _sentinel_fallback
+    )
+    with pytest.raises(PublicJobFetchError, match="unsafe_public_url"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="ftp://jobs.example/x"),
+        )
+
+
+def test_fetch_fallback_propagates_render_failure_and_blank_render(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _no_op_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("network down")
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (_ for _ in ()).throw(PublicJobFetchError("public_fetch_failed")),
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://jobs.example/spa"),
+        )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: ("   ", None),
+    )
+    with pytest.raises(PublicJobFetchError, match="empty_public_page"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://jobs.example/spa"),
+        )
+
+
+def test_render_with_playwright_uses_the_injected_seam(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: ("seam text", "seam title"),
+    )
+    body, title = _render_with_playwright("https://jobs.example/x")
+    assert (body, title) == ("seam text", "seam title")
+
+
+def test_render_with_playwright_fails_closed_when_playwright_is_missing(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", None)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_RUNTIME", None
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+
+
+def test_render_with_playwright_fails_closed_on_launch_failure(monkeypatch) -> None:
+    pw = _FakePlaywright(None, start_error=RuntimeError("no browser binary"))
+    _install_fake_playwright(monkeypatch, pw)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+
+    pw2 = _FakePlaywright(None, launch_error=RuntimeError("launch boom"))
+    _install_fake_playwright(monkeypatch, pw2)
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+    assert pw2.stopped is True  # started playwright must be torn down
+
+    pw3 = _FakePlaywright(
+        None,
+        launch_error=RuntimeError("launch boom"),
+        stop_error=RuntimeError("stop boom"),
+    )
+    _install_fake_playwright(monkeypatch, pw3)
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+    assert pw3.stopped is True  # a failing teardown never masks the fetch error
+
+
+def test_render_with_playwright_fails_closed_on_goto_and_body_errors(monkeypatch) -> None:
+    page = _FakePage(goto_result=None)
+    _install_fake_playwright(monkeypatch, _FakePlaywright(_FakeBrowser(page)))
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+    assert page.closed is True
+
+    page = _FakePage(goto_error=RuntimeError("nav failed"))
+    _install_fake_playwright(monkeypatch, _FakePlaywright(_FakeBrowser(page)))
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+    assert page.closed is True
+
+    page = _FakePage(
+        body="x", goto_result=SimpleNamespace(), inner_text_error=RuntimeError("boom")
+    )
+    _install_fake_playwright(monkeypatch, _FakePlaywright(_FakeBrowser(page)))
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+    assert page.closed is True
+
+
+def test_render_with_playwright_renders_and_guards_every_request(monkeypatch) -> None:
+    page = _FakePage(
+        body="渲染后的岗位正文\n工作职责：构建智能体。",
+        title="AI Agent 开发工程师",
+        goto_result=SimpleNamespace(),
+    )
+    pw = _FakePlaywright(_FakeBrowser(page))
+    _install_fake_playwright(monkeypatch, pw)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+
+    body, title = _render_with_playwright("https://jobs.example/jobs/1")
+
+    assert (body, title) == ("渲染后的岗位正文\n工作职责：构建智能体。", "AI Agent 开发工程师")
+    assert page.closed is True
+    assert pw.launch_kwargs == {"headless": True}
+    assert page.handler is not None
+
+    def fake_is_public(url: str) -> bool:
+        if url == "https://broken.example/x":
+            raise ValueError("dns")
+        return url.startswith("https://jobs.example")
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._is_public_url", fake_is_public
+    )
+    public_route, private_route, error_route = _FakeRoute(), _FakeRoute(), _FakeRoute()
+    page.handler(public_route, SimpleNamespace(url="https://jobs.example/app.js"))
+    page.handler(private_route, SimpleNamespace(url="http://169.254.169.254/latest/meta-data"))
+    page.handler(error_route, SimpleNamespace(url="https://broken.example/x"))
+    assert public_route.continued and not public_route.aborted
+    assert private_route.aborted and not private_route.continued
+    assert error_route.aborted
+
+
+def test_render_with_playwright_reuses_an_already_launched_runtime(monkeypatch) -> None:
+    # A non-None runtime means the browser already exists: no second launch, and
+    # a broken page object still degrades to a stable failure code.
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_RUNTIME",
+        (object(), object()),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+    with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
+        _render_with_playwright("https://jobs.example/x")
+
+
+def test_is_public_url_rejects_schemes_credentials_private_and_unresolvable(monkeypatch) -> None:
+    assert _is_public_url("ftp://jobs.example/x") is False
+    assert _is_public_url("https://user:pass@jobs.example/x") is False
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.socket.getaddrinfo",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("dns")),
+    )
+    assert _is_public_url("https://jobs.example/x") is False
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.socket.getaddrinfo",
+        lambda *a, **k: [(None, None, None, None, ("10.0.0.1", 0))],
+    )
+    assert _is_public_url("https://jobs.example/x") is False
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.socket.getaddrinfo",
+        lambda *a, **k: [(None, None, None, None, ("1.2.3.4", 0))],
+    )
+    assert _is_public_url("https://jobs.example/x") is True

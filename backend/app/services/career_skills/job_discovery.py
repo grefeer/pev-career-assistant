@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from html.parser import HTMLParser
 import hashlib
 import ipaddress
 import re
 import socket
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 from pydantic import BaseModel, Field, field_validator
@@ -19,6 +21,28 @@ from backend.app.services.job_discovery.tools.jd_extraction import extract_jd_ca
 
 _MAX_PUBLIC_REDIRECTS = 5
 _PUBLIC_FETCH_HEADERS = {"User-Agent": "CareerAssistantPEV/1.0 (+public-job-fetch)"}
+
+# SPA / JS-rendered career sites (bytedance, tencent, zhaopin, lagou, ...)
+# return an empty shell to plain ``requests``. When the requests fast path
+# fails or yields no visible text, the fetch falls back to a headless-Chromium
+# render that re-applies the same public-URL safety checks per request. The
+# fallback is off by default so unit suites never launch a browser; runtime
+# assembly enables it from ``Settings.job_discovery_playwright_fallback_enabled``.
+_PLAYWRIGHT_FALLBACK_CODES = frozenset(
+    {"public_fetch_failed", "empty_public_page", "public_page_content_insufficient"}
+)
+# Visible text below this many chars is a shell (SPA boot stub, "Not Found",
+# anti-bot placeholder) rather than usable job evidence; the renderer decides.
+_MIN_USABLE_TEXT_CHARS = 160
+_PLAYWRIGHT_FALLBACK_ENABLED = False
+_PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
+_PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
+
+
+def enable_playwright_fallback(enabled: bool) -> None:
+    """Toggle the rendered-fetch fallback (called from runtime assembly)."""
+    global _PLAYWRIGHT_FALLBACK_ENABLED
+    _PLAYWRIGHT_FALLBACK_ENABLED = enabled
 
 
 _JOB_RESULT_URL_TOKENS = (
@@ -309,6 +333,32 @@ class _SoSearchResultParser(HTMLParser):
         self._title_parts = []
 
 
+def _is_public_url(url: str) -> bool:
+    """True only for http(s), userinfo-free hosts resolving to a global IP.
+
+    Returns False for non-http(s) schemes, embedded credentials, unresolvable
+    hosts, and non-global (loopback / RFC1918 / link-local / cloud-metadata)
+    addresses -- a permissive check used by the Playwright route guard, which
+    must fail closed on any ambiguous destination.
+    """
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        return False
+    try:
+        addresses = socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    return all(
+        ipaddress.ip_address(sockaddr[0]).is_global
+        for _family, _kind, _proto, _canon, sockaddr in addresses
+    )
+
+
 def _assert_public_url(url: str) -> None:
     parsed = urlsplit(url)
     if (
@@ -323,8 +373,7 @@ def _assert_public_url(url: str) -> None:
     except OSError as exc:
         raise PublicJobFetchError("public_host_unresolvable") from exc
     for _family, _kind, _proto, _canon, sockaddr in addresses:
-        address = ipaddress.ip_address(sockaddr[0])
-        if not address.is_global:
+        if not ipaddress.ip_address(sockaddr[0]).is_global:
             raise PublicJobFetchError("unsafe_public_url")
 
 
@@ -357,14 +406,101 @@ def _fetch_validated(url: str) -> requests.Response:
     raise PublicJobFetchError("unsafe_public_url")
 
 
+def _render_with_playwright(url: str) -> tuple[str, str | None]:
+    """Render ``url`` in headless Chromium; return (body_text, title).
+
+    Uses the seam ``_PLAYWRIGHT_FETCH_IMPL`` when injected (unit tests); the
+    real path lazily imports playwright and reuses one browser per process.
+    A per-request route guard aborts any request whose destination is not a
+    global public address, mirroring ``_assert_public_url`` inside the
+    rendered page (SPA redirects and fetch() subresources included).
+    """
+    if _PLAYWRIGHT_FETCH_IMPL is not None:
+        return _PLAYWRIGHT_FETCH_IMPL(url)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise PublicJobFetchError("public_fetch_failed") from None
+    global _PLAYWRIGHT_RUNTIME
+    pw, browser = _PLAYWRIGHT_RUNTIME or (None, None)
+    if browser is None:
+        try:
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            _PLAYWRIGHT_RUNTIME = (pw, browser)
+        except Exception:
+            if pw is not None:
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+            raise PublicJobFetchError("public_fetch_failed") from None
+    try:
+        page = browser.new_page()
+
+        def _abort_non_public(route: Any, request: Any) -> None:
+            try:
+                if _is_public_url(request.url):
+                    route.continue_()
+                else:
+                    route.abort()
+            except Exception:
+                route.abort()
+
+        page.route("**/*", _abort_non_public)
+        try:
+            response = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            if response is None:
+                raise PublicJobFetchError("public_fetch_failed")
+            page.wait_for_timeout(1_500)
+            body_text = page.inner_text("body") or ""
+            return body_text, page.title() or None
+        finally:
+            page.close()
+    except PublicJobFetchError:
+        raise
+    except Exception:
+        raise PublicJobFetchError("public_fetch_failed") from None
+
+
 def fetch_public_job_page(
     context: ToolContext, payload: FetchPublicJobPageInput
 ) -> FetchPublicJobPageOutput:
-    """Fetch public HTML and expose immutable visible-text evidence to Executor."""
+    """Fetch public HTML and expose immutable visible-text evidence to Executor.
+
+    The plain ``requests`` fast path is tried first. When it fails, or when it
+    returns a shell with no usable text (SPA / login wall), the fetch falls back
+    to a headless-Chromium render of the same URL -- still under the original
+    public-URL validation. The fallback is gated by a runtime flag so unit
+    suites stay deterministic.
+    """
     del context
     _assert_public_url(payload.url)
     try:
-        response = _fetch_validated(payload.url)
+        return _fetch_public_page_requests(payload.url)
+    except PublicJobFetchError as error:
+        if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
+            raise
+    rendered_text, rendered_title = _render_with_playwright(payload.url)
+    visible_text = rendered_text.strip()[:12_000]
+    if not visible_text:
+        raise PublicJobFetchError("empty_public_page")
+    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
+        raise PublicJobFetchError("public_page_content_insufficient")
+    rendered_bytes = visible_text.encode("utf-8", errors="replace")
+    return FetchPublicJobPageOutput(
+        artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
+        source_url=payload.url,
+        title=rendered_title,
+        visible_text=visible_text,
+        content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
+    )
+
+
+def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
+    """The non-rendered evidence path: requests + visible-text normalization."""
+    try:
+        response = _fetch_validated(url)
         response.raise_for_status()
     except PublicJobFetchError:
         raise
@@ -379,13 +515,11 @@ def fetch_public_job_page(
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
-    short_page_markers = ("登录", "login", "验证", "verify", "captcha", "安全检查")
-    page_summary = f"{title or ''}\n{visible_text}".lower()
-    if len(visible_text) < 160 and any(marker in page_summary for marker in short_page_markers):
+    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
         raise PublicJobFetchError("public_page_content_insufficient")
     return FetchPublicJobPageOutput(
         artifact_id=f"observed:{hashlib.sha256(html.encode('utf-8', errors='replace')).hexdigest()}",
-        source_url=payload.url,
+        source_url=url,
         title=title,
         visible_text=visible_text,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),

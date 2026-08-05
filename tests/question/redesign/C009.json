@@ -1,0 +1,45 @@
+{
+  "id": "C009",
+  "chain": [
+    {
+      "question": "请在猎聘网前端开发工程师专区收集适合我的岗位信息（岗位名称、公司、城市、薪资、经验/学历要求），抓取页面并保存证据。",
+      "meta": {
+        "complexity": "simple",
+        "accessibility": "public",
+        "skills": [
+          "job-discovery"
+        ],
+        "site_types": [
+          "aggregator"
+        ],
+        "time_window": null,
+        "time_window_text": null
+      },
+      "profile": {
+        "id": "P3",
+        "role": "前端开发工程师（2 年经验）",
+        "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+      }
+    },
+    {
+      "question": "针对上一环节收集的岗位，结合我的简历按匹配度排序，选出最匹配的一个。",
+      "meta": {
+        "complexity": "complex",
+        "accessibility": "public",
+        "skills": [
+          "job-matching"
+        ],
+        "site_types": [
+          "aggregator"
+        ],
+        "time_window": null,
+        "time_window_text": null
+      },
+      "profile": {
+        "id": "P3",
+        "role": "前端开发工程师（2 年经验）",
+        "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+      }
+    }
+  ]
+}

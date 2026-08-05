@@ -1,0 +1,21 @@
+{
+  "id": "R028",
+  "question": "猎聘网前端开发工程师专区找深圳的前端开发工程师（2 年经验）岗位，哪个最适合我？",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  }
+}

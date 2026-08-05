@@ -6,6 +6,7 @@ from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.career_skills import (
     career_planning,
+    career_sheets,
     job_discovery,
     job_matching,
     resume_tailoring,
@@ -45,7 +46,18 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.SearchPublicJobPagesOutput,
             allowed_roles=frozenset({AgentRole.executor}),
             handler=job_discovery.search_public_job_pages,
-            description="搜索公开招聘页；仅在用户没有提供候选 URL 时用于发现直接招聘链接。",
+            description="搜索公开招聘页；仅在用户没有提供候选 URL、且 smartsheet 无匹配记录时用于发现直接招聘链接。",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="query-career-sheet-records",
+            skill_name="job-discovery",
+            input_model=career_sheets.QueryCareerSheetRecordsInput,
+            output_model=career_sheets.QueryCareerSheetRecordsOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=career_sheets.query_career_sheet_records,
+            description="查询招聘 smartsheet（内推/招聘链接台账）按企业/岗位/地点关键词与近 N 天过滤，返回候选招聘 URL；主证据源，无匹配时才用网络搜索。",
         )
     )
     registry.register(

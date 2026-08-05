@@ -1,0 +1,45 @@
+{
+  "id": "C013",
+  "chain": [
+    {
+      "question": "请在猎聘产品经理专区收集适合我的 AIGC 产品经理（应届生）岗位信息（岗位名称、公司、城市、薪资、经验/学历要求），抓取页面并保存证据。",
+      "meta": {
+        "complexity": "simple",
+        "accessibility": "public",
+        "skills": [
+          "job-discovery"
+        ],
+        "site_types": [
+          "aggregator"
+        ],
+        "time_window": null,
+        "time_window_text": null
+      },
+      "profile": {
+        "id": "P4",
+        "role": "AIGC 产品经理（应届生）",
+        "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+      }
+    },
+    {
+      "question": "针对上一环节收集的岗位，给我一份面试准备计划。",
+      "meta": {
+        "complexity": "complex",
+        "accessibility": "public",
+        "skills": [
+          "career-planning"
+        ],
+        "site_types": [
+          "aggregator"
+        ],
+        "time_window": null,
+        "time_window_text": null
+      },
+      "profile": {
+        "id": "P4",
+        "role": "AIGC 产品经理（应届生）",
+        "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+      }
+    }
+  ]
+}

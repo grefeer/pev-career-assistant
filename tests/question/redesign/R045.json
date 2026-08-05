@@ -1,0 +1,21 @@
+{
+  "id": "R045",
+  "question": "针对猎聘网上的产品经理（AIGC 方向）岗位，给出简历修改建议（改动点+原因）。",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  }
+}

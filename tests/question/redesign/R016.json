@@ -1,0 +1,21 @@
+{
+  "id": "R016",
+  "question": "国聘网上最近发布的 Java 后端开发工程师（3 年经验）岗位有哪些适合我？请汇总岗位与投递链接。",
+  "meta": {
+    "complexity": "simple",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "state-owned"
+    ],
+    "time_window": "recent-7-days",
+    "time_window_text": "最近7天"
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  }
+}

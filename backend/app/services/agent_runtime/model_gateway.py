@@ -147,10 +147,13 @@ class LangChainModelGateway:
 
         This matches the ordinary-JSON recovery budget of the structured-output
         path (three total attempts); each attempt is a bounded transport
-        recovery, never an Agent decision or a tool-selection retry.
+        recovery, never an Agent decision or a tool-selection retry.  A
+        deterministic provider (temperature 0) would reproduce the same broken
+        completion on identical messages, so each retry appends a corrective
+        schema-format hint that changes the input.
         """
         last_error: AgentModelGatewayError | None = None
-        for _ in range(3):
+        for attempt in range(3):
             try:
                 return self._decide_with_local_json_validation(
                     messages=messages,
@@ -161,6 +164,19 @@ class LangChainModelGateway:
                 if error.code == "model_request_failed":
                     raise
                 last_error = error
+                if attempt < 2:
+                    messages = [
+                        *messages,
+                        SystemMessage(
+                            content=(
+                                "Your previous response was not one valid JSON "
+                                "object matching the requested schema. Return "
+                                "ONLY a single JSON object: no prose before or "
+                                "after it, no extra fields, no trailing "
+                                "punctuation."
+                            )
+                        ),
+                    ]
         raise AgentModelGatewayError("invalid_model_response") from last_error
 
     def _decide_with_local_json_validation(

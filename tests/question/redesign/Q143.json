@@ -1,0 +1,21 @@
+{
+  "id": "Q143",
+  "question": "稀土掘金社区的技术招聘帖（帖子自带发布时间）中，有没有适合我的前端开发工程师（2 年经验）岗位？",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P3",
+    "role": "前端开发工程师（2 年经验）",
+    "summary": "社招（2 年经验），方向：前端开发 Vue3，技能：Vue3、TypeScript、Vite，城市：广州、深圳"
+  }
+}

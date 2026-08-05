@@ -1,0 +1,21 @@
+{
+  "id": "Q133",
+  "question": "我想找深圳的AI 应用开发工程师（应届生）岗位，请在本校就业信息网搜索并汇总岗位信息。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "job-discovery"
+    ],
+    "site_types": [
+      "campus"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-3-days",
+    "time_window_text": "最近3天"
+  },
+  "profile": {
+    "id": "P1",
+    "role": "AI 应用开发工程师（应届生）",
+    "summary": "应届生（校招），方向：AI应用开发 大模型 Agent，技能：Python、LangChain、RAG、Agent，城市：北京、深圳"
+  }
+}

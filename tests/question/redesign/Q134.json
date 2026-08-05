@@ -1,0 +1,21 @@
+{
+  "id": "Q134",
+  "question": "我的简历如何调整才能匹配“Java 后端开发工程师”这个岗位？请先找到一份该岗位的公开 JD 再给出定制建议。",
+  "meta": {
+    "complexity": "simple",
+    "skills": [
+      "resume-tailoring"
+    ],
+    "site_types": [
+      "campus"
+    ],
+    "accessibility": "public",
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  }
+}

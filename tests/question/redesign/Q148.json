@@ -1,0 +1,22 @@
+{
+  "id": "Q148",
+  "question": "北京的 AIGC 产品经理（应届生）岗位有哪些适合我？请在猎聘产品经理专区（含 AIGC 专场）查找并匹配。",
+  "meta": {
+    "complexity": "complex",
+    "skills": [
+      "job-discovery",
+      "job-matching"
+    ],
+    "site_types": [
+      "tech-vertical"
+    ],
+    "accessibility": "public",
+    "time_window": "recent-1-day",
+    "time_window_text": "最近1天"
+  },
+  "profile": {
+    "id": "P4",
+    "role": "AIGC 产品经理（应届生）",
+    "summary": "应届生（校招），方向：AIGC产品 AI产品经理，技能：产品设计、AIGC 应用、数据分析，城市：北京"
+  }
+}

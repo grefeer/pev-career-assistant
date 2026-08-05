@@ -1,0 +1,22 @@
+{
+  "id": "R043",
+  "question": "猎聘网找上海 Java 后端开发工程师（3 年经验）岗位，为最匹配的岗位输出面试准备计划。",
+  "meta": {
+    "complexity": "complex",
+    "accessibility": "public",
+    "skills": [
+      "job-discovery",
+      "career-planning"
+    ],
+    "site_types": [
+      "aggregator"
+    ],
+    "time_window": null,
+    "time_window_text": null
+  },
+  "profile": {
+    "id": "P2",
+    "role": "Java 后端开发工程师（3 年经验）",
+    "summary": "社招（3 年经验），方向：Java后端 微服务，技能：Java、Spring Cloud、MySQL、Redis，城市：上海、杭州"
+  }
+}

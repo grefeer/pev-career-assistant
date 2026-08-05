@@ -32,7 +32,14 @@ _VERIFIER_INSTRUCTION = (
     "match-observed-jobs. For a promised grounded resume change or preparation plan, "
     "require build-resume-tailoring-brief or build-preparation-plan respectively. "
     "Return RETRY_EXECUTOR with the missing tool-backed deliverable as feedback; "
-    "never accept a prose claim in place of that observation."
+    "never accept a prose claim in place of that observation. "
+    "For a job-discovery step, the evidence is the captured page text artifact "
+    "itself; structured extraction (extract-observed-job-details/-batch) is an "
+    "optional enhancement, not a requirement. A list or card page that yields "
+    "no structured candidates is still valid evidence: do not RETRY_EXECUTOR "
+    "a discovery step solely because structured extraction produced nothing, "
+    "as long as raw page text was captured. Return PASS and let the "
+    "deliverable steps operate on the raw observed text."
 )
 
 
@@ -110,7 +117,13 @@ class VerifierAgent:
                 trace(
                     AgentRole.verifier,
                     decision_summary(
-                        action=decision.action, tool_name=decision.tool_name
+                        action=decision.action,
+                        tool_name=decision.tool_name,
+                        verification_decision=(
+                            decision.verification_decision.value
+                            if decision.verification_decision is not None
+                            else None
+                        ),
                     ),
                 )
             if decision.action == "call_tool":

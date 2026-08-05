@@ -1,0 +1,1502 @@
+[
+  {
+    "id": "Q076",
+    "profile": "P4",
+    "question": "搜索AIGC产品 AI产品经理岗位（拉勾网），针对目标岗位给出面试建议。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D", "E"],
+    "company": "拉勾网",
+    "role_term": "AIGC产品经理/AI产品经理",
+    "platform_site": "lagou.com（拉勾网）",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "拉勾网实测返回CF_APP_WAF人机验证页，JD正文不可抓（eval Q076实锤）；改写为liepin产品经理落地页（可抓已验证）或大厂可渲染官方招聘页，时间窗按台账近3天更新公司表述"
+  },
+  {
+    "id": "Q077",
+    "profile": "P1",
+    "question": "根据 JD 内容，准备AI 应用开发工程师（应届生）岗位的自我介绍与项目阐述思路。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "未指名（学校就业信息网类）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "引用\"该JD\"但全新会话无JD，实测台账无匹配、搜索仅百度百科（eval Q077）；链式：Q1收集AI应用开发JD→Q2自我介绍与项目阐述"
+  },
+  {
+    "id": "Q078",
+    "profile": "P2",
+    "question": "比较候选岗位与我的匹配度，为最优选择制定求职准备计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "学校就业信息网（候选岗位）",
+    "time_window": "recent-7-days",
+    "verdict": "chain",
+    "notes": "\"候选岗位\"依赖前置收集；实测台账匹配岗（杭州龙旗/禾迈/FranklinWH）官方页均不可抓（mokahr/dingtalkoxm判unsafe、51job无JD正文）；链式：Q1台账近7天找Java岗→Q2匹配+准备计划"
+  },
+  {
+    "id": "Q079",
+    "profile": "P3",
+    "question": "针对该岗位 JD，制定 3 天内的面试冲刺计划。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该岗位JD\"引用前置上下文（全新会话无该岗位）；实测最终轮succeeded（O1后agent自发现JD）——A类设计缺陷仍在，链式化（Q1找前端JD→Q2冲刺计划）保证设计诚实与稳定复现；注意\"3天内\"是计划时限非发布窗口，无需时间窗改写"
+  },
+  {
+    "id": "Q080",
+    "profile": "P4",
+    "question": "基于候选岗位的匹配排名，为前 3 名定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": "recent-30-days",
+    "verdict": "chain",
+    "notes": "\"候选岗位匹配排名\"依赖前置环节；链式后题（Q1收集+匹配→Q2为前3定制简历），时间窗由Q1按台账近30天处理"
+  },
+  {
+    "id": "Q081",
+    "profile": "P1",
+    "question": "我想找北京的AI 应用开发工程师（应届生）岗位，请在字节跳动招聘官网搜索并汇总岗位信息。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D"],
+    "company": "字节跳动",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "jobs.bytedance.com",
+    "time_window": "recent-1-day",
+    "verdict": "keep",
+    "notes": "官网经Playwright可渲染（实测空结果负面合法）；岗位名\"AI应用开发工程师\"过窄致恒空结果，微调放宽为\"AI工程师/大模型应用开发\"；时间窗判定按台账近1天更新（字节在台账内）"
+  },
+  {
+    "id": "Q082",
+    "profile": "P2",
+    "question": "最近1天从字节跳动的官方招聘页（jobs.bytedance.com）收集的岗位值得投吗？如果适合，帮我定制简历并准备面试。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["A", "D", "E"],
+    "company": "字节跳动",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "jobs.bytedance.com",
+    "time_window": "recent-1-day",
+    "verdict": "chain",
+    "notes": "\"已收集的岗位\"前置依赖+字节列表页不显示发布日期（实测Q082明示）；链式：L1台账近1天→字节收集Java后端岗（需渲染）→L2评估+简历+面试"
+  },
+  {
+    "id": "Q083",
+    "profile": "P3",
+    "question": "我要找前端开发工程师（2 年经验）工作，帮我从国家电网招聘平台抓取最近发布的岗位，关键词前端开发 Vue3。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["B", "D", "E"],
+    "company": "国家电网",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "国家电网官方招聘站（sgcc）",
+    "time_window": "recent-3-days",
+    "verdict": "delete",
+    "notes": "种子为第三方备考资讯页与官方脱节（B）；国网官方招聘站不可抓、台账0记录（E）；实测\"成功\"交付的是长沙人才网信雅达代招岗，与题目来源脱节——国网无前端Vue3社招岗，纯死路删除；如保留价值改写为学校就业网/综合招聘平台"
+  },
+  {
+    "id": "Q084",
+    "profile": "P4",
+    "question": "从国家电网招聘平台最近3天发布的岗位中选出最适合我的，定制简历，并准备对应的面试问题。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["B", "C", "D", "E"],
+    "company": "国家电网",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "国家电网官方招聘站（sgcc）",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "AIGC产品经理应届生×央国企组合不现实（C）+国网官方站不可抓、搜索仅返回Boss/智联/拉勾登录墙页（E）+第三方资讯页种子脱节（B）；改写：换有AIGC产品经理校招岗的大厂（字节/腾讯等可渲染官网）或换岗位方向，时间窗按台账近3天"
+  },
+  {
+    "id": "Q085",
+    "profile": "P1",
+    "question": "从已抓取的 JD 中选出与我匹配度最高的前 3 个岗位。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "聚合平台（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"已抓取的JD\"前置依赖（实测台账2条记录页面均不可抓、搜索无有效JD）；链式后题：Q1收集→Q2选前3"
+  },
+  {
+    "id": "Q086",
+    "profile": "P2",
+    "question": "找岗位→匹配→面试规划：在Boss 直聘按“Java后端 微服务”搜索上海的岗位，最近7天。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "Boss直聘",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "zhipin.com（Boss直聘）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "Boss直聘需登录且反爬严格，搜索页抓取失败（实测Q086实锤）；改写为liepin Java后端落地页（可抓已验证）/百度招聘/技术社区，时间窗按台账近7天"
+  },
+  {
+    "id": "Q087",
+    "profile": "P3",
+    "question": "基于我的简历，从已抓取岗位中推荐最匹配的 5 个。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "学校就业信息网（已抓取岗位）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"已抓取岗位\"前置依赖（实测candidate_urls为空、批量提取缺artifact_ids）；链式后题：Q1台账/就业网收集→Q2推荐5个"
+  },
+  {
+    "id": "Q088",
+    "profile": "P4",
+    "question": "从最近收集的岗位（学校就业指导中心官网/就业信息网）选出适合我的，针对前 2 个定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "学校就业指导中心官网/就业信息网",
+    "time_window": "recent-30-days",
+    "verdict": "chain",
+    "notes": "\"最近收集的岗位\"前置依赖；来源可抓（台账721条实测可查）；链式后题：Q1台账近30天收集→Q2选2个定制简历"
+  },
+  {
+    "id": "Q089",
+    "profile": "P1",
+    "question": "对比已收集岗位与我的背景，列出最值得投递的 3 个。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测上下文无candidate_urls，如实索要）；链式后题：Q1收集→Q2对比选3个"
+  },
+  {
+    "id": "Q090",
+    "profile": "P2",
+    "question": "已收集的岗位哪个最适合我？定制简历并制定面试计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": "recent-1-day",
+    "verdict": "chain",
+    "notes": "\"已收集的岗位\"前置依赖（实测无candidate_urls）；链式后题，时间窗由Q1按台账近1天处理"
+  },
+  {
+    "id": "Q091",
+    "profile": "P3",
+    "question": "根据该 JD 的要求，改写我的项目经历描述。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—（未指名公司官网）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "未指名（公司官网）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"引用前置上下文（全新会话无该JD）；实测最终轮succeeded（O1后agent自发现JD）——仍建议链式化（Q1收集前端JD→Q2改写项目经历）保证上下文真实存在"
+  },
+  {
+    "id": "Q092",
+    "profile": "P4",
+    "question": "搜索AIGC产品 AI产品经理岗位（网易招聘官网，最近3天），然后针对它定制简历和准备面试。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring", "career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D", "E"],
+    "company": "网易",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "网易招聘官网",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "网易官网反爬，4轮重测全部诚实放弃（eval Q092/Q109实锤）；改写为可抓源（liepin产品经理落地页/腾讯等可渲染官网/技术社区），时间窗按台账近3天"
+  },
+  {
+    "id": "Q093",
+    "profile": "P1",
+    "question": "为投递“大模型应用开发工程师”，优化我的简历自我评价与项目部分。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["E"],
+    "company": "央国企（未指名）",
+    "role_term": "大模型应用开发工程师",
+    "platform_site": "央国企招聘平台（未指名）",
+    "time_window": null,
+    "verdict": "rewrite",
+    "notes": "未指名公司+央国企平台列表页多为SPA/不可抓（实测多数轮次无进展，仅1轮曾成功属证据噪声）；改写：指向liepin大模型应用开发工程师落地页（可抓种子已验证）或链式先收集JD；央国企是否有\"大模型应用开发\"岗名需确认"
+  },
+  {
+    "id": "Q094",
+    "profile": "P2",
+    "question": "从中粮集团招聘平台最近7天岗位中选出与我社招（3 年经验）背景最匹配的。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "中粮集团",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "中粮集团招聘平台（国聘iguopin.com）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "实测国聘中粮主页只渲染单位简介、岗位列表未加载，台账无近7天中粮记录；改写：预置中粮可抓页面种子（校招镜像页fenbi/hebut已验证可抓）或明确台账路径，时间窗按台账近7天"
+  },
+  {
+    "id": "Q095",
+    "profile": "P3",
+    "question": "根据该 JD 的技术栈Vue3、TypeScript、Vite，帮我规划面试复习重点。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A", "E"],
+    "company": "聚合平台（未指名）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "聚合平台（gated，未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文且聚合平台gated（实测索要JD）；链式：Q1收集可抓源前端JD→Q2按技术栈规划复习重点"
+  },
+  {
+    "id": "Q096",
+    "profile": "P4",
+    "question": "最近30天牛客网（校招笔试与招聘社区）的AIGC 产品经理（应届生）岗位如何准备？先找岗位再制定面试计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["D"],
+    "company": "牛客网",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "nowcoder.com（牛客网）",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "实测牛客岗位详情页可抓（找到1个真实AIGC/AI Agent产品经理岗但投递窗口2026-03~06已过、与画像冲突）；主要问题为时间窗表述（按台账近30天）与投递窗口冲突风险；改写时指明具体岗位页或台账路径"
+  },
+  {
+    "id": "Q097",
+    "profile": "P1",
+    "question": "给我一份面试追问清单，基于该 JD 的要求。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "学校就业网（校园渠道）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文（实测索要JD链接）；链式后题：Q1收集AI应用开发JD→Q2追问清单"
+  },
+  {
+    "id": "Q098",
+    "profile": "P2",
+    "question": "在教育部大学生就业网找最近1天的Java 后端开发工程师（3 年经验）岗位，并为匹配度最高的定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D", "E"],
+    "company": "教育部（大学生就业网）",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "ncss.cn（教育部大学生就业网）",
+    "time_window": "recent-1-day",
+    "verdict": "rewrite",
+    "notes": "实测ncss岗位搜索需学信网账号登录、公开抓取不可行（eval Q098实锤）；改写为学校就业信息网/台账或各省就业平台；另社招3年×校招平台错配需注意；时间窗按台账近1天"
+  },
+  {
+    "id": "Q099",
+    "profile": "P3",
+    "question": "面试该岗位时如何回答“项目经历”？基于 JD 定制准备方案。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该岗位JD\"引用前置上下文；实测最终轮succeeded（O1后agent自发现JD）——仍建议链式化（Q1收集JD→Q2项目经历问答方案）保证上下文真实存在"
+  },
+  {
+    "id": "Q100",
+    "profile": "P4",
+    "question": "已收集岗位哪个最匹配？输出对应简历定制方案。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": "recent-3-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测match-observed-jobs空结果）；链式后题，时间窗由Q1按台账近3天处理"
+  },
+  {
+    "id": "Q101",
+    "profile": "P1",
+    "question": "对比这些候选岗位，我的Python、LangChain、RAG、Agent经验更适合哪个？",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"这些候选岗位\"引用前置上下文；实测最终轮succeeded（O1后agent自收集JD完成对比）——仍建议链式化（Q1收集→Q2对比）保证上下文真实存在"
+  },
+  {
+    "id": "Q102",
+    "profile": "P2",
+    "question": "对比这些候选岗位，我的Java、Spring Cloud、MySQL、Redis经验更适合哪个？",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"这些候选岗位\"前置依赖（实测台账1条记录申请链接dingtalkoxm被安全策略判unsafe）；链式后题：Q1收集→Q2对比"
+  },
+  {
+    "id": "Q103",
+    "profile": "P3",
+    "question": "针对“Web 前端工程师”岗位，给我一份面试准备计划。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "—（未指名公司官网）",
+    "role_term": "Web前端工程师",
+    "platform_site": "公司官网（未指名）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "无前置依赖、来源可抓；O1后agent自发现腾讯高级前端JD并全链路成功（eval Q103实锤succeeded）；可微调为指名公司或链式更稳定"
+  },
+  {
+    "id": "Q104",
+    "profile": "P4",
+    "question": "根据该 JD 的技术栈产品设计、AIGC 应用、数据分析，帮我规划面试复习重点。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文（实测索要JD）；链式：Q1收集AIGC产品经理JD→Q2按技术栈规划复习重点"
+  },
+  {
+    "id": "Q105",
+    "profile": "P1",
+    "question": "根据该 JD 的技术栈Python、LangChain、RAG、Agent，帮我规划面试复习重点。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文（实测格式异常/无JD可依）；链式：Q1收集AI应用开发JD→Q2按技术栈规划复习重点"
+  },
+  {
+    "id": "Q106",
+    "profile": "P2",
+    "question": "最近7天美团的官方招聘页适合我的Java 后端开发工程师（3 年经验）岗位有哪些？为最匹配的岗位定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "美团",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "careers.meituan.com",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "实测美团搜索页只返回通用列表静态框架、筛选结果不渲染，台账无近7天美团记录（eval Q106实锤）；改写：预置具体JD URL种子或换渠道，时间窗按台账近7天"
+  },
+  {
+    "id": "Q107",
+    "profile": "P3",
+    "question": "最近3天拼多多的官方招聘页有哪些前端开发工程师（2 年经验）岗位适合我？按匹配度排序。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D", "E"],
+    "company": "拼多多",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "拼多多官方招聘页",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "拼多多官网反爬，4轮重测全部诚实放弃（eval Q107实锤）；改写为第三方可抓源（牛客内推帖/掘金/v2ex转载）或换公司，时间窗按台账近3天"
+  },
+  {
+    "id": "Q108",
+    "profile": "P4",
+    "question": "在已收集的岗位中，帮我挑出最值得投递的 2 个并给出准备建议。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "career-planning"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": "recent-1-day",
+    "verdict": "chain",
+    "notes": "\"已收集的岗位\"前置依赖（实测台账无AIGC匹配、搜索仅百科词条）；链式后题，时间窗由Q1按台账近1天处理"
+  },
+  {
+    "id": "Q109",
+    "profile": "P1",
+    "question": "在网易招聘官网找最近30天的AI 应用开发工程师（应届生）岗位，并为匹配度最高的定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["D", "E"],
+    "company": "网易",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "网易招聘官网",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "网易官网反爬，4轮重测全部诚实放弃（eval Q109实锤）；改写为可抓源（百度招聘GRADUATE JD页/腾讯可渲染官网/liepin），时间窗按台账近30天"
+  },
+  {
+    "id": "Q110",
+    "profile": "P2",
+    "question": "在已收集岗位中选出最匹配的，针对它定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring"],
+      "site_types": ["company-official"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "公司官网（未指名）",
+    "time_window": "recent-30-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测匹配工具空结果）；链式后题，时间窗由Q1按台账近30天处理"
+  },
+  {
+    "id": "Q111",
+    "profile": "P3",
+    "question": "已收集岗位中，哪些要求Vue3、TypeScript、Vite？帮我挑出匹配的。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "央国企（未指名）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测台账匹配公司页面为公司介绍页/链接不可抓）；链式后题：Q1收集→Q2按技术栈筛选"
+  },
+  {
+    "id": "Q112",
+    "profile": "P4",
+    "question": "已收集的岗位里，哪个与我的应届生（校招）背景最契合？给出理由。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-matching"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"已收集的岗位\"引用前置上下文；早期轮次实测可经台账找到长亭科技2027 AI校招产品经理岗、最终轮waiting_user——台账可作\"已收集\"来源；仍建议链式化（Q1台账收集→Q2契合度）"
+  },
+  {
+    "id": "Q113",
+    "profile": "P1",
+    "question": "给出AI 应用开发实习生岗位的面试建议，包括常见问题与回答要点。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "央国企（未指名）",
+    "role_term": "AI应用开发实习生",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "通用面试建议题、目标明确、无需外部来源，设计上现实可评测；实测最终轮waiting_user（agent索要JD）——微调评估口径允许基于画像+可自选的公开JD输出通用建议；央国企有AI实习岗（运营商/研究院），组合现实；保留"
+  },
+  {
+    "id": "Q114",
+    "profile": "P2",
+    "question": "Java 后端开发工程师面试前我该如何准备？输出详细计划。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "通用准备计划、无前置依赖；实测waiting_user（索要JD）——微调评估口径：允许基于画像+自找公开JD生成通用计划；保留"
+  },
+  {
+    "id": "Q115",
+    "profile": "P3",
+    "question": "前端开发工程师面试前我该如何准备？输出详细计划。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "通用准备计划；实测因步骤skill限定（仅career-planning）无法先抓JD而卡住——微调提示词允许画像基础计划；保留"
+  },
+  {
+    "id": "Q116",
+    "profile": "P4",
+    "question": "从中国建筑集团招聘平台找最近1天的AIGC 产品经理（应届生）岗位，为其中一个定制简历并准备面试。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring", "career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["C", "D", "E"],
+    "company": "中国建筑集团",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "中国建筑集团招聘平台（cscec.com，域名失效）",
+    "time_window": "recent-1-day",
+    "verdict": "rewrite",
+    "notes": "cscec.com域名已失效不可解析（eval Q063同类实锤）+中国建筑×AIGC产品经理应届生组合不现实（央国企无此类岗）；改写：换有AIGC产品经理校招岗的大厂（字节/腾讯/网易）或换岗位方向，时间窗按台账近1天"
+  },
+  {
+    "id": "Q117",
+    "profile": "P1",
+    "question": "在已收集岗位中选出最匹配的，输出简历调整方案和面试准备清单。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": "recent-1-day",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖；链式后题（Q1台账近1天收集→Q2匹配+简历+面试清单）"
+  },
+  {
+    "id": "Q118",
+    "profile": "P2",
+    "question": "在国家电网招聘平台找最近3天的Java 后端开发工程师（3 年经验）岗位，为最合适的制定求职计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["B", "D", "E"],
+    "company": "国家电网",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "国家电网官方招聘站（sgcc）",
+    "time_window": "recent-3-days",
+    "verdict": "delete",
+    "notes": "与Q083同构：第三方资讯页种子脱节（B）+国网官方招聘站不可抓、台账0记录（E），国网社招Java后端基本不走公开平台；如保留\"找岗+求职计划\"设计价值，可改写为学校就业网/国聘可抓源"
+  },
+  {
+    "id": "Q119",
+    "profile": "P3",
+    "question": "把已收集岗位按我的匹配度排序，输出排名和面试准备要点。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "career-planning"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": "recent-3-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖；链式后题（Q1台账近3天收集→Q2排序+面试要点）"
+  },
+  {
+    "id": "Q120",
+    "profile": "P4",
+    "question": "从已收集岗位里挑出最适合我的，输出简历定制方案。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring"],
+      "site_types": ["state-owned"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "央国企平台（未指名）",
+    "time_window": "recent-1-day",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测索要URL列表）；链式后题（Q1收集→Q2挑最优+简历方案）"
+  },
+  {
+    "id": "Q121",
+    "profile": "P1",
+    "question": "帮我在Boss 直聘上找最近3天发布的AI 应用开发工程师（应届生）岗位，方向是AI应用开发 大模型 Agent，地点深圳。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D", "E"],
+    "company": "Boss直聘",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "zhipin.com（Boss直聘）",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "Boss直聘需登录且反爬严格（实测搜索页被拦截）；r4重测agent换liepin路径真实成功——改写为直接指名可抓渠道（liepin角色落地页/百度招聘），时间窗按台账近3天"
+  },
+  {
+    "id": "Q122",
+    "profile": "P2",
+    "question": "最近7天拉勾网（互联网招聘平台）有哪些Java 后端开发工程师（3 年经验）岗位？请列出岗位标题和链接。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "拉勾网",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "lagou.com（拉勾网）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "拉勾WAF人机验证，3个岗位URL均被拦截（eval Q122实锤：summary自述无法完成）；改写为liepin Java落地页/其他可抓聚合源，时间窗按台账近7天"
+  },
+  {
+    "id": "Q123",
+    "profile": "P3",
+    "question": "针对Vue 前端开发岗位，给出简历修改建议（改动点+原因）。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["E"],
+    "company": "聚合平台（未指名）",
+    "role_term": "Vue前端开发岗位",
+    "platform_site": "聚合平台（gated，未指名）",
+    "time_window": null,
+    "verdict": "rewrite",
+    "notes": "未指名平台且gated不可抓，实测无JD可依（build-resume-tailoring-brief需target_artifact_id）；改写：指名可抓平台JD（liepin前端落地页）或链式（Q1收集JD→Q2改简历）"
+  },
+  {
+    "id": "Q124",
+    "profile": "P4",
+    "question": "请根据该 JD 定制我的简历，把AIGC 产品经理（应届生）项目经验放到最前面。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "聚合平台（gated，未指名）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文（实测索要JD URL/文本）；链式：Q1收集AIGC产品经理JD→Q2定制简历（保留\"项目经验放最前\"指令）"
+  },
+  {
+    "id": "Q125",
+    "profile": "P1",
+    "question": "我的简历如何调整才能匹配“大模型应用开发工程师”这个岗位？",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["E"],
+    "company": "聚合平台（未指名）",
+    "role_term": "大模型应用开发工程师",
+    "platform_site": "聚合平台（gated，未指名）",
+    "time_window": null,
+    "verdict": "rewrite",
+    "notes": "未指名平台且gated；实测搜索仅教程/百科无真实JD；改写：指名可抓来源（liepin大模型应用开发工程师落地页可抓已验证）或链式先收集JD"
+  },
+  {
+    "id": "Q126",
+    "profile": "P2",
+    "question": "最近7天Boss 直聘（综合招聘平台）上适合我的Java 后端开发工程师（3 年经验）岗位有哪些？选出最适合的 2 个，针对每个定制简历，并给出面试建议。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "Boss直聘",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "zhipin.com（Boss直聘）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "Boss直聘登录墙（实测台账11条均27届秋招与3年社招错配、搜索无果）；改写换可抓源（liepin Java落地页），时间窗按台账近7天"
+  },
+  {
+    "id": "Q127",
+    "profile": "P3",
+    "question": "在拉勾网找一个适合我的前端开发工程师（2 年经验）岗位（最近3天），定制简历+面试准备。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D", "E"],
+    "company": "拉勾网",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "lagou.com（拉勾网）",
+    "time_window": "recent-3-days",
+    "verdict": "rewrite",
+    "notes": "拉勾WAF人机验证，5个候选URL均无法获取JD（eval Q127实锤）；改写为liepin前端落地页（可抓已验证），时间窗按台账近3天"
+  },
+  {
+    "id": "Q128",
+    "profile": "P4",
+    "question": "从已收集岗位里挑出前 2 个最合适的，针对它们定制简历并准备面试。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "聚合平台（gated，未指名）",
+    "time_window": "recent-3-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖；链式后题（Q1收集→Q2选前2+简历+面试），时间窗由Q1处理"
+  },
+  {
+    "id": "Q129",
+    "profile": "P1",
+    "question": "在前程无忧找最近7天的AI 应用开发工程师（应届生）岗位并筛选出最适合我的。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D", "E"],
+    "company": "前程无忧",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "we.51job.com（前程无忧）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "实测51job搜索页JS动态加载无JD正文、旧接口同样无果（eval Q129实锤）；改写换可抓源（百度招聘GRADUATE JD页/liepin），时间窗按台账近7天"
+  },
+  {
+    "id": "Q130",
+    "profile": "P2",
+    "question": "收集猎聘（中高端招聘平台）最近1天岗位，针对其中一个定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring"],
+      "site_types": ["aggregator"],
+      "accessibility": "gated",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D", "E"],
+    "company": "猎聘",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "liepin.com（猎聘）",
+    "time_window": "recent-1-day",
+    "verdict": "rewrite",
+    "notes": "实测猎聘首页/搜索/按时间筛选页均无JD证据（列表需登录或JS接口）；但猎聘角色落地页可抓（Q011/Q055种子已验证）——改写为给落地页或具体岗位页种子，时间窗按台账近1天"
+  },
+  {
+    "id": "Q131",
+    "profile": "P3",
+    "question": "用关键词“前端开发 Vue3”在基层就业项目公告搜索前端开发工程师（2 年经验）相关岗位，只要深圳的。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["C", "D"],
+    "company": "基层就业项目（选调生/三支一扶类，非公司）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "基层就业项目公告",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "基层就业项目公告（选调生/三支一扶）无前端开发社招岗——岗位×来源错配（实测agent换liepin才成功）；改写：来源换学校就业网/猎聘落地页，时间窗按台账近30天"
+  },
+  {
+    "id": "Q132",
+    "profile": "P4",
+    "question": "教育部大学生就业网（ncss.cn）最近有没有适合应届生（校招）的岗位？帮我收集一下AIGC 产品经理（应届生）方向的。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D", "E"],
+    "company": "教育部（大学生就业网）",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "ncss.cn（教育部大学生就业网）",
+    "time_window": "recent-1-day",
+    "verdict": "rewrite",
+    "notes": "实测ncss岗位搜索需学信网账号登录、公开抓取不可行（eval Q132实锤）；改写为学校就业信息网/台账（本校就业网台账721条可查），时间窗按台账近1天"
+  },
+  {
+    "id": "Q133",
+    "profile": "P1",
+    "question": "我想找深圳的AI 应用开发工程师（应届生）岗位，请在本校就业信息网搜索并汇总岗位信息。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["D"],
+    "company": "本校（未指名）",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "本校就业信息网（台账）",
+    "time_window": "recent-3-days",
+    "verdict": "keep",
+    "notes": "本校就业信息网=台账查询（721条），实测succeeded（空结果负面合法）；题目文本未含时间窗，台账查询支持近N天过滤，无需改写；保留"
+  },
+  {
+    "id": "Q134",
+    "profile": "P2",
+    "question": "我的简历如何调整才能匹配“Java 后端开发工程师”这个岗位？",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "—",
+    "role_term": "Java后端开发工程师",
+    "platform_site": "学校就业信息网（校园渠道）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "目标明确、来源可抓，O1后agent可自发现JD；实测无JD时卡住（社招×校招源错配风险）——微调为\"先找一份Java后端JD再定制\"或链式更稳；保留"
+  },
+  {
+    "id": "Q135",
+    "profile": "P3",
+    "question": "帮我按目标 JD 定制简历：突出Vue3、TypeScript、Vite、弱化无关经历。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "未指名（目标JD）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"目标JD\"无上下文（实测台账无匹配、搜索仅教程/百科）；链式：Q1收集前端JD→Q2定制简历（保留\"突出Vue3/TS/Vite\"指令）"
+  },
+  {
+    "id": "Q136",
+    "profile": "P4",
+    "question": "帮我完成一次完整求职：在基层就业项目公告找最近30天的AIGC 产品经理（应届生）岗位→筛选适合我的→为最匹配岗位定制简历→准备面试。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["C", "D"],
+    "company": "基层就业项目（选调生/三支一扶类，非公司）",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "基层就业项目公告",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "基层就业项目公告×AIGC产品经理应届生组合不现实（该渠道无此类岗）；全流程设计有价值——改写：来源换学校就业网/台账或大厂校招渠道，时间窗按台账近30天"
+  },
+  {
+    "id": "Q137",
+    "profile": "P1",
+    "question": "基于已收集岗位做完整求职准备：匹配排序、简历定制、面试建议。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "学校就业信息网（校园渠道）",
+    "time_window": "recent-7-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖；链式后题（Q1台账近7天收集→Q2匹配排序+简历+面试建议）"
+  },
+  {
+    "id": "Q138",
+    "profile": "P2",
+    "question": "帮我找最近7天的Java 后端开发工程师（3 年经验）岗位（学校就业指导中心官网/就业信息网），并为最佳选择做简历定制与面试计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "resume-tailoring", "career-planning"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D"],
+    "company": "本校（未指名）",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "学校就业指导中心官网/就业信息网",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "学校就业网以校招为主，P2社招3年×校招平台错配（实测无法找到匹配岗）；改写：明确\"台账近7天更新公司中查其社招Java岗\"或换liepin Java落地页；时间窗按台账近7天"
+  },
+  {
+    "id": "Q139",
+    "profile": "P3",
+    "question": "收集学校就业网发布的宣讲会与双选会信息最近30天岗位，按我的背景匹配排序。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["D"],
+    "company": "本校（未指名）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "学校就业网宣讲会/双选会",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "未指定具体学校URL，实测无法定位就业网、台账无宣讲会记录；改写：指定具体学校就业网URL或台账宣讲会sheet；P3社招2年×校招宣讲会错配需注意；时间窗按台账近30天"
+  },
+  {
+    "id": "Q140",
+    "profile": "P4",
+    "question": "基于已收集岗位的匹配排名，为最匹配的岗位定制简历。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "resume-tailoring"],
+      "site_types": ["campus"],
+      "accessibility": "public",
+      "time_window": "recent-3-days",
+      "time_window_text": "最近3天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "学校就业信息网（校园渠道）",
+    "time_window": "recent-3-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"引用前置上下文；早期轮次实测经台账找到长亭科技AI校招产品经理岗、最终轮waiting_user（波动）——链式化后（Q1台账收集→Q2定制）可稳定复现；时间窗由Q1处理"
+  },
+  {
+    "id": "Q141",
+    "profile": "P1",
+    "question": "最近7天发布的AI 应用开发工程师（应届生）岗位里，技术社区招聘频道/开源项目招聘帖发布的有哪些？我要北京的。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D"],
+    "company": "技术社区/开源项目（未指名）",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "技术社区招聘频道/开源项目招聘帖（未指名）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "渠道过泛（实测台账无匹配、搜索仅百度百科）；改写：指名v2ex酷工作/掘金招聘节点或具体开源项目帖URL；时间窗按帖子更新时间/台账近7天"
+  },
+  {
+    "id": "Q142",
+    "profile": "P2",
+    "question": "请到AI 行业垂直招聘渠道看看有没有适合社招（3 年经验）的岗位，方向Java后端 微服务，最好在杭州。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-30-days",
+      "time_window_text": "最近30天"
+    },
+    "categories": ["D"],
+    "company": "AI垂直招聘渠道（未指名）",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "AI行业垂直招聘渠道（未指名）",
+    "time_window": "recent-30-days",
+    "verdict": "rewrite",
+    "notes": "\"AI行业垂直招聘渠道\"未指名，搜索主导不可复现（实测仅Oracle产品页）；改写：指名具体渠道（v2ex/掘金/牛客内推/liepin落地页）；时间窗按台账近30天"
+  },
+  {
+    "id": "Q143",
+    "profile": "P3",
+    "question": "最近1天更新过的岗位中，稀土掘金社区的技术招聘帖有没有适合我的前端开发工程师（2 年经验）岗位？",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["job-discovery"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D"],
+    "company": "稀土掘金社区",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "juejin.cn（稀土掘金社区）",
+    "time_window": "recent-1-day",
+    "verdict": "keep",
+    "notes": "掘金帖可抓、帖子自带更新时间；早期轮次实测捕获4个前端岗位并匹配成功、最终轮waiting_user（波动）——微调明确\"最近1天\"按帖子/台账更新时间判定口径即可稳定；保留"
+  },
+  {
+    "id": "Q144",
+    "profile": "P4",
+    "question": "针对产品经理（AIGC 方向）岗位，给出简历修改建议（改动点+原因）。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["OK"],
+    "company": "—",
+    "role_term": "产品经理（AIGC方向）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": null,
+    "verdict": "keep",
+    "notes": "无前置依赖，O1后agent自发现腾讯AIGC产品经理JD并全链路成功（eval Q144实锤succeeded）；保留，可微调指名公司/来源更稳定"
+  },
+  {
+    "id": "Q145",
+    "profile": "P1",
+    "question": "基于该 JD 与我的应届生（校招）背景，定制一份针对性简历。",
+    "meta": {
+      "complexity": "simple",
+      "skills": ["resume-tailoring"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": null,
+      "time_window_text": null
+    },
+    "categories": ["A"],
+    "company": "—",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": null,
+    "verdict": "chain",
+    "notes": "\"该JD\"无上下文（实测搜索仅百科词条无公开招聘页）；链式：Q1收集AI应用开发JD→Q2定制简历"
+  },
+  {
+    "id": "Q146",
+    "profile": "P2",
+    "question": "最近1天在技术社区招聘频道/开源项目招聘帖有哪些Java 后端开发工程师（3 年经验）岗位适合我？给出匹配排名、最优岗位的简历调整方案和面试准备计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "resume-tailoring", "career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D"],
+    "company": "技术社区/开源项目（未指名）",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "技术社区招聘频道/开源项目招聘帖（未指名）",
+    "time_window": "recent-1-day",
+    "verdict": "rewrite",
+    "notes": "渠道未指名（实测台账工具失败+搜索仅Oracle产品页）；改写：指名v2ex/掘金具体节点URL；时间窗按帖子/台账近1天"
+  },
+  {
+    "id": "Q147",
+    "profile": "P3",
+    "question": "最近7天AI/大模型行业垂直招聘渠道的前端开发工程师（2 年经验）岗位中，哪些适合我？给出匹配排名和面试准备建议。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching", "career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D"],
+    "company": "AI垂直招聘渠道（未指名）",
+    "role_term": "前端开发工程师（2年经验）",
+    "platform_site": "AI行业垂直招聘渠道（未指名）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "\"AI/大模型行业垂直招聘渠道\"未指名不可复现；改写：指名v2ex/掘金/liepin落地页；时间窗按台账近7天"
+  },
+  {
+    "id": "Q148",
+    "profile": "P4",
+    "question": "北京的AIGC 产品经理（应届生）岗位（稀土掘金社区，最近1天）哪些适合我？",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "job-matching"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-1-day",
+      "time_window_text": "最近1天"
+    },
+    "categories": ["D"],
+    "company": "稀土掘金社区",
+    "role_term": "AIGC产品经理（应届生）",
+    "platform_site": "juejin.cn（稀土掘金社区）",
+    "time_window": "recent-1-day",
+    "verdict": "keep",
+    "notes": "早期轮次实测agent经liepin北京AIGC专场页（zpaigccpjlt25d）完成匹配、最终轮waiting_user（波动）——微调：直接指名liepin专场页URL以稳定复现；时间窗按台账近1天"
+  },
+  {
+    "id": "Q149",
+    "profile": "P1",
+    "question": "收集V2EX 酷工作节点最近7天的AI 应用开发工程师（应届生）岗位，并规划面试准备。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-discovery", "career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["D"],
+    "company": "V2EX",
+    "role_term": "AI应用开发工程师（应届生）",
+    "platform_site": "v2ex.com/go/jobs（V2EX酷工作）",
+    "time_window": "recent-7-days",
+    "verdict": "rewrite",
+    "notes": "v2ex可抓（种子库probe验证过2168ch）但波动大，实测直接抓取失败；改写：预置v2ex列表页/具体帖URL种子；时间窗按帖子更新时间/台账近7天"
+  },
+  {
+    "id": "Q150",
+    "profile": "P2",
+    "question": "基于已收集岗位，推荐与我背景最契合的岗位并给出求职准备计划。",
+    "meta": {
+      "complexity": "complex",
+      "skills": ["job-matching", "career-planning"],
+      "site_types": ["tech-vertical"],
+      "accessibility": "public",
+      "time_window": "recent-7-days",
+      "time_window_text": "最近7天"
+    },
+    "categories": ["A", "D"],
+    "company": "—",
+    "role_term": "Java后端开发工程师（3年经验）",
+    "platform_site": "未指名（技术垂直渠道）",
+    "time_window": "recent-7-days",
+    "verdict": "chain",
+    "notes": "\"已收集岗位\"前置依赖（实测candidate_urls为空、台账工具失败）；链式后题（Q1台账近7天收集→Q2推荐+准备计划）"
+  }
+]
