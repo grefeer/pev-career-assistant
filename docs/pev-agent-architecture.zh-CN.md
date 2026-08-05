@@ -182,9 +182,9 @@ stateDiagram-v2
     [*] --> queued: create_queued_run
     queued --> running: 后台 execute_queued_run
     queued --> cancelled: 人工
-    running --> waiting_user: need_user
+    running --> waiting_user: need_user / wall_clock_budget_exhausted / invalid_model_response / RETRY 超限
     running --> succeeded: 全部 step PASS
-    running --> failed: 预算耗尽 / invalid_model_response / FAIL
+    running --> failed: 轮次/工具预算耗尽 / FAIL
     running --> cancelled: 人工
     waiting_user --> running: resume_run
     waiting_user --> failed: 出错
@@ -378,7 +378,7 @@ flowchart LR
 
 1. **Skill 权限单步单 Skill**：Planner 每个 step 只能绑定一个 Skill；Executor 只看到当前 step 权限内的工具。`ExecutionPlan.validate_plan_authority` 强制 `step.allowed_skills ⊆ task.allowed_skills`。
 2. **工具只接受证据，不接受模型自报**：`_persist_observed_evidence` 只持久化工具产出（带 `source_url` + `content_hash` + `visible_text`/`candidates`），模型自报的 URI 永不落库。
-3. **预算硬上限**：`AgentBudget`（轮次/工具调用/重规划/墙钟）、`ToolCallBudget`、`AgentTurnBudget` 由宿主强制，Agent 无法绕过。`build_adaptive_agent_budget` 按 Skill 数量自适应放大轮次上限。
+3. **预算硬上限**：`AgentBudget`（轮次/工具调用/重规划/墙钟）、`ToolCallBudget`、`AgentTurnBudget` 由宿主强制，Agent 无法绕过。`build_adaptive_agent_budget` 按 Skill 数量自适应放大轮次上限。**墙钟（wall-clock）是软可恢复信号**：`wall_clock_budget_exhausted` 在三个 Agent 边界（Planner/Executor/Verifier）均降级为可恢复的 `waiting_user`（而非终态 `failed`），因为这只是传输/资源暂停——`resume()` 重新计算 `deadline = time.monotonic() + max_wall_clock_seconds` 即可继续。轮次/工具预算是**与延迟无关的工作权限**，resume 时从 DB 重建 `used` 计数，**不重置**（只有时钟窗口刷新）。相比之下，`agent_turn_budget_exhausted` 与 `tool_budget_exhausted` 仍为终态 `failed`（工作权限耗尽不可恢复）。
 4. **工具异常不外泄**：`ToolRegistry.invoke` 把任何 handler 异常转为 `ToolObservation(status=failed, error_code=...)`，未知工具/角色越权/输入输出不合法都有稳定 error_code。
 5. **所有权隔离**：所有 `get/list` 都先做 owner 校验（`get_run_for_owner`），跨用户不可见。
 6. **MySQL 权威**：SSE、Redis 都非权威；恢复只信任 DB。

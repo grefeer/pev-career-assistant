@@ -14,6 +14,8 @@ from backend.app.domain.agent_runtime import (
     AgentRole,
     ComplexityLevel,
     RunStatus,
+    StepStatus,
+    VerificationDecision,
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
@@ -28,6 +30,7 @@ from backend.app.services.agent_runtime.schemas import (
     PlanStep,
     PlannerResult,
     ToolObservation,
+    VerifierResult,
 )
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_context import ToolContext
@@ -1835,3 +1838,265 @@ def test_runtime_retains_successful_evidence_when_executor_later_hits_turn_limit
     assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
         ("public_job_page", "https://jobs.example/agent"),
     ]
+
+
+def test_runtime_degrades_planner_wall_clock_to_waiting_for_user(db_session) -> None:
+    """Wall-clock exhaustion at the planner degrades to recoverable waiting_user, not failed."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    runtime = object.__new__(AgentRuntime)
+    result = runtime._finish_planner_non_plan(
+        db_session, run.id, run,
+        PlannerResult(status="failed", error_code="wall_clock_budget_exhausted"),
+    )
+    db_session.commit()
+
+    assert (result.status, result.error_code) == (
+        RunStatus.waiting_user,
+        "wall_clock_budget_exhausted",
+    )
+    assert "运行时间预算耗尽" in (result.summary or "")
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "planner_budget_exhausted"
+    assert events[-1].payload_json["question"] == result.summary
+    # The error_code is persisted on the run row for observability.
+    refreshed = db_session.get(AgentRun, run.id)
+    assert refreshed.error_code == "wall_clock_budget_exhausted"
+    assert refreshed.status is RunStatus.waiting_user
+
+
+def test_runtime_degrades_executor_wall_clock_to_waiting_for_user(db_session) -> None:
+    """Executor wall-clock exhaustion mid-step pauses the run recoverably instead of failing."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.verifier: [],
+    })
+    result = _runtime_for_gateway(gateway)._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+        deadline=0.0,
+    )
+    db_session.commit()
+
+    assert (result.status, result.error_code) == (
+        RunStatus.waiting_user,
+        "wall_clock_budget_exhausted",
+    )
+    assert step.status is StepStatus.failed
+    assert step.error_code == "wall_clock_budget_exhausted"
+    refreshed = db_session.get(AgentRun, run.id)
+    assert refreshed.status is RunStatus.waiting_user
+    assert refreshed.error_code == "wall_clock_budget_exhausted"
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "run_needs_user"
+
+
+def test_runtime_degrades_verifier_wall_clock_to_waiting_for_user(db_session) -> None:
+    """R004: executor completed but verifier hits deadline -> recoverable waiting_user."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=True
+    )
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [],
+        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.verifier: [],
+    })
+    runtime = _runtime_for_gateway(gateway)
+    runtime._verifier = MagicMock()
+    runtime._verifier.run.return_value = VerifierResult(
+        decision=VerificationDecision.FAIL,
+        feedback="Wall-clock budget exhausted before verification.",
+        error_code="wall_clock_budget_exhausted",
+    )
+
+    result = runtime._run_step(
+        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+    )
+    db_session.commit()
+
+    assert (result.status, result.error_code) == (
+        RunStatus.waiting_user,
+        "wall_clock_budget_exhausted",
+    )
+    assert step.status is StepStatus.failed
+    assert step.error_code == "wall_clock_budget_exhausted"
+    refreshed = db_session.get(AgentRun, run.id)
+    assert refreshed.status is RunStatus.waiting_user
+    assert refreshed.error_code == "wall_clock_budget_exhausted"
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "run_needs_user"
+
+
+def test_runtime_resume_after_verifier_wall_clock_recomputes_deadline_and_proceeds(db_session) -> None:
+    """Resume after verifier wall-clock gives a fresh deadline so the verifier can run."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    plan_decision = {
+        "action": "plan", "complexity": "L3", "success_criteria": ["有证据"],
+        "steps": [{
+            "step_id": "discover", "objective": "提取公开 JD",
+            "allowed_skills": ["job-discovery"], "requires_verification": True,
+        }],
+    }
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [plan_decision, plan_decision],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "已提取"},
+            {"action": "complete", "summary": "已提取"},
+        ],
+        AgentRole.verifier: [],
+    })
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
+        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    runtime._verifier.run.return_value = VerifierResult(
+        decision=VerificationDecision.FAIL,
+        feedback="Wall-clock budget exhausted before verification.",
+        error_code="wall_clock_budget_exhausted",
+    )
+    task = AgentTaskRequest(
+        goal="找岗位", allowed_skills=["job-discovery"],
+        budget=AgentBudget(max_agent_turns=6, max_tool_calls=6, max_replans=0),
+    )
+
+    waiting = runtime.run(db_session, user_id=user.id, task=task)
+    db_session.commit()
+
+    assert (waiting.status, waiting.error_code) == (
+        RunStatus.waiting_user,
+        "wall_clock_budget_exhausted",
+    )
+
+    # Resume: the verifier now returns PASS with the freshly recomputed deadline.
+    runtime._verifier.run.return_value = VerifierResult(
+        decision=VerificationDecision.PASS,
+    )
+    resumed = runtime.resume(
+        db_session, user_id=user.id, run_id=waiting.run_id, task=task,
+    )
+    db_session.commit()
+
+    assert resumed.status is RunStatus.succeeded
+    # The fresh plan + step ran to completion after resume.
+    assert run_repository.count_plans(db_session, waiting.run_id) == 2
+    events = run_repository.list_events(db_session, waiting.run_id)
+    assert "run_resumed" in [event.event_type for event in events]
+    assert events[-1].event_type == "run_succeeded"
+
+
+def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_session) -> None:
+    """Only the wall-clock window refreshes on resume; turn/tool budgets keep their consumed counts."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    plan_decision = {
+        "action": "plan", "complexity": "L3", "success_criteria": ["有证据"],
+        "steps": [{
+            "step_id": "discover", "objective": "提取公开 JD",
+            "allowed_skills": ["job-discovery"], "requires_verification": True,
+        }],
+    }
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [plan_decision, plan_decision],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "fetch-job", "tool_input": {}},
+            {"action": "complete", "summary": "已提取"},
+            {"action": "call_tool", "tool_name": "fetch-job", "tool_input": {}},
+            {"action": "complete", "summary": "已提取"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {"title": "AI Agent 开发工程师"},
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    runtime._verifier.run.return_value = VerifierResult(
+        decision=VerificationDecision.FAIL,
+        feedback="Wall-clock budget exhausted before verification.",
+        error_code="wall_clock_budget_exhausted",
+    )
+    task = AgentTaskRequest(
+        goal="找岗位", allowed_skills=["job-discovery"],
+        budget=AgentBudget(max_agent_turns=6, max_tool_calls=6, max_replans=0),
+    )
+
+    waiting = runtime.run(db_session, user_id=user.id, task=task)
+    db_session.commit()
+
+    assert waiting.status is RunStatus.waiting_user
+    turns_before_resume = run_repository.count_turns(db_session, waiting.run_id)
+    tools_before_resume = run_repository.count_tool_decisions(db_session, waiting.run_id)
+    assert turns_before_resume > 0
+    assert tools_before_resume > 0
+
+    # Resume: the verifier returns PASS so the step completes.
+    runtime._verifier.run.return_value = VerifierResult(
+        decision=VerificationDecision.PASS,
+    )
+    resumed = runtime.resume(
+        db_session, user_id=user.id, run_id=waiting.run_id, task=task,
+    )
+    db_session.commit()
+
+    assert resumed.status is RunStatus.succeeded
+    # Turns and tool calls are cumulative across resume (not reset to 0):
+    # the first run consumed turns/tools, and the resume consumed more on top.
+    assert run_repository.count_turns(db_session, waiting.run_id) > turns_before_resume
+    assert run_repository.count_tool_decisions(db_session, waiting.run_id) > tools_before_resume
+    # The resume planner saw fewer remaining turns than a fresh run would
+    # (max - consumed_before_resume - 1 for its own consume), proving the
+    # turn budget was not reset. First-run planner had remaining = max - 1.
+    first_run_remaining = gateway.states[AgentRole.planner][0]["remaining_agent_turns"]
+    resume_remaining = gateway.states[AgentRole.planner][1]["remaining_agent_turns"]
+    assert resume_remaining < first_run_remaining
+    # The resume executor's first call_tool saw fewer remaining tool calls
+    # than the first run's call_tool, proving the tool budget was not reset.
+    first_run_tool_remaining = gateway.states[AgentRole.executor][0]["remaining_tool_calls"]
+    resume_tool_remaining = gateway.states[AgentRole.executor][2]["remaining_tool_calls"]
+    assert resume_tool_remaining < first_run_tool_remaining
+

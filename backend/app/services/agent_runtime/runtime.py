@@ -362,6 +362,20 @@ class AgentRuntime:
                     execution.user_question,
                     output_artifact_refs=observed_artifact_refs,
                 )
+            if execution.error_code == "wall_clock_budget_exhausted":
+                # Wall-clock exhaustion is a transport/resource pause, not a
+                # business failure: resume() recomputes a fresh deadline and
+                # the executor continues the remaining turns. Route to a
+                # recoverable waiting_user instead of failing the run, and
+                # surface the stable error_code for observability.
+                return self._wait_for_user(
+                    db,
+                    run_id,
+                    persisted_step,
+                    "运行时间预算耗尽（模型响应偏慢），该步骤尚未完成。恢复运行将获得新的时间窗口继续。",
+                    output_artifact_refs=observed_artifact_refs,
+                    error_code="wall_clock_budget_exhausted",
+                )
             if execution.status != "succeeded":
                 return self._fail_step(
                     db,
@@ -412,6 +426,21 @@ class AgentRuntime:
                         error.code,
                         output_artifact_refs=execution.artifact_refs,
                     )
+            if verification.error_code == "wall_clock_budget_exhausted":
+                # Wall-clock exhaustion before a verification decision is a
+                # transport/resource pause: the step's executor work is already
+                # persisted, and resume() recomputes a fresh deadline so the
+                # verifier can run its remaining calls. Route to a recoverable
+                # waiting_user instead of failing the run, surfacing the stable
+                # error_code for observability.
+                return self._wait_for_user(
+                    db,
+                    run_id,
+                    persisted_step,
+                    "运行时间预算耗尽（模型响应偏慢），步骤产出待核验。恢复运行将获得新的时间窗口完成核验。",
+                    output_artifact_refs=execution.artifact_refs,
+                    error_code="wall_clock_budget_exhausted",
+                )
             if verification.error_code:
                 return self._fail_step(
                     db,
@@ -871,20 +900,26 @@ class AgentRuntime:
         planner_result: PlannerResult,
     ) -> AgentRunResult:
         if planner_result.status == "needs_user":
-            run_repository.finish_run(
+            return self._finish_planner_waiting(
                 db,
+                run_id,
                 run,
-                status=RunStatus.waiting_user,
-                final_summary=planner_result.user_question,
-            )
-            run_repository.append_event(
-                db,
-                run_id=run_id,
+                planner_result.user_question,
                 event_type="planner_needs_user",
-                payload_json={"question": planner_result.user_question},
             )
-            return AgentRunResult(
-                run_id, RunStatus.waiting_user, planner_result.user_question
+        if planner_result.error_code == "wall_clock_budget_exhausted":
+            # The planner ran out of wall-clock before producing a plan. This
+            # is a transport/resource pause, not a business failure: resume()
+            # recomputes a fresh deadline and the planner re-attempts its plan.
+            # Route to a recoverable waiting_user with a distinct event and the
+            # stable error_code for observability, instead of failing the run.
+            return self._finish_planner_waiting(
+                db,
+                run_id,
+                run,
+                "运行时间预算耗尽（模型响应偏慢），无法生成执行计划。恢复运行将获得新的时间窗口重试。",
+                event_type="planner_budget_exhausted",
+                error_code="wall_clock_budget_exhausted",
             )
         error_code = planner_result.error_code or "planner_failed"
         run_repository.finish_run(db, run, status=RunStatus.failed, error_code=error_code)
@@ -903,17 +938,49 @@ class AgentRuntime:
         run: AgentRun,
     ) -> AgentRunResult:
         """A planner with persistently invalid output cannot plan safely: wait for a retry."""
-        question = "模型输出格式异常，无法生成执行计划。请重试，或补充岗位/条件信息后重新发起。"
+        return self._finish_planner_waiting(
+            db,
+            run_id,
+            run,
+            "模型输出格式异常，无法生成执行计划。请重试，或补充岗位/条件信息后重新发起。",
+            event_type="planner_needs_user",
+        )
+
+    def _finish_planner_waiting(
+        self,
+        db: Session,
+        run_id: str,
+        run: AgentRun,
+        question: str,
+        *,
+        event_type: str,
+        error_code: str | None = None,
+    ) -> AgentRunResult:
+        """Finish a planner-paused run as ``waiting_user`` without an AgentStep.
+
+        The planner has no persisted step yet, so ``_wait_for_user`` (which
+        requires a step) cannot be used. This helper closes the run as
+        recoverable and emits the caller-supplied ``event_type`` so the
+        distinct pause reasons (``planner_needs_user`` for invalid-model /
+        need-user, ``planner_budget_exhausted`` for wall-clock) stay
+        distinguishable in the event trace. ``error_code`` is persisted on the
+        run row and surfaced on the result for observability when set (e.g.
+        wall-clock); the invalid-model / need-user paths keep ``error_code=None``.
+        """
         run_repository.finish_run(
-            db, run, status=RunStatus.waiting_user, final_summary=question
+            db,
+            run,
+            status=RunStatus.waiting_user,
+            final_summary=question,
+            error_code=error_code,
         )
         run_repository.append_event(
             db,
             run_id=run_id,
-            event_type="planner_needs_user",
+            event_type=event_type,
             payload_json={"question": question},
         )
-        return AgentRunResult(run_id, RunStatus.waiting_user, question)
+        return AgentRunResult(run_id, RunStatus.waiting_user, question, error_code)
 
     def _wait_for_user(
         self,
@@ -923,7 +990,15 @@ class AgentRuntime:
         question: str | None,
         *,
         output_artifact_refs: list[dict[str, str]] | None = None,
+        error_code: str | None = None,
     ) -> AgentRunResult:
+        """Pause a step-bearing run for a human reply, recoverable via resume().
+
+        ``error_code`` is persisted on both the step and the run row when set
+        (e.g. ``wall_clock_budget_exhausted``) so the pause reason is observable
+        without inspecting the event trace; genuine need-user pauses keep the
+        default ``need_user`` step code and ``None`` run error_code.
+        """
         run = db.get(AgentRun, run_id)
         if run is None:  # defensive: foreign-key integrity normally prevents this.
             raise RuntimeError("Agent run disappeared during execution")
@@ -932,13 +1007,14 @@ class AgentRuntime:
             step,
             status=StepStatus.failed,
             output_artifact_refs=output_artifact_refs,
-            error_code="need_user",
+            error_code=error_code or "need_user",
         )
         run_repository.finish_run(
             db,
             run,
             status=RunStatus.waiting_user,
             final_summary=question,
+            error_code=error_code,
         )
         run_repository.append_event(
             db,
@@ -946,7 +1022,7 @@ class AgentRuntime:
             event_type="run_needs_user",
             payload_json={"question": question},
         )
-        return AgentRunResult(run_id, RunStatus.waiting_user, question)
+        return AgentRunResult(run_id, RunStatus.waiting_user, question, error_code)
 
     def _fail_step(
         self,
