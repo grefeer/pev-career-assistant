@@ -90,7 +90,6 @@ def test_summarize_observations_collapses_older_items_when_over_budget() -> None
     # The last 3 (most-recent) stay full.
     for item in result[-3:]:
         assert "visible_text" in item["output"]
-        assert "pages" not in item["output"] or "pages" in item["output"]
     # The first 5 (older) are summary lines.
     for item in result[:5]:
         assert "tool_name" in item

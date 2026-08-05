@@ -497,6 +497,101 @@ def test_gateway_last_usage_none_when_no_usage_metadata() -> None:
     assert gateway.last_usage is None
 
 
+class NonDictStructuredResultModel:
+    """Provider returns a non-dict from structured invoke, then recovers via JSON."""
+
+    def __init__(self) -> None:
+        self._structured = False
+        self._model = "test-non-dict"
+        self.fallback_invoked = False
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "NonDictStructuredResultModel":
+        self._structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        if self._structured:
+            self._structured = False
+            # Non-dict raw_result: isinstance(raw_result, dict) is False
+            return "not-a-dict"
+        self.fallback_invoked = True
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
+
+
+def test_gateway_handles_non_dict_structured_result() -> None:
+    """A non-dict structured result triggers JSON fallback without extracting usage from it."""
+    model = NonDictStructuredResultModel()
+    gateway = LangChainModelGateway(model)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert model.fallback_invoked is True
+    # Usage extracted from the fallback response, not from the non-dict structured result.
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["input_tokens"] == 10
+
+
+class TokenUsageFallbackModel:
+    """Provider returns usage via response_metadata.token_usage, not usage_metadata."""
+
+    def __init__(self) -> None:
+        self.include_raw = False
+        self.model = "token-usage-model"
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "TokenUsageFallbackModel":
+        self.include_raw = include_raw
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        raw_message = type(
+            "RawMessage",
+            (),
+            {
+                "usage_metadata": None,
+                "response_metadata": {
+                    "token_usage": {"prompt_tokens": 200, "completion_tokens": 100},
+                },
+            },
+        )()
+        return {"parsed": {"action": "need_user", "user_question": "请确认城市。"}, "raw": raw_message}
+
+
+def test_gateway_extracts_usage_from_response_metadata_token_usage() -> None:
+    """last_usage is populated from response_metadata.token_usage when usage_metadata is absent."""
+    model = TokenUsageFallbackModel()
+    gateway = LangChainModelGateway(model)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["model_name"] == "token-usage-model"
+    assert gateway.last_usage["input_tokens"] == 200
+    assert gateway.last_usage["output_tokens"] == 100
+
+
 def test_gateway_last_usage_populated_from_usage_metadata() -> None:
     """last_usage is populated correctly from the model's usage_metadata."""
     model = RecordingModel(

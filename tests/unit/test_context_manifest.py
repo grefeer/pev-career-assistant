@@ -38,6 +38,17 @@ def test_compute_evidence_chars_ignores_non_string_visible_text() -> None:
     assert compute_evidence_chars(evidence) == 5
 
 
+def test_compute_evidence_chars_ignores_non_dict_items() -> None:
+    """Non-dict items in the evidence list are silently skipped."""
+    evidence: list = [
+        "not-a-dict",
+        None,
+        42,
+        {"visible_text": "hello"},
+    ]
+    assert compute_evidence_chars(evidence) == 5
+
+
 def test_build_context_manifest_counts_match_inputs() -> None:
     """Counts and lengths match the supplied inputs exactly."""
     instruction = "You are a test agent."

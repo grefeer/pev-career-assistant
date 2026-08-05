@@ -127,6 +127,28 @@ class InvalidModelGateway:
         raise AgentModelGatewayError("invalid_model_response")
 
 
+class NoUsageGateway:
+    """Gateway that returns valid decisions but reports no token usage."""
+
+    def __init__(self, scripts: dict[AgentRole, list[dict[str, Any]]]) -> None:
+        self.scripts = scripts
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return None
+
+    def decide(
+        self,
+        *,
+        role: AgentRole,
+        instruction: str,
+        state: dict[str, Any],
+        response_model: type[BaseModel],
+    ) -> BaseModel:
+        assert instruction and state
+        return response_model.model_validate(self.scripts[role].pop(0))
+
+
 class CrashAfterFirstExecutorDecisionGateway:
     """Simulate process loss after a persisted Executor decision checkpoint."""
 
@@ -375,6 +397,108 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         # Planner has observations
         if turn.role is AgentRole.planner:
             assert turn.context_manifest["observation_count"] >= 0
+
+
+def test_runtime_trace_records_nulls_when_gateway_has_no_usage(db_session) -> None:
+    """When the gateway reports last_usage=None, turns persist null model/usage/manifest."""
+    user = User(
+        id="user-no-usage",
+        account="user-no-usage@example.test",
+        nickname="user-no-usage",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = NoUsageGateway(
+        {
+            AgentRole.planner: [
+                {
+                    "action": "plan",
+                    "complexity": "L3",
+                    "success_criteria": ["完整 JD 有公开来源"],
+                    "steps": [
+                        {
+                            "step_id": "discover",
+                            "objective": "提取公开岗位",
+                            "allowed_skills": ["job-discovery"],
+                            "requires_verification": True,
+                        }
+                    ],
+                }
+            ],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "fetch-job",
+                    "tool_input": {},
+                },
+                {
+                    "action": "complete",
+                    "summary": "已提取完整 JD",
+                    "artifact_refs": [{"uri": "artifact://job/1"}],
+                },
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "check-job-evidence",
+                    "tool_input": {},
+                },
+                {"action": "decide", "verification_decision": "PASS"},
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="fetch-job",
+            skill_name="job-discovery",
+            input_model=EmptyInput,
+            output_model=JobOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {"title": "AI Agent 开发工程师"},
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="check-job-evidence",
+            skill_name="job-discovery",
+            input_model=EmptyInput,
+            output_model=EvidenceOutput,
+            allowed_roles=frozenset({AgentRole.verifier}),
+            handler=lambda _context, _payload: {"complete": True},
+        )
+    )
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"]),
+    )
+    db_session.commit()
+
+    assert result.status is RunStatus.succeeded
+    turns = list(
+        db_session.scalars(
+            select(AgentTurn)
+            .where(AgentTurn.run_id == result.run_id)
+            .order_by(AgentTurn.created_at.asc(), AgentTurn.id.asc())
+        )
+    )
+    assert len(turns) == 5
+    # When last_usage is None, every turn records null usage and no context manifest.
+    for turn in turns:
+        assert turn.model_name is None
+        assert turn.input_tokens is None
+        assert turn.output_tokens is None
+        assert turn.context_manifest is None
 
 
 def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(db_session) -> None:
