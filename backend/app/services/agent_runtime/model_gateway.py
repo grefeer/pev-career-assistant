@@ -234,7 +234,12 @@ class LangChainModelGateway:
             raise AgentModelGatewayError("invalid_model_response") from exc
 
     def _extract_usage(self, raw_message: Any) -> None:
-        """Extract token usage from a raw AIMessage and store in _last_usage."""
+        """Extract token usage from a raw AIMessage and store in _last_usage.
+
+        Sets self._last_usage to a dict with usage data when available,
+        or None if no usage metadata is present. This follows the
+        Protocol contract of returning dict[str, Any] | None.
+        """
         usage_metadata = getattr(raw_message, "usage_metadata", None)
         response_metadata = getattr(raw_message, "response_metadata", {})
         token_usage = (
@@ -256,12 +261,7 @@ class LangChainModelGateway:
                 "output_tokens": token_usage.get("completion_tokens"),
             }
         else:
-            # Always populate last_usage with the keys even when no metadata exists
-            self._last_usage = {
-                "model_name": getattr(self._model, "model", None),
-                "input_tokens": None,
-                "output_tokens": None,
-            }
+            self._last_usage = None
 
 
 def _response_format_unavailable(error: Exception) -> bool:

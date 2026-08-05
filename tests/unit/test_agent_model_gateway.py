@@ -494,9 +494,7 @@ def test_gateway_last_usage_none_when_no_usage_metadata() -> None:
     )
 
     assert result.action == "need_user"
-    assert gateway.last_usage is not None
-    assert gateway.last_usage["input_tokens"] is None
-    assert gateway.last_usage["output_tokens"] is None
+    assert gateway.last_usage is None
 
 
 def test_gateway_last_usage_populated_from_usage_metadata() -> None:
@@ -523,11 +521,33 @@ def test_gateway_last_usage_populated_from_usage_metadata() -> None:
 
 
 def test_gateway_last_usage_reset_between_decide_calls() -> None:
-    """last_usage is reset to None at the start of each decide call."""
-    model = RecordingModel(
-        {"action": "need_user", "user_question": "请确认城市。"},
-        usage_metadata={"input_tokens": 150, "output_tokens": 50},
-    )
+    """last_usage is overwritten/reset between decide() calls on the same gateway."""
+
+    class SequentialRecordingModel:
+        """Return different responses with different usage on sequential calls."""
+
+        def __init__(self, responses_with_usage: list[tuple[object, dict | None]]) -> None:
+            self.responses_with_usage = responses_with_usage
+            self.messages: list[object] = []
+            self.model: str | None = "sequential-model"
+
+        def with_structured_output(
+            self, _schema: type[BaseModel], include_raw: bool = False
+        ) -> "SequentialRecordingModel":
+            return self
+
+        def invoke(self, messages: list[object]) -> object:
+            self.messages = messages
+            response, usage = self.responses_with_usage.pop(0)
+            raw_message = type("RawMessage", (), {"usage_metadata": usage})()
+            return {"parsed": response, "raw": raw_message}
+
+    model = SequentialRecordingModel([
+        ({"action": "need_user", "user_question": "请确认城市。"},
+         {"input_tokens": 150, "output_tokens": 50}),
+        ({"action": "need_user", "user_question": "请确认城市。"},
+         {"input_tokens": 300, "output_tokens": 75}),
+    ])
     gateway = LangChainModelGateway(model)
 
     gateway.decide(
@@ -538,18 +558,18 @@ def test_gateway_last_usage_reset_between_decide_calls() -> None:
     )
     assert gateway.last_usage is not None
     assert gateway.last_usage["input_tokens"] == 150
+    assert gateway.last_usage["output_tokens"] == 50
 
-    # Second call without usage metadata
-    model2 = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
-    gateway2 = LangChainModelGateway(model2)
-    gateway2.decide(
+    gateway.decide(
         role=AgentRole.planner,
         instruction="形成计划",
         state={"goal": "找岗位"},
         response_model=PlannerDecision,
     )
-    assert gateway2.last_usage is not None
-    assert gateway2.last_usage["input_tokens"] is None
+    assert gateway.last_usage is not None
+    # Second call's usage should overwrite the first call's values
+    assert gateway.last_usage["input_tokens"] == 300
+    assert gateway.last_usage["output_tokens"] == 75
 
 
 def test_gateway_last_usage_populated_for_local_json_validation_path() -> None:
