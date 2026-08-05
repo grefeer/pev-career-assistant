@@ -252,3 +252,56 @@ def test_repository_append_event_preserves_payload_under_the_ceiling(db_session,
 
     persisted = agent_runtime.list_events(db_session, run.id)[0]
     assert persisted.payload_json == payload
+
+
+def test_repository_create_turn_persists_context_manifest(db_session) -> None:
+    """context_manifest is stored as nullable JSON on AgentTurn."""
+    user = _user("user-ctx", "user-ctx@example.test")
+    db_session.add(user)
+    db_session.commit()
+
+    run = agent_runtime.create_run(
+        db_session,
+        user_id=user.id,
+        goal="test context manifest",
+        allowed_skills=["job-discovery"],
+        context_summary={},
+        budget_json={},
+        agent_version="pev-test",
+    )
+
+    context_manifest = {
+        "system_prompt_chars": 1500,
+        "tool_catalog_count": 5,
+        "tool_catalog_chars": 300,
+        "observation_count": 2,
+        "observation_chars": 1200,
+        "evidence_chars": 5000,
+        "model_name": "test-model",
+    }
+    turn_with_manifest = agent_runtime.create_turn(
+        db_session,
+        run_id=run.id,
+        role=AgentRole.planner,
+        turn_index=1,
+        decision_json={"action": "plan"},
+        context_manifest=context_manifest,
+    )
+
+    turn_without_manifest = agent_runtime.create_turn(
+        db_session,
+        run_id=run.id,
+        role=AgentRole.executor,
+        turn_index=2,
+        decision_json={"action": "call_tool"},
+        context_manifest=None,
+    )
+    db_session.commit()
+
+    # Verify the manifest is persisted
+    assert turn_with_manifest.context_manifest == context_manifest
+    assert turn_with_manifest.context_manifest["system_prompt_chars"] == 1500
+    assert turn_with_manifest.context_manifest["model_name"] == "test-model"
+
+    # Verify None is allowed
+    assert turn_without_manifest.context_manifest is None

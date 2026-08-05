@@ -301,6 +301,7 @@ def create_turn(
     model_name: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    context_manifest: dict[str, Any] | None = None,
 ) -> AgentTurn:
     """Append a privacy-safe role decision summary."""
     turn = AgentTurn(
@@ -311,6 +312,7 @@ def create_turn(
         model_name=model_name,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        context_manifest=context_manifest,
     )
     db.add(turn)
     db.flush()

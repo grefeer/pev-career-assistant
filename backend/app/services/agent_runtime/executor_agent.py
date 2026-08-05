@@ -22,6 +22,7 @@ from backend.app.services.agent_runtime.schemas import (
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
+from backend.app.services.agent_runtime.context_manifest import build_context_manifest
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
@@ -263,12 +264,23 @@ class ExecutorAgent:
                 response_model=ExecutorDecision,
             )
             if trace is not None:
+                usage = self._gateway.last_usage
+                if isinstance(usage, dict):
+                    usage["context_manifest"] = build_context_manifest(
+                        instruction=_EXECUTOR_INSTRUCTION,
+                        available_tools=available_tools,
+                        observations_for_decision=[
+                            *prior_observations_for_decision,
+                            *observations_for_decision,
+                        ],
+                        model_name=usage.get("model_name"),
+                    )
                 trace(
                     AgentRole.executor,
                     decision_summary(
                         action=decision.action, tool_name=decision.tool_name
                     ),
-                    self._gateway.last_usage,
+                    usage,
                 )
             if decision.action == "call_tool":
                 if (

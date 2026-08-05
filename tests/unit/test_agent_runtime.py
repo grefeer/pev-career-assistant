@@ -352,6 +352,26 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         assert turn.model_name == "scripted-model"
         assert turn.input_tokens == 100
         assert turn.output_tokens == 50
+    # Verify context manifest is persisted with expected fields for every turn
+    for turn in turns:
+        assert turn.context_manifest is not None
+        assert "system_prompt_chars" in turn.context_manifest
+        assert "tool_catalog_count" in turn.context_manifest
+        assert "tool_catalog_chars" in turn.context_manifest
+        assert "observation_count" in turn.context_manifest
+        assert "observation_chars" in turn.context_manifest
+        assert "evidence_chars" in turn.context_manifest
+        assert "model_name" in turn.context_manifest
+        assert turn.context_manifest["model_name"] == "scripted-model"
+        # All count fields are integers (no raw content)
+        assert isinstance(turn.context_manifest["system_prompt_chars"], int)
+        assert isinstance(turn.context_manifest["tool_catalog_count"], int)
+        assert isinstance(turn.context_manifest["tool_catalog_chars"], int)
+        assert isinstance(turn.context_manifest["observation_count"], int)
+        assert isinstance(turn.context_manifest["observation_chars"], int)
+        # Planner has observations
+        if turn.role is AgentRole.planner:
+            assert turn.context_manifest["observation_count"] >= 0
 
 
 def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(db_session) -> None:

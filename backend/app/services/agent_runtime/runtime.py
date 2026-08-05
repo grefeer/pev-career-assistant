@@ -530,10 +530,12 @@ class AgentRuntime:
             model_name = None
             input_tokens = None
             output_tokens = None
+            context_manifest = None
             if turn_metadata is not None and isinstance(turn_metadata, dict):
                 model_name = turn_metadata.get("model_name")
                 input_tokens = turn_metadata.get("input_tokens")
                 output_tokens = turn_metadata.get("output_tokens")
+                context_manifest = turn_metadata.get("context_manifest")
             run_repository.create_turn(
                 db,
                 run_id=run_id,
@@ -543,6 +545,7 @@ class AgentRuntime:
                 model_name=model_name,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                context_manifest=context_manifest,
             )
             # A completed model decision is a recovery checkpoint. Tool output
             # remains evidence-bound and is replay-safe if a process stops before
