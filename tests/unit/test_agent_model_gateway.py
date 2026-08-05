@@ -686,14 +686,23 @@ def test_gateway_last_usage_populated_for_local_json_validation_path() -> None:
 
 
 def test_catalog_in_system_prompt_flag_off_preserves_original_behavior() -> None:
-    """When catalog_in_system_prompt is False (default), output is byte-identical to before."""
+    """When catalog_in_system_prompt is False (default), output is byte-identical to before.
+
+    Strict equality guard - ANY change to off-path literals/separators/order will fail.
+    This is a binding constraint for Task 6: flag-default-OFF must not shift behavior.
+    """
+    import json
+
     model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
     gateway = LangChainModelGateway(model, catalog_in_system_prompt=False)
 
+    role = AgentRole.planner
+    instruction = "形成计划"
     state = {"goal": "找岗位", "available_tools": [{"name": "tool1", "description": "desc"}]}
+
     gateway.decide(
-        role=AgentRole.planner,
-        instruction="形成计划",
+        role=role,
+        instruction=instruction,
         state=state,
         response_model=PlannerDecision,
     )
@@ -701,13 +710,25 @@ def test_catalog_in_system_prompt_flag_off_preserves_original_behavior() -> None
     assert len(model.messages) == 2
     system_msg, human_msg = model.messages
 
-    # SystemMessage must NOT contain catalog JSON
-    assert "Available tools" not in system_msg.content
-    assert "tool1" not in system_msg.content
+    # Hardcoded expected SystemMessage (call _role_action_contract manually, copy its output)
+    # _role_action_contract(AgentRole.planner) returns exactly:
+    # "The action must be exactly one of: call_tool, plan, need_user. "\
+    # "call_tool needs tool_name; plan needs complexity, success_criteria and steps; "\
+    # "need_user needs user_question."
+    expected_system = (
+        f"Role: {role.value}. {instruction} "
+        "Return exactly one decision matching the requested schema. "
+        "The action must be exactly one of: call_tool, plan, need_user. "
+        "call_tool needs tool_name; plan needs complexity, success_criteria and steps; "
+        "need_user needs user_question."
+    )
 
-    # HumanMessage MUST contain available_tools
-    assert "available_tools" in human_msg.content
-    assert "tool1" in human_msg.content
+    # Expected HumanMessage: byte-identical to json.dumps with exact separators
+    expected_human = json.dumps(state, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    # STRICT equality assertions (not substring)
+    assert system_msg.content == expected_system, "SystemMessage content changed on off-path"
+    assert human_msg.content == expected_human, "HumanMessage content changed on off-path"
 
 
 def test_catalog_in_system_prompt_flag_on_moves_catalog_to_system() -> None:
