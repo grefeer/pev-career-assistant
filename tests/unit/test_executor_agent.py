@@ -669,3 +669,360 @@ def test_executor_hands_a_blocked_search_stall_to_the_user() -> None:
     assert [obs.error_code for obs in result.observations] == [
         "candidate_urls_already_supplied", "candidate_urls_already_supplied",
     ]
+
+
+def test_executor_hands_to_user_on_interspersed_duplicate_waste() -> None:
+    """R004 regression guard: interspersed duplicates trip the TOTAL cap, not consecutive.
+
+    Pattern: success(a) -> dup(a) -> success(b) -> dup(a) -> success(c) -> dup(a).
+    The consecutive counter resets on each success, so the old consecutive-only
+    cap never fires. The total-wasted counter is NOT reset by interspersed
+    success and reaches 3 at the third duplicate, handing the step to the user.
+    """
+    invocations = {"a": 0, "b": 0, "c": 0}
+
+    def handler_a(_context, _payload):
+        invocations["a"] += 1
+        return {"title": "岗位一"}
+
+    def handler_b(_context, _payload):
+        invocations["b"] += 1
+        return {"title": "岗位二"}
+
+    def handler_c(_context, _payload):
+        invocations["c"] += 1
+        return {"title": "岗位三"}
+
+    registry = ToolRegistry()
+    for name, handler in (
+        ("fetch-a", handler_a), ("fetch-b", handler_b), ("fetch-c", handler_c),
+    ):
+        registry.register(ToolDefinition(
+            name=name, skill_name="job-discovery", input_model=FetchInput,
+            output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+            handler=handler,
+        ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-a", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-a", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-b", "tool_input": {"url": "https://jobs.example/2"}},
+        {"action": "call_tool", "tool_name": "fetch-a", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-c", "tool_input": {"url": "https://jobs.example/3"}},
+        {"action": "call_tool", "tool_name": "fetch-a", "tool_input": {"url": "https://jobs.example/1"}},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["三个 JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        # Enough budget for the real calls; the duplicates are deduped.
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert result.status == "needs_user"
+    # Each unique tool was invoked exactly once; the 3 duplicates were deduped.
+    assert invocations == {"a": 1, "b": 1, "c": 1}
+    # Five observations recorded (3 successes + 2 deduped dups); the 6th dup
+    # tripped the total cap and was not recorded.
+    assert [obs.error_code for obs in result.observations] == [
+        None, "duplicate_tool_call", None, "duplicate_tool_call", None,
+    ]
+    assert "累计" in result.user_question
+
+
+def test_executor_hands_to_user_on_alternating_no_progress_waste() -> None:
+    """Q057 pattern guard: alternating failed calls trip the TOTAL cap.
+
+    Pattern: fail(search) -> fail(fetch) -> fail(search). The consecutive
+    counter resets on each real tool execution (even a failing one), so the
+    consecutive-only cap never fires. The total-wasted counter counts each
+    turn that produced no new succeeded observation and reaches 3 at the
+    third failure, handing the step to the user.
+    """
+    search_attempts = {"count": 0}
+    fetch_attempts = {"count": 0}
+
+    def failing_search(_context, _payload):
+        search_attempts["count"] += 1
+        raise RuntimeError("search provider error")
+
+    def failing_fetch(_context, _payload):
+        fetch_attempts["count"] += 1
+        raise RuntimeError("page not found")
+
+    registry = ToolRegistry()
+    for name, handler in (("search-jobs", failing_search), ("fetch-page", failing_fetch)):
+        registry.register(ToolDefinition(
+            name=name, skill_name="job-discovery", input_model=FetchInput,
+            output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+            handler=handler,
+        ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {"url": "https://jobs.example/s1"}},
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/f1"}},
+        {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {"url": "https://jobs.example/s2"}},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert result.status == "needs_user"
+    assert search_attempts["count"] == 2
+    assert fetch_attempts["count"] == 1
+    # All three failed tool calls were invoked and recorded (real failures are
+    # auditable observations); the third failure tripped the total cap AFTER
+    # its observation was recorded, unlike synthetic dedup/blocked
+    # observations which are not recorded when they trip the cap.
+    assert [obs.error_code for obs in result.observations] == [
+        "tool_execution_failed", "tool_execution_failed", "tool_execution_failed",
+    ]
+    assert "累计" in result.user_question
+
+
+def test_executor_does_not_trip_total_waste_cap_on_retry_after_failure() -> None:
+    """A legitimate retry after a failed call must NOT trip the total-waste cap.
+
+    Pattern: fail(a) -> succeed(a, retry) -> complete. The failed call
+    increments total_wasted to 1, but the successful retry does not increment
+    it (succeeded_calls grows). total_wasted stays at 1, well under the cap.
+    """
+    attempts = {"count": 0}
+
+    def flaky(_context, _payload):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("transient failure")
+        return {"title": "AI Agent 开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=flaky,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "complete", "summary": "重试后抓取成功"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(2),
+    )
+
+    assert result.status == "succeeded"
+    assert attempts["count"] == 2
+    assert [obs.error_code for obs in result.observations] == ["tool_execution_failed", None]
+
+
+def test_executor_allows_two_exploratory_failures_without_tripping_total_cap() -> None:
+    """1-2 exploratory empty failures are legitimate exploration, not waste.
+
+    Pattern: fail(search, query A) -> fail(search, query B) -> succeed(fetch) -> complete.
+    Two failed searches bring total_wasted to 2 (under the cap of 3); the
+    subsequent successful fetch and complete are not blocked.
+    """
+    search_attempts = {"count": 0}
+
+    def failing_search(_context, _payload):
+        search_attempts["count"] += 1
+        raise RuntimeError("no results")
+
+    def successful_fetch(_context, _payload):
+        return {"title": "AI Agent 开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="search-jobs", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=failing_search,
+    ))
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=successful_fetch,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {"url": "https://jobs.example/s1"}},
+        {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {"url": "https://jobs.example/s2"}},
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "complete", "summary": "已抓取 JD"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert result.status == "succeeded"
+    assert search_attempts["count"] == 2
+    assert [obs.error_code for obs in result.observations] == [
+        "tool_execution_failed", "tool_execution_failed", None,
+    ]
+
+
+def test_executor_projects_already_succeeded_calls_in_decision_state() -> None:
+    """The decision state carries a compact already_succeeded_calls list.
+
+    After a successful tool call, the next decision's state must include an
+    ``already_succeeded_calls`` entry with ``tool`` and ``input_summary``
+    keys, so the model can recognise "I already called this" and avoid a
+    duplicate. The projection is a separate state field, so it survives
+    observation summarization (it is never truncated away).
+    """
+    invocations = {"count": 0}
+
+    def handler(_context, _payload):
+        invocations["count"] += 1
+        return {"title": "AI Agent 开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=handler,
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "complete", "summary": "已抓取 JD"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "succeeded"
+    # The second decision's state must carry the already-succeeded call.
+    second_state = gateway.states[1]
+    assert "already_succeeded_calls" in second_state
+    succeeded_projection = second_state["already_succeeded_calls"]
+    assert len(succeeded_projection) == 1
+    assert succeeded_projection[0]["tool"] == "fetch-page"
+    # input_summary is a compact JSON repr of the input, not the full payload.
+    assert isinstance(succeeded_projection[0]["input_summary"], str)
+    assert "https://jobs.example/1" in succeeded_projection[0]["input_summary"]
+    # The first decision's state has an empty list (no succeeded calls yet).
+    assert gateway.states[0]["already_succeeded_calls"] == []
+
+
+def test_executor_truncates_already_succeeded_calls_input_summary() -> None:
+    """Large tool inputs are truncated to keep the decision state bounded."""
+    long_url = "https://jobs.example/" + "x" * 300
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {"title": "岗位"},
+    ))
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": long_url}},
+        {"action": "complete", "summary": "done"},
+    ])
+    task = AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "succeeded"
+    input_summary = gateway.states[1]["already_succeeded_calls"][0]["input_summary"]
+    # Truncated repr ends with "..." and stays within the compact budget.
+    assert input_summary.endswith("...")
+    assert len(input_summary) <= 200
+
+
+def test_executor_total_waste_cap_fires_in_candidate_urls_branch_after_prior_failure() -> None:
+    """Total-waste cap fires in candidate_urls branch after a prior failed call.
+
+    Pattern: fail(fetch) -> candidate_urls #1 -> candidate_urls #2.
+    The failed call brings total_wasted to 1 (consecutive stays 0, reset by
+    the real execution). The two candidate_urls calls bring total to 3 while
+    consecutive is only 2, so the TOTAL cap fires instead of the consecutive
+    cap. This covers the total-waste path in the candidate_urls branch.
+    """
+    fetch_attempts = {"count": 0}
+
+    def failing_fetch(_context, _payload):
+        fetch_attempts["count"] += 1
+        raise RuntimeError("page not found")
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=failing_fetch,
+    ))
+    task = AgentTaskRequest(
+        goal="处理候选 JD",
+        allowed_skills=["job-discovery"],
+        context={"candidate_urls": ["https://jobs.example/agent"]},
+    )
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["处理候选 JD"],
+        steps=[PlanStep(step_id="discover", objective="处理候选", allowed_skills=["job-discovery"])],
+    )
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "search-public-job-pages", "tool_input": {"query": "Java"}},
+        {"action": "call_tool", "tool_name": "search-public-job-pages", "tool_input": {"query": "Java"}},
+    ])
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "needs_user"
+    assert fetch_attempts["count"] == 1
+    # The failed fetch was recorded; the first candidate_urls block was
+    # recorded; the second candidate_urls block tripped the total cap
+    # (total=3, consecutive=2) and was NOT recorded.
+    assert [obs.error_code for obs in result.observations] == [
+        "tool_execution_failed", "candidate_urls_already_supplied",
+    ]
+    # Total-waste message, not the consecutive candidate_urls message.
+    assert "累计" in result.user_question
+

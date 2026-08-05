@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -41,6 +42,12 @@ _EXECUTOR_INSTRUCTION = (
     "if evidence cannot support one, state the limitation rather than silently "
     "omitting it. "
     "\n## 行为规则\n"
+    "Already-succeeded calls are listed in `already_succeeded_calls` in the "
+    "decision state. Do NOT re-invoke a (tool, input) you already succeeded "
+    "with - reuse its prior observation. Re-calling a succeeded tool wastes a "
+    "turn and counts toward the waste limit: after 3 total wasted turns "
+    "(duplicates, blocked searches, or failed calls) the step is handed to "
+    "the user. "
     "When context supplies candidate_urls, treat them as a finite candidate set: "
     "prefer fetch-public-job-pages to capture the set in one bounded observation; "
     "otherwise fetch each unique URL at most once, then use the observed artifact IDs to "
@@ -181,6 +188,57 @@ _EXECUTOR_INSTRUCTION = (
 # evidence; after this cap the agent stops and hands control to the human.
 _MAX_CONSECUTIVE_STALLS = 3
 
+# Per-step TOTAL wasted turns (NOT reset by interspersed success). Counts
+# duplicate_tool_call + candidate_urls_already_supplied + any turn whose
+# tool call did not append a new succeeded observation (catches alternating
+# no-progress like search-empty/fetch-fail). After this cap the harness
+# hands the step to the user: sustained no-progress even interspersed with
+# success burns the wall clock without converging on the outcome.
+_MAX_TOTAL_WASTED_TURNS = 3
+
+# Compact character budget for each already_succeeded_calls entry's
+# input_summary: enough for a URL list or query, not enough to bloat the
+# decision state with large payloads.
+_SUCCEEDED_INPUT_SUMMARY_CHARS = 200
+
+# Cap the projected already_succeeded_calls list so a runaway step cannot
+# bloat the decision state. The harness's dedup check is authoritative
+# regardless of this projection, so capping only affects model awareness.
+_MAX_PROJECTED_SUCCEEDED_CALLS = 10
+
+# Human-readable questions for the two waste caps. The consecutive-stall cap
+# fires on 3 identical no-progress decisions in a row; the total-waste cap
+# fires on 3 wasted turns interspersed with success (R004 pattern) or
+# alternating no-progress (Q057 pattern).
+_CANDIDATE_URLS_STALL_QUESTION = (
+    "连续尝试无效工具调用仍未取得进展。请人工确认当前已收集的岗位产出，"
+    "或提供更精确的岗位页面后重试。"
+)
+_DUPLICATE_STALL_QUESTION = (
+    "连续重复调用同一工具未产生新结果，无法继续自动完成该步骤。"
+    "请人工确认当前产出，或补充缺失的岗位页面/信息后重试。"
+)
+_TOTAL_WASTE_QUESTION = (
+    "累计多次无效或重复的工具调用未取得进展，无法继续自动完成该步骤。"
+    "请人工确认当前产出，或补充缺失的岗位页面/信息后重试。"
+)
+
+
+def _summarize_succeeded_call(
+    tool_name: str, tool_input: dict[str, Any]
+) -> dict[str, str]:
+    """Compact identifier for an already-succeeded (tool, input) pair.
+
+    The model needs enough to recognise "I already called this tool with
+    these arguments" without seeing the full (possibly large) payload. The
+    input is serialised to a compact JSON string and truncated; only the
+    most recent ``_MAX_PROJECTED_SUCCEEDED_CALLS`` entries are projected.
+    """
+    input_repr = json.dumps(tool_input, ensure_ascii=False, separators=(",", ":"))
+    if len(input_repr) > _SUCCEEDED_INPUT_SUMMARY_CHARS:
+        input_repr = input_repr[: _SUCCEEDED_INPUT_SUMMARY_CHARS - 3] + "..."
+    return {"tool": tool_name, "input_summary": input_repr}
+
 
 class ExecutorAgent:
     """Bounded perceive–decide–act–observe loop for a single plan step."""
@@ -213,6 +271,13 @@ class ExecutorAgent:
         # Consecutive no-progress decisions (deduped re-calls / blocked search)
         # reset on any real tool execution, complete, or needs_user.
         consecutive_stalls = 0
+        # Per-step TOTAL wasted turns (NOT reset by interspersed success).
+        # Counts duplicate_tool_call + candidate_urls_already_supplied +
+        # turns whose tool call did not append a new succeeded observation.
+        # After _MAX_TOTAL_WASTED_TURNS the harness hands the step to the
+        # user: sustained no-progress even interspersed with success burns
+        # the wall clock without converging on the step's outcome.
+        total_wasted_turns = 0
         # Loop-invariant projections of the (immutable) plan/step: serialize
         # once instead of re-dumping and re-building the tool catalog every
         # turn. The catalog is also memoized inside ToolRegistry.
@@ -276,6 +341,12 @@ class ExecutorAgent:
                     "observations": summarized_observations,
                     "prior_observations": prior_observations_for_decision,
                     "verifier_feedback": task.context.get("verifier_feedback", []),
+                    "already_succeeded_calls": [
+                        _summarize_succeeded_call(name, payload)
+                        for name, payload in succeeded_calls[
+                            -_MAX_PROJECTED_SUCCEEDED_CALLS:
+                        ]
+                    ],
                 },
                 response_model=ExecutorDecision,
             )
@@ -307,14 +378,18 @@ class ExecutorAgent:
                     and _has_candidate_urls(task)
                 ):
                     consecutive_stalls += 1
+                    total_wasted_turns += 1
                     if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
-                            user_question=(
-                                "连续尝试无效工具调用仍未取得进展。请人工确认当前"
-                                "已收集的岗位产出，或提供更精确的岗位页面后重试。"
-                            ),
+                            user_question=_CANDIDATE_URLS_STALL_QUESTION,
+                        )
+                    if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_TOTAL_WASTE_QUESTION,
                         )
                     record_observation(
                         observations,
@@ -331,15 +406,18 @@ class ExecutorAgent:
                     for name, payload in succeeded_calls
                 ):
                     consecutive_stalls += 1
+                    total_wasted_turns += 1
                     if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
-                            user_question=(
-                                "连续重复调用同一工具未产生新结果，无法继续自动完成"
-                                "该步骤。请人工确认当前产出，或补充缺失的岗位页面/"
-                                "信息后重试。"
-                            ),
+                            user_question=_DUPLICATE_STALL_QUESTION,
+                        )
+                    if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_TOTAL_WASTE_QUESTION,
                         )
                     record_observation(
                         observations,
@@ -370,6 +448,21 @@ class ExecutorAgent:
                 tool_context = _with_observed_page(tool_context, observation)
                 if observation.status == "succeeded":
                     succeeded_calls.append((decision.tool_name, decision.tool_input))
+                else:
+                    # The tool was invoked but did not produce a new succeeded
+                    # observation. Count this as a wasted turn for the total
+                    # cap (sustained no-progress even when interspersed with
+                    # successful calls), but NOT for the consecutive-stall cap
+                    # (a real execution is not a stall). A small number of
+                    # exploratory failures stays under the cap; only sustained
+                    # no-progress trips it.
+                    total_wasted_turns += 1
+                    if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_TOTAL_WASTE_QUESTION,
+                        )
                 continue
             if decision.action == "complete":
                 return ExecutorResult(
