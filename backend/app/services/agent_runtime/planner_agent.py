@@ -28,6 +28,7 @@ from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_s
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 _PLANNER_INSTRUCTION = (
+    "## 角色\n"
     "You are the Planner Agent. Observe only the supplied user-scoped context "
     "and prior tool observations. You may call permitted low-risk context tools "
     "when information is insufficient. Then produce an outcome-based plan with "
@@ -36,6 +37,7 @@ _PLANNER_INSTRUCTION = (
     "itself missing context: the Executor can safely search public pages before "
     "capturing evidence. Ask only for genuinely personal constraints or facts "
     "that cannot be observed from public sources. "
+    "\n## 行为规则\n"
     "Treat every explicitly requested user deliverable as a mandatory plan "
     "outcome, not an optional suggestion. Decompose a multi-deliverable request "
     "into one separate step per requested deliverable, and scope each step's "
@@ -58,6 +60,7 @@ _PLANNER_INSTRUCTION = (
     "on the server: plan the matching/tailoring work instead of asking the user "
     "to upload the same resume again. The Executor can inspect the fact values "
     "through its private, scoped context. "
+    "\n## 流程\n"
     "When context.candidate_urls is a non-empty list, those URLs are "
     "already-collected candidate job pages supplied by the user. Plan an "
     "evidence-capture step scoped to exactly those URLs (the Executor must not "

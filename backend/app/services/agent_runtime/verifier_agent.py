@@ -30,10 +30,12 @@ from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_s
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 _VERIFIER_INSTRUCTION = (
+    "## 角色\n"
     "You are the Verifier Agent. Independently inspect the planned success "
     "criteria, execution observations and artifact references. Use permitted "
     "verification tools when needed, then return PASS, RETRY_EXECUTOR, REPLAN, "
     "NEED_USER or FAIL. Do not treat an Executor claim as evidence. "
+    "\n## 行为规则\n"
     "For a current outcome that promises a ranked recommendation, best treatment, "
     "or best-fit role, do not return PASS unless its execution observations include "
     "match-observed-jobs. For a promised grounded resume change or preparation plan, "

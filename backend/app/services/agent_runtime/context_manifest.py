@@ -7,6 +7,7 @@ never raw content, URLs, or user data. It is safe to persist and audit.
 from __future__ import annotations
 
 import json
+import re
 
 
 def compute_evidence_chars(observed_public_evidence: list[dict] | None) -> int:
@@ -30,6 +31,54 @@ def compute_evidence_chars(observed_public_evidence: list[dict] | None) -> int:
             if isinstance(visible_text, str):
                 total += len(visible_text)
     return total
+
+
+def prompt_section_stats(instruction: str) -> dict[str, int]:
+    """Per-section char counts, keyed by section header text (without the '## ' prefix).
+
+    Sections are delimited by lines beginning with '## '. Characters between a
+    header and the next header (or end) belong to that section. Text before the
+    first '## ' header (if any) is keyed '_preamble'. Returns {} for an empty
+    string. Counts characters only, never raw content.
+
+    Args:
+        instruction: The agent's system prompt/instruction text, potentially
+            with section headers.
+
+    Returns:
+        Dict mapping section names (without '## ' prefix) to character counts.
+        Header lines themselves are counted in the section they introduce.
+    """
+    if not instruction:
+        return {}
+
+    # Find all section headers with their positions
+    header_pattern = re.compile(r"^## (.+)$", re.MULTILINE)
+    matches = list(header_pattern.finditer(instruction))
+
+    if not matches:
+        # No headers: count everything as preamble
+        return {"_preamble": len(instruction)}
+
+    stats: dict[str, int] = {}
+
+    # Preamble: everything before the first header
+    first_start = matches[0].start()
+    if first_start > 0:
+        stats["_preamble"] = first_start
+
+    # Calculate each section's length
+    for i, match in enumerate(matches):
+        section_name = match.group(1)
+        section_start = match.start()
+        if i + 1 < len(matches):
+            next_start = matches[i + 1].start()
+            section_length = next_start - section_start
+        else:
+            section_length = len(instruction) - section_start
+        stats[section_name] = section_length
+
+    return stats
 
 
 def build_context_manifest(
@@ -74,4 +123,5 @@ def build_context_manifest(
         ),
         "evidence_chars": evidence_chars,
         "model_name": model_name,
+        "prompt_sections": prompt_section_stats(instruction),
     }
