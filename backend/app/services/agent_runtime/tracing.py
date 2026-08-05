@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 from backend.app.domain.agent_runtime import AgentRole
 
 
-DecisionTrace = Callable[[AgentRole, dict[str, str]], None]
+DecisionTrace = Callable[[AgentRole, dict[str, str], dict[str, Any] | None], None]
 
 
 def decision_summary(

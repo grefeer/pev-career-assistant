@@ -23,6 +23,15 @@ class AgentModelGateway(Protocol):
     the role itself decides whether to execute the requested permitted action.
     """
 
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        """Return token usage for the most recent decide() call, if available.
+
+        Returns a dict with {"model_name": str, "input_tokens": int, "output_tokens": int}
+        when usage is available, or None otherwise.
+        """
+        ...
+
     def decide(
         self,
         *,
@@ -59,6 +68,12 @@ class LangChainModelGateway:
         # this flag changes only the wire protocol used to validate that one
         # decision locally.
         self._prefer_local_json_validation = prefer_local_json_validation
+        self._last_usage: dict[str, Any] | None = None
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        """Return token usage for the most recent decide() call, if available."""
+        return self._last_usage
 
     def decide(
         self,
@@ -73,6 +88,7 @@ class LangChainModelGateway:
         The model has no direct tools here.  It only returns an action; the
         corresponding Agent loop validates and performs it through ToolRegistry.
         """
+        self._last_usage = None
         messages = [
             SystemMessage(
                 content=(
@@ -94,8 +110,15 @@ class LangChainModelGateway:
                 response_model=response_model,
             )
         try:
-            structured_model = self._model.with_structured_output(response_model)
+            structured_model = self._model.with_structured_output(
+                response_model, include_raw=True
+            )
             raw_result = structured_model.invoke(messages)
+            parsed = raw_result.get("parsed") if isinstance(raw_result, dict) else None
+            if isinstance(raw_result, dict):
+                raw_message = raw_result.get("raw")
+                if raw_message is not None:
+                    self._extract_usage(raw_message)
         except Exception as exc:  # noqa: BLE001 - provider exceptions are untrusted.
             if _response_format_unavailable(exc):
                 return self._decide_with_local_json_validation(
@@ -105,7 +128,7 @@ class LangChainModelGateway:
                 )
             raise AgentModelGatewayError("model_request_failed") from exc
         try:
-            return response_model.model_validate(raw_result)
+            return response_model.model_validate(parsed)
         except Exception as exc:  # noqa: BLE001 - invalid JSON/model output is recoverable.
             # Some OpenAI-compatible providers accept the structured request
             # but occasionally return an object that violates it. One bounded
@@ -201,6 +224,7 @@ class LangChainModelGateway:
             raw_result = self._model.invoke(fallback_messages)
         except Exception as exc:  # noqa: BLE001 - provider boundary.
             raise AgentModelGatewayError("model_request_failed") from exc
+        self._extract_usage(raw_result)
         content = getattr(raw_result, "content", raw_result)
         if not isinstance(content, str):
             raise AgentModelGatewayError("invalid_model_response")
@@ -208,6 +232,36 @@ class LangChainModelGateway:
             return response_model.model_validate(json.loads(_strip_json_fence(content)))
         except Exception as exc:  # noqa: BLE001 - untrusted model content.
             raise AgentModelGatewayError("invalid_model_response") from exc
+
+    def _extract_usage(self, raw_message: Any) -> None:
+        """Extract token usage from a raw AIMessage and store in _last_usage."""
+        usage_metadata = getattr(raw_message, "usage_metadata", None)
+        response_metadata = getattr(raw_message, "response_metadata", {})
+        token_usage = (
+            response_metadata.get("token_usage")
+            if isinstance(response_metadata, dict)
+            else None
+        )
+
+        if usage_metadata is not None and isinstance(usage_metadata, dict):
+            self._last_usage = {
+                "model_name": getattr(self._model, "model", None),
+                "input_tokens": usage_metadata.get("input_tokens"),
+                "output_tokens": usage_metadata.get("output_tokens"),
+            }
+        elif token_usage is not None and isinstance(token_usage, dict):
+            self._last_usage = {
+                "model_name": getattr(self._model, "model", None),
+                "input_tokens": token_usage.get("prompt_tokens"),
+                "output_tokens": token_usage.get("completion_tokens"),
+            }
+        else:
+            # Always populate last_usage with the keys even when no metadata exists
+            self._last_usage = {
+                "model_name": getattr(self._model, "model", None),
+                "input_tokens": None,
+                "output_tokens": None,
+            }
 
 
 def _response_format_unavailable(error: Exception) -> bool:

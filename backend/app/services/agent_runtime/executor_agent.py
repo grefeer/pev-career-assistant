@@ -268,6 +268,7 @@ class ExecutorAgent:
                     decision_summary(
                         action=decision.action, tool_name=decision.tool_name
                     ),
+                    self._gateway.last_usage,
                 )
             if decision.action == "call_tool":
                 if (

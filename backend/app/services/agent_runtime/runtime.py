@@ -521,14 +521,28 @@ class AgentRuntime:
         """Return a run-local, role-indexed callback for safe decision summaries."""
         turn_indices = dict(initial_turn_indices or {role: 0 for role in AgentRole})
 
-        def trace(role: AgentRole, decision_json: dict[str, str]) -> None:
+        def trace(
+            role: AgentRole,
+            decision_json: dict[str, str],
+            turn_metadata: dict[str, object] | None = None,
+        ) -> None:
             turn_indices[role] += 1
+            model_name = None
+            input_tokens = None
+            output_tokens = None
+            if turn_metadata is not None and isinstance(turn_metadata, dict):
+                model_name = turn_metadata.get("model_name")
+                input_tokens = turn_metadata.get("input_tokens")
+                output_tokens = turn_metadata.get("output_tokens")
             run_repository.create_turn(
                 db,
                 run_id=run_id,
                 role=role,
                 turn_index=turn_indices[role],
                 decision_json=decision_json,
+                model_name=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
             # A completed model decision is a recovery checkpoint. Tool output
             # remains evidence-bound and is replay-safe if a process stops before

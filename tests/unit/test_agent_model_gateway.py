@@ -21,40 +21,64 @@ from backend.app.services.agent_runtime.schemas import PlannerDecision
 class RecordingModel:
     """The smallest external-model double retaining structured-output behavior."""
 
-    def __init__(self, response: object) -> None:
+    def __init__(self, response: object, usage_metadata: dict[str, int] | None = None) -> None:
         self.response = response
+        self.usage_metadata = usage_metadata
         self.messages: list[object] = []
         self.schema: type[BaseModel] | None = None
+        self.include_raw: bool = False
+        self.model: str | None = None
 
-    def with_structured_output(self, schema: type[BaseModel]) -> "RecordingModel":
+    def with_structured_output(
+        self, schema: type[BaseModel], include_raw: bool = False
+    ) -> "RecordingModel":
         self.schema = schema
+        self.include_raw = include_raw
         return self
 
     def invoke(self, messages: list[object]) -> object:
         self.messages = messages
+        if self.include_raw:
+            raw_message = type(
+                "RawMessage", (), {"usage_metadata": self.usage_metadata}
+            )()
+            return {"parsed": self.response, "raw": raw_message}
         return self.response
 
 
 class JsonOnlyModel:
     """OpenAI-compatible provider double that rejects response_format schemas."""
 
-    def with_structured_output(self, _schema: type[BaseModel]) -> "JsonOnlyModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "JsonOnlyModel":
         return self
 
     def invoke(self, _messages: list[object]) -> object:
         if not hasattr(self, "rejected"):
             self.rejected = True
             raise RuntimeError("response_format type is unavailable now")
-        return type("RawResponse", (), {"content": '{"action":"need_user","user_question":"请确认城市。"}'})()
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
 
 
 class RaisingModel:
-    def with_structured_output(self, _schema: type[BaseModel]) -> "RaisingModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "RaisingModel":
         raise RuntimeError("provider is down")
 
 
 class FallbackResponseModel:
-    def with_structured_output(self, _schema: type[BaseModel]) -> "FallbackResponseModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "FallbackResponseModel":
         raise RuntimeError("response_format not supported")
 
     def __init__(self, content: object | Exception) -> None:
@@ -63,7 +87,14 @@ class FallbackResponseModel:
     def invoke(self, _messages: list[object]) -> object:
         if isinstance(self.content, Exception):
             raise self.content
-        return type("RawResponse", (), {"content": self.content})()
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": self.content,
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
 
 
 class LocalJsonPreferredModel:
@@ -72,7 +103,9 @@ class LocalJsonPreferredModel:
     def __init__(self) -> None:
         self.structured_requested = False
 
-    def with_structured_output(self, _schema: type[BaseModel]) -> "LocalJsonPreferredModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "LocalJsonPreferredModel":
         self.structured_requested = True
         raise AssertionError("structured protocol must not be requested")
 
@@ -80,7 +113,10 @@ class LocalJsonPreferredModel:
         return type(
             "RawResponse",
             (),
-            {"content": '{"action":"need_user","user_question":"请确认城市。"}'},
+            {
+                "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
         )()
 
 
@@ -95,34 +131,52 @@ class SequencedLocalJsonModel(LocalJsonPreferredModel):
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return type("RawResponse", (), {"content": response})()
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": response,
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
 
 
 class InvalidStructuredThenJsonModel:
     """Provider returns an invalid structured object but supports ordinary JSON retry."""
 
-    def with_structured_output(self, _schema: type[BaseModel]) -> "InvalidStructuredThenJsonModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "InvalidStructuredThenJsonModel":
         self.structured = True
         return self
 
     def invoke(self, _messages: list[object]) -> object:
         if getattr(self, "structured", False):
             self.structured = False
-            return {"action": "not-valid"}
-        return type("RawResponse", (), {"content": '{"action":"need_user","user_question":"请确认城市。"}'})()
+            return {"parsed": {"action": "not-valid"}, "raw": None}
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
 
 
 class InvalidStructuredThenFailureModel:
     """A malformed structured result must preserve a subsequent provider outage."""
 
-    def with_structured_output(self, _schema: type[BaseModel]) -> "InvalidStructuredThenFailureModel":
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False
+    ) -> "InvalidStructuredThenFailureModel":
         self.structured = True
         return self
 
     def invoke(self, _messages: list[object]) -> object:
         if getattr(self, "structured", False):
             self.structured = False
-            return {"action": "not-valid"}
+            return {"parsed": {"action": "not-valid"}, "raw": None}
         raise RuntimeError("ordinary JSON retry is down")
 
 
@@ -133,7 +187,7 @@ class InvalidStructuredTwiceThenJsonModel:
         self.json_attempts = 0
 
     def with_structured_output(
-        self, _schema: type[BaseModel]
+        self, _schema: type[BaseModel], include_raw: bool = False
     ) -> "InvalidStructuredTwiceThenJsonModel":
         self.structured = True
         return self
@@ -141,14 +195,18 @@ class InvalidStructuredTwiceThenJsonModel:
     def invoke(self, _messages: list[object]) -> object:
         if getattr(self, "structured", False):
             self.structured = False
-            return {"action": "not-valid"}
+            return {"parsed": {"action": "not-valid"}, "raw": None}
         self.json_attempts += 1
         content = (
             '{"action":"not-valid"}'
             if self.json_attempts == 1
             else '{"action":"need_user","user_question":"请确认城市。"}'
         )
-        return type("RawResponse", (), {"content": content})()
+        return type(
+            "RawResponse",
+            (),
+            {"content": content, "usage_metadata": {"input_tokens": 10, "output_tokens": 5}},
+        )()
 
 
 class InvalidStructuredThenRetryFailureModel:
@@ -158,7 +216,7 @@ class InvalidStructuredThenRetryFailureModel:
         self.json_attempts = 0
 
     def with_structured_output(
-        self, _schema: type[BaseModel]
+        self, _schema: type[BaseModel], include_raw: bool = False
     ) -> "InvalidStructuredThenRetryFailureModel":
         self.structured = True
         return self
@@ -166,10 +224,17 @@ class InvalidStructuredThenRetryFailureModel:
     def invoke(self, _messages: list[object]) -> object:
         if getattr(self, "structured", False):
             self.structured = False
-            return {"action": "not-valid"}
+            return {"parsed": {"action": "not-valid"}, "raw": None}
         self.json_attempts += 1
         if self.json_attempts == 1:
-            return type("RawResponse", (), {"content": '{"action":"not-valid"}'})()
+            return type(
+                "RawResponse",
+                (),
+                {
+                    "content": '{"action":"not-valid"}',
+                    "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )()
         raise RuntimeError("retry is down")
 
 
@@ -414,3 +479,92 @@ def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
     assert isinstance(gateway, LangChainModelGateway)
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
     assert gateway._prefer_local_json_validation is True
+
+
+def test_gateway_last_usage_none_when_no_usage_metadata() -> None:
+    """last_usage is None when the model provides no usage metadata."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["input_tokens"] is None
+    assert gateway.last_usage["output_tokens"] is None
+
+
+def test_gateway_last_usage_populated_from_usage_metadata() -> None:
+    """last_usage is populated correctly from the model's usage_metadata."""
+    model = RecordingModel(
+        {"action": "need_user", "user_question": "请确认城市。"},
+        usage_metadata={"input_tokens": 150, "output_tokens": 50},
+    )
+    model.model = "test-model"
+    gateway = LangChainModelGateway(model)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["model_name"] == "test-model"
+    assert gateway.last_usage["input_tokens"] == 150
+    assert gateway.last_usage["output_tokens"] == 50
+
+
+def test_gateway_last_usage_reset_between_decide_calls() -> None:
+    """last_usage is reset to None at the start of each decide call."""
+    model = RecordingModel(
+        {"action": "need_user", "user_question": "请确认城市。"},
+        usage_metadata={"input_tokens": 150, "output_tokens": 50},
+    )
+    gateway = LangChainModelGateway(model)
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["input_tokens"] == 150
+
+    # Second call without usage metadata
+    model2 = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway2 = LangChainModelGateway(model2)
+    gateway2.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+    assert gateway2.last_usage is not None
+    assert gateway2.last_usage["input_tokens"] is None
+
+
+def test_gateway_last_usage_populated_for_local_json_validation_path() -> None:
+    """last_usage works for the local JSON validation fallback path."""
+    model = JsonOnlyModel()
+    gateway = LangChainModelGateway(model)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["input_tokens"] == 10
+    assert gateway.last_usage["output_tokens"] == 5

@@ -86,6 +86,11 @@ class RoleScriptedGateway:
         self.states: dict[AgentRole, list[dict[str, Any]]] = {
             role: [] for role in AgentRole
         }
+        self.last_usage = {
+            "model_name": "scripted-model",
+            "input_tokens": 100,
+            "output_tokens": 50,
+        }
 
     def decide(
         self,
@@ -103,12 +108,20 @@ class RoleScriptedGateway:
 class FailingGateway:
     """Provider boundary double that simulates a recoverable model outage."""
 
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return None
+
     def decide(self, **_kwargs):  # noqa: ANN003
         raise AgentModelGatewayError("model_request_failed")
 
 
 class InvalidModelGateway:
     """Provider double whose completions never parse into the response model."""
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return None
 
     def decide(self, **_kwargs):  # noqa: ANN003
         raise AgentModelGatewayError("invalid_model_response")
@@ -119,6 +132,10 @@ class CrashAfterFirstExecutorDecisionGateway:
 
     def __init__(self) -> None:
         self._executor_decisions = 0
+
+    @property
+    def last_usage(self) -> dict[str, Any] | None:
+        return {"model_name": "crash-model", "input_tokens": 100, "output_tokens": 50}
 
     def decide(self, *, role: AgentRole, response_model: type[BaseModel], **_kwargs) -> BaseModel:
         if role is AgentRole.planner:
@@ -330,6 +347,11 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
         (AgentRole.verifier, "call_tool"),
         (AgentRole.verifier, "decide"),
     ]
+    # Verify token usage is persisted for every turn
+    for turn in turns:
+        assert turn.model_name == "scripted-model"
+        assert turn.input_tokens == 100
+        assert turn.output_tokens == 50
 
 
 def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(db_session) -> None:
