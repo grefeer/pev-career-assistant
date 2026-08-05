@@ -125,7 +125,6 @@ class LangChainModelGateway:
                 system_content += f"\n\nAvailable tools (JSON):\n{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
             human_state = state_copy
         else:
-            # TEMPORARY MUTATION: change separators to test guard
             human_state = state
 
         messages = [
