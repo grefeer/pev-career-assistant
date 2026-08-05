@@ -94,6 +94,7 @@ def test_planner_uses_context_tool_observation_before_creating_a_plan() -> None:
             "status": "succeeded",
             "output": {"target_roles": ["AI 应用开发"]},
             "error_code": None,
+            "error_message": None,
         }
     ]
 

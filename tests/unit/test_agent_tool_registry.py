@@ -142,6 +142,9 @@ def test_registry_rejects_invalid_registration_and_catalog_filters_skill_authori
 
 
 def test_registry_reports_skill_forbidden_invalid_output_and_handler_failure() -> None:
+    # Import here to avoid circular import issues
+    from backend.app.services.career_skills.job_discovery import PublicJobFetchError
+
     registry = ToolRegistry()
     context = ToolContext(user_id="user-a", run_id="run-a")
     invalid_output = ToolDefinition(
@@ -154,8 +157,22 @@ def test_registry_reports_skill_forbidden_invalid_output_and_handler_failure() -
         output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
         handler=lambda _context, _payload: (_ for _ in ()).throw(RuntimeError("down")),
     )
+    typed_error = ToolDefinition(
+        name="typed-error", skill_name="job-discovery", input_model=JobInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: (_ for _ in ()).throw(PublicJobFetchError("unsafe_public_url")),
+    )
+    sensitive_error = ToolDefinition(
+        name="sensitive-error", skill_name="job-discovery", input_model=JobInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: (_ for _ in ()).throw(RuntimeError(
+            "https://user:secret@example.com/path contains token abc123xyz"
+        )),
+    )
     registry.register(invalid_output)
     registry.register(crashing)
+    registry.register(typed_error)
+    registry.register(sensitive_error)
 
     forbidden = registry.invoke(
         role=AgentRole.executor, name="bad-output", context=context, payload={"job_id": "1"},
@@ -167,10 +184,24 @@ def test_registry_reports_skill_forbidden_invalid_output_and_handler_failure() -
     failed = registry.invoke(
         role=AgentRole.executor, name="crash", context=context, payload={"job_id": "1"},
     )
+    typed = registry.invoke(
+        role=AgentRole.executor, name="typed-error", context=context, payload={"job_id": "1"},
+    )
+    sensitive = registry.invoke(
+        role=AgentRole.executor, name="sensitive-error", context=context, payload={"job_id": "1"},
+    )
 
     assert forbidden.error_code == "tool_skill_forbidden"
     assert invalid.error_code == "invalid_tool_output"
     assert failed.error_code == "tool_execution_failed"
+    assert failed.error_message == "down"
+    # Typed exceptions carry their specific error_code instead of tool_execution_failed
+    assert typed.error_code == "unsafe_public_url"
+    assert typed.error_message == "unsafe_public_url"
+    # Sensitive info like user:pass@ in URLs must be redacted
+    assert sensitive.error_message is not None
+    assert "user:secret" not in sensitive.error_message
+    assert "[redacted]@" in sensitive.error_message
 
 
 def test_scoped_catalog_excludes_unaffiliated_tools_to_match_invoke_scope() -> None:

@@ -9,6 +9,14 @@ from pydantic import BaseModel, Field, field_validator
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
 
+class ResumeTailoringError(RuntimeError):
+    """Stable, non-sensitive resume-tailoring failure."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class BuildResumeTailoringBriefInput(BaseModel):
     """One evidence-backed target JD and the terms the Agent wants checked."""
 
@@ -59,11 +67,11 @@ def build_resume_tailoring_brief(
     """Compare only one observed JD with facts already confirmed by the user."""
     target = _find_target(context.metadata.get("observed_public_evidence"), payload.target_artifact_id)
     if target is None:
-        raise ValueError("target_evidence_not_found")
+        raise ResumeTailoringError("target_evidence_not_found")
     source_url = target.get("source_url")
     visible_text = target.get("visible_text")
     if not isinstance(source_url, str) or not isinstance(visible_text, str):
-        raise ValueError("target_evidence_incomplete")
+        raise ResumeTailoringError("target_evidence_incomplete")
     job_text = f"{target.get('title') or ''}\n{visible_text}".lower()
     required_keywords = [
         (keyword, keyword.lower())

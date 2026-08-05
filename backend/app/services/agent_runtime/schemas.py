@@ -180,6 +180,7 @@ class ToolObservation(BaseModel):
     status: str
     output: dict[str, Any] | None = None
     error_code: str | None = None
+    error_message: str | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "ToolObservation":

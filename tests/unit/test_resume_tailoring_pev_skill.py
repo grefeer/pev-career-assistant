@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.resume_tailoring import (
     BuildResumeTailoringBriefInput,
+    ResumeTailoringError,
     _find_fact_ref_for_keyword,
     _find_target,
     _flatten_text,
@@ -98,7 +99,7 @@ def test_resume_brief_rejects_missing_or_incomplete_evidence_and_empty_keywords(
     with pytest.raises(ValidationError):
         BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=[" "])
     no_target = ToolContext(user_id="user-a", run_id="run-a", metadata={"observed_public_evidence": []})
-    with pytest.raises(ValueError, match="target_evidence_not_found"):
+    with pytest.raises(ResumeTailoringError, match="target_evidence_not_found"):
         build_resume_tailoring_brief(
             no_target,
             BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=["Python"]),
@@ -107,7 +108,7 @@ def test_resume_brief_rejects_missing_or_incomplete_evidence_and_empty_keywords(
         user_id="user-a", run_id="run-a",
         metadata={"observed_public_evidence": [{"artifact_id": "jd", "source_url": "https://jobs.example"}]},
     )
-    with pytest.raises(ValueError, match="target_evidence_incomplete"):
+    with pytest.raises(ResumeTailoringError, match="target_evidence_incomplete"):
         build_resume_tailoring_brief(
             incomplete,
             BuildResumeTailoringBriefInput(target_artifact_id="jd", target_keywords=["Python"]),

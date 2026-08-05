@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -11,6 +12,16 @@ from pydantic import BaseModel, ValidationError
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.schemas import ToolObservation
 from backend.app.services.agent_runtime.tool_context import ToolContext
+
+
+def _sanitize_error_message(text: str, max_length: int = 500) -> str:
+    """Strip sensitive substrings (credentials in URLs) and truncate safely.
+
+    Never expose raw tokens, passwords, or user-info-bearing URLs to the agent.
+    """
+    # Strip userinfo from URLs: https://user:pass@host -> https://[redacted]@host
+    stripped = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^@]+@", r"\1[redacted]@", text)
+    return stripped[:max_length]
 
 ToolHandler = Callable[[ToolContext, BaseModel], BaseModel | Mapping[str, Any]]
 
@@ -143,11 +154,14 @@ class ToolRegistry:
                 status="failed",
                 error_code="invalid_tool_output",
             )
-        except Exception:  # noqa: BLE001 - external tools need a stable observation.
+        except Exception as exc:  # noqa: BLE001 - external tools need a stable observation.
+            code = getattr(exc, "code", None) or "tool_execution_failed"
+            message = _sanitize_error_message(str(exc))
             return ToolObservation(
                 tool_name=name,
                 status="failed",
-                error_code="tool_execution_failed",
+                error_code=code,
+                error_message=message,
             )
         return ToolObservation(
             tool_name=name,

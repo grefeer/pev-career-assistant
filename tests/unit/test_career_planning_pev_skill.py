@@ -5,6 +5,7 @@ from datetime import date
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.career_planning import (
     BuildPreparationPlanInput,
+    CareerPlanningError,
     _find_target,
     build_preparation_plan,
 )
@@ -102,7 +103,7 @@ def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence()
     assert _find_target("not-a-list", "jd") is None
     assert _find_target([], "jd") is None
     missing_context = ToolContext(user_id="user-a", run_id="run-a", metadata={})
-    with pytest.raises(ValueError, match="target_evidence_not_found"):
+    with pytest.raises(CareerPlanningError, match="target_evidence_not_found"):
         build_preparation_plan(
             missing_context,
             BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=["Python"]),
@@ -111,7 +112,7 @@ def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence()
         user_id="user-a", run_id="run-a",
         metadata={"observed_public_evidence": [{"artifact_id": "jd", "visible_text": "Python"}]},
     )
-    with pytest.raises(ValueError, match="target_evidence_incomplete"):
+    with pytest.raises(CareerPlanningError, match="target_evidence_incomplete"):
         build_preparation_plan(
             incomplete_context,
             BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=["Python"]),

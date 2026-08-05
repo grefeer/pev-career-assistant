@@ -10,6 +10,14 @@ from pydantic import BaseModel, Field, field_validator
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
 
+class CareerPlanningError(RuntimeError):
+    """Stable, non-sensitive career-planning failure."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class BuildPreparationPlanInput(BaseModel):
     """One evidence-backed target JD plus topics the Agent wants validated."""
 
@@ -62,11 +70,11 @@ def build_preparation_plan(
     """Produce actions only for topics that the selected observed JD contains."""
     target = _find_target(context.metadata.get("observed_public_evidence"), payload.target_artifact_id)
     if target is None:
-        raise ValueError("target_evidence_not_found")
+        raise CareerPlanningError("target_evidence_not_found")
     source_url = target.get("source_url")
     visible_text = target.get("visible_text")
     if not isinstance(source_url, str) or not isinstance(visible_text, str):
-        raise ValueError("target_evidence_incomplete")
+        raise CareerPlanningError("target_evidence_incomplete")
     searchable = f"{target.get('title') or ''}\n{visible_text}".lower()
     topic_pairs = [
         (keyword, keyword.lower())
