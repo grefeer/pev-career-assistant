@@ -27,13 +27,15 @@ class RecordingModel:
         self.messages: list[object] = []
         self.schema: type[BaseModel] | None = None
         self.include_raw: bool = False
+        self.method: str | None = None
         self.model: str | None = None
 
     def with_structured_output(
-        self, schema: type[BaseModel], include_raw: bool = False
+        self, schema: type[BaseModel], *, include_raw: bool = False, method: str = "json_schema", **kwargs: object
     ) -> "RecordingModel":
         self.schema = schema
         self.include_raw = include_raw
+        self.method = method
         return self
 
     def invoke(self, messages: list[object]) -> object:
@@ -50,7 +52,7 @@ class JsonOnlyModel:
     """OpenAI-compatible provider double that rejects response_format schemas."""
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "JsonOnlyModel":
         return self
 
@@ -70,14 +72,14 @@ class JsonOnlyModel:
 
 class RaisingModel:
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "RaisingModel":
         raise RuntimeError("provider is down")
 
 
 class FallbackResponseModel:
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "FallbackResponseModel":
         raise RuntimeError("response_format not supported")
 
@@ -104,7 +106,7 @@ class LocalJsonPreferredModel:
         self.structured_requested = False
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "LocalJsonPreferredModel":
         self.structured_requested = True
         raise AssertionError("structured protocol must not be requested")
@@ -145,7 +147,7 @@ class InvalidStructuredThenJsonModel:
     """Provider returns an invalid structured object but supports ordinary JSON retry."""
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "InvalidStructuredThenJsonModel":
         self.structured = True
         return self
@@ -168,7 +170,7 @@ class InvalidStructuredThenFailureModel:
     """A malformed structured result must preserve a subsequent provider outage."""
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "InvalidStructuredThenFailureModel":
         self.structured = True
         return self
@@ -187,7 +189,7 @@ class InvalidStructuredTwiceThenJsonModel:
         self.json_attempts = 0
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "InvalidStructuredTwiceThenJsonModel":
         self.structured = True
         return self
@@ -216,7 +218,7 @@ class InvalidStructuredThenRetryFailureModel:
         self.json_attempts = 0
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "InvalidStructuredThenRetryFailureModel":
         self.structured = True
         return self
@@ -478,7 +480,8 @@ def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
 
     assert isinstance(gateway, LangChainModelGateway)
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert gateway._prefer_local_json_validation is True
+    assert gateway._prefer_local_json_validation is False
+    assert gateway._structured_method == "json_mode"
 
 
 def test_gateway_last_usage_none_when_no_usage_metadata() -> None:
@@ -506,7 +509,7 @@ class NonDictStructuredResultModel:
         self.fallback_invoked = False
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "NonDictStructuredResultModel":
         self._structured = True
         return self
@@ -554,7 +557,7 @@ class TokenUsageFallbackModel:
         self.model = "token-usage-model"
 
     def with_structured_output(
-        self, _schema: type[BaseModel], include_raw: bool = False
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
     ) -> "TokenUsageFallbackModel":
         self.include_raw = include_raw
         return self
@@ -627,7 +630,7 @@ def test_gateway_last_usage_reset_between_decide_calls() -> None:
             self.model: str | None = "sequential-model"
 
         def with_structured_output(
-            self, _schema: type[BaseModel], include_raw: bool = False
+            self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
         ) -> "SequentialRecordingModel":
             return self
 
@@ -845,6 +848,8 @@ def test_build_agent_model_gateway_passes_catalog_flag_from_settings(monkeypatch
         settings_override(agent_harness_catalog_in_system_prompt=True)
     )
     assert captured["catalog_in_system_prompt"] is True
+    assert captured["structured_method"] == "json_schema"
+    assert captured["prefer_local_json_validation"] is False
 
     # Test with the setting disabled (default)
     captured.clear()
@@ -852,3 +857,120 @@ def test_build_agent_model_gateway_passes_catalog_flag_from_settings(monkeypatch
         settings_override(agent_harness_catalog_in_system_prompt=False)
     )
     assert captured["catalog_in_system_prompt"] is False
+    assert captured["structured_method"] == "json_schema"
+    assert captured["prefer_local_json_validation"] is False
+
+
+def test_json_mode_gateway_appends_json_word_to_system_message() -> None:
+    """json_mode (DeepSeek response_format) requires the word 'json' in the prompt.
+
+    The gateway appends a minimal hint satisfying that protocol requirement
+    WITHOUT changing the action contract.  This covers the True branch of the
+    ``if self._structured_method == "json_mode"`` conditional.
+    """
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, structured_method="json_mode")
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    system_msg = model.messages[0]
+    assert "Return one JSON object matching the requested schema." in system_msg.content
+    assert "json" in system_msg.content.lower()
+
+
+def test_json_schema_gateway_does_not_append_json_word_hint() -> None:
+    """json_schema (default) must NOT append the json_mode-specific hint.
+
+    This covers the False branch of the conditional and is a mutation guard:
+    if the hint append were unconditional, the SystemMessage would contain it
+    and this test would fail.  Combined with the strict-equality off-path
+    test, this pins the non-deepSeek path as byte-identical to pre-Task-7.
+    """
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model)  # default structured_method="json_schema"
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    system_msg = model.messages[0]
+    assert "Return one JSON object matching the requested schema." not in system_msg.content
+
+
+def test_json_mode_gateway_passes_method_json_mode_to_structured_output() -> None:
+    """A json_mode gateway must pass method='json_mode' and include_raw=True."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, structured_method="json_mode")
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert model.method == "json_mode"
+    assert model.include_raw is True
+
+
+def test_json_schema_gateway_passes_method_json_schema_to_structured_output() -> None:
+    """A json_schema (default) gateway passes method='json_schema' (== langchain default).
+
+    Passing method='json_schema' explicitly is equivalent to omitting it (langchain
+    default), so the non-deepSeek path is byte-identical to pre-Task-7.
+    """
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model)  # default structured_method="json_schema"
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert model.method == "json_schema"
+    assert model.include_raw is True
+
+
+def test_build_agent_model_gateway_deepseek_non_v4_model_uses_json_schema(monkeypatch) -> None:
+    """A deepseek-base URL with a non-v4 model must NOT use json_mode or thinking-disabled.
+
+    Covers the branch where ``"deepseek" in base_url`` is True but
+    ``model.startswith("deepseek-v4")`` is False: is_deepseek_v4 is False,
+    no extra_body, structured_method stays json_schema.  Mutation guard:
+    if the condition dropped the model check, this test would fail.
+    """
+    captured: dict[str, object] = {}
+
+    class CapturingChatModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: "key"
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.deepseek.example",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.model_gateway.ChatOpenAI", CapturingChatModel
+    )
+
+    gateway = build_agent_model_gateway(
+        settings_override(agent_harness_model="deepseek-v3-chat")
+    )
+
+    assert isinstance(gateway, LangChainModelGateway)
+    assert "extra_body" not in captured
+    assert gateway._structured_method == "json_schema"
+    assert gateway._prefer_local_json_validation is False

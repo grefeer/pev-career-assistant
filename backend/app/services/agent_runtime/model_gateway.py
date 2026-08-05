@@ -67,6 +67,7 @@ class LangChainModelGateway:
         *,
         prefer_local_json_validation: bool = False,
         catalog_in_system_prompt: bool = False,
+        structured_method: str = "json_schema",
     ) -> None:
         self._model = model
         # Some otherwise compatible providers accept response_format but do
@@ -78,6 +79,11 @@ class LangChainModelGateway:
         # the HumanMessage into the SystemMessage. This enables prompt caching
         # for providers that support it, since the catalog is step-constant.
         self._catalog_in_system_prompt = catalog_in_system_prompt
+        # Structured-output wire protocol: "json_schema" (langchain default,
+        # OpenAI Structured Outputs) or "json_mode" (response_format
+        # {"type":"json_object"}).  The default equals langchain's default so
+        # the non-deepSeek path is byte-identical to omitting the arg.
+        self._structured_method = structured_method
         self._last_usage: dict[str, Any] | None = None
 
     @property
@@ -105,6 +111,13 @@ class LangChainModelGateway:
             f"{_role_action_contract(role)}"
         )
 
+        if self._structured_method == "json_mode":
+            # DeepSeek's response_format={"type":"json_object"} (json_mode)
+            # requires the word "json" in the prompt; this minimal hint
+            # satisfies that protocol requirement without changing the
+            # action contract.
+            system_content += " Return one JSON object matching the requested schema."
+
         if self._catalog_in_system_prompt:
             state_copy = dict(state)
             catalog = state_copy.pop("available_tools", None)
@@ -112,6 +125,7 @@ class LangChainModelGateway:
                 system_content += f"\n\nAvailable tools (JSON):\n{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
             human_state = state_copy
         else:
+            # TEMPORARY MUTATION: change separators to test guard
             human_state = state
 
         messages = [
@@ -130,7 +144,7 @@ class LangChainModelGateway:
             )
         try:
             structured_model = self._model.with_structured_output(
-                response_model, include_raw=True
+                response_model, include_raw=True, method=self._structured_method
             )
             raw_result = structured_model.invoke(messages)
             parsed = raw_result.get("parsed") if isinstance(raw_result, dict) else None
@@ -336,15 +350,15 @@ def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
         "api_key": api_key,
         "base_url": base_url,
     }
-    if "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
-        "deepseek-v4"
-    ):
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-    prefers_local_json = "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
+    is_deepseek_v4 = "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
         "deepseek-v4"
     )
+    if is_deepseek_v4:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+    structured_method = "json_mode" if is_deepseek_v4 else "json_schema"
     return LangChainModelGateway(
         ChatOpenAI(**kwargs),
-        prefer_local_json_validation=prefers_local_json,
+        prefer_local_json_validation=False,
         catalog_in_system_prompt=settings.agent_harness_catalog_in_system_prompt,
+        structured_method=structured_method,
     )
