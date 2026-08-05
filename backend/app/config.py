@@ -152,6 +152,7 @@ class Settings(BaseSettings):
     agent_harness_max_event_payload_bytes: int = Field(
         default=16_384, ge=1_024, le=262_144
     )
+    agent_harness_catalog_in_system_prompt: bool = False
 
     # Personal mode (single-user application-assistant) settings.
     # When True: registration disabled, require_admin bypassed for the seeded

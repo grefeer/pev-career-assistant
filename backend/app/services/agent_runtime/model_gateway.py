@@ -61,13 +61,23 @@ class AgentModelGatewayConfigError(RuntimeError):
 class LangChainModelGateway:
     """Schema-first gateway for any LangChain OpenAI-compatible chat model."""
 
-    def __init__(self, model: Any, *, prefer_local_json_validation: bool = False) -> None:
+    def __init__(
+        self,
+        model: Any,
+        *,
+        prefer_local_json_validation: bool = False,
+        catalog_in_system_prompt: bool = False,
+    ) -> None:
         self._model = model
         # Some otherwise compatible providers accept response_format but do
         # not reliably honour it.  They still make a real autonomous decision;
         # this flag changes only the wire protocol used to validate that one
         # decision locally.
         self._prefer_local_json_validation = prefer_local_json_validation
+        # When True, the tool catalog (available_tools in state) is moved from
+        # the HumanMessage into the SystemMessage. This enables prompt caching
+        # for providers that support it, since the catalog is step-constant.
+        self._catalog_in_system_prompt = catalog_in_system_prompt
         self._last_usage: dict[str, Any] | None = None
 
     @property
@@ -89,17 +99,26 @@ class LangChainModelGateway:
         corresponding Agent loop validates and performs it through ToolRegistry.
         """
         self._last_usage = None
+        system_content = (
+            f"Role: {role.value}. {instruction} "
+            "Return exactly one decision matching the requested schema. "
+            f"{_role_action_contract(role)}"
+        )
+
+        if self._catalog_in_system_prompt:
+            state_copy = dict(state)
+            catalog = state_copy.pop("available_tools", None)
+            if catalog is not None:
+                system_content += f"\n\nAvailable tools (JSON):\n{json.dumps(catalog, ensure_ascii=False, separators=(',', ':'))}"
+            human_state = state_copy
+        else:
+            human_state = state
+
         messages = [
-            SystemMessage(
-                content=(
-                    f"Role: {role.value}. {instruction} "
-                    "Return exactly one decision matching the requested schema. "
-                    f"{_role_action_contract(role)}"
-                )
-            ),
+            SystemMessage(content=system_content),
             HumanMessage(
                 content=json.dumps(
-                    state, ensure_ascii=False, separators=(",", ":"), default=str
+                    human_state, ensure_ascii=False, separators=(",", ":"), default=str
                 )
             ),
         ]
@@ -325,5 +344,7 @@ def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
         "deepseek-v4"
     )
     return LangChainModelGateway(
-        ChatOpenAI(**kwargs), prefer_local_json_validation=prefers_local_json
+        ChatOpenAI(**kwargs),
+        prefer_local_json_validation=prefers_local_json,
+        catalog_in_system_prompt=settings.agent_harness_catalog_in_system_prompt,
     )

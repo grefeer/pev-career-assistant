@@ -683,3 +683,151 @@ def test_gateway_last_usage_populated_for_local_json_validation_path() -> None:
     assert gateway.last_usage is not None
     assert gateway.last_usage["input_tokens"] == 10
     assert gateway.last_usage["output_tokens"] == 5
+
+
+def test_catalog_in_system_prompt_flag_off_preserves_original_behavior() -> None:
+    """When catalog_in_system_prompt is False (default), output is byte-identical to before."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, catalog_in_system_prompt=False)
+
+    state = {"goal": "找岗位", "available_tools": [{"name": "tool1", "description": "desc"}]}
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state=state,
+        response_model=PlannerDecision,
+    )
+
+    assert len(model.messages) == 2
+    system_msg, human_msg = model.messages
+
+    # SystemMessage must NOT contain catalog JSON
+    assert "Available tools" not in system_msg.content
+    assert "tool1" not in system_msg.content
+
+    # HumanMessage MUST contain available_tools
+    assert "available_tools" in human_msg.content
+    assert "tool1" in human_msg.content
+
+
+def test_catalog_in_system_prompt_flag_on_moves_catalog_to_system() -> None:
+    """When catalog_in_system_prompt is True, catalog moves to SystemMessage."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, catalog_in_system_prompt=True)
+
+    state = {"goal": "找岗位", "available_tools": [{"name": "tool1", "description": "desc"}]}
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state=state,
+        response_model=PlannerDecision,
+    )
+
+    assert len(model.messages) == 2
+    system_msg, human_msg = model.messages
+
+    # SystemMessage MUST contain catalog
+    assert "Available tools" in system_msg.content
+    assert "tool1" in system_msg.content
+
+    # HumanMessage must NOT contain available_tools
+    assert "available_tools" not in human_msg.content
+    assert "tool1" not in human_msg.content
+
+
+def test_catalog_in_system_prompt_flag_on_returns_valid_decision() -> None:
+    """Catalog placement does not affect decision validity."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, catalog_in_system_prompt=True)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位", "available_tools": [{"name": "t1"}]},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert result.user_question == "请确认城市。"
+
+
+def test_catalog_in_system_prompt_flag_on_does_not_mutate_caller_state() -> None:
+    """Caller's state dict must remain unchanged after decide()."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, catalog_in_system_prompt=True)
+
+    state = {"goal": "找岗位", "available_tools": [{"name": "tool1"}]}
+    original_state = dict(state)
+
+    gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state=state,
+        response_model=PlannerDecision,
+    )
+
+    # Caller's state is unchanged
+    assert state == original_state
+    assert "available_tools" in state
+
+
+def test_catalog_in_system_prompt_flag_on_graceful_when_no_catalog_in_state() -> None:
+    """No crash when catalog_in_system_prompt is True but state has no available_tools."""
+    model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
+    gateway = LangChainModelGateway(model, catalog_in_system_prompt=True)
+
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},  # No available_tools
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    system_msg, _ = model.messages
+    # No "Available tools" section when there's no catalog
+    assert "Available tools" not in system_msg.content
+
+
+def test_config_catalog_in_system_prompt_defaults_to_false() -> None:
+    """The default for agent_harness_catalog_in_system_prompt must be False."""
+    from backend.app.config import Settings
+
+    assert Settings().agent_harness_catalog_in_system_prompt is False
+
+
+def test_build_agent_model_gateway_passes_catalog_flag_from_settings(monkeypatch) -> None:
+    """build_agent_model_gateway wires the catalog flag from settings to the gateway."""
+    captured: dict[str, object] = {}
+
+    class CapturingGateway:
+        def __init__(self, model: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: "key"
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.example.com",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.model_gateway.ChatOpenAI", lambda **_: None
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.model_gateway.LangChainModelGateway",
+        CapturingGateway,
+    )
+
+    # Test with the setting enabled
+    build_agent_model_gateway(
+        settings_override(agent_harness_catalog_in_system_prompt=True)
+    )
+    assert captured["catalog_in_system_prompt"] is True
+
+    # Test with the setting disabled (default)
+    captured.clear()
+    build_agent_model_gateway(
+        settings_override(agent_harness_catalog_in_system_prompt=False)
+    )
+    assert captured["catalog_in_system_prompt"] is False
