@@ -33,6 +33,13 @@ from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
+#: Character budget for the ``observed_public_evidence`` context supplied to
+#: later Agent turns. The most-recent artifacts are kept full (with bounded
+#: ``visible_text``); older artifacts that exceed this budget collapse to
+#: identifier-only summary lines so early-link evidence is preserved as a
+#: pointer rather than silently dropped.
+_EVIDENCE_BUDGET_CHARS = 48_000
+
 
 @dataclass(frozen=True)
 class AgentRunResult:
@@ -563,27 +570,69 @@ class AgentRuntime:
     def _with_observed_public_evidence(
         db: Session, task: AgentTaskRequest, run_id: str
     ) -> AgentTaskRequest:
-        """Expose bounded, tool-produced public evidence to later Agent turns."""
-        remaining_characters = 48_000
-        evidence: list[dict[str, str]] = []
+        """Expose bounded, tool-produced public evidence to later Agent turns.
+
+        Most-recent artifacts are kept full (with bounded ``visible_text``);
+        older artifacts that do not fit the character budget collapse to
+        identifier-only summary lines (``artifact_id``/``source_url``/
+        ``content_hash``/``title`` - never ``visible_text``), so early-link
+        evidence is preserved as a traceable pointer rather than silently
+        dropped. Total ``visible_text`` characters stay within ``_EVIDENCE_BUDGET_CHARS``.
+
+        ``list_evidence_artifacts`` returns oldest-first (production order); we
+        walk newest-to-oldest when assigning the character budget so the
+        freshest evidence - most relevant to the current decision - is kept
+        full, and the oldest evidence is the first to be summarized.
+        """
+        budget_chars = _EVIDENCE_BUDGET_CHARS
+        # Build candidate items in oldest-first order (production order) with
+        # full visible_text. Artifacts without a non-empty visible_text are
+        # skipped - they carry no page evidence the model can act on.
+        candidates: list[dict[str, str]] = []
         for artifact in run_repository.list_evidence_artifacts(db, run_id):
             visible_text = artifact.content_json.get("visible_text")
             if not isinstance(visible_text, str) or not visible_text:
                 continue
-            text = visible_text[:remaining_characters]
-            item = {
+            item: dict[str, str] = {
                 "artifact_id": artifact.id,
                 "source_url": artifact.source_url,
                 "content_hash": artifact.content_hash,
-                "visible_text": text,
+                "visible_text": visible_text,
             }
             title = artifact.content_json.get("title")
             if isinstance(title, str):
                 item["title"] = title
-            evidence.append(item)
-            remaining_characters -= len(text)
-            if remaining_characters <= 0:
-                break
+            candidates.append(item)
+        # Walk newest-to-oldest, assigning truncated visible_text to items
+        # that fit within the remaining budget. Items that don't fit (budget
+        # exhausted) become identifier-only summary lines. This preserves the
+        # most-recent evidence full while keeping older evidence as pointers.
+        full_visible_text: dict[int, str] = {}
+        remaining = budget_chars
+        for index in range(len(candidates) - 1, -1, -1):
+            text = candidates[index]["visible_text"]
+            truncated = text[:remaining]
+            if not truncated:
+                break  # Budget exhausted; this and all older items get summarized.
+            full_visible_text[index] = truncated
+            remaining -= len(truncated)
+        # Assemble the result in oldest-first order: summaries for older
+        # artifacts, full items (with bounded visible_text) for recent ones.
+        evidence: list[dict[str, str]] = []
+        for index, item in enumerate(candidates):
+            if index in full_visible_text:
+                full_item = dict(item)
+                full_item["visible_text"] = full_visible_text[index]
+                evidence.append(full_item)
+            else:
+                summary: dict[str, str] = {
+                    "artifact_id": item["artifact_id"],
+                    "source_url": item["source_url"],
+                    "content_hash": item["content_hash"],
+                }
+                if "title" in item:
+                    summary["title"] = item["title"]
+                evidence.append(summary)
         context = dict(task.context)
         context["observed_public_evidence"] = evidence
         return task.model_copy(update={"context": context})

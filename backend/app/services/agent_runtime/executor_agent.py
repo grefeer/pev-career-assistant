@@ -10,6 +10,7 @@ from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.observation_projection import (
     observation_for_decision,
     record_observation,
+    summarize_observations,
 )
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
@@ -241,6 +242,13 @@ class ExecutorAgent:
                     observations=observations,
                     error_code="agent_turn_budget_exhausted",
                 )
+            # Bound the observation list the model sees: keep the most-recent
+            # projections full (as projected per-item by observation_for_decision)
+            # and collapse older ones to identifier-only summary lines when the
+            # accumulated list exceeds the character budget. The model still sees
+            # every observation's identity, but the oldest ones lose their
+            # visible_text/pages/details so the list stays bounded in long chains.
+            summarized_observations = summarize_observations(observations_for_decision)
             decision = self._gateway.decide(
                 role=AgentRole.executor,
                 instruction=_EXECUTOR_INSTRUCTION,
@@ -260,7 +268,7 @@ class ExecutorAgent:
                     "plan": plan_json,
                     "step": step_json,
                     "available_tools": available_tools,
-                    "observations": list(observations_for_decision),
+                    "observations": summarized_observations,
                     "prior_observations": prior_observations_for_decision,
                     "verifier_feedback": task.context.get("verifier_feedback", []),
                 },
@@ -274,7 +282,7 @@ class ExecutorAgent:
                         available_tools=available_tools,
                         observations_for_decision=[
                             *prior_observations_for_decision,
-                            *observations_for_decision,
+                            *summarized_observations,
                         ],
                         evidence_chars=compute_evidence_chars(
                             context.metadata.get("observed_public_evidence")

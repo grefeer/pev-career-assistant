@@ -6,7 +6,10 @@ import time
 
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
-from backend.app.services.agent_runtime.observation_projection import record_observation
+from backend.app.services.agent_runtime.observation_projection import (
+    record_observation,
+    summarize_observations,
+)
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -95,6 +98,10 @@ class VerifierAgent:
                     observations=observations,
                     error_code="agent_turn_budget_exhausted",
                 )
+            # Bound the observation list the model sees: keep the most-recent
+            # projections full and collapse older ones to identifier-only summary
+            # lines when the accumulated list exceeds the character budget.
+            summarized_observations = summarize_observations(observations_for_decision)
             decision = self._gateway.decide(
                 role=AgentRole.verifier,
                 instruction=_VERIFIER_INSTRUCTION,
@@ -113,7 +120,7 @@ class VerifierAgent:
                         if turn_budget is not None
                         else task.budget.max_agent_turns - _turn - 1
                     ),
-                    "observations": list(observations_for_decision),
+                    "observations": summarized_observations,
                 },
                 response_model=VerifierDecision,
             )
@@ -123,7 +130,7 @@ class VerifierAgent:
                     usage["context_manifest"] = build_context_manifest(
                         instruction=_VERIFIER_INSTRUCTION,
                         available_tools=available_tools,
-                        observations_for_decision=observations_for_decision,
+                        observations_for_decision=summarized_observations,
                         evidence_chars=compute_evidence_chars(
                             context.metadata.get("observed_public_evidence")
                         ),
