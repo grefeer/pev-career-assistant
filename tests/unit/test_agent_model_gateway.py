@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 from pydantic import BaseModel
 
@@ -11,11 +13,15 @@ from backend.app.services.agent_runtime.model_gateway import (
     AgentModelGatewayError,
     LangChainModelGateway,
     build_agent_model_gateway,
+    _coerce_response_fields,
     _role_action_contract,
     _strip_json_fence,
 )
 from tests.conftest import settings_override
-from backend.app.services.agent_runtime.schemas import PlannerDecision
+from backend.app.services.agent_runtime.schemas import (
+    ExecutorDecision,
+    PlannerDecision,
+)
 
 
 class RecordingModel:
@@ -415,6 +421,45 @@ def test_gateway_fails_safely_when_preferred_local_json_retry_cannot_recover(
         )
 
 
+def test_gateway_logs_failed_content_when_local_json_retry_exhausts(caplog) -> None:
+    """Each failed parse attempt and the terminal exhaustion are logged for drift triage."""
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(AgentModelGatewayError, match="invalid_model_response"):
+            LangChainModelGateway(
+                SequencedLocalJsonModel(['{"action":"not-valid"}'] * 3),
+                prefer_local_json_validation=True,
+            ).decide(
+                role=AgentRole.planner,
+                instruction="形成计划",
+                state={"goal": "找岗位"},
+                response_model=PlannerDecision,
+            )
+
+    messages = [record.getMessage() for record in caplog.records]
+    parse_failures = [m for m in messages if "local-json parse failed" in m]
+    assert len(parse_failures) == 3
+    assert all('{"action":"not-valid"}' in m for m in parse_failures)
+    assert all("role=planner" in m for m in parse_failures)
+    assert any("exhausted local-json retry" in m for m in messages)
+
+
+def test_gateway_logs_stage1_raw_content_when_local_recovery_fails(caplog) -> None:
+    """Stage-1 raw completion is logged when local recovery falls through to retry."""
+    with caplog.at_level(logging.WARNING):
+        result = LangChainModelGateway(StructuredInvalidWithRawUnrecoverableModel()).decide(
+            role=AgentRole.planner,
+            instruction="形成计划",
+            state={"goal": "找岗位"},
+            response_model=PlannerDecision,
+        )
+
+    assert result.action == "need_user"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage1 raw unrecoverable" in m and "not valid json at all" in m for m in messages
+    )
+
+
 def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:
     """An enabled harness must not fall back to a fabricated model decision."""
     monkeypatch.setattr(
@@ -454,6 +499,17 @@ def test_gateway_accepts_fenced_json_and_describes_every_role_contract() -> None
     assert _strip_json_fence("{}") == "{}"
     assert "complete" in _role_action_contract(AgentRole.executor)
     assert "REPLAN" in _role_action_contract(AgentRole.verifier)
+
+
+def test_strip_json_fence_handles_leading_prose_with_fence() -> None:
+    """Prose prefixed before a fenced JSON object is truncated at the first ``{``."""
+    content = "I have the list. Let me fetch more.\n\n```json\n{\"action\":\"call_tool\"}\n```"
+    assert _strip_json_fence(content) == '{"action":"call_tool"}'
+
+
+def test_strip_json_fence_handles_leading_prose_bare_json() -> None:
+    """Prose prefixed before a bare JSON object is truncated at the first ``{``."""
+    assert _strip_json_fence("Reasoning here {\"action\":\"call_tool\"}") == '{"action":"call_tool"}'
 
 
 def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
@@ -1010,3 +1066,410 @@ def test_combined_catalog_in_system_prompt_and_json_mode_produces_coherent_messa
     # HumanMessage must NOT contain available_tools (it was popped)
     assert "available_tools" not in human_msg.content
     assert "tool1" not in human_msg.content
+
+
+# --- Fix 1: corrective-hint retry on the structured-output failure path ---
+
+
+class InvalidStructuredThenHintSensitiveModel:
+    """Stage 1 returns an invalid structured object; plain invoke recovers only
+    once the corrective schema-format hint has been appended.
+
+    This pins Fix 1: the DeepSeek-style structured-failure path must route through
+    ``_decide_with_local_json_retry`` so a corrective SystemMessage is appended
+    between retry attempts (previously Stage 3 was byte-identical to Stage 2).
+    """
+
+    _HINT_PREFIX = "Your previous response was not one valid JSON"
+
+    def __init__(self) -> None:
+        self._structured = False
+        self.plain_attempts = 0
+        self.last_plain_messages: list[object] | None = None
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
+    ) -> "InvalidStructuredThenHintSensitiveModel":
+        self._structured = True
+        return self
+
+    def invoke(self, messages: list[object]) -> object:
+        if self._structured:
+            self._structured = False
+            return {"parsed": {"action": "not-valid"}, "raw": None}
+        self.plain_attempts += 1
+        self.last_plain_messages = list(messages)
+        has_corrective_hint = any(
+            getattr(m, "content", "").startswith(self._HINT_PREFIX) for m in messages
+        )
+        content = (
+            '{"action":"need_user","user_question":"请确认城市。"}'
+            if has_corrective_hint
+            else '{"action":"not-valid"}'
+        )
+        return type(
+            "RawResponse",
+            (),
+            {"content": content, "usage_metadata": {"input_tokens": 10, "output_tokens": 5}},
+        )()
+
+
+def test_gateway_appends_corrective_hint_on_structured_fallback_retry() -> None:
+    """Fix 1: the structured-failure retry appends a corrective schema-format hint.
+
+    A deterministic (temperature 0) provider reproduces the same broken
+    completion on identical messages, so the retry must change the input. The
+    corrective SystemMessage is appended between attempts and the second plain
+    invoke receives it.
+    """
+    model = InvalidStructuredThenHintSensitiveModel()
+    result = LangChainModelGateway(model).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    # One invalid plain attempt (no hint) + one successful plain attempt (hint).
+    assert model.plain_attempts == 2
+    assert any(
+        getattr(m, "content", "").startswith(InvalidStructuredThenHintSensitiveModel._HINT_PREFIX)
+        for m in (model.last_plain_messages or [])
+    )
+
+
+# --- Fix 2: tolerant field-name coercion (input -> tool_input) ---
+
+
+class InvalidStructuredThenInputFieldModel:
+    """Stage 1 invalid; Stage 2 emits ``input`` instead of ``tool_input``.
+
+    Mirrors observed DeepSeek json_mode drift: a call_tool decision carrying the
+    OpenAI tool-call convention ``input`` rather than the schema's ``tool_input``.
+    """
+
+    def __init__(self) -> None:
+        self._structured = False
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
+    ) -> "InvalidStructuredThenInputFieldModel":
+        self._structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        if self._structured:
+            self._structured = False
+            return {"parsed": {"action": "not-valid"}, "raw": None}
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": (
+                    '{"action":"call_tool","tool_name":"search-public-job-pages",'
+                    '"input":{"query":"python"}}'
+                ),
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
+
+
+def test_gateway_coerces_input_field_name_to_tool_input_before_validation() -> None:
+    """Fix 2: a provider-emitted ``input`` is coerced to ``tool_input`` then validated.
+
+    Without coercion the extra ``input`` field is rejected (additionalProperties
+    forbid) and the run degrades to ``invalid_model_response``. With coercion the
+    call_tool decision is recovered on the first ordinary-JSON retry.
+    """
+    result = LangChainModelGateway(InvalidStructuredThenInputFieldModel()).decide(
+        role=AgentRole.executor,
+        instruction="执行步骤",
+        state={"goal": "找岗位"},
+        response_model=ExecutorDecision,
+    )
+
+    assert result.action == "call_tool"
+    assert result.tool_name == "search-public-job-pages"
+    assert result.tool_input == {"query": "python"}
+
+
+class _NoToolInputModel(BaseModel):
+    """A response model without a ``tool_input`` field (coerce must be a no-op)."""
+
+    model_config = {"extra": "forbid"}
+
+    action: str
+
+
+def test_coerce_response_fields_renames_input_to_tool_input() -> None:
+    data = {
+        "action": "call_tool",
+        "tool_name": "search",
+        "input": {"query": "python"},
+    }
+    coerced = _coerce_response_fields(data, ExecutorDecision)
+
+    assert "input" not in coerced
+    assert coerced["tool_input"] == {"query": "python"}
+
+
+def test_coerce_response_fields_noop_when_tool_input_already_present() -> None:
+    data = {
+        "action": "call_tool",
+        "tool_name": "search",
+        "input": {"query": "stale"},
+        "tool_input": {"query": "fresh"},
+    }
+    coerced = _coerce_response_fields(data, ExecutorDecision)
+
+    # correct_name already present -> the wrong name is left untouched.
+    assert coerced["input"] == {"query": "stale"}
+    assert coerced["tool_input"] == {"query": "fresh"}
+
+
+def test_coerce_response_fields_noop_for_schema_without_tool_input() -> None:
+    data = {"action": "need_user", "input": {"query": "x"}}
+    coerced = _coerce_response_fields(data, _NoToolInputModel)
+
+    assert coerced == {"action": "need_user", "input": {"query": "x"}}
+
+
+@pytest.mark.parametrize("payload", [None, [1, 2, 3], "string", 42, True])
+def test_coerce_response_fields_noop_for_non_dict(payload: object) -> None:
+    assert _coerce_response_fields(payload, PlannerDecision) is payload
+
+
+def test_coerce_unwraps_single_key_wrapper() -> None:
+    """A single-key wrapper the model emitted (e.g. {"plan": {...}}) is unwrapped."""
+    data = {"plan": {"action": "need_user", "user_question": "城市？"}}
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced == {"action": "need_user", "user_question": "城市？"}
+
+
+def test_coerce_no_unwrap_when_single_key_is_schema_field() -> None:
+    """A single key that IS a schema field is not treated as a wrapper."""
+    data = {"action": "need_user"}
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced == {"action": "need_user"}
+
+
+def test_coerce_infers_missing_action_for_plan_payload() -> None:
+    """A plan payload emitted without the enclosing ``action`` gets ``plan`` inferred."""
+    data = {"complexity": "medium", "success_criteria": ["c1"], "steps": []}
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced["action"] == "plan"
+
+
+def test_coerce_no_action_inference_when_no_plan_fields() -> None:
+    """No ``action`` inference when the payload lacks plan-only fields."""
+    data = {"tool_name": "search"}
+    coerced = _coerce_response_fields(data, ExecutorDecision)
+
+    assert coerced == {"tool_name": "search"}
+
+
+def test_coerce_renames_decision_to_action() -> None:
+    """A provider-emitted ``decision`` field is coerced to ``action``."""
+    data = {"decision": "call_tool", "tool_name": "search", "tool_input": {"q": "x"}}
+    coerced = _coerce_response_fields(data, ExecutorDecision)
+
+    assert "decision" not in coerced
+    assert coerced["action"] == "call_tool"
+
+
+def test_coerce_leaves_decision_when_action_already_present() -> None:
+    """``decision`` is not renamed over an existing ``action``."""
+    data = {"action": "need_user", "decision": "stale", "user_question": "城市？"}
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced["action"] == "need_user"
+    assert coerced["decision"] == "stale"
+
+
+def test_coerce_infers_missing_step_id_for_plan_steps() -> None:
+    """A plan step emitted without ``step_id`` gets a deterministic id inferred."""
+    data = {
+        "complexity": "medium",
+        "success_criteria": ["c1"],
+        "steps": [
+            {"objective": "list companies", "allowed_skills": ["job-discovery"]},
+            {"objective": "verify roles", "allowed_skills": ["job-discovery"]},
+        ],
+    }
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced["steps"][0]["step_id"] == "step-1"
+    assert coerced["steps"][1]["step_id"] == "step-2"
+
+
+def test_coerce_preserves_existing_step_id() -> None:
+    """A step that already carries ``step_id`` is left untouched."""
+    data = {
+        "complexity": "medium",
+        "success_criteria": ["c1"],
+        "steps": [{"step_id": "keep", "objective": "o", "allowed_skills": ["job-discovery"]}],
+    }
+    coerced = _coerce_response_fields(data, PlannerDecision)
+
+    assert coerced["steps"][0]["step_id"] == "keep"
+
+
+class StructuredInvalidWithRawRecoverableModel:
+    """Stage 1 parsed invalid; ``raw.content`` carries a recoverable decision.
+
+    Pins Stage-1 local recovery: the raw completion must be repaired locally
+    (coerce) and returned WITHOUT a second model call.
+    """
+
+    def __init__(self) -> None:
+        self._structured = False
+        self.invoke_count = 0
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
+    ) -> "StructuredInvalidWithRawRecoverableModel":
+        self._structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        self.invoke_count += 1
+        if self._structured:
+            self._structured = False
+            raw_message = type(
+                "RawMessage",
+                (),
+                {
+                    "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                    "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )()
+            return {"parsed": {"action": "not-valid"}, "raw": raw_message}
+        raise AssertionError("model retry must not run when raw_content recovers")
+
+
+def test_gateway_recovers_raw_content_locally_without_model_retry() -> None:
+    """Stage-1 raw-content local recovery succeeds without a second model call."""
+    model = StructuredInvalidWithRawRecoverableModel()
+    gateway = LangChainModelGateway(model)
+    result = gateway.decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    assert result.user_question == "请确认城市。"
+    # Only the structured invoke ran; no Stage-2 retry.
+    assert model.invoke_count == 1
+    # Usage was extracted from the Stage-1 raw message.
+    assert gateway.last_usage is not None
+    assert gateway.last_usage["input_tokens"] == 10
+
+
+class StructuredInvalidWithRawDecisionFieldModel:
+    """Stage 1 parsed invalid; ``raw.content`` uses ``decision`` instead of ``action``.
+
+    Pins Stage-1 local recovery of the ``decision`` -> ``action`` field-name drift
+    observed in real DeepSeek json_mode draws: the raw completion is repaired
+    locally and returned WITHOUT a second model call.
+    """
+
+    def __init__(self) -> None:
+        self._structured = False
+        self.invoke_count = 0
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
+    ) -> "StructuredInvalidWithRawDecisionFieldModel":
+        self._structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        self.invoke_count += 1
+        if self._structured:
+            self._structured = False
+            raw_message = type(
+                "RawMessage",
+                (),
+                {
+                    "content": (
+                        '{"decision":"call_tool","tool_name":'
+                        '"search-public-job-pages","tool_input":{"query":"python"}}'
+                    ),
+                    "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )()
+            return {"parsed": {"action": "not-valid"}, "raw": raw_message}
+        raise AssertionError("model retry must not run when decision-field raw recovers")
+
+
+def test_gateway_recovers_decision_field_drift_via_raw_content() -> None:
+    """Stage-1 raw-content local recovery repairs the ``decision`` field name."""
+    model = StructuredInvalidWithRawDecisionFieldModel()
+    result = LangChainModelGateway(model).decide(
+        role=AgentRole.executor,
+        instruction="执行步骤",
+        state={"goal": "找岗位"},
+        response_model=ExecutorDecision,
+    )
+
+    assert result.action == "call_tool"
+    assert result.tool_name == "search-public-job-pages"
+    assert result.tool_input == {"query": "python"}
+    assert model.invoke_count == 1
+
+
+class StructuredInvalidWithRawUnrecoverableModel:
+    """Stage 1 parsed invalid; ``raw.content`` is also unrecoverable -> fall to retry."""
+
+    def __init__(self) -> None:
+        self._structured = False
+        self.invoke_count = 0
+
+    def with_structured_output(
+        self, _schema: type[BaseModel], include_raw: bool = False, **kwargs: object
+    ) -> "StructuredInvalidWithRawUnrecoverableModel":
+        self._structured = True
+        return self
+
+    def invoke(self, _messages: list[object]) -> object:
+        self.invoke_count += 1
+        if self._structured:
+            self._structured = False
+            raw_message = type(
+                "RawMessage",
+                (),
+                {
+                    "content": "not valid json at all",
+                    "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+                },
+            )()
+            return {"parsed": {"action": "not-valid"}, "raw": raw_message}
+        return type(
+            "RawResponse",
+            (),
+            {
+                "content": '{"action":"need_user","user_question":"请确认城市。"}',
+                "usage_metadata": {"input_tokens": 10, "output_tokens": 5},
+            },
+        )()
+
+
+def test_gateway_falls_through_to_retry_when_raw_content_unrecoverable() -> None:
+    """When local raw-content recovery fails, the bounded model retry runs."""
+    model = StructuredInvalidWithRawUnrecoverableModel()
+    result = LangChainModelGateway(model).decide(
+        role=AgentRole.planner,
+        instruction="形成计划",
+        state={"goal": "找岗位"},
+        response_model=PlannerDecision,
+    )
+
+    assert result.action == "need_user"
+    # Stage-1 structured invoke + one Stage-2 retry invoke.
+    assert model.invoke_count == 2

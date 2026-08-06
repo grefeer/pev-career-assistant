@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Protocol, TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -11,6 +12,8 @@ from pydantic import BaseModel
 
 from backend.app.config import Settings
 from backend.app.domain.agent_runtime import AgentRole
+
+logger = logging.getLogger(__name__)
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
@@ -141,6 +144,7 @@ class LangChainModelGateway:
                 role=role,
                 response_model=response_model,
             )
+        raw_content: str | None = None
         try:
             structured_model = self._model.with_structured_output(
                 response_model, include_raw=True, method=self._structured_method
@@ -151,6 +155,9 @@ class LangChainModelGateway:
                 raw_message = raw_result.get("raw")
                 if raw_message is not None:
                     self._extract_usage(raw_message)
+                    candidate = getattr(raw_message, "content", None)
+                    if isinstance(candidate, str):
+                        raw_content = candidate
         except Exception as exc:  # noqa: BLE001 - provider exceptions are untrusted.
             if _response_format_unavailable(exc):
                 return self._decide_with_local_json_validation(
@@ -160,36 +167,39 @@ class LangChainModelGateway:
                 )
             raise AgentModelGatewayError("model_request_failed") from exc
         try:
-            return response_model.model_validate(parsed)
+            return response_model.model_validate(
+                _coerce_response_fields(parsed, response_model)
+            )
         except Exception as exc:  # noqa: BLE001 - invalid JSON/model output is recoverable.
-            # Some OpenAI-compatible providers accept the structured request
-            # but occasionally return an object that violates it. One bounded
-            # ordinary-JSON retry is a transport compatibility recovery, not a
-            # business retry or an Agent-selected action.
+            # The structured-output path returned None or a schema-violating
+            # object. Before a second model call, try to recover the raw
+            # completion locally: strip fences, unwrap a single-key wrapper,
+            # infer a missing action, rename wrong field names. This is a
+            # deterministic local repair, never an Agent decision or a
+            # tool selection. If the raw completion is itself unrecoverable
+            # (e.g. steps emitted as strings), fall through to a bounded model
+            # retry with a corrective schema-format hint per attempt.
+            if raw_content is not None:
+                try:
+                    return _parse_and_validate(raw_content, response_model)
+                except Exception:  # noqa: BLE001 - fall through to model retry.
+                    logger.warning(
+                        "gateway stage1 raw unrecoverable; role=%s model=%s "
+                        "content=%r",
+                        role.value,
+                        response_model.__name__,
+                        raw_content[:2000],
+                    )
             try:
-                return self._decide_with_local_json_validation(
+                return self._decide_with_local_json_retry(
                     messages=messages,
                     role=role,
                     response_model=response_model,
                 )
-            except AgentModelGatewayError as fallback_error:
-                if fallback_error.code == "model_request_failed":
-                    raise fallback_error from exc
-                # A few OpenAI-compatible endpoints occasionally emit one
-                # malformed ordinary-JSON completion after accepting the
-                # schema request. Retry the transport protocol once more;
-                # this remains a bounded schema-validation recovery, never an
-                # Agent decision or a tool-selection retry.
-                try:
-                    return self._decide_with_local_json_validation(
-                        messages=messages,
-                        role=role,
-                        response_model=response_model,
-                    )
-                except AgentModelGatewayError as retry_error:
-                    if retry_error.code == "model_request_failed":
-                        raise retry_error from exc
-                raise AgentModelGatewayError("invalid_model_response") from exc
+            except AgentModelGatewayError as retry_error:
+                if retry_error.code == "model_request_failed":
+                    raise retry_error from exc
+                raise
 
     def _decide_with_local_json_retry(
         self,
@@ -232,6 +242,11 @@ class LangChainModelGateway:
                             )
                         ),
                     ]
+        logger.warning(
+            "gateway exhausted local-json retry; role=%s model=%s attempts=3",
+            role.value,
+            response_model.__name__,
+        )
         raise AgentModelGatewayError("invalid_model_response") from last_error
 
     def _decide_with_local_json_validation(
@@ -261,8 +276,14 @@ class LangChainModelGateway:
         if not isinstance(content, str):
             raise AgentModelGatewayError("invalid_model_response")
         try:
-            return response_model.model_validate(json.loads(_strip_json_fence(content)))
+            return _parse_and_validate(content, response_model)
         except Exception as exc:  # noqa: BLE001 - untrusted model content.
+            logger.warning(
+                "gateway local-json parse failed; role=%s model=%s content=%r",
+                role.value,
+                response_model.__name__,
+                content[:2000],
+            )
             raise AgentModelGatewayError("invalid_model_response") from exc
 
     def _extract_usage(self, raw_message: Any) -> None:
@@ -304,13 +325,101 @@ def _response_format_unavailable(error: Exception) -> bool:
 
 
 def _strip_json_fence(content: str) -> str:
-    """Accept a provider's harmless Markdown JSON fence, never surrounding prose."""
+    """Accept a provider's harmless Markdown JSON fence or leading prose.
+
+    Some providers prefix the (possibly fenced) JSON object with explanatory
+    prose. When the content no longer starts with a fence, truncate at the
+    first object opener ``{`` so ``json.loads`` sees a clean leading token,
+    and drop a trailing fence that the prose pushed off the start.
+    """
     cleaned = content.strip()
     if cleaned.startswith("```json") and cleaned.endswith("```"):
         return cleaned[7:-3].strip()
     if cleaned.startswith("```") and cleaned.endswith("```"):
         return cleaned[3:-3].strip()
+    brace = cleaned.find("{")
+    if brace > 0:
+        cleaned = cleaned[brace:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].strip()
     return cleaned
+
+
+# Known provider-emitted wrong field names that should map to a schema field
+# before validation. Applied only when the target field exists in the response
+# schema and is not already present, so schemas without the target field are
+# left untouched. ``input`` is the OpenAI tool-call convention (schema field
+# ``tool_input``); ``decision`` is a provider synonym for the ``action`` field
+# emitted by some json_mode draws.
+_WRONG_RESPONSE_FIELD_NAMES = {"input": "tool_input", "decision": "action"}
+
+
+def _coerce_response_fields(
+    data: object, response_model: type[BaseModel]
+) -> object:
+    """Tolerantly repair provider-emitted drift before schema validation.
+
+    Four safe, schema-aware repairs, each a no-op when the precondition does
+    not hold:
+
+    1. Unwrap a single-key wrapper the model emitted instead of the flat
+       decision (e.g. ``{"plan": {...}}``), when the wrapper key is not itself
+       a schema field and its value is a dict.
+    2. Infer a missing ``action="plan"`` when the model returned a plan
+       payload (``complexity``/``success_criteria``/``steps``) without the
+       enclosing action. Gated on plan-only fields, so Executor/Verifier
+       schemas (which have no ``plan`` action) are unaffected.
+    3. Rename provider-emitted wrong field names (``input`` -> ``tool_input``,
+       ``decision`` -> ``action``) only when the target is a schema field and
+       not already present.
+    4. Infer a missing ``step_id`` on each plan step (the model sometimes
+       emits ``objective``/``allowed_skills`` without the required id) when the
+       response model declares a ``steps`` field. Non-plan schemas are
+       unaffected.
+
+    Returns non-dict payloads unchanged, so this is a safe no-op for every
+    response model that lacks the relevant fields.
+    """
+    if not isinstance(data, dict):
+        return data
+    schema_fields = response_model.model_json_schema().get("properties", {})
+    if len(data) == 1:
+        only_key, only_value = next(iter(data.items()))
+        if only_key not in schema_fields and isinstance(only_value, dict):
+            data = only_value
+    if (
+        "action" in schema_fields
+        and "action" not in data
+        and ("steps" in data or "complexity" in data or "success_criteria" in data)
+    ):
+        data["action"] = "plan"
+    for wrong_name, correct_name in _WRONG_RESPONSE_FIELD_NAMES.items():
+        if (
+            wrong_name in data
+            and correct_name in schema_fields
+            and correct_name not in data
+        ):
+            data[correct_name] = data.pop(wrong_name)
+    if "steps" in schema_fields:
+        steps = data.get("steps")
+        if isinstance(steps, list):
+            for index, step in enumerate(steps):
+                if isinstance(step, dict) and not step.get("step_id"):
+                    step["step_id"] = f"step-{index + 1}"
+    return data
+
+
+def _parse_and_validate(
+    content: str, response_model: type[ResponseT]
+) -> ResponseT:
+    """Strip fences -> JSON parse -> coerce drift -> validate against the schema.
+
+    No exception handling: callers wrap this in a try/except so they can map
+    failures to the appropriate recoverable gateway error.
+    """
+    data = json.loads(_strip_json_fence(content))
+    data = _coerce_response_fields(data, response_model)
+    return response_model.model_validate(data)
 
 
 def _role_action_contract(role: AgentRole) -> str:
