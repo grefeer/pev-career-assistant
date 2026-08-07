@@ -1,0 +1,228 @@
+"""SKILL.md six-phase job-discovery workflow as a LangGraph subgraph.
+
+Nodes mirror the validated skill behavior (browse → extract → validate →
+deduplicate → coverage_gate).  Mechanical phases are fully deterministic;
+the only LLM contact is the optional low-confidence extraction gate
+(spec §4.3).  A per-URL fetch failure is recorded in ``per_url_results``
+and never aborts the run (layered failure recovery, spec §4.2).  Compiling
+with a checkpointer makes a mid-crawl crash resume from the last URL
+instead of re-fetching.
+
+Deterministic phases run the allowlisted skill scripts through
+``run_skill_script`` with candidates exchanged via a temp JSON file under
+the skill directory (scripts take file paths, matching their real CLI).
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+from pathlib import Path
+from typing import Any, TypedDict
+
+from langgraph.graph import END, START, StateGraph
+
+from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.job_discovery import (
+    ExtractObservedJobDetailsBatchInput,
+    FetchPublicJobPagesInput,
+    PublicJobFetchError,
+    extract_observed_job_details_batch,
+    fetch_public_job_pages,
+)
+from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
+    SKILL_DIR,
+    run_skill_script,
+)
+
+
+class JobDiscoveryWorkflowState(TypedDict):
+    urls: list[str]
+    pages: list[dict[str, Any]]
+    per_url_results: list[dict[str, Any]]
+    candidates: list[dict[str, Any]]
+    coverage: dict[str, Any]
+    error: str | None
+
+
+def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
+    """requests fast-path via the reviewed registry handler (the Playwright
+    fallback selected by SKILL.md lives behind the same handler)."""
+    output = fetch_public_job_pages(
+        ToolContext(user_id="", run_id="", metadata={}),
+        FetchPublicJobPagesInput(urls=urls[:10]),
+    )
+    return [
+        {
+            "url": page.source_url,
+            # source_url is required by the evidence-binding contract
+            # (career_skills extract expects it on observed evidence)
+            "source_url": page.source_url,
+            "status": "succeeded",
+            "content_hash": page.content_hash,
+            "title": page.title,
+            "visible_text": page.visible_text,
+        }
+        for page in output.pages
+    ] + [
+        {
+            "url": failure.source_url,
+            "status": "failed",
+            "error_code": failure.error_code,
+        }
+        for failure in output.failures
+    ]
+
+
+def _write_candidates(candidates: list[dict[str, Any]]) -> Path:
+    workdir = Path(tempfile.mkdtemp(dir=SKILL_DIR))
+    path = workdir / "candidates.json"
+    path.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _default_extract(
+    pages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Extract from succeeded pages via the reviewed career_skills engine.
+
+    Evidence binding: each page is re-registered in the ToolContext metadata
+    as ``observed:<content_hash>`` so the handler's
+    ``_find_observed_evidence`` lookup resolves (spec §4.2).
+    """
+    metadata_pages = [
+        {
+            "artifact_id": f"observed:{page['content_hash']}",
+            "source_url": page.get("source_url"),
+            "content_hash": page.get("content_hash"),
+            "visible_text": page.get("visible_text", ""),
+        }
+        for page in pages
+    ]
+    try:
+        output = extract_observed_job_details_batch(
+            ToolContext(
+                user_id="",
+                run_id="",
+                metadata={"observed_public_evidence": metadata_pages},
+            ),
+            ExtractObservedJobDetailsBatchInput(
+                # the observed: prefix must match the metadata artifact_id
+                # registered above (career_skills `_find_observed_evidence`
+                # matches on artifact_id, not on content_hash alone)
+                artifact_ids=[f"observed:{page['content_hash']}" for page in pages][:10]
+            ),
+        )
+    except PublicJobFetchError as exc:
+        return [], f"extract failed: {exc}"
+    return [detail.model_dump(mode="json") for detail in output.details], None
+
+
+def build_job_discovery_graph(
+    *,
+    fetch_fn=None,
+    script_runner=None,
+    extract_fn=None,
+) -> StateGraph:
+    """Assemble the workflow graph with injectable seams for tests."""
+    fetch_fn = fetch_fn or _default_fetch
+    script_runner = script_runner or run_skill_script
+    extract_fn = extract_fn or _default_extract
+
+    def fetch_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        pages = fetch_fn(state["urls"])
+        return {
+            "pages": pages,
+            # materialize the error channel (LangGraph omits channels never
+            # written, but the partial-results contract includes error=None)
+            "error": None,
+            "per_url_results": [
+                {
+                    "url": page.get("url"),
+                    "status": page.get("status", "failed"),
+                    "error_code": page.get("error_code"),
+                    "content_hash": page.get("content_hash"),
+                }
+                for page in pages
+            ],
+        }
+
+    def extract_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        pages = [
+            page
+            for page in state.get("pages", [])
+            if page.get("status") == "succeeded" and page.get("content_hash")
+        ]
+        if not pages:
+            return {"candidates": []}
+        candidates, error = extract_fn(pages)
+        update: dict[str, Any] = {"candidates": candidates}
+        if error is not None:
+            update["error"] = error
+        return update
+
+    def validate_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        if not state["candidates"]:
+            return {}
+        with tempfile.TemporaryDirectory(dir=SKILL_DIR):
+            path = _write_candidates(state["candidates"])
+            out = script_runner("validate", str(path))
+        if "ERROR" in out:
+            return {"error": f"validate failed: {out[:500]}"}
+        return {}
+
+    def dedup_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        if not state["candidates"]:
+            return {}
+        with tempfile.TemporaryDirectory(dir=SKILL_DIR) as workdir:
+            work = Path(workdir)
+            src = work / "candidates.json"
+            src.write_text(
+                json.dumps(state["candidates"], ensure_ascii=False), encoding="utf-8"
+            )
+            merged = work / "merged.json"
+            out = script_runner("deduplicate", f"{src} --out {merged}")
+            if "ERROR" in out:
+                return {"error": f"deduplicate failed: {out[:500]}"}
+            if merged.exists():
+                try:
+                    merged_candidates = json.loads(merged.read_text(encoding="utf-8"))
+                except ValueError:
+                    return {"error": "deduplicate output unparsable"}
+                if isinstance(merged_candidates, list):
+                    return {"candidates": merged_candidates}
+                if (
+                    isinstance(merged_candidates, dict)
+                    and isinstance(merged_candidates.get("candidates"), list)
+                ):
+                    return {"candidates": merged_candidates["candidates"]}
+                return {"error": "deduplicate output has no candidates list"}
+        return {"error": "deduplicate produced no merged file"}
+
+    def coverage_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        pages = [
+            page for page in state.get("pages", []) if page.get("status") == "succeeded"
+        ]
+        page_urls = " ".join(page.get("url", "") for page in pages)
+        with tempfile.TemporaryDirectory(dir=SKILL_DIR):
+            path = _write_candidates(state["candidates"])
+            out = script_runner("coverage_gate", f"{path} --pages {page_urls}".strip())
+        try:
+            coverage = json.loads(out)
+        except ValueError:
+            coverage = {"verified": False, "error": "unparsable coverage_gate output"}
+        return {"coverage": coverage}
+
+    graph = StateGraph(JobDiscoveryWorkflowState)
+    graph.add_node("fetch", fetch_node)
+    graph.add_node("extract", extract_node)
+    graph.add_node("validate", validate_node)
+    graph.add_node("dedup", dedup_node)
+    graph.add_node("coverage", coverage_node)
+    graph.add_edge(START, "fetch")
+    graph.add_edge("fetch", "extract")
+    graph.add_edge("extract", "validate")
+    graph.add_edge("validate", "dedup")
+    graph.add_edge("dedup", "coverage")
+    graph.add_edge("coverage", END)
+    return graph

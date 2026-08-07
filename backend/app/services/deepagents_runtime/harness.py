@@ -43,6 +43,9 @@ from backend.app.services.deepagents_runtime.tools.adapters import (
     bind_tool_context,
     build_skill_tools,
 )
+from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+    workflow_thread_id,
+)
 
 _OBSERVATION_EXCERPT_LIMIT = 1_200
 _STALL_LIMIT = 3
@@ -325,11 +328,14 @@ class DeepAgentsHarness:
         )
         try:
             with bind_tool_context(tool_ctx):
-                with current_budgets(budgets):
-                    result = agent.invoke(
-                        {"messages": [HumanMessage(step.objective)]},
-                        {"configurable": {"thread_id": _agent_thread(state["run_id"], state["step_index"], "executor")}},
-                    )
+                with workflow_thread_id(
+                    _agent_thread(state["run_id"], state["step_index"], "workflow")
+                ):
+                    with current_budgets(budgets):
+                        result = agent.invoke(
+                            {"messages": [HumanMessage(step.objective)]},
+                            {"configurable": {"thread_id": _agent_thread(state["run_id"], state["step_index"], "executor")}},
+                        )
         except TurnBudgetExhausted as exc:
             return _degrade(state, str(exc))
         decisions, evidence = _project_tool_observations(result["messages"])
