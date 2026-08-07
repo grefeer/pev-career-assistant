@@ -40,6 +40,8 @@ def build_job_discovery_tool(
     script_runner=None,
     extract_fn=None,
     checkpointer: Any = None,
+    settings=None,
+    candidates_dir=None,
 ) -> StructuredTool:
     """Wrap the compiled job-discovery workflow as a single @tool.
 
@@ -47,11 +49,17 @@ def build_job_discovery_tool(
     ``workflow_thread_id``), so a mid-crawl crash resumes from the last URL
     instead of re-fetching.  Returns a ToolObservation (the harness's
     ``_project_tool_observations`` validates every ToolMessage against that
-    schema — a bare dict would be silently dropped as invalid).
+    schema — a bare dict would be silently dropped as invalid).  ``settings``
+    gates the optional LLM extraction (spec §4.3); ``candidates_dir`` points
+    the per-page write/dedup phases at a run-scoped output directory.
     """
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch_fn, script_runner=script_runner, extract_fn=extract_fn
+        fetch_fn=fetch_fn,
+        script_runner=script_runner,
+        extract_fn=extract_fn,
+        settings=settings,
+        candidates_dir=candidates_dir,
     ).compile(checkpointer=checkpointer)
 
     def _observe(status: str, **kwargs: Any) -> str:
@@ -81,6 +89,12 @@ def build_job_discovery_tool(
                 "per_url_results": final.get("per_url_results", []),
                 "candidates": final.get("candidates", []),
                 "coverage": final.get("coverage", {"verified": False}),
+                # dedup node output (U10): merged_count = the deduplicate
+                # script's output_count, dedup_stats = its stats dict; both
+                # default to the no-merge sentinels when the node skipped
+                # (batch fast-path wrote no per-page files)
+                "merged_count": final.get("merged_count", 0),
+                "dedup_stats": final.get("dedup_stats", {}),
             },
         )
 
