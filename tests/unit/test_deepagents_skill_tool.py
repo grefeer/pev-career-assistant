@@ -741,6 +741,73 @@ def test_job_discovery_tool_incremental_prior_metadata(tmp_path) -> None:
     assert results["merged_count"] == 1
 
 
+def test_job_discovery_tool_incremental_dict_args_path(tmp_path) -> None:
+    # C1 (review round 1): the harness ToolNode invokes tools with dict
+    # args; the args_schema strips the {"payload": ...} wrapper BEFORE
+    # run(), so run() receives the inner object string — the first unwrap
+    # branch must never index "payload" blindly, or the incremental object
+    # crashes with KeyError through the production invocation path
+    calls: list[str] = []
+
+    def incremental_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        calls.append(f"{script} {cli_args}")
+        if script == "state" and cli_args.startswith("check "):
+            return json.dumps({"exit_code": 1})
+        if script == "state":
+            return json.dumps({"marked": True})
+        if script == "normalize":
+            return json.dumps({"input": "后端工程师", "normalized": "backend-engineer"})
+        return _fake_runner(script, cli_args=cli_args, stdin=stdin)
+
+    def incremental_extract(pages: list[dict]) -> tuple[list[dict], None]:
+        (tmp_path / "page_00.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "title": "后端工程师",
+                        "responsibilities": "负责后端服务开发",
+                        "requirements": "精通 Python",
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return _fake_extract(pages)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=incremental_runner,
+        extract_fn=incremental_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(
+            {
+                "payload": json.dumps(
+                    {
+                        "urls": ["https://a.com"],
+                        "prior_metadata": {
+                            "file_id": "f1",
+                            "sheet_id": "s1",
+                            "update_time": "2026-08-07",
+                        },
+                    }
+                )
+            }
+        )
+    )
+    assert out["status"] == "succeeded"
+    results = out["output"]
+    # the full incremental pipeline ran through the dict-args path: state
+    # check before fetch, mark after extraction, prior_metadata threaded
+    assert results["per_url_results"][0]["status"] == "succeeded"
+    assert "state check https://a.com 2026-08-07" in calls
+    assert "state mark hash-0 https://a.com 2026-08-07 --file-id f1 --sheet-id s1" in calls
+    assert results["normalize_keys"]["后端工程师"] == "backend-engineer"
+
+
 def test_job_discovery_tool_dict_input_without_prior_metadata(tmp_path) -> None:
     # Task 10: a {"urls": [...]} object input without prior_metadata takes the
     # single-shot path — no state check/mark, no merged accumulation

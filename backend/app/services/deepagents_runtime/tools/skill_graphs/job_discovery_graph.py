@@ -398,18 +398,30 @@ def build_job_discovery_graph(
 
     ``state_dir`` is the stable incremental store root (default: the skill
     dir — ``output/state.json``, ``output/candidates/merged_final.json``,
-    ``output/errors.jsonl``).  ``prior_metadata`` on the invoke input flips
-    a run to incremental mode; absent, no state check/mark runs (single-shot).
+    ``output/errors.jsonl``).  When ``candidates_dir`` is not given it
+    derives from the resolved state dir (``<state_dir>/output/candidates``),
+    so merged_final.json always lands where the next run's
+    ``load_prior_candidates`` reads it back; an explicit ``candidates_dir``
+    still wins.  ``prior_metadata`` on the invoke input flips a run to
+    incremental mode; absent, no state check/mark runs (single-shot).
     """
     script_runner = script_runner or run_skill_script
+    state_dir = _resolve_state_dir(state_dir)
+    if candidates_dir is None:
+        # the stable store owns the candidates output: merged_final.json
+        # must land exactly where load_prior_candidates reads it
+        # (<state_dir>/output/candidates/merged_final.json), so a run with
+        # only state_dir set (the natural production incremental wiring)
+        # accumulates correctly.  Default behavior is byte-identical:
+        # state_dir=None -> SKILL_DIR/output/candidates (today's default).
+        candidates_dir = str(Path(state_dir) / _CANDIDATES_DIR)
+    candidates_dir = _resolve_candidates_dir(candidates_dir)
     extract_fn = extract_fn or functools.partial(
         _default_extract,
         settings=settings,
         script_runner=script_runner,
         candidates_dir=candidates_dir,
     )
-    candidates_dir = _resolve_candidates_dir(candidates_dir)
-    state_dir = _resolve_state_dir(state_dir)
     fetch_fn = fetch_fn or functools.partial(
         _default_fetch, state_dir=str(state_dir)
     )

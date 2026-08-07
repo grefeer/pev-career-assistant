@@ -52,12 +52,14 @@ def build_job_discovery_tool(
     ``_project_tool_observations`` validates every ToolMessage against that
     schema — a bare dict would be silently dropped as invalid).  ``settings``
     gates the optional LLM extraction (spec §4.3); ``candidates_dir`` points
-    the per-page write/dedup phases at a run-scoped output directory;
-    ``state_dir`` is the stable incremental store root (Task 10).  The input
-    payload accepts a JSON array (single-shot) or an object
-    ``{"urls": [...], "prior_metadata": {...}}`` (incremental: state
-    check/mark + merged accumulation; ``prior_metadata`` = ``file_id`` /
-    ``sheet_id`` / ``update_time``).
+    the per-page write/dedup phases at a run-scoped output directory
+    (default: ``<state_dir>/output/candidates`` — derived from the resolved
+    state dir so merged_final.json accumulates exactly where the next run's
+    prior store reads it back); ``state_dir`` is the stable incremental
+    store root (Task 10).  The input payload accepts a JSON array
+    (single-shot) or an object ``{"urls": [...], "prior_metadata": {...}}``
+    (incremental: state check/mark + merged accumulation;
+    ``prior_metadata`` = ``file_id`` / ``sheet_id`` / ``update_time``).
     """
 
     graph = build_job_discovery_graph(
@@ -78,10 +80,13 @@ def build_job_discovery_tool(
     def run(payload: str) -> str:
         try:
             value = json.loads(payload)
-            if isinstance(value, dict):
+            if isinstance(value, dict) and "payload" in value:
                 # string-input path: StructuredTool passes the raw input
                 # string positionally, so the {"payload": ...} wrapper JSON
-                # arrives here instead of the decoded array
+                # arrives here instead of the decoded array.  The args_schema
+                # (ToolNode) already strips that wrapper, so a dict here is
+                # usually the incremental object {"urls": [...],
+                # "prior_metadata": {...}} — never index "payload" blindly.
                 value = json.loads(value["payload"])
             if isinstance(value, dict):
                 # incremental input object: {"urls": [...], "prior_metadata": {...}}

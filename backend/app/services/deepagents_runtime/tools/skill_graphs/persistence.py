@@ -61,12 +61,16 @@ def state_mark(
     ``mark <content_hash> <url> <update_time> --file-id <f> --sheet-id <s>``.
     The script derives one entry_id per (content_hash, url) itself —
     ``entry_id = content_hash[:16]_url_hash8`` (its verified format) — so
-    hashes are passed whole, never pre-truncated.  A missing ``file_id`` or
-    ``sheet_id`` raises ValueError (the real script marks both flags
-    required).  ``state_dir`` is accepted for interface parity.
+    hashes are passed whole, never pre-truncated.  A blank ``file_id``,
+    ``sheet_id`` or ``update_time`` raises ValueError (the real script marks
+    the flags required, and a blank update_time collapses the positional —
+    the mark would silently fail).  ``state_dir`` is accepted for interface
+    parity.
     """
     if not file_id or not sheet_id:
         raise ValueError("state mark requires both file_id and sheet_id")
+    if not update_time:
+        raise ValueError("state mark requires update_time")
     for content_hash in content_hashes:
         (runner or run_skill_script)(
             "state",

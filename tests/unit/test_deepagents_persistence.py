@@ -48,6 +48,13 @@ def test_state_mark_requires_file_and_sheet_id() -> None:
             "https://a/1", ["h1"], runner=runner, state_dir="x",
             file_id="f", sheet_id="", update_time="2026-01-01",
         )
+    # M3 (review round 1): a blank update_time collapses the third
+    # positional — the real script's required-arg error would silently fail
+    with pytest.raises(ValueError):
+        state_mark(
+            "https://a/1", ["h1"], runner=runner, state_dir="x",
+            file_id="f", sheet_id="s", update_time="",
+        )
     state_mark(
         "https://a/1", ["h1"], runner=runner, state_dir="x",
         file_id="f", sheet_id="s", update_time="2026-01-01",

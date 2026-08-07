@@ -1119,6 +1119,140 @@ def test_graph_incremental_dedup_accumulates_prior(tmp_path) -> None:
     assert final["error"] is None
 
 
+def test_graph_incremental_two_run_round_trip_accumulates(tmp_path) -> None:
+    # I2 (review round 1): with only state_dir set (no explicit
+    # candidates_dir), the candidates dir derives to
+    # <state_dir>/output/candidates — so run 1's merged_final.json lands
+    # exactly where run 2's load_prior_candidates reads it, and the merge
+    # genuinely accumulates across two incremental runs
+    def union_dedup(script: str, cli_args: str = "", stdin: str = "") -> str:
+        # faithful to the real deduplicate: identity-merge the input files
+        # into --out; output_count = the merged size
+        parts = cli_args.split()
+        out_path = Path(parts[parts.index("--out") + 1])
+        merged: list[dict] = []
+        for token in parts[: parts.index("--out")]:
+            merged.extend(json.loads(Path(token).read_text(encoding="utf-8")))
+        out_path.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        return json.dumps(
+            {
+                "status": "ok",
+                "stats": {
+                    "input_count": len(parts[: parts.index("--out")]),
+                    "output_count": len(merged),
+                    "duplicates_removed": 0,
+                },
+                "output_file": str(out_path),
+            }
+        )
+
+    def build_and_run(url: str, title: str, company: str) -> tuple[list[tuple[str, str, str]], dict]:
+        calls: list[tuple[str, str, str]] = []
+
+        def recording_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+            calls.append((script, cli_args, stdin))
+            if script == "state" and cli_args.startswith("check "):
+                return json.dumps({"exit_code": 1})
+            if script == "state":
+                return json.dumps({"marked": True})
+            if script == "normalize":
+                return json.dumps({"input": title, "normalized": title})
+            if script == "deduplicate":
+                return union_dedup(script, cli_args=cli_args, stdin=stdin)
+            return _fake_runner(script, cli_args, stdin)
+
+        def extract(pages: list[dict]) -> tuple[list[dict], None]:
+            # page files land in the DERIVED candidates dir
+            out = tmp_path / "output" / "candidates"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "page_00.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "title": title,
+                            "company": company,
+                            "responsibilities": "负责",
+                            "requirements": "要求",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return [{"title": title, "company": company}], None
+
+        graph = build_job_discovery_graph(
+            fetch_fn=_fake_fetch,
+            script_runner=recording_runner,
+            extract_fn=extract,
+            state_dir=str(tmp_path),  # no explicit candidates_dir -> derived
+        ).compile()
+        final = graph.invoke(
+            {
+                "urls": [url],
+                "prior_metadata": {
+                    "file_id": "f1",
+                    "sheet_id": "s1",
+                    "update_time": "2026-08-07",
+                },
+            }
+        )
+        assert final["error"] is None
+        return calls, final
+
+    merged = tmp_path / "output" / "candidates" / "merged_final.json"
+
+    # run 1: merged_final lands at the derived stable store location
+    calls1, final1 = build_and_run(
+        "https://run1.example.com/", "历史职位", "老公司"
+    )
+    assert merged.exists()
+    merged_content = json.loads(merged.read_text(encoding="utf-8"))
+    assert any(
+        c.get("title") == "历史职位" and c.get("company") == "老公司"
+        for c in merged_content
+    )
+    assert len(merged_content) == 1
+    assert final1["merged_count"] == 1
+    assert any(
+        script == "state"
+        and cli == "mark hash-0 https://run1.example.com/ 2026-08-07 --file-id f1 --sheet-id s1"
+        for script, cli, _stdin in calls1
+    )
+
+    # run 2: same state_dir loads run 1's merged store as prior, stages it
+    # via write_candidates --append, and the dedup merge includes it
+    calls2, final2 = build_and_run(
+        "https://run2.example.com/", "新职位", "新公司"
+    )
+    appends = [
+        (cli, stdin)
+        for script, cli, stdin in calls2
+        if script == "write_candidates" and "--append" in cli
+    ]
+    assert len(appends) == 1
+    # the staged prior is exactly run 1's merged store content
+    prior = json.loads(appends[0][1])
+    assert any(
+        c.get("title") == "历史职位" and c.get("company") == "老公司"
+        for c in prior
+    )
+    assert "prior_merged.json" in appends[0][0]
+    dedup_cli = [cli for script, cli, _stdin in calls2 if script == "deduplicate"][0]
+    assert str(tmp_path / "output" / "candidates" / "prior_merged.json") in dedup_cli
+    assert "page_00.json" in dedup_cli
+    merged_content = json.loads(merged.read_text(encoding="utf-8"))
+    assert any(
+        c.get("title") == "历史职位" and c.get("company") == "老公司"
+        for c in merged_content
+    )
+    assert any(
+        c.get("title") == "新职位" and c.get("company") == "新公司"
+        for c in merged_content
+    )
+    assert final2["merged_count"] == 2
+
+
 def test_build_resolves_default_state_dir_to_skill_dir() -> None:
     # Task 10: state_dir=None resolves to the skill dir itself (the stable
     # store lands at SKILL_DIR/output/...); build-only, never invoked, so no
