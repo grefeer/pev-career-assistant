@@ -8,6 +8,9 @@ and never aborts the run (layered failure recovery, spec §4.2).  Compiling
 with a checkpointer makes a mid-crawl crash resume from the last URL
 instead of re-fetching.
 
+The fetch node runs the real skill browser through ``browse_fetch_urls``
+(site classification -> mode fallback chain -> per-URL evidence); the
+``fetch_fn`` seam keeps tests deterministic without Playwright.
 Deterministic phases run the allowlisted skill scripts through
 ``run_skill_script`` with candidates exchanged via a temp JSON file under
 the skill directory (scripts take file paths, matching their real CLI).
@@ -25,15 +28,20 @@ from langgraph.graph import END, START, StateGraph
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.job_discovery import (
     ExtractObservedJobDetailsBatchInput,
-    FetchPublicJobPagesInput,
     PublicJobFetchError,
     extract_observed_job_details_batch,
-    fetch_public_job_pages,
+)
+from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import (
+    browse_fetch_urls,
 )
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
     run_skill_script,
 )
+
+#: Upper bound for the per-URL visible-text projection the harness's
+#: evidence promotion reads (mirrors the observation projection's excerpt).
+_VISIBLE_TEXT_LIMIT = 1200
 
 
 class JobDiscoveryWorkflowState(TypedDict):
@@ -45,33 +53,69 @@ class JobDiscoveryWorkflowState(TypedDict):
     error: str | None
 
 
+def _read_page_text(path: str) -> str:
+    """First page file's UTF-8 text, bounded to the evidence projection limit.
+
+    A missing/unreadable page file yields "" (never crashes the fetch);
+    the visible_text projection is what the harness's evidence promotion
+    reads, so it stays small (spec §4.2).
+    """
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")[
+            :_VISIBLE_TEXT_LIMIT
+        ]
+    except OSError:
+        return ""
+
+
 def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
-    """requests fast-path via the reviewed registry handler (the Playwright
-    fallback selected by SKILL.md lives behind the same handler)."""
-    output = fetch_public_job_pages(
-        ToolContext(user_id="", run_id="", metadata={}),
-        FetchPublicJobPagesInput(urls=urls[:10]),
-    )
-    return [
-        {
-            "url": page.source_url,
-            # source_url is required by the evidence-binding contract
-            # (career_skills extract expects it on observed evidence)
-            "source_url": page.source_url,
-            "status": "succeeded",
-            "content_hash": page.content_hash,
-            "title": page.title,
-            "visible_text": page.visible_text,
-        }
-        for page in output.pages
-    ] + [
-        {
-            "url": failure.source_url,
-            "status": "failed",
-            "error_code": failure.error_code,
-        }
-        for failure in output.failures
-    ]
+    """Browse-backed fetch: classify -> mode fallback chain -> per-URL evidence.
+
+    Orchestrates ``browse_fetch_urls`` (site classification + the allowlisted
+    ``browse`` script through run_skill_script).  Per-URL evidence = the
+    first page file's full sha256; ``visible_text`` is the first page text
+    bounded to ≤1200 chars.  ``blocked`` URLs map to ``error_code="blocked"``
+    (the stall-breaker treats them as no-progress); ``wechat_pending`` URLs
+    are carried through untouched for Task 9.  A per-URL failure never
+    aborts the run (layered failure recovery, spec §4.2).
+    """
+    pages: list[dict[str, Any]] = []
+    for result in browse_fetch_urls(urls):
+        if result.status == "succeeded":
+            page: dict[str, Any] = {
+                "url": result.url,
+                # source_url is required by the evidence-binding contract
+                # (career_skills extract expects it on observed evidence)
+                "source_url": result.url,
+                "status": "succeeded",
+                "title": result.title,
+                "mode": result.mode,
+                "page_files": [pf.path for pf in result.page_files],
+                "terminal_evidence": result.terminal_evidence,
+                "cached": result.cached,
+                "used_path": result.used_path,
+                "visible_text": "",
+            }
+            if result.page_files:
+                first = result.page_files[0]
+                page["content_hash"] = first.content_hash
+                page["visible_text"] = _read_page_text(first.path)
+            else:
+                # no page files on disk (e.g. a cache hit): no evidence hash
+                page["content_hash"] = None
+            pages.append(page)
+        else:
+            pages.append(
+                {
+                    "url": result.url,
+                    "source_url": result.url,
+                    "status": result.status,
+                    "error_code": result.error_code,
+                    "blocked_reason": result.blocked_reason,
+                    "mode": result.mode,
+                }
+            )
+    return pages
 
 
 def _write_candidates(candidates: list[dict[str, Any]]) -> Path:
@@ -146,6 +190,12 @@ def build_job_discovery_graph(
                     "status": page.get("status", "failed"),
                     "error_code": page.get("error_code"),
                     "content_hash": page.get("content_hash"),
+                    # browse mode + resolved page-file paths surface how the
+                    # evidence was gathered; visible_text is the bounded
+                    # first-page projection (≤1200 chars)
+                    "mode": page.get("mode"),
+                    "page_files": page.get("page_files"),
+                    "visible_text": page.get("visible_text"),
                 }
                 for page in pages
             ],

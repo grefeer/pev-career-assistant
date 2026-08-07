@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -311,36 +312,60 @@ def test_coverage_without_content_hash_omits_terminal_evidence() -> None:
     assert "missing_terminal_evidence" in final["coverage"]["reasons"]
 
 
-def test_default_seams_used_without_injection(monkeypatch) -> None:
+def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
     import backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_graph as jdg
     from backend.app.services.career_skills.job_discovery import (
         ExtractObservedJobDetailsBatchOutput,
         ExtractObservedJobDetailsOutput,
         ExtractedJobDetails,
-        FetchPublicJobPageOutput,
-        FetchPublicJobPagesOutput,
-        PublicJobPageFetchFailure,
     )
+    from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import (
+        PageFile,
+        UrlFetchResult,
+    )
+
+    # the default fetch runs the real browse chain: a succeeded URL must
+    # resolve its evidence from an on-disk page file (full-sha256 + bounded
+    # visible_text), a blocked URL folds to error_code="blocked", and a
+    # WeChat URL is carried through untouched (never browsed)
+    page_file = tmp_path / "pages" / "page_01.txt"
+    page_file.parent.mkdir()
+    page_text = "岗位：后端工程师\n" + "职责：" + "x" * 3000
+    page_file.write_text(page_text, encoding="utf-8")
+    content_hash = hashlib.sha256(page_file.read_bytes()).hexdigest()
 
     monkeypatch.setattr(
         jdg,
-        "fetch_public_job_pages",
-        lambda context, payload: FetchPublicJobPagesOutput(
-            pages=[
-                FetchPublicJobPageOutput(
-                    artifact_id="observed:h1",
-                    source_url="https://example.com/jobs",
-                    title="后端工程师",
-                    visible_text="岗位：后端工程师",
-                    content_hash="h1",
-                )
-            ],
-            failures=[
-                PublicJobPageFetchFailure(
-                    source_url="https://blocked.example.com", error_code="blocked"
-                )
-            ],
-        ),
+        "browse_fetch_urls",
+        lambda urls: [
+            UrlFetchResult(
+                url="https://example.com/jobs",
+                site_class="list",
+                mode="list",
+                status="succeeded",
+                page_files=[
+                    PageFile(
+                        path=str(page_file),
+                        content_hash=content_hash,
+                        text_length=len(page_text.encode("utf-8")),
+                    )
+                ],
+            ),
+            UrlFetchResult(
+                url="https://blocked.example.com",
+                site_class="probe",
+                mode="list",
+                status="blocked",
+                blocked_reason="captcha",
+                error_code="blocked",
+            ),
+            UrlFetchResult(
+                url="https://mp.weixin.qq.com/s/x",
+                site_class="wechat",
+                mode=None,
+                status="wechat_pending",
+            ),
+        ],
     )
     monkeypatch.setattr(
         jdg,
@@ -348,9 +373,9 @@ def test_default_seams_used_without_injection(monkeypatch) -> None:
         lambda context, payload: ExtractObservedJobDetailsBatchOutput(
             details=[
                 ExtractObservedJobDetailsOutput(
-                    source_artifact_id="h1",
+                    source_artifact_id=f"observed:{content_hash}",
                     source_url="https://example.com/jobs",
-                    content_hash="h1",
+                    content_hash=content_hash,
                     candidates=[
                         ExtractedJobDetails(
                             title="后端工程师",
@@ -364,9 +389,9 @@ def test_default_seams_used_without_injection(monkeypatch) -> None:
                             confidence=0.9,
                             evidence_refs=[
                                 {
-                                    "artifact_id": "h1",
+                                    "artifact_id": content_hash,
                                     "source_url": "https://example.com/jobs",
-                                    "content_hash": "h1",
+                                    "content_hash": content_hash,
                                 }
                             ],
                             normalization_warnings=[],
@@ -380,11 +405,79 @@ def test_default_seams_used_without_injection(monkeypatch) -> None:
 
     graph = build_job_discovery_graph().compile()
     final = graph.invoke(
-        {"urls": ["https://example.com/jobs", "https://blocked.example.com"]}
+        {
+            "urls": [
+                "https://example.com/jobs",
+                "https://blocked.example.com",
+                "https://mp.weixin.qq.com/s/x",
+            ]
+        }
     )
-    statuses = [r["status"] for r in final["per_url_results"]]
-    assert "succeeded" in statuses
-    assert "failed" in statuses
+    by_url = {r["url"]: r for r in final["per_url_results"]}
+    # evidence promotion: source_url + content_hash (full sha256 of the page
+    # file bytes) + the bounded visible_text projection (≤1200 chars)
+    ok = by_url["https://example.com/jobs"]
+    assert ok["status"] == "succeeded"
+    assert ok["source_url"] == "https://example.com/jobs"
+    assert ok["content_hash"] == content_hash
+    assert ok["mode"] == "list"
+    assert ok["page_files"] == [str(page_file)]
+    assert ok["visible_text"] == page_text[:1200]
+    assert len(ok["visible_text"]) <= 1200
+    # error folding: blocked URLs map to per-url error_code="blocked"
+    blocked = by_url["https://blocked.example.com"]
+    assert blocked["status"] == "blocked"
+    assert blocked["error_code"] == "blocked"
+    # wechat_pending carried through untouched (Task 9)
+    wechat = by_url["https://mp.weixin.qq.com/s/x"]
+    assert wechat["status"] == "wechat_pending"
+    assert wechat["error_code"] is None
     assert final["candidates"]
     assert final["coverage"]["verified"] is True
     assert final["error"] is None
+
+
+def test_default_fetch_page_file_edges(monkeypatch, tmp_path) -> None:
+    # succeeded without page files (e.g. a cache hit): no evidence hash and
+    # no visible_text; a page file that vanished between hash and read:
+    # empty visible_text (never crashes the fetch)
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_graph as jdg
+    from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import (
+        PageFile,
+        UrlFetchResult,
+    )
+
+    monkeypatch.setattr(
+        jdg,
+        "browse_fetch_urls",
+        lambda urls: [
+            UrlFetchResult(
+                url="https://cached.example.com",
+                site_class="list",
+                mode="list",
+                status="succeeded",
+                cached=True,
+            ),
+            UrlFetchResult(
+                url="https://ghost.example.com",
+                site_class="list",
+                mode="list",
+                status="succeeded",
+                page_files=[
+                    PageFile(
+                        path=str(tmp_path / "gone.txt"), content_hash="h", text_length=0
+                    )
+                ],
+            ),
+        ],
+    )
+
+    pages = jdg._default_fetch(
+        ["https://cached.example.com", "https://ghost.example.com"]
+    )
+    by_url = {page["url"]: page for page in pages}
+    assert by_url["https://cached.example.com"]["content_hash"] is None
+    assert by_url["https://cached.example.com"]["visible_text"] == ""
+    assert by_url["https://cached.example.com"]["page_files"] == []
+    assert by_url["https://ghost.example.com"]["content_hash"] == "h"
+    assert by_url["https://ghost.example.com"]["visible_text"] == ""

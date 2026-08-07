@@ -19,6 +19,8 @@ def _fake_fetch(urls: list[str]) -> list[dict]:
             "source_url": url,
             "status": "succeeded",
             "content_hash": f"hash-{index}",
+            "mode": "list",
+            "page_files": [f"output/evidence/run-0/pages/page_{index:02d}.txt"],
             "visible_text": "岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：精通 Python",
         }
         for index, url in enumerate(urls)
@@ -129,6 +131,12 @@ def test_job_discovery_tool_returns_valid_tool_observation() -> None:
     # fetch evidence
     assert results["per_url_results"][0]["source_url"] == "https://example.com/jobs"
     assert results["per_url_results"][0]["content_hash"] == "hash-0"
+    # browse provenance keys: the mode that produced the evidence + the
+    # resolved page-file paths (Task 4 per_url_results shape + Task 7)
+    assert results["per_url_results"][0]["mode"] == "list"
+    assert results["per_url_results"][0]["page_files"] == [
+        "output/evidence/run-0/pages/page_00.txt"
+    ]
     assert results["candidates"][0]["title"] == "后端工程师"
     assert results["coverage"]["verified"] is True
     assert results["coverage"]["coverage_verified"] is True
