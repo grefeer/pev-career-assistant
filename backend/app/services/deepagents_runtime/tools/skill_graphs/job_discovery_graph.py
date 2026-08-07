@@ -51,6 +51,10 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runne
     SKILL_DIR,
     run_skill_script,
 )
+from backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice import (
+    WechatResult,
+    run_wechat_slice,
+)
 
 #: Upper bound for the per-URL visible-text projection the harness's
 #: evidence promotion reads (mirrors the observation projection's excerpt).
@@ -60,12 +64,17 @@ _VISIBLE_TEXT_LIMIT = 1200
 #: write_candidates script enforces --out under output/).
 _CANDIDATES_DIR = "output/candidates"
 
+#: Default OCR working directory for the WeChat slice (doc: ``output/ocr``;
+#: a fixed run-0 subdir keeps concurrent runs from interleaving files).
+_WECHAT_OUT_DIR = str(SKILL_DIR / "output" / "ocr" / "run-0")
+
 
 class JobDiscoveryWorkflowState(TypedDict):
     urls: list[str]
     pages: list[dict[str, Any]]
     per_url_results: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
+    wechat_candidates: list[dict[str, Any]]
     coverage: dict[str, Any]
     error: str | None
     merged_count: int
@@ -112,9 +121,10 @@ def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
     bounded to ≤1200 chars.  Page files surface as JSON-safe dicts for the
     per-page extraction fan-out.  ``blocked`` URLs map to
     ``error_code="blocked"`` (the stall-breaker treats them as no-progress);
-    ``wechat_pending`` URLs are carried through untouched for Task 9.  A
-    per-URL failure never aborts the run (layered failure recovery,
-    spec §4.2).
+    ``wechat_pending`` URLs are carried through untouched here - the fetch
+    node routes them into the Task 9 WeChat slice (``wechat_slice.py``)
+    before the extract node.  A per-URL failure never aborts the run
+    (layered failure recovery, spec §4.2).
     """
     pages: list[dict[str, Any]] = []
     for result in browse_fetch_urls(urls):
@@ -338,6 +348,7 @@ def build_job_discovery_graph(
     extract_fn=None,
     settings=None,
     candidates_dir=None,
+    wechat_fn=None,
 ) -> StateGraph:
     """Assemble the workflow graph with injectable seams for tests."""
     fetch_fn = fetch_fn or _default_fetch
@@ -348,16 +359,91 @@ def build_job_discovery_graph(
         script_runner=script_runner,
         candidates_dir=candidates_dir,
     )
+    if wechat_fn is None:
+        # default: the real Task 9 slice, run through the same runner seam
+        # (name resolution at call time keeps the seam monkeypatchable)
+        def default_wechat_fn(url: str) -> WechatResult:
+            context = ToolContext(
+                user_id="", run_id="", metadata={"observed_public_evidence": []}
+            )
+            llm_extractor = (
+                build_llm_extractor(settings) if settings is not None else None
+            )
+            return run_wechat_slice(
+                url,
+                runner=script_runner,
+                out_dir=_WECHAT_OUT_DIR,
+                context=context,
+                extract_fn=extract_observed_job_details,
+                llm_extractor=llm_extractor,
+            )
+
+        wechat_fn = default_wechat_fn
     candidates_dir = _resolve_candidates_dir(candidates_dir)
 
     def fetch_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
         pages = fetch_fn(state["urls"])
-        return {
-            "pages": pages,
-            # materialize the error channel (LangGraph omits channels never
-            # written, but the partial-results contract includes error=None)
-            "error": None,
-            "per_url_results": [
+        per_url: list[dict[str, Any]] = []
+        wechat_candidates: list[dict[str, Any]] = []
+        wechat_index = 0
+        for page in pages:
+            if page.get("status") == "wechat_pending":
+                # Task 9: route the article through the WeChat OCR slice; a
+                # slice crash is a per-URL failure (recoverable), never a
+                # run abort.  Candidates from succeeded/partial_success
+                # results are persisted with a wechat page id so the dedup
+                # node's page_*.json glob sees them and coverage counts them.
+                try:
+                    result = wechat_fn(page.get("url", ""))
+                except Exception:  # noqa: BLE001 - fold any slice crash
+                    result = WechatResult(
+                        page.get("url", ""),
+                        "failed",
+                        None,
+                        [],
+                        None,
+                        False,
+                        "wechat_slice_error",
+                    )
+                page_id = f"page_wechat_{wechat_index:02d}"
+                wechat_index += 1
+                if result.candidates and result.status in {
+                    "succeeded",
+                    "partial_success",
+                }:
+                    write_page_candidates(
+                        page_id,
+                        result.candidates,
+                        runner=script_runner,
+                        candidates_dir=str(candidates_dir),
+                    )
+                    wechat_candidates.extend(
+                        c.model_dump(mode="json") for c in result.candidates
+                    )
+                per_url.append(
+                    {
+                        "url": page.get("url"),
+                        "source_url": page.get("source_url"),
+                        "status": result.status,
+                        # needs_manual_review is a recoverable classification:
+                        # the human reviews, the run is never auto-retried
+                        "error_code": (
+                            "needs_manual_review"
+                            if result.status == "needs_manual_review"
+                            else None
+                        ),
+                        "blocked_reason": (
+                            result.reason if result.status == "blocked" else None
+                        ),
+                        "reason": result.reason,
+                        "channel": result.channel,
+                        "application_channel_json": result.application_channel_json,
+                        "needs_deep_crawl": result.needs_deep_crawl,
+                        "candidate_count": len(result.candidates),
+                    }
+                )
+                continue
+            per_url.append(
                 {
                     "url": page.get("url"),
                     # source_url + content_hash together let the harness's
@@ -379,20 +465,30 @@ def build_job_discovery_graph(
                     # login/captcha/anti-bot/unsafe-url on blocked URLs
                     "blocked_reason": page.get("blocked_reason"),
                 }
-                for page in pages
-            ],
+            )
+        return {
+            "pages": pages,
+            # materialize the error channel (LangGraph omits channels never
+            # written, but the partial-results contract includes error=None)
+            "error": None,
+            "per_url_results": per_url,
+            "wechat_candidates": wechat_candidates,
         }
 
     def extract_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        # Task 9: the slice's candidates (persisted as page_wechat_NN.json by
+        # the fetch node) merge into the per-run candidate set ahead of the
+        # regular page candidates; dedup/coverage see both flows.
+        wechat_candidates = state.get("wechat_candidates") or []
         pages = [
             page
             for page in state.get("pages", [])
             if page.get("status") == "succeeded" and page.get("content_hash")
         ]
         if not pages:
-            return {"candidates": []}
+            return {"candidates": wechat_candidates}
         candidates, error = extract_fn(pages)
-        update: dict[str, Any] = {"candidates": candidates}
+        update: dict[str, Any] = {"candidates": wechat_candidates + candidates}
         if error is not None:
             update["error"] = error
         return update

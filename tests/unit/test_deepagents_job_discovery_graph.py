@@ -7,6 +7,9 @@ from pathlib import Path
 from backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_graph import (
     build_job_discovery_graph,
 )
+from backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice import (
+    WechatResult,
+)
 from tests.conftest import settings_override
 
 
@@ -483,7 +486,8 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
     # the default fetch runs the real browse chain: a succeeded URL resolves
     # its evidence from an on-disk page file (full-sha256 + bounded
     # visible_text), a blocked URL folds to error_code="blocked", and a
-    # WeChat URL is carried through untouched (never browsed)
+    # WeChat URL routes into the Task 9 OCR slice (never browsed; the slice
+    # itself is stubbed - no live HTTP in unit tests)
     page_file = tmp_path / "pages" / "page_01.txt"
     page_file.parent.mkdir()
     page_text = "岗位：后端工程师\n" + "职责：" + "x" * 3000
@@ -553,6 +557,21 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(jdg, "extract_observed_job_details", fake_per_page)
     monkeypatch.setattr(jdg, "run_skill_script", _fake_runner)
+    # Task 9: wechat_pending URLs route into the slice before the extract
+    # node; the per-URL entry surfaces the slice's classification
+    monkeypatch.setattr(
+        jdg,
+        "run_wechat_slice",
+        lambda url, **kwargs: WechatResult(
+            url=url,
+            status="needs_manual_review",
+            channel="C",
+            candidates=[],
+            application_channel_json=None,
+            needs_deep_crawl=False,
+            reason="仅含联系方式",
+        ),
+    )
 
     graph = build_job_discovery_graph(candidates_dir=str(tmp_path)).compile()
     final = graph.invoke(
@@ -581,10 +600,14 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
     assert blocked["status"] == "blocked"
     assert blocked["error_code"] == "blocked"
     assert blocked["blocked_reason"] == "captcha"
-    # wechat_pending carried through untouched (Task 9)
+    # Task 9: a WeChat URL routes into the OCR slice (stubbed: contact-only
+    # classification) -> per-URL entry surfaces needs_manual_review + channel
     wechat = by_url["https://mp.weixin.qq.com/s/x"]
-    assert wechat["status"] == "wechat_pending"
-    assert wechat["error_code"] is None
+    assert wechat["status"] == "needs_manual_review"
+    assert wechat["error_code"] == "needs_manual_review"
+    assert wechat["channel"] == "C"
+    assert wechat["reason"] == "仅含联系方式"
+    assert wechat["candidate_count"] == 0
     # per-page extraction: exactly one call with the bare page hash, and the
     # candidates were persisted -> the dedup node merged them
     assert captured == [content_hash]
