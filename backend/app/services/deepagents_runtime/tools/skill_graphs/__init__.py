@@ -11,8 +11,13 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
 from backend.app.services.agent_runtime.schemas import ToolObservation
+from backend.app.services.deepagents_runtime.tools.adapters import build_skill_tools
 from backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_graph import (
     build_job_discovery_graph,
+    resolve_run_output_dirs,
+)
+from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
+    run_skill_script,
 )
 
 _workflow_thread: ContextVar[str | None] = ContextVar(
@@ -43,6 +48,8 @@ def build_job_discovery_tool(
     settings=None,
     candidates_dir=None,
     state_dir=None,
+    evidence_dir=None,
+    wechat_out_dir=None,
 ) -> StructuredTool:
     """Wrap the compiled job-discovery workflow as a single @tool.
 
@@ -56,7 +63,10 @@ def build_job_discovery_tool(
     (default: ``<state_dir>/output/candidates`` — derived from the resolved
     state dir so merged_final.json accumulates exactly where the next run's
     prior store reads it back); ``state_dir`` is the stable incremental
-    store root (Task 10).  The input payload accepts a JSON array
+    store root (Task 10); ``evidence_dir`` pins the browse page-file root +
+    coverage manifest (Task 11, must stay under ``output/evidence`` for the
+    gate's containment check); ``wechat_out_dir`` pins the Task 9 OCR
+    slice's working dir.  The input payload accepts a JSON array
     (single-shot) or an object ``{"urls": [...], "prior_metadata": {...}}``
     (incremental: state check/mark + merged accumulation;
     ``prior_metadata`` = ``file_id`` / ``sheet_id`` / ``update_time``).
@@ -69,6 +79,8 @@ def build_job_discovery_tool(
         settings=settings,
         candidates_dir=candidates_dir,
         state_dir=state_dir,
+        evidence_dir=evidence_dir,
+        wechat_out_dir=wechat_out_dir,
     ).compile(checkpointer=checkpointer)
 
     def _observe(status: str, **kwargs: Any) -> str:
@@ -102,21 +114,42 @@ def build_job_discovery_tool(
             return _observe(
                 "failed", error_code=f"workflow_error: {type(exc).__name__}"
             )
+        per_url = final.get("per_url_results", [])
+        # Task 11 output contract: the observation-level status stays
+        # succeeded/failed (the ToolObservation schema rejects anything
+        # else); the workflow status lives inside the output dict —
+        # "blocked" when every URL was blocked (per-url error_code=blocked),
+        # "succeeded" otherwise (per-url failures are recorded inside pages)
+        status = (
+            "blocked"
+            if per_url and all(r.get("error_code") == "blocked" for r in per_url)
+            else "succeeded"
+        )
         return _observe(
             "succeeded",
             output={
-                "per_url_results": final.get("per_url_results", []),
-                "candidates": final.get("candidates", []),
-                "coverage": final.get("coverage", {"verified": False}),
+                "status": status,
+                "pages": final.get("pages", []),
+                # Task 11: the merged/persisted candidates snapshot the
+                # coverage gate read ("" when neither node produced one)
+                "candidates_file": final.get("candidates_file") or "",
                 # dedup node output (U10): merged_count = the deduplicate
                 # script's output_count, dedup_stats = its stats dict; both
                 # default to the no-merge sentinels when the node skipped
                 # (batch fast-path wrote no per-page files)
                 "merged_count": final.get("merged_count", 0),
+                # Task 11: observed browse terminal markers (never
+                # synthesized), exactly what the coverage manifest recorded
+                "terminal_evidence": final.get("terminal_evidence", []),
+                "coverage": final.get("coverage", {"verified": False}),
+                "per_url_results": per_url,
+                "candidates": final.get("candidates", []),
                 "dedup_stats": final.get("dedup_stats", {}),
                 # Task 10: comparison-key map from the normalize node (keys
                 # only — stored titles are never altered)
                 "normalize_keys": final.get("normalize_keys", {}),
+                # the graph's error channel surfaces here (empty when none)
+                "errors": [final["error"]] if final.get("error") else [],
             },
         )
 
@@ -128,7 +161,41 @@ def build_job_discovery_tool(
             "（低置信才用 LLM）、校验、去重、覆盖门控。输入 JSON 数组"
             "（用户给出的官方招聘 URL），或增量对象 {\"urls\": [...], "
             "\"prior_metadata\": {file_id, sheet_id, update_time}}；返回 "
-            "per_url_results + candidates + coverage + normalize_keys。"
+            "status + pages + candidates_file + merged_count + "
+            "terminal_evidence + coverage + per_url_results + candidates + "
+            "errors。"
         ),
         args_schema=_JsonPayload,
     )
+
+
+def build_job_discovery_tools(
+    skill_name: str,
+    *,
+    budgets=None,
+    tracker=None,
+    run_id: str | None = None,
+) -> list[Any]:
+    """Harness tool_factory: job-discovery -> the workflow tool, else the
+    existing career-skills tools.
+
+    Used by ``compare_runner.run_deepagents_question`` (Task 11 wiring).
+    For ``job-discovery`` returns a single ``build_job_discovery_tool`` with
+    production defaults (real browse orchestration + real per-page
+    extraction + in-memory subgraph checkpointer) and — when ``run_id`` is
+    given — run-scoped output dirs so eval runs never touch the shared
+    defaults (controller D1).  Other skills fall back to
+    ``build_skill_tools`` (budgets/tracker forwarded as-is).
+    """
+    if skill_name == "job-discovery":
+        dirs = resolve_run_output_dirs(run_id) if run_id else {}
+        return [
+            build_job_discovery_tool(
+                fetch_fn=None,
+                script_runner=run_skill_script,
+                extract_fn=None,
+                checkpointer=None,
+                **dirs,
+            )
+        ]
+    return build_skill_tools(skill_name=skill_name, budgets=budgets, tracker=tracker)

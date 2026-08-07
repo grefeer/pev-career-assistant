@@ -338,7 +338,7 @@ def test_run_deepagents_question_default_harness_path(monkeypatch) -> None:
             self.kwargs = kwargs
 
     class _FakeHarnessClass:
-        def __init__(self, *, model_factory, checkpointer):
+        def __init__(self, *, model_factory, checkpointer, tool_factory=None):
             # exercise both role branches of the default model_factory
             model_factory("planner")
             model_factory("executor")
@@ -403,3 +403,81 @@ def test_main_entrypoint_guard_runs_cli(monkeypatch) -> None:
     with pytest.raises(SystemExit) as excinfo:
         runpy.run_path(str(cr.__file__), run_name="__main__")
     assert excinfo.value.code == 1
+
+
+def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
+    # the deepagents leg constructs its harness with a tool_factory: for
+    # skill "job-discovery" it returns the workflow tool built with
+    # production defaults + run-scoped output dirs; other skills fall back
+    # to build_skill_tools (existing path)
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+    from backend.app.services.deepagents_runtime.tools import skill_graphs as sg
+
+    class _Settings:
+        agent_harness_model = "deepseek-chat"
+
+    budgets = DeepAgentsBudgets(
+        max_agent_turns=12, max_tool_calls=20, max_replans=2, max_wall_clock_seconds=600
+    )
+    final = {
+        "run_status": "succeeded",
+        "budget": budgets.to_dict(),
+        "plan_json": None,
+        "error_code": None,
+    }
+
+    class _FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    captured: dict = {}
+
+    class _FakeHarnessClass:
+        def __init__(self, *, model_factory, checkpointer, tool_factory=None):
+            captured["tool_factory"] = tool_factory
+            model_factory("planner")
+            model_factory("executor")
+
+        def run(self, request, *, run_id, budgets=None):
+            return final
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(cr, "DeepAgentsHarness", _FakeHarnessClass)
+    monkeypatch.setattr(cr, "create_checkpointer", lambda settings: object())
+
+    def fake_jd_tool(**kwargs):
+        captured["jd_kwargs"] = kwargs
+        return "jd-tool"
+
+    def fake_skill_tools(*, skill_name, budgets, tracker):
+        captured["skill_tools"] = {
+            "skill_name": skill_name,
+            "budgets": budgets,
+            "tracker": tracker,
+        }
+        return ["skill-tool"]
+
+    monkeypatch.setattr(sg, "build_job_discovery_tool", fake_jd_tool)
+    monkeypatch.setattr(sg, "build_skill_tools", fake_skill_tools)
+
+    metrics = run_deepagents_question(
+        _question(), settings=_Settings(), run_id="eval-Q001"
+    )
+    assert metrics.status == "succeeded"
+    factory = captured["tool_factory"]
+    assert factory is not None
+    # job-discovery -> single workflow tool with production defaults
+    assert factory("job-discovery") == ["jd-tool"]
+    kwargs = captured["jd_kwargs"]
+    assert kwargs["fetch_fn"] is None
+    assert kwargs["script_runner"] is sg.run_skill_script
+    assert kwargs["extract_fn"] is None
+    assert kwargs["checkpointer"] is None
+    # run-scoped output dirs keyed by the question's run_id
+    assert kwargs["state_dir"] == sg.resolve_run_output_dirs("eval-Q001")["state_dir"]
+    assert kwargs["candidates_dir"] == sg.resolve_run_output_dirs("eval-Q001")[
+        "candidates_dir"
+    ]
+    # other skills -> existing build_skill_tools path
+    assert factory("resume-tailoring") == ["skill-tool"]
+    assert captured["skill_tools"]["skill_name"] == "resume-tailoring"

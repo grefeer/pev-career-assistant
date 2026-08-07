@@ -75,8 +75,15 @@ def run_skill_script(
     stdin: str = "",
     *,
     runner: _ScriptRunner | None = None,
+    cwd: Path | str | None = None,
 ) -> str:
-    """Run one allowlisted skill script; never raises, returns stdout/error."""
+    """Run one allowlisted skill script; never raises, returns stdout/error.
+
+    ``cwd`` (default ``SKILL_DIR``) redirects the script's own working
+    directory — the run-scoped ``state_dir`` for ``state.py check/mark`` so
+    each eval run writes its own ``output/state.json`` instead of the shared
+    skill default.  Script paths always resolve under ``SKILL_DIR/scripts``.
+    """
     if script not in _ALLOWED_SCRIPTS:
         return f"ERROR: script not allowed: {script}"
     script_path = SKILL_DIR / "scripts" / f"{script}.py"
@@ -86,11 +93,12 @@ def run_skill_script(
         parts = shlex.split(cli_args, posix=(os.name != "nt")) if cli_args else []
     except ValueError as exc:
         return f"ERROR: could not parse cli_args {cli_args!r}: {exc}"
+    resolved_cwd = Path(cwd) if cwd is not None else SKILL_DIR
     try:
         return (runner or _default_runner)(
             script_path,
             parts,
-            cwd=SKILL_DIR,
+            cwd=resolved_cwd,
             stdin=stdin if stdin else None,
             timeout=_SCRIPT_TIMEOUT_SEC,
         )

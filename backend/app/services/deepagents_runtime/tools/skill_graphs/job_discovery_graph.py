@@ -89,6 +89,11 @@ class JobDiscoveryWorkflowState(TypedDict):
     error: str | None
     merged_count: int
     dedup_stats: dict[str, Any]
+    #: Task 11: observed browse terminal markers (empty when none — never
+    #: synthesized); candidates_file = the merged/persisted snapshot path the
+    #: coverage gate read
+    terminal_evidence: list[str]
+    candidates_file: str | None
     #: Task 10: comparison-key map from the normalize node (keys only —
     #: stored titles are never altered)
     normalize_keys: dict[str, str]
@@ -142,8 +147,106 @@ def _resolve_state_dir(state_dir: str | None) -> Path:
     return resolved
 
 
+def _resolve_evidence_dir(evidence_dir: str | None, state_dir: Path) -> Path:
+    """Resolve the per-run evidence dir (must stay under output/evidence/).
+
+    The real coverage_gate.py resolves the manifest's evidence root from the
+    script cwd (``output/evidence``) and rejects any manifest page file
+    outside it, so run-scoped evidence keeps its ``run-<run_id>`` suffix
+    under ``SKILL_DIR/output/evidence``.  None -> the state-dir-derived
+    default (``<state_dir>/output/evidence/run-0`` — the graph has no run_id
+    when built without one; Task 11 wires run-scoped dirs).
+    """
+    if evidence_dir is None:
+        return Path(state_dir) / "output" / "evidence" / "run-0"
+    resolved = Path(evidence_dir)
+    if not resolved.is_absolute():
+        resolved = SKILL_DIR / resolved
+    return resolved
+
+
+def resolve_run_output_dirs(run_id: str) -> dict[str, str]:
+    """Run-scoped output dirs keyed by a run id (Task 11, controller D1).
+
+    Every dir derives from the run id — never the shared defaults:
+    ``state_dir`` = ``SKILL_DIR/output/runs/run-<run_id>`` (state.json,
+    errors.jsonl, work snapshots), ``candidates_dir`` = its
+    ``output/candidates`` (merged_final.json accumulates there),
+    ``evidence_dir`` = ``SKILL_DIR/output/evidence/run-<run_id>`` (kept
+    under ``output/evidence`` so the gate's containment check passes) and
+    ``wechat_out_dir`` = ``SKILL_DIR/output/ocr/run-<run_id>``.
+    """
+    state_dir = SKILL_DIR / "output" / "runs" / f"run-{run_id}"
+    return {
+        "state_dir": str(state_dir),
+        "candidates_dir": str(state_dir / "output" / "candidates"),
+        "evidence_dir": str(SKILL_DIR / "output" / "evidence" / f"run-{run_id}"),
+        "wechat_out_dir": str(SKILL_DIR / "output" / "ocr" / f"run-{run_id}"),
+    }
+
+
+def build_manifest(
+    *,
+    out_dir: str,
+    results: list[dict[str, Any]],
+    merged_count: int,
+    listing_count: int | None,
+) -> dict[str, Any]:
+    """Honest coverage manifest from the run's real outputs (Task 11).
+
+    ``page_files`` = real non-zero page files (paths resolve relative
+    against ``out_dir``; duplicates dropped); ``terminal_evidence`` = the
+    last marker actually observed by browse as a string — the real
+    coverage_gate.py requires ``isinstance(str)`` (a list would read as
+    "missing"), or ``[]`` when nothing was observed — never derived from the
+    last page hash.  ``listing_count`` passes through (None when dedup never
+    ran — honestly unknown, never fabricated from the candidate count).
+    ``declared_total_pages`` stays None and ``truncated_by_max_pages`` False
+    because browse emits them but the in-graph page dicts do not propagate
+    them (honest "unknown" — the gate only flags truncation when the
+    manifest asserts it).
+    """
+    page_files: list[str] = []
+    markers: list[str] = []
+    for result in results:
+        for raw in result.get("page_files") or []:
+            path = raw.get("path") if isinstance(raw, dict) else raw
+            if not isinstance(path, str) or not path:
+                continue
+            resolved = Path(path)
+            if not resolved.is_absolute():
+                resolved = Path(out_dir) / resolved
+            try:
+                if resolved.is_file() and resolved.stat().st_size > 0:
+                    if str(resolved) not in page_files:
+                        page_files.append(str(resolved))
+            except OSError:
+                continue
+        for marker in result.get("terminal_evidence") or []:
+            if isinstance(marker, str) and marker and marker not in markers:
+                markers.append(marker)
+    return {
+        "page_files": page_files,
+        "terminal_evidence": markers[-1] if markers else [],
+        "declared_total_pages": None,
+        "pages_collected": len(page_files),
+        "truncated_by_max_pages": False,
+        "listing_count": listing_count,
+        "merged_count": merged_count,
+    }
+
+
+def _write_manifest(manifest: dict[str, Any], *, state_dir: Path) -> Path:
+    """Persist the coverage manifest next to the candidates snapshot."""
+    workdir = Path(state_dir) / "output" / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = workdir / "manifest.json"
+    path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 def _default_fetch(
-    urls: list[str], *, state_dir: str | None = None
+    urls: list[str], *, state_dir: str | None = None, evidence_dir: str | None = None
 ) -> list[dict[str, Any]]:
     """Browse-backed fetch: classify -> mode fallback chain -> per-URL evidence.
 
@@ -157,11 +260,16 @@ def _default_fetch(
     node routes them into the Task 9 WeChat slice (``wechat_slice.py``)
     before the extract node.  A per-URL failure never aborts the run
     (layered failure recovery, spec §4.2).  ``state_dir`` derives the
-    per-run evidence dir (``<state_dir>/output/evidence/run-0`` — the graph
-    has no run_id; Task 11 wires run-scoped dirs).
+    per-run evidence dir (``<state_dir>/output/evidence/run-0``); an
+    explicit ``evidence_dir`` wins (Task 11 run-scoped wiring keeps the
+    dir under ``output/evidence`` so the gate's containment check passes).
     """
+    if evidence_dir is not None:
+        results = browse_fetch_urls(urls, out_dir=evidence_dir)
+    else:
+        results = browse_fetch_urls(urls, state_dir=state_dir)
     pages: list[dict[str, Any]] = []
-    for result in browse_fetch_urls(urls, state_dir=state_dir):
+    for result in results:
         if result.status == "succeeded":
             page: dict[str, Any] = {
                 "url": result.url,
@@ -393,6 +501,8 @@ def build_job_discovery_graph(
     candidates_dir=None,
     wechat_fn=None,
     state_dir=None,
+    evidence_dir=None,
+    wechat_out_dir=None,
 ) -> StateGraph:
     """Assemble the workflow graph with injectable seams for tests.
 
@@ -402,11 +512,16 @@ def build_job_discovery_graph(
     derives from the resolved state dir (``<state_dir>/output/candidates``),
     so merged_final.json always lands where the next run's
     ``load_prior_candidates`` reads it back; an explicit ``candidates_dir``
-    still wins.  ``prior_metadata`` on the invoke input flips a run to
+    still wins.  ``evidence_dir`` (Task 11) pins the browse output + the
+    coverage manifest's page-file root (must stay under
+    ``output/evidence`` for the gate's containment check); ``wechat_out_dir``
+    pins the Task 9 OCR slice's working dir (defaults: state-dir-derived
+    run-0).  ``prior_metadata`` on the invoke input flips a run to
     incremental mode; absent, no state check/mark runs (single-shot).
     """
     script_runner = script_runner or run_skill_script
     state_dir = _resolve_state_dir(state_dir)
+    evidence_dir = _resolve_evidence_dir(evidence_dir, state_dir)
     if candidates_dir is None:
         # the stable store owns the candidates output: merged_final.json
         # must land exactly where load_prior_candidates reads it
@@ -423,13 +538,16 @@ def build_job_discovery_graph(
         candidates_dir=candidates_dir,
     )
     fetch_fn = fetch_fn or functools.partial(
-        _default_fetch, state_dir=str(state_dir)
+        _default_fetch,
+        state_dir=str(state_dir),
+        evidence_dir=str(evidence_dir),
     )
     if wechat_fn is None:
         # default: the real Task 9 slice, run through the same runner seam
         # (name resolution at call time keeps the seam monkeypatchable);
         # the stable store path rides along so the slice's deep-crawl
-        # hand-off lands at <state_dir>/output/errors.jsonl
+        # hand-off lands at <state_dir>/output/errors.jsonl; out_dir stays
+        # run-scoped when the graph is built with one (Task 11, D3)
         def default_wechat_fn(url: str) -> WechatResult:
             context = ToolContext(
                 user_id="", run_id="", metadata={"observed_public_evidence": []}
@@ -440,7 +558,7 @@ def build_job_discovery_graph(
             return run_wechat_slice(
                 url,
                 runner=script_runner,
-                out_dir=_WECHAT_OUT_DIR,
+                out_dir=wechat_out_dir or _WECHAT_OUT_DIR,
                 state_dir=str(state_dir),
                 context=context,
                 extract_fn=extract_observed_job_details,
@@ -693,6 +811,8 @@ def build_job_discovery_graph(
                 "candidates": merged_candidates,
                 "merged_count": output_count,
                 "dedup_stats": stats,
+                # Task 11: the merged store the tool contract reports
+                "candidates_file": str(merged),
             }
         if not isinstance(merged_candidates, dict):
             return {"error": "deduplicate output has no candidates list"}
@@ -702,6 +822,7 @@ def build_job_discovery_graph(
             "candidates": merged_candidates["candidates"],
             "merged_count": output_count,
             "dedup_stats": stats,
+            "candidates_file": str(merged),
         }
 
     def normalize_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
@@ -720,18 +841,20 @@ def build_job_discovery_graph(
         pages = [
             page for page in state.get("pages", []) if page.get("status") == "succeeded"
         ]
-        page_urls = " ".join(page.get("url", "") for page in pages)
         path = _write_candidates(state["candidates"], state_dir=state_dir)
-        # real coverage_gate.py (non-manifest path) emits
-        # coverage_verified/page_count/.../reasons and always reports
-        # missing_terminal_evidence when --terminal-evidence is absent;
-        # the subgraph's best terminal signal is the last captured page
-        # hash (browse's end-of-list marker is not available in-graph)
-        cli = f"{path} --pages {page_urls}".strip() if page_urls else str(path)
-        terminal = pages[-1].get("content_hash") if pages else None
-        if terminal:
-            cli += f" --terminal-evidence {terminal}"
-        out = script_runner("coverage_gate", cli)
+        # Task 11: honest manifest contract — page_files = only real non-zero
+        # files under the evidence dir, terminal_evidence = only markers
+        # browse actually observed (never the last page hash, never
+        # fabricated); URLs are never passed as --pages (Task 4 review gap
+        # #2 — the defect this rewrite removes)
+        manifest = build_manifest(
+            out_dir=str(evidence_dir),
+            results=pages,
+            merged_count=state.get("merged_count", 0),
+            listing_count=state.get("merged_count") or None,
+        )
+        manifest_path = _write_manifest(manifest, state_dir=state_dir)
+        out = script_runner("coverage_gate", f"{path} --manifest {manifest_path}")
         try:
             coverage = json.loads(out)
         except ValueError:
@@ -741,7 +864,21 @@ def build_job_discovery_graph(
         # map the real script's coverage_verified to `verified` so the tool
         # contract always carries a bool and consumers never KeyError
         coverage.setdefault("verified", bool(coverage.get("coverage_verified", False)))
-        return {"coverage": coverage}
+        # the manifest's terminal_evidence is the last observed marker as a
+        # str (the gate's contract) or [] — the channel carries the markers
+        # list either way, never a synthesized value
+        terminal = manifest["terminal_evidence"]
+        if not isinstance(terminal, list):
+            terminal = [terminal] if isinstance(terminal, str) and terminal else []
+        update: dict[str, Any] = {
+            "coverage": coverage,
+            "terminal_evidence": terminal,
+        }
+        if not state.get("candidates_file"):
+            # the dedup node didn't run (no per-page files): the honest
+            # persisted snapshot is the work/candidates.json the gate read
+            update["candidates_file"] = str(path)
+        return update
 
     graph = StateGraph(JobDiscoveryWorkflowState)
     graph.add_node("fetch", fetch_node)

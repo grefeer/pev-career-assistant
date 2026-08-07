@@ -33,6 +33,9 @@ from backend.app.services.career_skills.registry import build_career_tool_regist
 from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
 from backend.app.services.deepagents_runtime.checkpoints.factory import create_checkpointer
 from backend.app.services.deepagents_runtime.harness import DeepAgentsHarness
+from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+    build_job_discovery_tools,
+)
 
 
 @dataclass
@@ -145,6 +148,11 @@ def run_deepagents_question(
     default path is unit-covered by monkeypatching ``cr.DeepAgentsHarness``
     and ``langchain_openai.ChatOpenAI``, see
     ``test_run_deepagents_question_default_harness_path``).
+
+    Task 11 wiring: the harness receives a ``tool_factory`` (closure
+    captures the run_id, which the harness cannot read from the workflow
+    thread ContextVar — it binds the thread after the factory call) so
+    job-discovery tools run with run-scoped output dirs (controller D1).
     """
     if harness is None:
         from langchain_openai import ChatOpenAI
@@ -159,6 +167,9 @@ def run_deepagents_question(
         harness = DeepAgentsHarness(
             model_factory=model_factory,
             checkpointer=create_checkpointer(settings),
+            tool_factory=lambda skill: build_job_discovery_tools(
+                skill, run_id=run_id
+            ),
         )
     request = AgentTaskRequest(
         goal=question.goal,

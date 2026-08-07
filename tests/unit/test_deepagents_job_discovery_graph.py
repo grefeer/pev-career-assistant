@@ -29,26 +29,25 @@ def _fake_fetch(urls: list[str]) -> list[dict]:
 
 def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
     if script == "coverage_gate":
-        # faithful to the real coverage_gate.py (non-manifest path): emits
-        # coverage_verified/page_count/.../reasons, never a bare `verified`,
-        # and reports missing_terminal_evidence when --terminal-evidence is
-        # absent (the verdict derives from evidence, not candidate existence)
+        # faithful to the real coverage_gate.py --manifest path: page_files
+        # must exist and be non-empty, terminal_evidence must be a str, and
+        # the verdict derives from evidence + JD bodies, not candidate
+        # existence.  Manifest containment + evidence_refs checks are skipped
+        # here (the real script enforces them; the fakes stay permissive).
         parts = cli_args.split()
         candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
-        pages: list[str] = []
-        terminal: str | None = None
-        if "--pages" in parts:
-            tail = parts[parts.index("--pages") + 1 :]
-            if "--terminal-evidence" in tail:
-                pages = tail[: tail.index("--terminal-evidence")]
-            else:
-                pages = tail
-        if "--terminal-evidence" in parts:
-            terminal = parts[parts.index("--terminal-evidence") + 1]
+        manifest_path = Path(parts[parts.index("--manifest") + 1])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        page_files = [
+            str(Path(p).resolve())
+            for p in manifest.get("page_files") or []
+            if isinstance(p, str) and Path(p).is_file() and Path(p).stat().st_size > 0
+        ]
+        terminal = manifest.get("terminal_evidence")
         reasons: list[str] = []
-        if not pages:
+        if not page_files:
             reasons.append("no_page_evidence")
-        if not terminal:
+        if not isinstance(terminal, str) or not terminal:
             reasons.append("missing_terminal_evidence")
         body_count = sum(
             bool(
@@ -59,16 +58,24 @@ def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         )
         if body_count != len(candidates):
             reasons.append("missing_jd_body")
+        expected_count = manifest.get("listing_count")
+        if not isinstance(expected_count, int):
+            expected_count = None
+        if expected_count is not None and len(candidates) != expected_count:
+            reasons.append("expected_count_mismatch")
         return json.dumps(
             {
                 "coverage_verified": not reasons,
-                "page_count": len(pages),
+                "page_count": len(page_files),
                 "candidate_count": len(candidates),
                 "body_candidate_count": body_count,
                 "unique_listing_count": len(candidates),
-                "expected_count": None,
-                "terminal_evidence": terminal,
+                "expected_count": expected_count,
+                "terminal_evidence": (
+                    terminal if isinstance(terminal, str) else None
+                ),
                 "reasons": reasons,
+                "manifest_path": str(manifest_path),
             },
             ensure_ascii=False,
         )
@@ -133,8 +140,37 @@ def _seed_page_file(tmp_path: Path) -> None:
 
 
 def test_workflow_runs_end_to_end_with_seams(tmp_path) -> None:
+    # a real on-disk page file + an observed terminal marker: the honest
+    # manifest counts the page and the gate opens
+    page_file = tmp_path / "pages" / "page_00.txt"
+    page_file.parent.mkdir(parents=True, exist_ok=True)
+    page_text = "招聘岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：硕士及以上"
+    page_file.write_text(page_text, encoding="utf-8")
+    digest = hashlib.sha256(page_file.read_bytes()).hexdigest()
+
+    def fetch(urls: list[str]) -> list[dict]:
+        return [
+            {
+                "url": url,
+                "source_url": url,
+                "status": "succeeded",
+                "content_hash": digest,
+                "mode": "list",
+                "page_files": [
+                    {
+                        "path": str(page_file),
+                        "content_hash": digest,
+                        "text_length": page_file.stat().st_size,
+                    }
+                ],
+                "terminal_evidence": ["next_control_absent"],
+                "visible_text": page_text,
+            }
+            for url in urls
+        ]
+
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
         state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
@@ -142,9 +178,12 @@ def test_workflow_runs_end_to_end_with_seams(tmp_path) -> None:
     assert final["candidates"]
     assert final["coverage"]["verified"] is True
     assert final["error"] is None
-    # batch fast-path wrote no per-page files: the dedup node skips and the
-    # merged_count channel is absent (tool default 0)
-    assert final.get("merged_count") is None
+    # the per-page extraction wrote a page file, so the dedup node ran and
+    # the merged store path surfaces
+    assert final["merged_count"] == 1
+    assert final["candidates_file"] == str(tmp_path / "merged_final.json")
+    # the observed markers channel mirrors the manifest (never synthesized)
+    assert final["terminal_evidence"] == ["next_control_absent"]
 
 
 def test_fetch_failure_recorded_per_url_not_fatal(tmp_path) -> None:
@@ -452,11 +491,38 @@ def test_coverage_non_object_output_falls_back(tmp_path) -> None:
     }
 
 
-def test_coverage_passes_terminal_evidence_and_maps_real_keys(tmp_path) -> None:
-    # regression for the review finding: the graph must pass
-    # --terminal-evidence (the real gate always reports
-    # missing_terminal_evidence without it) and expose the mapped `verified`
-    # bool beside the real script's coverage_verified key
+def test_coverage_passes_manifest_and_maps_real_keys(tmp_path) -> None:
+    # regression for the review finding (Task 4 gap #2): the graph must run
+    # coverage_gate with --manifest — never URLs as --pages, never a
+    # synthesized --terminal-evidence from the last page hash — and expose
+    # the mapped `verified` bool beside the real script's coverage_verified
+    page_file = tmp_path / "pages" / "page_00.txt"
+    page_file.parent.mkdir(parents=True, exist_ok=True)
+    page_text = "招聘岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：硕士及以上"
+    page_file.write_text(page_text, encoding="utf-8")
+    digest = hashlib.sha256(page_file.read_bytes()).hexdigest()
+
+    def fetch(urls: list[str]) -> list[dict]:
+        return [
+            {
+                "url": url,
+                "source_url": url,
+                "status": "succeeded",
+                "content_hash": digest,
+                "mode": "list",
+                "page_files": [
+                    {
+                        "path": str(page_file),
+                        "content_hash": digest,
+                        "text_length": page_file.stat().st_size,
+                    }
+                ],
+                "terminal_evidence": ["next_control_absent"],
+                "visible_text": page_text,
+            }
+            for url in urls
+        ]
+
     recorded: dict[str, str] = {}
 
     def recording_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
@@ -465,16 +531,21 @@ def test_coverage_passes_terminal_evidence_and_maps_real_keys(tmp_path) -> None:
         return _fake_runner(script, cli_args, stdin)
 
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=recording_runner, candidates_dir=str(tmp_path),
+        fetch_fn=fetch, script_runner=recording_runner, candidates_dir=str(tmp_path),
         state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
-    assert "--terminal-evidence hash-0" in recorded["coverage_gate"]
-    assert "--pages https://example.com/jobs" in recorded["coverage_gate"]
+    assert "--manifest" in recorded["coverage_gate"]
+    # the defects are gone: URLs are never passed as --pages and terminal
+    # evidence is never synthesized
+    assert "--pages https://example.com/jobs" not in recorded["coverage_gate"]
+    assert "--terminal-evidence" not in recorded["coverage_gate"]
     assert final["coverage"]["coverage_verified"] is True
     assert final["coverage"]["verified"] is True
     assert final["coverage"]["reasons"] == []
     assert final["coverage"]["page_count"] == 1
+    # the observed-markers channel carries exactly what browse observed
+    assert final["terminal_evidence"] == ["next_control_absent"]
 
 
 def test_coverage_without_content_hash_omits_terminal_evidence(tmp_path) -> None:
@@ -531,6 +602,9 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
                         text_length=len(page_text.encode("utf-8")),
                     )
                 ],
+                # observed marker (Task 7): browse reported the list end —
+                # the honest manifest propagates exactly this
+                terminal_evidence=["next_control_absent"],
             ),
             UrlFetchResult(
                 url="https://blocked.example.com",
@@ -1000,9 +1074,11 @@ def test_default_extract_zero_candidates_page(tmp_path) -> None:
     assert final["candidates"] == []
     assert final["error"] is None
     assert not list(tmp_path.glob("page_*.json"))
-    # the faithful coverage fake derives its verdict from evidence, not
-    # candidate existence: terminal evidence is present, so no reasons
-    assert final["coverage"]["reasons"] == []
+    # the honest manifest only counts real non-zero page files: the empty
+    # page file is dropped and no marker was observed, so the gate reports
+    # the evidence gaps it actually saw
+    assert "no_page_evidence" in final["coverage"]["reasons"]
+    assert "missing_terminal_evidence" in final["coverage"]["reasons"]
 
 
 # ---------------------------------------------------------------------------

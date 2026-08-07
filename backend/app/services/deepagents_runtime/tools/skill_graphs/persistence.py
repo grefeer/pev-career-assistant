@@ -14,12 +14,23 @@ temp dirs.
 
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     run_skill_script,
 )
+
+
+def _state_invoke(runner, state_dir: str):
+    """Bind the state script to the run-scoped cwd (never the shared skill
+    cwd) so each run's ``output/state.json`` lives under its own state dir.
+    Test runners stay untouched (they receive the plain 3-arg call).
+    """
+    if runner is not None:
+        return runner
+    return functools.partial(run_skill_script, cwd=state_dir)
 
 
 def state_check(url: str, update_time: str, *, runner=None, state_dir: str) -> bool:
@@ -29,10 +40,10 @@ def state_check(url: str, update_time: str, *, runner=None, state_dir: str) -> b
     seam's JSON carries ``exit_code`` (test seam) or the real script's
     ``action`` (``skip``/``extract``).  Unparsable or non-object output
     folds to False (extract) so a broken state never silently skips a URL.
-    ``state_dir`` is accepted for interface parity — the script resolves
-    its own ``output/state.json`` from the pinned skill cwd.
+    The real script runs with ``cwd=state_dir`` (run-scoped
+    ``output/state.json``); test runners keep the plain 3-arg call.
     """
-    out = (runner or run_skill_script)("state", cli_args=f"check {url} {update_time}")
+    out = _state_invoke(runner, state_dir)("state", cli_args=f"check {url} {update_time}")
     try:
         parsed = json.JSONDecoder().raw_decode(out, 0)[0]
     except ValueError:
@@ -64,15 +75,16 @@ def state_mark(
     hashes are passed whole, never pre-truncated.  A blank ``file_id``,
     ``sheet_id`` or ``update_time`` raises ValueError (the real script marks
     the flags required, and a blank update_time collapses the positional —
-    the mark would silently fail).  ``state_dir`` is accepted for interface
-    parity.
+    the mark would silently fail).  The real script runs with
+    ``cwd=state_dir`` (run-scoped ``output/state.json``); test runners keep
+    the plain 3-arg call.
     """
     if not file_id or not sheet_id:
         raise ValueError("state mark requires both file_id and sheet_id")
     if not update_time:
         raise ValueError("state mark requires update_time")
     for content_hash in content_hashes:
-        (runner or run_skill_script)(
+        _state_invoke(runner, state_dir)(
             "state",
             cli_args=(
                 f"mark {content_hash} {url} {update_time} "

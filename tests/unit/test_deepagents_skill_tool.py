@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import shutil
 from pathlib import Path
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -64,25 +66,25 @@ def _fake_extract(pages: list[dict]) -> tuple[list[dict], None]:
 
 def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
     if script == "coverage_gate":
-        # faithful to the real coverage_gate.py (non-manifest path): emits
-        # coverage_verified/page_count/.../reasons and reports
-        # missing_terminal_evidence when --terminal-evidence is absent
+        # faithful to the real coverage_gate.py --manifest path: page_files
+        # must exist and be non-empty, terminal_evidence must be a str, and
+        # the verdict derives from evidence + JD bodies, not candidate
+        # existence.  Manifest containment + evidence_refs checks are skipped
+        # here (the real script enforces them; the fakes stay permissive).
         parts = cli_args.split()
         candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
-        pages: list[str] = []
-        terminal: str | None = None
-        if "--pages" in parts:
-            tail = parts[parts.index("--pages") + 1 :]
-            if "--terminal-evidence" in tail:
-                pages = tail[: tail.index("--terminal-evidence")]
-            else:
-                pages = tail
-        if "--terminal-evidence" in parts:
-            terminal = parts[parts.index("--terminal-evidence") + 1]
+        manifest_path = Path(parts[parts.index("--manifest") + 1])
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        page_files = [
+            str(Path(p).resolve())
+            for p in manifest.get("page_files") or []
+            if isinstance(p, str) and Path(p).is_file() and Path(p).stat().st_size > 0
+        ]
+        terminal = manifest.get("terminal_evidence")
         reasons: list[str] = []
-        if not pages:
+        if not page_files:
             reasons.append("no_page_evidence")
-        if not terminal:
+        if not isinstance(terminal, str) or not terminal:
             reasons.append("missing_terminal_evidence")
         body_count = sum(
             bool(
@@ -93,44 +95,48 @@ def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         )
         if body_count != len(candidates):
             reasons.append("missing_jd_body")
+        expected_count = manifest.get("listing_count")
+        if not isinstance(expected_count, int):
+            expected_count = None
+        if expected_count is not None and len(candidates) != expected_count:
+            reasons.append("expected_count_mismatch")
         return json.dumps(
             {
                 "coverage_verified": not reasons,
-                "page_count": len(pages),
+                "page_count": len(page_files),
                 "candidate_count": len(candidates),
                 "body_candidate_count": body_count,
                 "unique_listing_count": len(candidates),
-                "expected_count": None,
-                "terminal_evidence": terminal,
+                "expected_count": expected_count,
+                "terminal_evidence": (
+                    terminal if isinstance(terminal, str) else None
+                ),
                 "reasons": reasons,
+                "manifest_path": str(manifest_path),
             },
             ensure_ascii=False,
         )
     if script == "validate":
         return json.dumps({"ok": True})
     if script == "deduplicate":
+        # faithful to the real script: merge the input files into --out and
+        # report output_count = the merged candidate count (the graph re-reads
+        # --out for the candidates channel, so the write must be real)
         parts = cli_args.split()
         out_path = Path(parts[parts.index("--out") + 1])
-        out_path.write_text(
-            json.dumps(
-                [
-                    {
-                        "title": "后端工程师",
-                        "responsibilities": "负责后端服务开发",
-                        "requirements": "精通 Python",
-                    }
-                ]
-            ),
-            encoding="utf-8",
-        )
+        inputs = [Path(token) for token in parts[: parts.index("--out")]]
+        merged: list[dict] = []
+        for path in inputs:
+            merged.extend(json.loads(path.read_text(encoding="utf-8")))
+        out_path.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
         return json.dumps(
             {
                 "status": "ok",
                 "stats": {
-                    "input_count": 1,
+                    "input_count": len(inputs),
                     "garbage_dropped": 0,
                     "garbage_titles": [],
-                    "output_count": 1,
+                    "output_count": len(merged),
                     "duplicates_removed": 0,
                     "shared_listing_urls_cleared": 0,
                 },
@@ -160,7 +166,7 @@ def _fake_extracted(title: str = "后端工程师") -> ExtractedJobDetails:
 
 def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
     tool = build_job_discovery_tool(
-        fetch_fn=_fake_fetch,
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
@@ -168,7 +174,7 @@ def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
     )
     # no thread bound -> config = {} branch (single-shot, no checkpointer)
     out = json.loads(
-        tool.invoke(json.dumps({"payload": json.dumps(["https://example.com/jobs"])}))
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
     )
     # the harness's _project_tool_observations validates every ToolMessage
     # against ToolObservation (extra="forbid"): tool_name/status are
@@ -178,34 +184,53 @@ def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
     assert out["tool_name"] == "run-job-discovery-workflow"
     assert out["status"] == "succeeded"
     results = out["output"]
+    # Task 11 output contract: status / pages / candidates_file /
+    # merged_count / terminal_evidence / coverage / per_url_results /
+    # candidates + errors (D2), with the Task 10 keys retained
     assert set(results) == {
+        "status",
+        "pages",
+        "candidates_file",
+        "merged_count",
+        "terminal_evidence",
+        "coverage",
         "per_url_results",
         "candidates",
-        "coverage",
-        "merged_count",
         "dedup_stats",
         "normalize_keys",
+        "errors",
     }
+    assert results["status"] == "succeeded"
     assert results["per_url_results"][0]["status"] == "succeeded"
     # evidence promotion contract: succeeded per-url entries carry both
     # source_url and content_hash so harness evidence projection promotes
     # fetch evidence
-    assert results["per_url_results"][0]["source_url"] == "https://example.com/jobs"
-    assert results["per_url_results"][0]["content_hash"] == "hash-0"
+    assert results["per_url_results"][0]["source_url"] == "https://job0.example.com"
+    assert results["per_url_results"][0]["content_hash"] == hashlib.sha256(
+        (tmp_path / "pages" / "page_00.txt").read_bytes()
+    ).hexdigest()
     # browse provenance keys: the mode that produced the evidence + the
     # resolved page-file paths (Task 4 per_url_results shape + Task 7)
     assert results["per_url_results"][0]["mode"] == "list"
     assert results["per_url_results"][0]["page_files"] == [
-        "output/evidence/run-0/pages/page_00.txt"
+        str(tmp_path / "pages" / "page_00.txt")
     ]
     assert results["candidates"][0]["title"] == "后端工程师"
     assert results["coverage"]["verified"] is True
     assert results["coverage"]["coverage_verified"] is True
     assert results["coverage"]["reasons"] == []
+    # observed marker only, never synthesized; the graph's error channel is
+    # empty on a clean run
+    assert results["terminal_evidence"] == ["next_control_absent"]
+    assert results["errors"] == []
     # the injected extract wrote no per-page files, so the dedup node has
-    # nothing to merge: counts stay at their no-merge defaults
+    # nothing to merge: counts stay at their no-merge defaults and
+    # candidates_file honestly points at the snapshot the gate read
     assert results["merged_count"] == 0
     assert results["dedup_stats"] == {}
+    assert results["candidates_file"] == str(
+        tmp_path / "output" / "work" / "candidates.json"
+    )
 
 
 def test_job_discovery_tool_threaded_invocation(tmp_path) -> None:
@@ -234,15 +259,17 @@ def test_job_discovery_tool_dict_input_path(tmp_path) -> None:
     # the deepagents ToolNode invokes tools with dict args ({"payload": ...});
     # verify the kwargs path maps the schema field to the func parameter
     tool = build_job_discovery_tool(
-        fetch_fn=_fake_fetch,
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
         state_dir=str(tmp_path),
     )
-    out = json.loads(tool.invoke({"payload": json.dumps(["https://example.com/jobs"])}))
+    out = json.loads(
+        tool.invoke({"payload": json.dumps(["https://job0.example.com"])})
+    )
     assert [r["url"] for r in out["output"]["per_url_results"]] == [
-        "https://example.com/jobs"
+        "https://job0.example.com"
     ]
     assert out["output"]["candidates"][0]["title"] == "后端工程师"
     assert out["output"]["coverage"]["verified"] is True
@@ -298,13 +325,13 @@ def test_job_discovery_tool_success_parses_as_tool_observation(tmp_path) -> None
     # ToolObservation (extra="forbid", required tool_name/status) or the
     # harness silently drops it and the run stalls
     tool = build_job_discovery_tool(
-        fetch_fn=_fake_fetch,
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
         state_dir=str(tmp_path),
     )
-    raw = tool.invoke(json.dumps({"payload": json.dumps(["https://example.com/jobs"])}))
+    raw = tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
     obs = ToolObservation.model_validate(json.loads(raw))
     assert obs.status == "succeeded"
     assert obs.error_code is None
@@ -832,3 +859,405 @@ def test_job_discovery_tool_dict_input_without_prior_metadata(tmp_path) -> None:
     assert out["status"] == "succeeded"
     # absent prior_metadata -> the workflow never touches the state store
     assert not any(c.startswith("state ") for c in calls)
+
+
+def _seed_fake_pages(
+    tmp_path: Path, count: int = 1, marker: str = "next_control_absent"
+) -> list[dict]:
+    """Real on-disk page files (absolute paths) + an observed terminal marker.
+
+    Mirrors browse.py's emitted page dicts: real non-empty ``page_NN.txt``
+    files under a pages dir, sha256-hashed, with ``terminal_evidence`` =
+    markers actually observed by browse (never synthesized by the caller).
+    """
+    pages_dir = tmp_path / "pages"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    out: list[dict] = []
+    for index in range(count):
+        path = pages_dir / f"page_{index:02d}.txt"
+        text = "招聘岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：精通 Python"
+        path.write_text(text, encoding="utf-8")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        out.append(
+            {
+                "url": f"https://job{index}.example.com",
+                "source_url": f"https://job{index}.example.com",
+                "status": "succeeded",
+                "content_hash": digest,
+                "mode": "list",
+                "page_files": [
+                    {
+                        "path": str(path),
+                        "content_hash": digest,
+                        "text_length": path.stat().st_size,
+                    }
+                ],
+                "terminal_evidence": [marker],
+                "visible_text": text,
+            }
+        )
+    return out
+
+
+def _fake_fetch_with_pages(tmp_path: Path):
+    return lambda urls: _seed_fake_pages(tmp_path, count=len(urls))
+
+
+def test_coverage_node_passes_real_manifest(tmp_path) -> None:
+    # runner intercepts coverage_gate and asserts --manifest path exists and
+    # its page_files point at real non-empty files; returns the real script's
+    # manifest-mode output shape {coverage_verified: True, reasons: [], ...}
+    captured: dict = {}
+
+    def manifest_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        if script == "coverage_gate":
+            parts = cli_args.split()
+            assert "--manifest" in parts
+            manifest_path = Path(parts[parts.index("--manifest") + 1])
+            assert manifest_path.is_file()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            captured["manifest"] = manifest
+            for page in manifest["page_files"]:
+                assert Path(page).is_file()
+                assert Path(page).stat().st_size > 0
+        return _fake_runner(script, cli_args, stdin)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
+        script_runner=manifest_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
+    )
+    assert out["status"] == "succeeded"
+    coverage = out["output"]["coverage"]
+    # honest gate-open: real page file + observed terminal marker + JD body
+    assert coverage["verified"] is True
+    assert coverage["reasons"] == []
+    manifest = captured["manifest"]
+    assert manifest["page_files"] == [str(tmp_path / "pages" / "page_00.txt")]
+    # the observed marker is the ONLY terminal evidence (never synthesized)
+    assert manifest["terminal_evidence"] == "next_control_absent"
+    # dedup never ran (extract fake wrote no per-page files): the listing
+    # count is honestly unknown, never fabricated from candidate count
+    assert manifest["listing_count"] is None
+
+
+def test_coverage_node_no_synthesized_terminal_evidence(tmp_path) -> None:
+    # results with terminal_evidence == [] -> manifest.terminal_evidence == []
+    # (never derived from the last page hash, never fabricated)
+    captured: dict = {}
+
+    def fetch_no_marker(urls: list[str]) -> list[dict]:
+        pages = _seed_fake_pages(tmp_path, count=len(urls))
+        for page in pages:
+            page["terminal_evidence"] = []
+        return pages
+
+    def manifest_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        if script == "coverage_gate":
+            parts = cli_args.split()
+            manifest_path = Path(parts[parts.index("--manifest") + 1])
+            captured["manifest"] = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        return _fake_runner(script, cli_args, stdin)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=fetch_no_marker,
+        script_runner=manifest_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
+    )
+    assert out["status"] == "succeeded"
+    assert captured["manifest"]["terminal_evidence"] == []
+    # the observed-markers channel is also empty (never synthesized)
+    assert out["output"]["terminal_evidence"] == []
+    # honest gate: missing terminal evidence keeps the run off the
+    # "coverage verified" claim
+    assert out["output"]["coverage"]["verified"] is False
+    assert "missing_terminal_evidence" in out["output"]["coverage"]["reasons"]
+
+
+def test_tool_output_contract_blocked_all_urls(tmp_path) -> None:
+    # all URLs blocked -> contract status "blocked", error_code "blocked" per
+    # url; candidates/coverage stay empty/honest (never a fake success)
+    def fetch_blocked(urls: list[str]) -> list[dict]:
+        return [
+            {
+                "url": url,
+                "source_url": url,
+                "status": "blocked",
+                "error_code": "blocked",
+                "blocked_reason": "captcha",
+            }
+            for url in urls
+        ]
+
+    tool = build_job_discovery_tool(
+        fetch_fn=fetch_blocked,
+        script_runner=_fake_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(
+            json.dumps({"payload": json.dumps(["https://a.com", "https://b.com"])})
+        )
+    )
+    assert out["status"] == "succeeded"
+    results = out["output"]
+    # ToolObservation itself rejects "blocked" as a status - the contract
+    # status lives inside the output dict (documented deviation)
+    assert results["status"] == "blocked"
+    assert len(results["per_url_results"]) == 2
+    assert all(r["error_code"] == "blocked" for r in results["per_url_results"])
+    assert results["candidates"] == []
+    assert results["errors"] == []
+    assert results["coverage"]["verified"] is False
+
+
+def test_tool_output_contract_merged_count_present(tmp_path) -> None:
+    # succeeded path -> merged_count == len(merged candidates) and
+    # candidates_file points at the merged store
+    def extract_with_pages(pages: list[dict]) -> tuple[list[dict], None]:
+        # persist per-page candidate files so the dedup merge path runs
+        for index, page in enumerate(pages):
+            (tmp_path / f"page_{index:02d}.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "title": f"职位{index}",
+                            "responsibilities": "负责后端服务开发",
+                            "requirements": "精通 Python",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return _fake_extract(pages)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
+        script_runner=_fake_runner,
+        extract_fn=extract_with_pages,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(
+            json.dumps(
+                {
+                    "payload": json.dumps(
+                        ["https://job0.example.com", "https://job1.example.com"]
+                    )
+                }
+            )
+        )
+    )
+    assert out["status"] == "succeeded"
+    results = out["output"]
+    assert results["status"] == "succeeded"
+    assert results["merged_count"] == 2
+    assert results["merged_count"] == len(results["candidates"])
+    assert results["candidates_file"] == str(tmp_path / "merged_final.json")
+
+
+def test_build_job_discovery_tools_run_scoped_dirs(monkeypatch) -> None:
+    # D1: two factory calls with different run_ids yield different,
+    # non-default dirs, keyed under the skill output (never the shared
+    # run-0 defaults); the factory-built tool keeps production defaults
+    from backend.app.services.deepagents_runtime.tools import skill_graphs as sg
+
+    captured: list[dict] = []
+    real_build = sg.build_job_discovery_tool
+
+    def fake_build(**kwargs):
+        captured.append(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(sg, "build_job_discovery_tool", fake_build)
+
+    tools_a = sg.build_job_discovery_tools(
+        "job-discovery", run_id="eval-1", budgets=None, tracker=None
+    )
+    tools_b = sg.build_job_discovery_tools(
+        "job-discovery", run_id="eval-2", budgets=None, tracker=None
+    )
+    assert len(tools_a) == 1 and len(tools_b) == 1
+    dirs_a, dirs_b = captured[0], captured[1]
+    # different run_ids -> different run-scoped dirs
+    for key in ("state_dir", "candidates_dir", "evidence_dir", "wechat_out_dir"):
+        assert dirs_a[key] != dirs_b[key]
+    # keyed under skill/job-discovery/output by run_id
+    assert dirs_a["state_dir"] == str(
+        SKILL_DIR / "output" / "runs" / "run-eval-1"
+    )
+    assert dirs_b["candidates_dir"] == str(
+        SKILL_DIR / "output" / "runs" / "run-eval-2" / "output" / "candidates"
+    )
+    assert dirs_a["evidence_dir"] == str(
+        SKILL_DIR / "output" / "evidence" / "run-eval-1"
+    )
+    assert dirs_a["wechat_out_dir"] == str(SKILL_DIR / "output" / "ocr" / "run-eval-1")
+    # never the shared defaults (run-0 / bare output dirs)
+    assert dirs_a["candidates_dir"] != str(SKILL_DIR / "output" / "candidates")
+    assert dirs_a["evidence_dir"] != str(SKILL_DIR / "output" / "evidence" / "run-0")
+    assert dirs_a["wechat_out_dir"] != str(SKILL_DIR / "output" / "ocr" / "run-0")
+    # production defaults: real browse orchestration + real extraction +
+    # in-memory subgraph checkpointer (no test seams)
+    assert dirs_a["fetch_fn"] is None
+    assert dirs_a["script_runner"] is sg.run_skill_script
+    assert dirs_a["extract_fn"] is None
+    assert dirs_a["checkpointer"] is None
+
+
+def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
+    # D1: the tool built from the factory writes merged_final.json into the
+    # run-scoped candidates dir (not the shared default store)
+    from backend.app.services.deepagents_runtime.tools import skill_graphs as sg
+    from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+        browse_fetch as bf,
+    )
+
+    run_id = "eval-merged"
+    state_dir = Path(sg.resolve_run_output_dirs(run_id)["state_dir"])
+    evidence_dir = Path(sg.resolve_run_output_dirs(run_id)["evidence_dir"])
+    shutil.rmtree(state_dir, ignore_errors=True)
+    shutil.rmtree(evidence_dir, ignore_errors=True)
+    try:
+        # production script seam (real run_skill_script would launch
+        # Playwright): mirror the real scripts' contracts for the scripts
+        # the run-scoped workflow invokes
+        def fake_script(script: str, cli_args: str = "", stdin: str = "", **kwargs):
+            if script == "browse":
+                parts = cli_args.split()
+                out_dir = Path(parts[parts.index("--out") + 1])
+                out_dir.mkdir(parents=True, exist_ok=True)
+                page = out_dir / "pages" / "page_01.txt"
+                page.parent.mkdir(parents=True, exist_ok=True)
+                page.write_text(
+                    "招聘岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：硕士及以上",
+                    encoding="utf-8",
+                )
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "mode": "list",
+                        "page_count": 1,
+                        "page_files": [str(page)],
+                        "terminal_evidence": "next_control_absent",
+                    }
+                )
+            if script == "write_candidates":
+                parts = cli_args.split()
+                out_path = Path(parts[parts.index("--out") + 1])
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(stdin, encoding="utf-8")
+                return json.dumps(
+                    {"status": "ok", "batch_kept": len(json.loads(stdin))}
+                )
+            if script == "validate":
+                return json.dumps({"ok": True})
+            if script == "deduplicate":
+                parts = cli_args.split()
+                out_path = Path(parts[parts.index("--out") + 1])
+                inputs = [Path(token) for token in parts[: parts.index("--out")]]
+                merged: list[dict] = []
+                for path in inputs:
+                    merged.extend(json.loads(path.read_text(encoding="utf-8")))
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(
+                    json.dumps(merged, ensure_ascii=False), encoding="utf-8"
+                )
+                return json.dumps(
+                    {
+                        "status": "ok",
+                        "stats": {
+                            "input_count": len(inputs),
+                            "garbage_dropped": 0,
+                            "garbage_titles": [],
+                            "output_count": len(merged),
+                            "duplicates_removed": 0,
+                            "shared_listing_urls_cleared": 0,
+                        },
+                        "load_errors": [],
+                        "verify_warnings_count": 0,
+                        "output_file": str(out_path),
+                    }
+                )
+            if script == "normalize":
+                return json.dumps(
+                    {"input": "后端工程师", "normalized": "backend-engineer"}
+                )
+            if script == "coverage_gate":
+                parts = cli_args.split()
+                manifest_path = Path(parts[parts.index("--manifest") + 1])
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
+                page_files = [
+                    p
+                    for p in manifest["page_files"]
+                    if Path(p).is_file() and Path(p).stat().st_size > 0
+                ]
+                terminal = manifest.get("terminal_evidence")
+                reasons: list[str] = []
+                if not page_files:
+                    reasons.append("no_page_evidence")
+                if not isinstance(terminal, str) or not terminal:
+                    reasons.append("missing_terminal_evidence")
+                if any(
+                    not (
+                        (c.get("responsibilities") or "").strip()
+                        or (c.get("requirements") or "").strip()
+                    )
+                    for c in candidates
+                ):
+                    reasons.append("missing_jd_body")
+                return json.dumps(
+                    {
+                        "coverage_verified": not reasons,
+                        "page_count": len(page_files),
+                        "candidate_count": len(candidates),
+                        "body_candidate_count": len(candidates),
+                        "unique_listing_count": len(candidates),
+                        "expected_count": manifest.get("listing_count"),
+                        "terminal_evidence": (
+                            terminal if isinstance(terminal, str) else None
+                        ),
+                        "reasons": reasons,
+                        "manifest_path": str(manifest_path),
+                    },
+                    ensure_ascii=False,
+                )
+            return "{}"
+
+        monkeypatch.setattr(jdg, "run_skill_script", fake_script)
+        monkeypatch.setattr(bf, "run_skill_script", fake_script)
+
+        tool = sg.build_job_discovery_tools(
+            "job-discovery", run_id=run_id, budgets=None, tracker=None
+        )[0]
+        out = json.loads(
+            tool.invoke(
+                json.dumps({"payload": json.dumps(["https://example.com/jobs"])})
+            )
+        )
+        assert out["status"] == "succeeded"
+        assert out["output"]["status"] == "succeeded"
+        merged_file = state_dir / "output" / "candidates" / "merged_final.json"
+        assert merged_file.is_file()
+        assert out["output"]["candidates_file"] == str(merged_file)
+        # the shared default store was never touched
+        assert not (SKILL_DIR / "output" / "candidates" / "merged_final.json").exists()
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        shutil.rmtree(evidence_dir, ignore_errors=True)

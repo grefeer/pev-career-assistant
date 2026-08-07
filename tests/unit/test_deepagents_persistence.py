@@ -147,25 +147,32 @@ def test_state_mark_calls_once_per_content_hash() -> None:
 
 
 def test_state_default_runner_resolves_run_skill_script(monkeypatch) -> None:
-    # runner=None resolves to the module-level run_skill_script: the
-    # monkeypatched fake proves the default channel is used without ever
-    # invoking a real skill script
+    # runner=None resolves to the module-level run_skill_script bound to the
+    # run-scoped cwd (Task 11 / D1: state.json lands in the run's own state
+    # dir, never the shared skill cwd): the monkeypatched fake proves the
+    # default channel carries cwd=state_dir without ever invoking a real
+    # skill script
     captured: dict = {}
     monkeypatch.setattr(
         persistence,
         "run_skill_script",
-        lambda script, cli_args="", stdin="": (
-            captured.update(script=script, cli_args=cli_args)
+        lambda script, cli_args="", stdin="", cwd=None: (
+            captured.update(script=script, cli_args=cli_args, cwd=cwd)
             or json.dumps({"exit_code": 0})
         ),
     )
     assert state_check("https://a/1", "2026-01-01", state_dir="x") is True
-    assert captured == {"script": "state", "cli_args": "check https://a/1 2026-01-01"}
+    assert captured == {
+        "script": "state",
+        "cli_args": "check https://a/1 2026-01-01",
+        "cwd": "x",
+    }
     state_mark(
         "https://a/1", ["h1"], state_dir="x",
         file_id="f", sheet_id="s", update_time="2026-01-01",
     )
     assert captured["cli_args"] == "mark h1 https://a/1 2026-01-01 --file-id f --sheet-id s"
+    assert captured["cwd"] == "x"
 
 
 # ---------------------------------------------------------------------------
