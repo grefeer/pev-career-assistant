@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
@@ -264,9 +265,9 @@ def test_stall_breaker_after_three_non_progress_decisions() -> None:
 
 
 def test_default_tool_factory_path_stalls_cleanly() -> None:
-    # tool_factory=None => the tools/adapters stub (build_skill_tools) is the
-    # default; with no tools the executor makes no progress and the stall
-    # breaker hands the run to the human.
+    # tool_factory=None => the tools/adapters build_skill_tools default path
+    # wraps the real registry tools; the scripted executor never calls a tool,
+    # so no progress is made and the stall breaker hands the run to the human.
     harness = DeepAgentsHarness(
         model_factory=_scripted_factory(
             {
@@ -552,24 +553,31 @@ def test_finalize_without_decisions_marks_failed() -> None:
     assert result["error_code"] == "verification_failed"
 
 
-def test_duplicate_call_tracker_dedups_keys() -> None:
+def test_duplicate_call_tracker_dedups_consecutive_identical() -> None:
     tracker = DuplicateCallTracker()
-    assert not tracker.check("candidate-key-1")
-    assert tracker.check("candidate-key-1")
-    assert not tracker.check("candidate-key-2")
+    payload = {"artifact_id": "a1"}
+    assert not tracker.is_duplicate("extract", payload)
+    assert tracker.is_duplicate("extract", payload)  # same call again
+    assert not tracker.is_duplicate("extract", {"artifact_id": "a2"})
 
 
-def test_build_skill_tools_stub_returns_empty_and_binds_context() -> None:
-    # P1 seam: no skill tools yet; the ContextVar pair must still work so the
-    # harness never crashes on the default tool_factory path.
+def test_build_skill_tools_returns_catalog_tools_and_binds_context() -> None:
+    # P2 seam: build_skill_tools wraps every registry tool of the skill and
+    # the tool_context() getter exposes the ContextVar bound by the harness.
     tools = build_skill_tools(
         skill_name="job-discovery",
-        budgets=object(),
+        budgets=DeepAgentsBudgets(
+            max_agent_turns=12, max_tool_calls=24, max_replans=2, max_wall_clock_seconds=300
+        ),
         tracker=DuplicateCallTracker(),
     )
-    assert tools == []
+    names = {tool.name for tool in tools}
+    assert "fetch-public-job-pages" in names
+    assert "extract-observed-job-details" in names
     ctx = ToolContext(user_id="u", run_id="r", metadata={"k": "v"})
-    assert tool_context.get() is None
+    with pytest.raises(RuntimeError):
+        tool_context()  # unbound outside an executor invocation
     with bind_tool_context(ctx):
-        assert tool_context.get() is ctx
-    assert tool_context.get() is None
+        assert tool_context() is ctx
+    with pytest.raises(RuntimeError):
+        tool_context()  # reset after the bind exits
