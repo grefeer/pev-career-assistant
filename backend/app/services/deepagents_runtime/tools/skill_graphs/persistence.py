@@ -47,27 +47,31 @@ def state_check(url: str, update_time: str, *, runner=None, state_dir: str) -> b
 
 def state_mark(
     url: str,
-    entry_ids: list[str],
+    content_hashes: list[str],
     *,
     runner=None,
     state_dir: str,
     file_id: str,
     sheet_id: str,
+    update_time: str,
 ) -> None:
-    """Mark the URL as processed — one ``mark`` call per entry id.
+    """Mark the URL as processed — one ``mark`` call per content hash.
 
-    ``entry_id = content_hash[:16]_url_hash8`` (the script's verified
-    format); a missing ``file_id`` or ``sheet_id`` raises ValueError (the
-    real script requires both flags).  ``state_dir`` is accepted for
-    interface parity.
+    Emits the real ``state.py mark`` form with three positionals —
+    ``mark <content_hash> <url> <update_time> --file-id <f> --sheet-id <s>``.
+    The script derives one entry_id per (content_hash, url) itself —
+    ``entry_id = content_hash[:16]_url_hash8`` (its verified format) — so
+    hashes are passed whole, never pre-truncated.  A missing ``file_id`` or
+    ``sheet_id`` raises ValueError (the real script marks both flags
+    required).  ``state_dir`` is accepted for interface parity.
     """
     if not file_id or not sheet_id:
         raise ValueError("state mark requires both file_id and sheet_id")
-    for entry_id in entry_ids:
+    for content_hash in content_hashes:
         (runner or run_skill_script)(
             "state",
             cli_args=(
-                f"mark {url} {entry_id} "
+                f"mark {content_hash} {url} {update_time} "
                 f"--file-id {file_id} --sheet-id {sheet_id}"
             ),
         )
@@ -137,6 +141,11 @@ def normalize_candidates(candidates: list[dict], *, runner=None) -> dict[str, st
     real script's ``{"input", "normalized"}`` contract — maps each
     original title to its normalized comparison key.  Stored titles are
     never altered (the script's contract: keys only).
+
+    Titles are quoted so multi-word titles stay a single token for both
+    the Windows (posix=False) and POSIX runners; a title containing a
+    literal ``"`` degrades to a skipped key (the runner returns the parse
+    ERROR string, raw_decode fails -> ``continue``) — never crashes.
     """
     runner = runner or run_skill_script
     keys: dict[str, str] = {}
@@ -144,7 +153,7 @@ def normalize_candidates(candidates: list[dict], *, runner=None) -> dict[str, st
         title = candidate.get("title")
         if not title:
             continue
-        out = runner("normalize", cli_args=f"--title {title} --json")
+        out = runner("normalize", cli_args=f'--title "{title}" --json')
         try:
             parsed = json.JSONDecoder().raw_decode(out, 0)[0]
         except ValueError:

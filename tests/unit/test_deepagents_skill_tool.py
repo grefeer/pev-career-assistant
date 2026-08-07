@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -728,16 +727,13 @@ def test_job_discovery_tool_incremental_prior_metadata(tmp_path) -> None:
         "check https://a.com 2026-08-07",
         "check https://b.com 2026-08-07",
     ]
-    # mark after extraction: only the processed URL, entry-id format
-    # content_hash[:16]_url_hash8, with the run's file/sheet flags
+    # mark after extraction: only the processed URL, the real state.py form
+    # mark <content_hash> <url> <update_time> with the run's file/sheet
+    # flags (the script derives entry_id = content_hash[:16]_url_hash8
+    # itself, so the full hash is passed positionally)
     marks = [a for s, a in calls if s == "state" and a.startswith("mark ")]
     assert len(marks) == 1
-    assert marks[0].startswith("mark https://b.com ")
-    assert "--file-id f1" in marks[0] and "--sheet-id s1" in marks[0]
-    entry_id = marks[0].split()[2]
-    assert entry_id == "hash-0"[:16] + "_" + hashlib.sha256(
-        b"https://b.com"
-    ).hexdigest()[:8]
+    assert marks[0] == "mark hash-0 https://b.com 2026-08-07 --file-id f1 --sheet-id s1"
     # comparison keys from the normalize node enter the tool output only
     assert results["normalize_keys"]["后端工程师"] == "backend-engineer"
     # the page-file merge still ran (single-shot semantics preserved under

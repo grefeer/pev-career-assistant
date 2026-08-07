@@ -39,12 +39,27 @@ def test_state_check_exit_zero_means_skip() -> None:
 def test_state_mark_requires_file_and_sheet_id() -> None:
     runner = FakeStateRunner({})
     with pytest.raises(ValueError):
-        state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="", sheet_id="f")
+        state_mark(
+            "https://a/1", ["h1"], runner=runner, state_dir="x",
+            file_id="", sheet_id="f", update_time="2026-01-01",
+        )
     with pytest.raises(ValueError):
-        state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="f", sheet_id="")
-    state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="f", sheet_id="s")
+        state_mark(
+            "https://a/1", ["h1"], runner=runner, state_dir="x",
+            file_id="f", sheet_id="", update_time="2026-01-01",
+        )
+    state_mark(
+        "https://a/1", ["h1"], runner=runner, state_dir="x",
+        file_id="f", sheet_id="s", update_time="2026-01-01",
+    )
     assert runner.calls[-1][0] == "state"
-    assert "--file-id f" in runner.calls[-1][1] and "--sheet-id s" in runner.calls[-1][1]
+    # the real state.py mark form: three positionals (content_hash url
+    # update_time) + both required flags; the script derives the entry_id
+    # (content_hash[:16]_url_hash8) itself
+    assert (
+        runner.calls[-1][1]
+        == "mark h1 https://a/1 2026-01-01 --file-id f --sheet-id s"
+    )
 
 
 def test_load_prior_candidates_missing_file() -> None:
@@ -105,22 +120,23 @@ def test_state_check_tolerates_unparsable_or_non_object_output() -> None:
         assert state_check("https://a/1", "2026-01-01", runner=runner, state_dir="x") is False
 
 
-def test_state_mark_calls_once_per_entry_id() -> None:
+def test_state_mark_calls_once_per_content_hash() -> None:
     runner = FakeStateRunner({})
     state_mark(
         "https://a/1",
-        ["h1_u1", "h2_u2"],
+        ["h1", "h2"],
         runner=runner,
         state_dir="x",
         file_id="f",
         sheet_id="s",
+        update_time="2026-01-01",
     )
     assert len(runner.calls) == 2
     for script, cli_args, _stdin in runner.calls:
         assert script == "state"
-        assert cli_args.startswith("mark https://a/1 ")
-        assert "--file-id f" in cli_args and "--sheet-id s" in cli_args
-    assert "h2_u2" in runner.calls[-1][1]
+    # one mark call per content hash, each carrying the full hash positionally
+    assert runner.calls[0][1] == "mark h1 https://a/1 2026-01-01 --file-id f --sheet-id s"
+    assert runner.calls[1][1] == "mark h2 https://a/1 2026-01-01 --file-id f --sheet-id s"
 
 
 def test_state_default_runner_resolves_run_skill_script(monkeypatch) -> None:
@@ -138,8 +154,11 @@ def test_state_default_runner_resolves_run_skill_script(monkeypatch) -> None:
     )
     assert state_check("https://a/1", "2026-01-01", state_dir="x") is True
     assert captured == {"script": "state", "cli_args": "check https://a/1 2026-01-01"}
-    state_mark("https://a/1", ["h1_u1"], state_dir="x", file_id="f", sheet_id="s")
-    assert captured["cli_args"] == "mark https://a/1 h1_u1 --file-id f --sheet-id s"
+    state_mark(
+        "https://a/1", ["h1"], state_dir="x",
+        file_id="f", sheet_id="s", update_time="2026-01-01",
+    )
+    assert captured["cli_args"] == "mark h1 https://a/1 2026-01-01 --file-id f --sheet-id s"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +277,39 @@ def test_normalize_candidates_maps_real_script_input_normalized() -> None:
     assert keys[" Java工程师 "] == "java工程师"
 
 
+def test_normalize_candidates_quotes_multi_word_titles() -> None:
+    # a multi-word title must reach the runner as ONE quoted token (the
+    # real runner splits with shlex posix=False on Windows); the real
+    # normalize.py {"input", "normalized"} contract maps title -> key
+    calls: list[str] = []
+
+    def runner(script, *, cli_args="", stdin=""):
+        assert script == "normalize"
+        calls.append(cli_args)
+        return json.dumps(
+            {"input": "AI Infra 研发工程师", "normalized": "ai-infra-engineer"}
+        )
+
+    keys = normalize_candidates([{"title": "AI Infra 研发工程师"}], runner=runner)
+    assert calls == ['--title "AI Infra 研发工程师" --json']
+    assert keys["AI Infra 研发工程师"] == "ai-infra-engineer"
+
+
+def test_normalize_candidates_quote_in_title_degrades_to_skipped_key() -> None:
+    # a title containing a literal quote breaks the quoted token; the runner
+    # returns the parse ERROR string -> the key is skipped, never a crash
+    calls: list[str] = []
+
+    def runner(script, *, cli_args="", stdin=""):
+        assert script == "normalize"
+        calls.append(cli_args)
+        return "ERROR: unrecognized arguments: 工程师"
+
+    keys = normalize_candidates([{"title": 'AI "工程师"'}], runner=runner)
+    assert calls == ['--title "AI "工程师"" --json']
+    assert keys == {}
+
+
 def test_normalize_candidates_skips_non_string_or_empty_values() -> None:
     def runner(script, *, cli_args="", stdin=""):
         return json.dumps({"normalized_title": None, "key": ""})
@@ -277,5 +329,5 @@ def test_normalize_candidates_default_runner_branch(monkeypatch) -> None:
         ),
     )
     keys = normalize_candidates([{"title": " Java工程师 "}])
-    assert captured == {"script": "normalize", "cli_args": "--title  Java工程师  --json"}
+    assert captured == {"script": "normalize", "cli_args": '--title " Java工程师 " --json'}
     assert keys["key"] == "java工程师"

@@ -23,7 +23,6 @@ file paths (matching the scripts' real CLI).
 from __future__ import annotations
 
 import functools
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, TypedDict
@@ -221,12 +220,6 @@ def _write_candidates(
     path = workdir / "candidates.json"
     path.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
     return path
-
-
-def _entry_ids(url: str, content_hash: str) -> list[str]:
-    """Per-URL state entry id: ``content_hash[:16]_url_hash8`` (verified format)."""
-    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
-    return [f"{content_hash[:16]}_{url_hash}"]
 
 
 def extract_page(
@@ -606,11 +599,12 @@ def build_job_discovery_graph(
                 ):
                     state_mark(
                         entry["url"],
-                        _entry_ids(entry["url"], entry["content_hash"]),
+                        [entry["content_hash"]],
                         runner=script_runner,
                         state_dir=str(state_dir),
                         file_id=str(prior_metadata.get("file_id", "")),
                         sheet_id=str(prior_metadata.get("sheet_id", "")),
+                        update_time=str(prior_metadata.get("update_time", "")),
                     )
         pages = [
             page
