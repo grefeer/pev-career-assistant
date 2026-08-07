@@ -4579,3 +4579,537 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 - §12 CLAUDE.md exception → Task 6 Step 6.
 - All types cross-checked between tasks: `DeepAgentsBudgets` methods (`try_consume_turn/tool/replan`, `start_window/refresh_window/window_exhausted`, `to_dict/from_dict`), `build_skill_tools(*, skill_name, budgets, tracker, context_factory=None, registry=None)`, `flush_run` kwargs, `RunMetrics` fields, `Question` fields — identical names in every task that references them.
 - Known iteration seams (honest bounds): Task 2 Step 5 lists the four most likely `create_deep_agent`/`structured_response`/`FakeListChatModel`/`agent.name` deviations with fixes; Task 6 Step 5 lists the two live-parity iteration points (Playwright fallback wiring, coverage_gate evidence paths).
+
+---
+
+## Plan Extension (2026-08-07, USER DECISION): full skill-parity port of job-discovery
+
+**Why this extension exists:** the parity gate (baseline: 6 URLs, success=3, candidates=797) failed against the Task 4 subgraph (run3: success=6, candidates=1, coverage verified=False). Root cause established by gap analysis (`.superpowers/sdd/2026-08-07-deepagents-runtime/skill-gap-inventory.md`, 94 items: PORTED 7 / PARTIAL 19 / MISSING 61 / OUT-OF-SUBGRAPH-SCOPE 7): the Task 4 subgraph rendered the skill as a single batch pass and did not port the skill's interactive browsing layer, per-page extraction fan-out, incremental persistence, or the WeChat image-article (OCR) branch. The user's decision: **port every idea/branch present in the 9 `skill/job-discovery` markdown docs into the subgraph (including the WeChat OCR branch); nothing may exist in the skill that does not exist in the subgraph; the parity gate remains the acceptance criterion and must be re-run when the port is complete.**
+
+**Scope rules (same as before, all tasks):** `skill/job-discovery/*` (scripts and docs) and `backend/app/services/career_skills/*` remain **read-only** — the subgraph drives the existing scripts' modes/parameters through `run_skill_script` and reuses the existing handlers. All 100% branch coverage / ruff / never-modify / commit-footer / security-gate constraints from Global Constraints above apply. Script CLI flag spellings must be verified against the real scripts by the implementer (the same seam pattern Task 4 used); the contract shapes below are the verified output keys.
+
+**Verified script contracts the extension builds on (from gap analysis, all verified against the real scripts):**
+
+- `browse.py <url> --mode <mode> [--out <dir>] [--max-pages N] [--cache-mode use|revalidate|off] [--wait MS]` prints one JSON line to stdout: `status` (`ok`|`blocked`|`error`), `url`, `mode`, `title`, `content_hash` (format `sha256_<16>`, truncated — **never** the manifest hash), `text_path`, `screenshot_path`. `status=blocked` (0-char shell / unsafe URL / nav error) — never retried; `status=error` (timeout / Playwright missing) exits 1.
+- `parallel-fetch` output additionally carries `used_path` (one of `parallel` / `spa_shell_no_pagination` / `spa_shell_empty_no_evidence` / `click_fallback_no_detect` / `click_fallback_fetch_error` / `interact_fallback_*`), `page_count`, `page_files` (list of `pages/page_NN.txt` relative to `--out`), `text_length`. `<500` chars is the SPA fast-fail → search-interact retry target.
+- `list` mode additionally carries `terminal_evidence` (one of `next_control_absent` / `page_content_repeated`) and, with `--cache-mode use`, writes `cache.json` in `--out` and marks hits `"cached": True`. Cache applies to `list` mode only.
+- `coverage_gate.py --manifest <manifest.json>` (or `--pages <paths>` + `--terminal-evidence <marker>`): requires candidates whose `evidence_refs[].content_hash` intersects the **sha256 of the page file bytes** (full hex, computed by the script from disk); manifest keys: `page_files` (real non-zero paths under the evidence dir), `terminal_evidence` (observed markers only — an empty list is honest), `declared_total_pages`, `pages_collected`, `truncated_by_max_pages`, `listing_count`. Output: `coverage_verified` + reasons + metrics; `missing_terminal_evidence` when no marker passed.
+- `write_candidates.py` reads candidate JSON from **stdin**, rejects candidates without `title`+`company`+`body` (title-only evidence is dropped), writes `output/candidates/page_NN.json` (suffix `page_<NN>_…` redirects to `page_NN.json`), `--out` must stay under `output/`, exit code 0 always, `--append` is identity-deduped.
+- `deduplicate.py` globs `output/candidates/page_*.json` (never `_merged.*`), writes `merged_final.json`, prints counts to stdout.
+- `state.py check <url> <update_time>` → exit 0 = skip / exit 1 = extract; `mark <url> <entry_id> --file-id <file-id> --sheet-id <sheet-id>` (both flags required); state lives at `output/state.json`; `entry_id = content_hash[:16]_url_hash8`.
+- `normalize.py` computes comparison keys only (`--title/--company/--text/--hash --json`) — it never alters stored titles.
+- `ocr_image.py` is in `_ALLOWED_SCRIPTS` but currently never invoked — Task 9 wires it.
+- `run_skill_script(script, cli_args="", stdin="", *, runner=None)` already supports `stdin` and `cwd=SKILL_DIR`; no runner change is needed for any task below.
+- `ExtractObservedJobDetailsInput` has **one** `artifact_id: str` field; `ExtractObservedJobDetailsOutput` = `source_artifact_id` / `source_url` / `content_hash` / `candidates: list[ExtractedJobDetails]`; `ExtractedJobDetails.confidence` is a non-nullable float. Per-page fan-out therefore = one `extract_with_gate` call per page file with that page's `artifact_id`.
+- Rulings on doc contradictions (matches the skill's own design): X1 → per-page fan-out is the canonical extraction path, batch extract retained only for static fast-path evidence; X2 → only observed terminal evidence is ever reported; M3 → validate step keeps the schema.md standard values (career_skills' English values are its read-only behavior); U10 → dedup stdout counts enter the tool output.
+
+---
+
+### Task 7: browse-backed fetch — site classification, mode selection, fallback chain, cache, terminal evidence
+
+**Files:**
+- Create: `backend/app/services/deepagents_runtime/tools/skill_graphs/browse_fetch.py`
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py` (fetch node + `_default_fetch` replacement; keep node/edge structure and all seams)
+- Test: `tests/unit/test_deepagents_browse_fetch.py`, extend `tests/unit/test_deepagents_skill_tool.py`
+
+**Interfaces:**
+- Consumes: `run_skill_script` (subprocess_runner.py), `_ALLOWED_SCRIPTS` (unchanged), current fetch-node seam `fetch_fn(urls, *, runner)` shape (Task 4).
+- Produces (later tasks rely on these exact names):
+  - `class SiteClass(str, Enum)` with `WECHAT` / `PARALLEL_FETCH` / `LIST` / `SEARCH_INTERACT` / `PROBE`; `classify_url(url: str) -> SiteClass` (module-level, pure).
+  - `@dataclass PageFile: path: str; content_hash: str; text_length: int` and `@dataclass UrlFetchResult: url; site_class: str; mode: str; status: str; used_path: str | None; page_files: list[PageFile]; terminal_evidence: list[str]; cached: bool; title: str | None; blocked_reason: str | None; error_code: str | None`.
+  - `page_file_hash(path: str, *, out_dir: str) -> tuple[str, int]` — full `sha256(file bytes).hexdigest()` + byte length (the manifest/evidence hash; browse's own `sha256_<16>` is never used as evidence hash).
+  - `browse_fetch_urls(urls: list[str], *, runner=None, out_dir: str | None = None, cache_mode: str = "use") -> list[UrlFetchResult]` — default `runner=None` calls `run_skill_script`; `out_dir=None` defaults to `output/evidence/run-<run_id>`-style stable dir (see Step 4).
+  - `mode_for_class(site_class: SiteClass, *, probe: dict | None = None) -> str` — the SKILL.md Phase 2 table + probe decision (Step 2).
+
+- [ ] **Step 1: Write the failing tests** — `tests/unit/test_deepagents_browse_fetch.py`:
+
+```python
+from __future__ import annotations
+
+import json
+import hashlib
+
+import pytest
+
+from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import (
+    SiteClass,
+    classify_url,
+    page_file_hash,
+    browse_fetch_urls,
+    mode_for_class,
+)
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://mp.weixin.qq.com/s/AbC123", SiteClass.WECHAT),
+        ("https://weixin.qq.com/s/xyz", SiteClass.WECHAT),
+        ("https://job.mokahr.com/abc", SiteClass.PARALLEL_FETCH),
+        ("https://jobs.bytedance.com/...", SiteClass.PARALLEL_FETCH),
+        ("https://jobs.feishu.cn/abc", SiteClass.LIST),
+        ("https://www.zhipin.com/job/1", SiteClass.SEARCH_INTERACT),
+        ("https://unknown.example.com/list", SiteClass.PROBE),
+    ],
+)
+def test_classify_url_table(url: str, expected: SiteClass) -> None:
+    assert classify_url(url) == expected
+
+
+def test_page_file_hash_is_sha256_of_bytes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "page_01.txt")
+        Path(path).write_text("职位描述", encoding="utf-8")
+        digest, size = page_file_hash(path, out_dir=tmp)
+        assert digest == hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        assert size == len("职位描述".encode("utf-8"))
+
+
+def test_parallel_fetch_success_contract(tmp_path) -> None:
+    # runner returns the verified parallel-fetch JSON contract
+    def fake_runner(script, *, cli_args="", stdin=""):
+        assert script == "browse"
+        assert "--mode parallel-fetch" in cli_args
+        return json.dumps({
+            "status": "ok", "url": "https://job.mokahr.com/abc", "mode": "parallel-fetch",
+            "title": "公司职位", "content_hash": "sha256_abcd1234",
+            "text_path": "output/evidence/run-x/页_01.txt",
+            "page_files": ["pages/page_01.txt", "pages/page_02.txt"],
+            "page_count": 2, "used_path": "parallel", "text_length": 5000,
+        })
+
+    results = browse_fetch_urls(
+        ["https://job.mokahr.com/abc"], runner=fake_runner, out_dir=str(tmp_path)
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.status == "succeeded"
+    assert result.mode == "parallel-fetch"
+    assert result.used_path == "parallel"
+    assert result.terminal_evidence == []
+    assert result.cached is False
+    assert len(result.page_files) == 2
+    assert all(pf.content_hash.startswith("sha256_") is False for pf in result.page_files)  # full hex
+```
+
+(Continue with: `test_spa_shell_empty_falls_back_to_search_interact_once`, `test_blocked_never_retried`, `test_error_retried_once_with_wait_5000`, `test_list_mode_terminal_evidence_and_cache_passthrough`, `test_wechat_urls_not_browsed`, `test_parallel_and_search_interact_hard_limits` — one each; the last asserts the fake runner records that at most one `--mode parallel-fetch` and one `--mode search-interact` invocation happened for a URL that exhausted both.)
+
+- [ ] **Step 2: Run tests to verify they fail** — `browse_fetch.py` does not exist yet.
+
+- [ ] **Step 3: Implement `classify_url` + `mode_for_class`** — encode the SKILL.md Phase 2 classification table (implementer reads `skill/job-discovery/SKILL.md` Phase 2 and `site-catalog.md` for the exact host lists; the verified families: `mp.weixin.qq.com`/`weixin.qq.com` articles → `WECHAT`; mokahr / bytedance / Mioffice hosts → `PARALLEL_FETCH`; `jobs.feishu.cn` → `LIST` (max-pages 3); zhipin / zhiye hosts → `SEARCH_INTERACT`; everything else → `PROBE`). `mode_for_class`: `PARALLEL_FETCH → "parallel-fetch"`, `LIST → "list"`, `SEARCH_INTERACT → "search-interact"`, `PROBE → "list"` (probe), `WECHAT → None` (never browsed here).
+
+- [ ] **Step 4: Implement `page_file_hash` + `browse_fetch_urls` with the fallback chain** — per URL, with **hard per-URL caps (one `parallel-fetch` + one `search-interact` maximum across the whole chain, enforced by a counter map)**: primary mode per classification; `PROBE` runs `list` and treats `text_length < 4096` as thin → `search-interact`; `PARALLEL_FETCH` with `page_count == 0` or `used_path` in `{spa_shell_empty_no_evidence, click_fallback_fetch_error}` → `search-interact`; `LIST` with `page_count == 0` → `search-interact`; `status=error` → one retry of the same mode with `--wait 5000`; `status=blocked` → never retried, mapped to `blocked_reason` per the browse output detail (implementer verifies the exact reason key in `browse.py`; the families are login/captcha/anti-bot/unsafe-url/empty-shell). `--cache-mode <cache_mode>` passed only for `list` mode. Each browse call resolves page files against `out_dir` and computes full-hash + length per page via `page_file_hash`; a page file missing on disk is dropped from `page_files` (never crashes). WeChat URLs return `UrlFetchResult(status="wechat_pending", mode=None, page_files=[])` without any browse call.
+
+- [ ] **Step 5: Rewire the fetch node** — `job_discovery_graph.py` fetch node calls `fetch_fn(urls)` (seam unchanged) whose new default `_default_fetch` orchestrates `browse_fetch_urls` and shapes `per_url_results` entries carrying `source_url` + `content_hash` (per-URL evidence = first page hash) + a bounded `visible_text` (first page text, ≤1200 chars) so the harness promotes evidence exactly as before; `status=blocked` URLs map to per-url `error_code="blocked"` (the stall-breaker treats them as no-progress); `wechat_pending` URLs are carried through untouched for Task 9. The old requests fast path (`fetch_public_job_pages`) is removed from the default fetch; the `fetch_fn` seam remains for tests.
+
+- [ ] **Step 6: Full suite + ruff** — `.\.venv\Scripts\python.exe -m pytest tests/unit/ -q` (all PASS, new package still 100% branch) and `.\.venv\Scripts\python.exe -m ruff check backend tests scripts`. Existing `test_deepagents_skill_tool.py` fakes that pinned the old fetch behavior are updated to the new `per_url_results` shape (Task 4 fix round 1 already established that shape; add `mode`/`page_files` keys).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/app/services/deepagents_runtime/tools/skill_graphs/browse_fetch.py backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py tests/unit/test_deepagents_browse_fetch.py tests/unit/test_deepagents_skill_tool.py
+git commit -m "feat(deepagents-runtime): browse-backed fetch with site classification + fallback chain
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: per-page extraction fan-out + LLM extraction gate (extraction-guide contract)
+
+**Files:**
+- Create: `backend/app/services/deepagents_runtime/tools/llm_extractor.py`
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py` (extract node + dedup node; read candidates from `page_NN.json`)
+- Modify: `backend/app/config.py` (add `deepagents_llm_extraction_enabled: bool = False` to `Settings`)
+- Test: `tests/unit/test_deepagents_llm_extractor.py`, extend `tests/unit/test_deepagents_skill_tool.py`
+
+**Interfaces:**
+- Consumes: `extract_with_gate(context, payload, *, enabled, llm_extractor=None)` (extract_gate.py), `ExtractObservedJobDetailsInput` / `ExtractObservedJobDetailsOutput` / `ExtractedJobDetails` (career_skills, read-only), Task 7 `PageFile`/`UrlFetchResult`, `run_skill_script` stdin, `settings_override` from `tests/conftest.py`.
+- Produces:
+  - `class LLMJobExtractor` with `__init__(self, settings)` and `__call__(self, context: ToolContext, payload: ExtractObservedJobDetailsInput) -> ExtractObservedJobDetailsOutput`; `build_llm_extractor(settings) -> LLMJobExtractor | None` (None when `deepagents_llm_extraction_enabled` is False).
+  - `extract_page(page: PageFile, *, url: str, out_dir: str, context: ToolContext, extract_fn, llm_extractor: Callable | None = None) -> list[ExtractedJobDetails]` — per-page gated extraction.
+  - `write_page_candidates(page_id: str, candidates: list[ExtractedJobDetails], *, runner=None, candidates_dir: str) -> int` — stdin contract to `write_candidates`; returns number of accepted candidates (title+company+body survivors).
+
+- [ ] **Step 1: Write the failing tests** — `tests/unit/test_deepagents_llm_extractor.py`:
+
+```python
+from __future__ import annotations
+
+import json
+
+import pytest
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel  # NOT available with bind_tools — use ScriptedModel from tests/unit/deepagents_testkit.py
+
+from backend.app.services.agent_runtime.schemas import ToolObservation
+from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.job_discovery import (
+    ExtractObservedJobDetailsInput,
+    ExtractObservedJobDetailsOutput,
+)
+from backend.app.services.deepagents_runtime.tools.llm_extractor import (
+    LLMJobExtractor,
+    build_llm_extractor,
+)
+from tests.conftest import settings_override
+from tests.unit.deepagents_testkit import ScriptedModel
+
+
+def test_build_llm_extractor_respects_flag() -> None:
+    off = settings_override(deepagents_llm_extraction_enabled=False)
+    assert build_llm_extractor(off) is None
+    on = settings_override(deepagents_llm_extraction_enabled=True)
+    extractor = build_llm_extractor(on)
+    assert extractor is not None
+    assert extractor._model is not None
+
+
+def test_extractor_folds_parse_failure_to_empty_candidates() -> None:
+    # ScriptedModel returns prose without any JSON -> extractor must NOT raise;
+    # it folds to an empty candidate list (verifier sees honest "no candidates").
+    model = ScriptedModel(responses=["这个页面没有可解析的职位内容。"])
+    extractor = LLMJobExtractor(settings_override(deepagents_llm_extraction_enabled=True))
+    extractor._model = model
+    ctx = ToolContext(user_id="u", run_id="r", metadata={})
+    output = extractor(ctx, ExtractObservedJobDetailsInput(artifact_id="page_01"))
+    assert output.candidates == []
+    assert output.content_hash == "page_01"
+```
+
+(Continue: `test_extractor_lenient_json_fence_strip` — model returns ```` ```json {…} ``` ```` and the extractor parses it; `test_extractor_uses_extraction_guide_prompt` — asserts the prompt mentions job-title/company/body fields per `extraction-guide.md`; `test_extractor_never_raises_on_model_error` — model raises, extractor folds.)
+
+- [ ] **Step 2: Run tests to verify they fail** — `llm_extractor.py` does not exist.
+
+- [ ] **Step 3: Implement `LLMJobExtractor`** — `ChatOpenAI(model=settings.agent_harness_model, temperature=0, max_tokens=4096)` (same model/params as the eval path). Prompt = the `skill/job-discovery/extraction-guide.md` contract (implementer transcribes its field list and output discipline verbatim into the system prompt). Parse: lenient — strip code fences, find the first `{…}` block, `json.loads`, tolerate trailing prose; validate the parsed list into `ExtractedJobDetails` items (drop invalid ones, never raise). Any model error / validation failure → return `ExtractObservedJobDetailsOutput(source_url="", content_hash=payload.artifact_id, candidates=[])` (fold, never raise). The `extraction-guide.md` field names map onto `ExtractedJobDetails` 12 fields (implementer maps from the schema file, read-only).
+
+- [ ] **Step 4: Rewrite the extract node as per-page fan-out** — for each `UrlFetchResult` with pages: for each `PageFile`: (1) read the page text from its resolved path; (2) register observed evidence `observed:<page.content_hash>` with that text + `source_url` (the same registration pattern the current `_default_extract` uses — verified against `career_skills/job_discovery.py:789-801`); (3) one `extract_with_gate(context, ExtractObservedJobDetailsInput(artifact_id=page.content_hash), enabled=<settings deepagents_llm_extraction_enabled>, llm_extractor=build_llm_extractor(settings))` call per page — the strict-Pareto union of regex + LLM candidates is already in `extract_with_gate`; (4) collect the output's candidates. Per-page evidence dicts (`source_url` + `content_hash` + bounded `visible_text`) enter `evidence_store` exactly as the harness expects. Batch extraction is retained **only** for evidence entries without page files (static fast-path compat; X1 ruling).
+
+- [ ] **Step 5: Persist candidates per page + dedup from page files** — after extraction per page, `write_page_candidates("page_01", candidates, runner=..., candidates_dir=...)` pipes the candidates JSON via stdin to `write_candidates` (the script enforces `output/` + valid-candidate rules and writes `page_NN.json`). The dedup node changes to: glob `page_*.json` (excluding `_merged.*`), run `deduplicate`, parse its stdout counts, read `merged_final.json`, and include `merged_count` + dedup counts in the tool output (U10 ruling). The old glob-merged path is removed.
+
+- [ ] **Step 6: Full suite + ruff** — both new tests and the extended tool tests pass; 100% branch coverage retained (the per-page loop branches — page-file-missing, zero-candidates, LLM-gate-triggered — must each be exercised by a test).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/app/services/deepagents_runtime/tools/llm_extractor.py backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py backend/app/config.py tests/unit/test_deepagents_llm_extractor.py tests/unit/test_deepagents_skill_tool.py
+git commit -m "feat(deepagents-runtime): per-page extraction fan-out with LLM gate + page-file candidates
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: WeChat image-article (OCR) slice — Levels 1-6 + channel triage + REPLACE-OCR
+
+**Files:**
+- Create: `backend/app/services/deepagents_runtime/tools/skill_graphs/wechat_slice.py`
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py` (route `wechat_pending` URLs into the slice; wire `errors.jsonl` append)
+- Test: `tests/unit/test_deepagents_wechat_slice.py`
+
+**Interfaces:**
+- Consumes: `run_skill_script` (now invoked with `ocr_image` for the first time), `_ALLOWED_SCRIPTS` (unchanged — `ocr_image` already allowlisted), Task 7 `classify_url`/`UrlFetchResult`, Task 8 `write_page_candidates`/`LLMJobExtractor` (OCR text is extraction input, not a replacement for the gate).
+- Produces:
+  - `@dataclass WechatResult: url; status: str; channel: str | None; candidates: list[ExtractedJobDetails]; application_channel_json: dict | None; needs_deep_crawl: bool; reason: str | None`.
+  - `run_wechat_slice(url: str, *, runner=None, out_dir: str, context: ToolContext, extract_fn, llm_extractor: Callable | None = None) -> WechatResult` — the Level 1-6 pipeline.
+  - `classify_wechat_channel(*, article_text: str, ocr_texts: list[str]) -> tuple[str, str | None]` — channel A/B/C/D + reason (pure function).
+  - `append_errors_jsonl(entry: dict, *, runner=None, out_dir: str) -> None` — append-one-line to `output/errors.jsonl` (idempotent entries carry `url` + `timestamp`-free cause key).
+
+- [ ] **Step 1: Write the failing tests** — `tests/unit/test_deepagents_wechat_slice.py`:
+
+```python
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice import (
+    classify_wechat_channel,
+    run_wechat_slice,
+    append_errors_jsonl,
+)
+
+
+def test_channel_a_job_content_in_text() -> None:
+    channel, reason = classify_wechat_channel(
+        article_text="岗位：前端工程师。公司：某某科技。负责……",
+        ocr_texts=[],
+    )
+    assert channel == "A"
+    assert reason is None
+
+
+def test_channel_b_job_content_only_in_ocr() -> None:
+    channel, reason = classify_wechat_channel(
+        article_text="欢迎转发",
+        ocr_texts=["招聘：后端工程师，薪资面议，简历投递……"],
+    )
+    assert channel == "B"
+    assert reason is None
+
+
+def test_channel_c_contact_only() -> None:
+    channel, reason = classify_wechat_channel(article_text="加微信: abc", ocr_texts=[])
+    assert channel == "C"
+    assert reason is not None
+
+
+def test_channel_d_non_job_promotional() -> None:
+    channel, reason = classify_wechat_channel(article_text="双十一大促，全场五折", ocr_texts=[])
+    assert channel == "D"
+    assert reason is not None
+
+
+def test_needs_deep_crawl_appends_errors_jsonl(tmp_path) -> None:
+    def fake_runner(script, *, cli_args="", stdin=""):
+        return json.dumps({"ok": True})  # state/ocr scripts are faked in unit tests
+
+    append_errors_jsonl(
+        {"url": "https://mp.weixin.qq.com/s/abc", "cause": "needs_deep_crawl"},
+        runner=fake_runner, out_dir=str(tmp_path),
+    )
+    lines = (tmp_path / "errors.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["url"] == "https://mp.weixin.qq.com/s/abc"
+```
+
+(Continue: `test_run_wechat_slice_full_pipeline` — fake runner responds to `browse`-less flow (article fetch is done by the slice's own requests guard — seam `fetch_html_fn`), `ocr_image` returns a fake OCR text, extraction returns one candidate, channel B, `application_channel_json` populated, `needs_deep_crawl=False`; `test_run_wechat_slice_channel_d_skips_extraction`; `test_run_wechat_slice_article_fetch_blocked` — non-public URL / nav failure → `status="blocked"`, `reason` set, no candidates; `test_ocr_image_failure_folds` — ocr script failure does not crash the slice, the image is skipped.)
+
+- [ ] **Step 2: Run tests to verify they fail** — `wechat_slice.py` does not exist.
+
+- [ ] **Step 3: Implement the Level 1-6 pipeline in `run_wechat_slice`** — implementer reads `skill/job-discovery/wechat-image-handling.md` (read-only) and encodes every Level verbatim; the verified skeleton: **L1** URL guard (scheme http(s), no userinfo, global IP — reuse the `_fetch_validated`/`_assert_public_url` semantics from the skill; redirects followed manually, max 5 hops, private/cloud-metadata target → `unsafe_public_url` blocked); **L2** parse the article HTML for `<img>` srcs (drop `data:` URIs); **L3** download each image with the doc's size filters (skip undersized/oversized — never raise); **L4** per surviving image, `run_skill_script("ocr_image", cli_args=...)` (exact flags from `scripts/ocr_image.py`); **L5** combine article text + OCR texts per the doc's combine format; **L6** `classify_wechat_channel`:
+  - A = job content sufficient in article text → extract candidates from combined text;
+  - B = job content only from OCR (REPLACE-OCR rule: when an image is a job posting, the OCR text replaces the article text as extraction input) → extract candidates from OCR text;
+  - C = contact-only (微信/邮箱, no job content) → `needs_manual_review` semantics: `status="needs_manual_review"`, reason, no candidates;
+  - D = non-job/promotional → `status="skipped"`, reason, no candidates.
+  - `needs_deep_crawl` (doc's condition — e.g. paginated long-form / iframe-embedded content) → `append_errors_jsonl({"url":…, "cause": "needs_deep_crawl"})` and the result carries the flag. Every candidate from channels A/B is enriched with `application_channel_json` per the doc (channel key + source image/OCR metadata), and candidates flow through the same `write_page_candidates` path so dedup/coverage see them.
+
+- [ ] **Step 4: Wire the slice into the graph** — the fetch node's `wechat_pending` results route to `run_wechat_slice` before the extract node; the slice's candidates merge into the per-run candidate set (same `page_NN.json` flow via `write_page_candidates` with a `wechat` page id). `needs_manual_review` URLs surface as per-url `error_code="needs_manual_review"` (a recoverable classification — the human reviews, never auto-retried).
+
+- [ ] **Step 5: Full suite + ruff** — 100% branch coverage retained (each channel branch, both OCR-failure and article-fetch-blocked branches exercised).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/app/services/deepagents_runtime/tools/skill_graphs/wechat_slice.py backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py tests/unit/test_deepagents_wechat_slice.py
+git commit -m "feat(deepagents-runtime): WeChat image-article OCR slice (levels 1-6 + channel triage)
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+### Task 10: incremental persistence — state check/mark, merged accumulation, errors.jsonl, normalize, stable state dir
+
+**Files:**
+- Create: `backend/app/services/deepagents_runtime/tools/skill_graphs/persistence.py`
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py` (state check/mark hooks + normalize node + stable out-dir selection; removes the `tempfile.mkdtemp` leak — Task 4 minor)
+- Test: `tests/unit/test_deepagents_persistence.py`, extend `tests/unit/test_deepagents_skill_tool.py`
+
+**Interfaces:**
+- Consumes: `run_skill_script` (`state`, `normalize`, `deduplicate`, `write_candidates`), Task 7 `browse_fetch_urls` (now takes `state_dir`), Task 8/9 candidate flows.
+- Produces:
+  - `state_check(url: str, update_time: str, *, runner=None, state_dir: str) -> bool` (True = skip — exit 0 per `state.py check`).
+  - `state_mark(url: str, entry_ids: list[str], *, runner=None, state_dir: str, file_id: str, sheet_id: str) -> None` — one `mark` call per entry id (`entry_id = content_hash[:16]_url_hash8`, verified format).
+  - `load_prior_candidates(*, state_dir: str) -> list[dict]` — reads `output/candidates/merged_final.json` if present, else `[]`.
+  - `append_errors_jsonl(entry: dict, *, runner=None, state_dir: str) -> None` — moved here from Task 9 (Task 9 imports it from this module).
+  - `normalize_candidates(candidates: list[dict], *, runner=None) -> dict[str, str]` — comparison-key map via `normalize.py --json` (never alters stored titles).
+
+- [ ] **Step 1: Write the failing tests** — `tests/unit/test_deepagents_persistence.py`:
+
+```python
+from __future__ import annotations
+
+import json
+import os
+
+import pytest
+
+from backend.app.services.deepagents_runtime.tools.skill_graphs.persistence import (
+    state_check,
+    state_mark,
+    load_prior_candidates,
+    append_errors_jsonl,
+    normalize_candidates,
+)
+
+
+class FakeStateRunner:
+    def __init__(self, exit_codes: dict[str, int]) -> None:
+        self.exit_codes = exit_codes
+        self.calls: list[tuple[str, str, str]] = []
+
+    def __call__(self, script, *, cli_args="", stdin=""):
+        self.calls.append((script, cli_args, stdin))
+        if script == "state" and cli_args.startswith("check "):
+            return json.dumps({"exit_code": self.exit_codes.get(cli_args, 0)})
+        if script == "state":
+            return json.dumps({"marked": True})
+        return json.dumps({"ok": True})
+
+
+def test_state_check_exit_zero_means_skip() -> None:
+    runner = FakeStateRunner({"check https://a/1 2026-01-01": 0})
+    assert state_check("https://a/1", "2026-01-01", runner=runner, state_dir="x") is True
+    runner2 = FakeStateRunner({"check https://a/1 2026-01-01": 1})
+    assert state_check("https://a/1", "2026-01-01", runner=runner2, state_dir="x") is False
+
+
+def test_state_mark_requires_file_and_sheet_id() -> None:
+    runner = FakeStateRunner({})
+    with pytest.raises(ValueError):
+        state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="", sheet_id="f")
+    with pytest.raises(ValueError):
+        state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="f", sheet_id="")
+    state_mark("https://a/1", ["h1_u1"], runner=runner, state_dir="x", file_id="f", sheet_id="s")
+    assert runner.calls[-1][0] == "state"
+    assert "--file-id f" in runner.calls[-1][1] and "--sheet-id s" in runner.calls[-1][1]
+
+
+def test_load_prior_candidates_missing_file() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        assert load_prior_candidates(state_dir=tmp) == []
+
+
+def test_load_prior_candidates_reads_merged_final(tmp_path) -> None:
+    out = tmp_path / "output" / "candidates"
+    out.mkdir(parents=True)
+    (out / "merged_final.json").write_text(json.dumps({"candidates": [{"title": "A"}]}), encoding="utf-8")
+    assert load_prior_candidates(state_dir=str(tmp_path)) == [{"title": "A"}]
+
+
+def test_append_errors_jsonl_appends_lines(tmp_path) -> None:
+    append_errors_jsonl({"url": "u1", "cause": "c1"}, runner=FakeStateRunner({}), state_dir=str(tmp_path))
+    append_errors_jsonl({"url": "u2", "cause": "c2"}, runner=FakeStateRunner({}), state_dir=str(tmp_path))
+    lines = (tmp_path / "output" / "errors.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+
+
+def test_normalize_candidates_returns_comparison_keys() -> None:
+    def runner(script, *, cli_args="", stdin=""):
+        assert script == "normalize"
+        return json.dumps({"normalized_title": "java-工程师", "key": "java工程师"})
+    keys = normalize_candidates([{"title": " Java工程师 "}], runner=runner)
+    assert keys["key"] == "java工程师"
+```
+
+- [ ] **Step 2: Run tests to verify they fail** — `persistence.py` does not exist.
+
+- [ ] **Step 3: Implement `persistence.py`** — `state_check`/`state_mark` map 1:1 to `state.py check/mark` (exit code 0 → skip; mark requires both `--file-id` and `--sheet-id` — a missing flag raises `ValueError`, matching the real script's CLI requirement). `load_prior_candidates` reads `output/candidates/merged_final.json` under `state_dir` (missing → `[]`). `append_errors_jsonl` appends one JSON line to `output/errors.jsonl`, creating dirs. `normalize_candidates` runs `normalize.py --json` over each candidate title/company and returns the comparison-key map (the script's contract: keys only, storage titles untouched).
+
+- [ ] **Step 4: Wire persistence into the graph** — (1) stable state dir replaces `tempfile.mkdtemp(dir=SKILL_DIR)` (Task 4 minor): per-run evidence under `SKILL_DIR/output/evidence/run-<run_id>`; `state.json`, `candidates/merged_final.json`, `errors.jsonl` are the **stable** incremental store (P1-P9 contract: check before each URL's fetch — skip when the state says the URL was already extracted with a matching update time; mark after extraction with the run's file/sheet ids; merged_final accumulates across runs because `write_candidates --append` + `deduplicate` merge prior + new); (2) a **normalize node** runs after dedup — comparison keys enter the tool output (not the stored titles); (3) `errors.jsonl` accumulates `needs_deep_crawl` / `needs_manual_review` entries across runs (Task 9's `append_errors_jsonl` moves to this module). The tool payload gains an optional `prior_metadata` input (file_id/sheet_id/update_time) — absent → no state check/mark (single-shot mode, unchanged behavior for the harness eval).
+
+- [ ] **Step 5: Full suite + ruff** — 100% branch coverage retained (skip-path, mark-path, missing-flag, missing-file, accumulate branches all exercised).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add backend/app/services/deepagents_runtime/tools/skill_graphs/persistence.py backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py tests/unit/test_deepagents_persistence.py tests/unit/test_deepagents_skill_tool.py
+git commit -m "feat(deepagents-runtime): incremental persistence (state check/mark, merged accumulation, errors.jsonl)
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+### Task 11: honest coverage gate (manifest contract) + tool output contract + production wiring
+
+**Files:**
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py` (coverage node rewrite)
+- Modify: `backend/app/services/deepagents_runtime/tools/skill_graphs/__init__.py` (tool output contract: `status` / `pages` / `merged_count` / `coverage` keys; remove the synthesized terminal-evidence and URLs-as-pages paths — Task 4 review gap #2)
+- Modify: `backend/app/services/deepagents_runtime/eval/compare_runner.py` (wire `tool_factory` for the deepagents leg — the production-path wiring point)
+- Test: extend `tests/unit/test_deepagents_skill_tool.py`, `tests/unit/test_deepagents_compare_runner.py`
+
+**Interfaces:**
+- Consumes: Task 7 `UrlFetchResult` (terminal evidence now observed, never synthesized), Task 8 merged candidates + `merged_count`, Task 10 persistence, `run_skill_script` (`coverage_gate` with `--manifest`).
+- Produces:
+  - `build_manifest(*, out_dir: str, results: list[UrlFetchResult], merged_count: int, listing_count: int | None) -> dict` — honest manifest: `page_files` = real non-zero paths under the evidence dir, `terminal_evidence` = observed markers only (empty list when none), `declared_total_pages`, `pages_collected`, `truncated_by_max_pages`, `listing_count`.
+  - Tool output dict now: `{"status": "succeeded" | "blocked" | "failed", "pages": [...], "candidates_file": "...", "merged_count": int, "terminal_evidence": [...], "coverage": {"verified": bool, "page_count": int, "reasons": [...]}, "per_url_results": [...], "candidates": [...]}` — `per_url_results`/`candidates` still carry `source_url` + `content_hash` for evidence promotion; `status="blocked"` (with per-url `error_code="blocked"`) when every URL was blocked, `"failed"` only on runner-level error, `"succeeded"` otherwise (per-url failures recorded inside `pages`).
+  - `build_job_discovery_tools(skill_name: str, *, budgets, tracker) -> list[Any]`-shaped factory used by `compare_runner.run_deepagents_question`: for `skill_name == "job-discovery"` returns `[build_job_discovery_tool(fetch_fn=None, script_runner=run_skill_script, extract_fn=None, checkpointer=None)]` (defaults → real browse orchestration + real per-page extraction + in-memory subgraph checkpointer); other skills → `build_skill_tools(skill_name=…, budgets=…, tracker=…)` (existing path).
+
+- [ ] **Step 1: Write the failing tests** — extend `tests/unit/test_deepagents_skill_tool.py`:
+
+```python
+def test_coverage_node_passes_real_manifest(tmp_path):
+    # runner intercepts coverage_gate and asserts --manifest path exists and
+    # its page_files point at real non-empty files; returns the real script's
+    # output shape {coverage_verified: True, reasons: [], ...}
+    ...
+
+def test_coverage_node_no_synthesized_terminal_evidence():
+    # results with terminal_evidence == [] -> manifest.terminal_evidence == []
+    # (never derived from the last page hash)
+
+def test_tool_output_contract_blocked_all_urls():
+    # all URLs blocked -> status "blocked", error_code "blocked" per url
+
+def test_tool_output_contract_merged_count_present():
+    # succeeded path -> merged_count == len(merged candidates)
+```
+
+Extend `tests/unit/test_deepagents_compare_runner.py`:
+
+```python
+def test_deepagents_leg_wires_job_discovery_tool_factory():
+    # monkeypatch cr.DeepAgentsHarness; assert the harness was constructed with
+    # a tool_factory and that calling it for skill "job-discovery" yields a
+    # single callable tool whose build params route to build_job_discovery_tool
+    # (patched at module level); other skills fall back to build_skill_tools.
+```
+
+- [ ] **Step 2: Run tests to verify they fail** — the manifest/coverage contract is not implemented (the current node passes URLs as `--pages` and synthesizes terminal evidence — both are the defects this task fixes).
+
+- [ ] **Step 3: Rewrite the coverage node honestly** — build the manifest from the real run outputs (`page_files` = only files that exist and are non-empty under the evidence dir; `terminal_evidence` = only markers actually observed by browse, empty list otherwise; counts from the run); run `coverage_gate --manifest <manifest_path>`; parse `coverage_verified` + reasons + metrics into the output; never fabricate `next_control_absent`/`page_content_repeated`, never pass URLs as page paths. When the coverage script exits non-zero / unparsable (including `missing_terminal_evidence`), the output reports `verified: False` with the reasons string — same safe degradation as Task 4 fix round 1.
+
+- [ ] **Step 4: Tool output contract** — `build_job_discovery_tool.run` returns `ToolObservation(tool_name=…, status=…, error_code=…, output={…})` with the Step 1 contract keys; `status` semantics per Interfaces above. The `_merged.*` glob exclusion from Task 8 prevents double-counting.
+
+- [ ] **Step 5: Wire `compare_runner`** — `run_deepagents_question`'s default harness construction gains `tool_factory=build_job_discovery_tools` (imports from the skill_graphs package); the `harness=None` default path stays the only wiring point (production API wiring remains P2+, documented in the spec — unchanged). Existing compare_runner tests keep passing (the monkeypatched harness seam absorbs the new kwarg).
+
+- [ ] **Step 6: Full suite + ruff** — 100% branch coverage retained; `test_deepagents_skill_tool.py`'s coverage fakes updated to mirror the real `coverage_gate` output shape (the Task 4 residual minor about the no-pages fake is resolved here).
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add backend/app/services/deepagents_runtime/tools/skill_graphs/job_discovery_graph.py backend/app/services/deepagents_runtime/tools/skill_graphs/__init__.py backend/app/services/deepagents_runtime/eval/compare_runner.py tests/unit/test_deepagents_skill_tool.py tests/unit/test_deepagents_compare_runner.py
+git commit -m "feat(deepagents-runtime): honest manifest coverage gate + tool output contract + eval wiring
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+### Task 12: parity gate re-run, Task 6 review minors, honest conclusion
+
+**Files:**
+- Modify: `backend/app/services/deepagents_runtime/eval/compare_runner.py` (per-question isolation — minor c)
+- Modify: `backend/app/services/deepagents_runtime/eval/summarize*.py` (bucket closure — minor d; exact file per repo layout)
+- Modify: `tests/manual/run_deepagents_parity.py` (parity-table run1 mislabel — minor a; SKIP-path claim — minor b)
+- Test: `tests/unit/test_deepagents_compare_runner.py`, `tests/unit/test_deepagents_parity.py` (if present)
+
+**Steps:**
+
+- [ ] **Step 1: Fix the 4 Task 6 review minors (recorded in the ledger 2026-08-07):**
+  - (a) parity report table rows for `gate`/`SKIP` contradict `parity_run1.log` → fix the report generation to read the log rows (never hardcode).
+  - (b) SKIP-path claim overstated: module-level imports execute before the env check → move the imports inside the env-guarded branch (or correct the claim in the log message; pick the code fix if the imports are heavy).
+  - (c) `run_comparison` has no per-question isolation: wrap each question's deepagents + legacy legs in `try/except`, record `{"error": …}` in `per_question`, and continue the round (a single failing question must not kill the round).
+  - (d) `summarize_comparison` buckets don't close: `unknown` statuses (e.g. `"unknown"` from the harness seam) never enter any tally → add an `"unknown"` bucket so `succeeded + waiting_user + failed + unknown == total` always.
+
+- [ ] **Step 2: Re-run the parity gate** — same 6-URL baseline, same command as Task 6. **Pass** = per the gate: `success ≥ 3` AND `candidates ≥ 797` (no regression vs baseline) AND coverage `verified=True` for the job-discovery step. If the live LLM/browse run needs Playwright + network (the task's known iteration point), follow the Task 6 Step 5 iteration procedure (re-run on transient infra failure; investigate on real regression).
+
+- [ ] **Step 3: Full suite + ruff + commit the minors** — run the full unit suite (100% branch) and ruff; commit the four fixes as one `fix(deepagents-runtime): parity tooling minors` commit (footer convention).
+
+- [ ] **Step 4: Honest conclusion** — write the outcome into the ledger (`.superpowers/sdd/2026-08-07-deepagents-runtime/progress.md`):
+  - If the gate passes: record the run numbers, name the parity branch (which modes/URLs reached which paths), and list any residual differences from the skill's behavior that are *documented decisions* (e.g. per-URL tool semantics vs the retired Smartsheet L3 flow — the 7 OUT-OF-SUBGRAPH-SCOPE items from the gap inventory) — never claim "100% identical" if the inventory says otherwise.
+  - If the gate fails: new honest conclusion per the parity-gate rule (spec §7: "不劣化才通过") — quantify the delta vs baseline, name the root cause with file:line evidence, and state whether the port decision (full port) or the parity baseline needs revisiting. Do NOT paper over the result.
+  - Also record: `user_id=""` production flush limitation remains (eval seam only; API wiring is P2+ per spec) — carried, not silently fixed.
+
+- [ ] **Step 5: Commit the conclusion** (docs/ledger-only commit, footer convention) — after this task the branch is ready for the final whole-branch review.
+
+---
+
+## Extension Self-Review Notes (vs the skill docs)
+
+- The gap inventory (`.superpowers/sdd/2026-08-07-deepagents-runtime/skill-gap-inventory.md`) is the traceability matrix: Tasks 7-12 map onto its MISSING/PARTIAL items by section (browse modes B1-B13 → Task 7; single-url extraction U1-U13 → Task 8; wechat W1-W6 → Task 9; incremental P1-P12 → Task 10; scripts R4/R6/R7 coverage+state+normalize → Tasks 10-11; schema M1-M7 → Task 8 validate/dedup standards). The 7 OUT-OF-SUBGRAPH-SCOPE items are the retired Smartsheet L3 ingestion flow (per-URL tool semantics) — explicitly concluded in Task 12 Step 4, not silently dropped.
+- X1/X2 headline contradictions from the inventory are resolved in the extension with the same rulings the skill's own docs make (per-page fan-out canonical; only observed terminal evidence).
+- Task 6's parity baseline (success=3, candidates=797) is the gate in Task 12; the extension changes the subgraph behavior, not the baseline.
+- All interfaces cross-checked across tasks: `UrlFetchResult` (7→8→11), `PageFile` (7→8), `LLMJobExtractor`/`extract_page` (8→9), `append_errors_jsonl` (9→10 move), `build_manifest` (11), tool output keys (8→11). No task references a name another task does not produce.
