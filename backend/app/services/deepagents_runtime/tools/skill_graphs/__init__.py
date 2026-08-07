@@ -42,6 +42,7 @@ def build_job_discovery_tool(
     checkpointer: Any = None,
     settings=None,
     candidates_dir=None,
+    state_dir=None,
 ) -> StructuredTool:
     """Wrap the compiled job-discovery workflow as a single @tool.
 
@@ -51,7 +52,12 @@ def build_job_discovery_tool(
     ``_project_tool_observations`` validates every ToolMessage against that
     schema — a bare dict would be silently dropped as invalid).  ``settings``
     gates the optional LLM extraction (spec §4.3); ``candidates_dir`` points
-    the per-page write/dedup phases at a run-scoped output directory.
+    the per-page write/dedup phases at a run-scoped output directory;
+    ``state_dir`` is the stable incremental store root (Task 10).  The input
+    payload accepts a JSON array (single-shot) or an object
+    ``{"urls": [...], "prior_metadata": {...}}`` (incremental: state
+    check/mark + merged accumulation; ``prior_metadata`` = ``file_id`` /
+    ``sheet_id`` / ``update_time``).
     """
 
     graph = build_job_discovery_graph(
@@ -60,6 +66,7 @@ def build_job_discovery_tool(
         extract_fn=extract_fn,
         settings=settings,
         candidates_dir=candidates_dir,
+        state_dir=state_dir,
     ).compile(checkpointer=checkpointer)
 
     def _observe(status: str, **kwargs: Any) -> str:
@@ -76,9 +83,16 @@ def build_job_discovery_tool(
                 # string positionally, so the {"payload": ...} wrapper JSON
                 # arrives here instead of the decoded array
                 value = json.loads(value["payload"])
+            if isinstance(value, dict):
+                # incremental input object: {"urls": [...], "prior_metadata": {...}}
+                invoke: dict[str, Any] = {"urls": value.get("urls", [])}
+                if value.get("prior_metadata") is not None:
+                    invoke["prior_metadata"] = value["prior_metadata"]
+            else:
+                invoke = {"urls": value}
             thread = _workflow_thread.get()
             config = {"configurable": {"thread_id": thread}} if thread else {}
-            final = graph.invoke({"urls": value}, config)
+            final = graph.invoke(invoke, config)
         except Exception as exc:  # noqa: BLE001 - fold into observation, never raise
             return _observe(
                 "failed", error_code=f"workflow_error: {type(exc).__name__}"
@@ -95,6 +109,9 @@ def build_job_discovery_tool(
                 # (batch fast-path wrote no per-page files)
                 "merged_count": final.get("merged_count", 0),
                 "dedup_stats": final.get("dedup_stats", {}),
+                # Task 10: comparison-key map from the normalize node (keys
+                # only — stored titles are never altered)
+                "normalize_keys": final.get("normalize_keys", {}),
             },
         )
 
@@ -104,7 +121,9 @@ def build_job_discovery_tool(
         description=(
             "按 SKILL.md 六阶段工作流批量处理招聘 URL：抓取页面、正则提取 JD"
             "（低置信才用 LLM）、校验、去重、覆盖门控。输入 JSON 数组"
-            "（用户给出的官方招聘 URL），返回 per_url_results + candidates + coverage。"
+            "（用户给出的官方招聘 URL），或增量对象 {\"urls\": [...], "
+            "\"prior_metadata\": {file_id, sheet_id, update_time}}；返回 "
+            "per_url_results + candidates + coverage + normalize_keys。"
         ),
         args_schema=_JsonPayload,
     )

@@ -23,8 +23,8 @@ file paths (matching the scripts' real CLI).
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
-import tempfile
 from pathlib import Path
 from typing import Any, Callable, TypedDict
 
@@ -46,6 +46,13 @@ from backend.app.services.deepagents_runtime.tools.llm_extractor import (
 from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import (
     PageFile,
     browse_fetch_urls,
+)
+from backend.app.services.deepagents_runtime.tools.skill_graphs.persistence import (
+    append_errors_jsonl,
+    load_prior_candidates,
+    normalize_candidates,
+    state_check,
+    state_mark,
 )
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
@@ -71,6 +78,10 @@ _WECHAT_OUT_DIR = str(SKILL_DIR / "output" / "ocr" / "run-0")
 
 class JobDiscoveryWorkflowState(TypedDict):
     urls: list[str]
+    #: Task 10: optional {file_id, sheet_id, update_time} — its presence
+    #: flips the run to incremental mode (state check/mark + merged
+    #: accumulation); absent = single-shot, unchanged behavior
+    prior_metadata: dict[str, Any] | None
     pages: list[dict[str, Any]]
     per_url_results: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
@@ -79,6 +90,9 @@ class JobDiscoveryWorkflowState(TypedDict):
     error: str | None
     merged_count: int
     dedup_stats: dict[str, Any]
+    #: Task 10: comparison-key map from the normalize node (keys only —
+    #: stored titles are never altered)
+    normalize_keys: dict[str, str]
 
 
 def _read_page_text(path: str) -> str:
@@ -112,7 +126,26 @@ def _resolve_candidates_dir(candidates_dir: str | None) -> Path:
     return resolved
 
 
-def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
+def _resolve_state_dir(state_dir: str | None) -> Path:
+    """Resolve the stable incremental store root under the skill dir.
+
+    None -> the skill dir itself (the store lands at
+    ``SKILL_DIR/output/...`` — state.json, candidates/merged_final.json,
+    errors.jsonl — the skill's canonical output area); a relative value
+    resolves under the skill dir too; absolute values pass through as-is
+    (tests use tmp dirs so the repo tree stays clean).
+    """
+    if state_dir is None:
+        return SKILL_DIR
+    resolved = Path(state_dir)
+    if not resolved.is_absolute():
+        resolved = SKILL_DIR / resolved
+    return resolved
+
+
+def _default_fetch(
+    urls: list[str], *, state_dir: str | None = None
+) -> list[dict[str, Any]]:
     """Browse-backed fetch: classify -> mode fallback chain -> per-URL evidence.
 
     Orchestrates ``browse_fetch_urls`` (site classification + the allowlisted
@@ -124,10 +157,12 @@ def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
     ``wechat_pending`` URLs are carried through untouched here - the fetch
     node routes them into the Task 9 WeChat slice (``wechat_slice.py``)
     before the extract node.  A per-URL failure never aborts the run
-    (layered failure recovery, spec §4.2).
+    (layered failure recovery, spec §4.2).  ``state_dir`` derives the
+    per-run evidence dir (``<state_dir>/output/evidence/run-0`` — the graph
+    has no run_id; Task 11 wires run-scoped dirs).
     """
     pages: list[dict[str, Any]] = []
-    for result in browse_fetch_urls(urls):
+    for result in browse_fetch_urls(urls, state_dir=state_dir):
         if result.status == "succeeded":
             page: dict[str, Any] = {
                 "url": result.url,
@@ -172,11 +207,26 @@ def _default_fetch(urls: list[str]) -> list[dict[str, Any]]:
     return pages
 
 
-def _write_candidates(candidates: list[dict[str, Any]]) -> Path:
-    workdir = Path(tempfile.mkdtemp(dir=SKILL_DIR))
+def _write_candidates(
+    candidates: list[dict[str, Any]], *, state_dir: Path
+) -> Path:
+    """Write the validate/coverage snapshot under the stable state dir.
+
+    Task 4 minor: replaces the ``tempfile.mkdtemp(dir=SKILL_DIR)`` leak —
+    the scratch file lives at ``<state_dir>/output/work/candidates.json``
+    (overwritten each run, never a tmp dir under the skill dir).
+    """
+    workdir = Path(state_dir) / "output" / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
     path = workdir / "candidates.json"
     path.write_text(json.dumps(candidates, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def _entry_ids(url: str, content_hash: str) -> list[str]:
+    """Per-URL state entry id: ``content_hash[:16]_url_hash8`` (verified format)."""
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
+    return [f"{content_hash[:16]}_{url_hash}"]
 
 
 def extract_page(
@@ -349,9 +399,15 @@ def build_job_discovery_graph(
     settings=None,
     candidates_dir=None,
     wechat_fn=None,
+    state_dir=None,
 ) -> StateGraph:
-    """Assemble the workflow graph with injectable seams for tests."""
-    fetch_fn = fetch_fn or _default_fetch
+    """Assemble the workflow graph with injectable seams for tests.
+
+    ``state_dir`` is the stable incremental store root (default: the skill
+    dir — ``output/state.json``, ``output/candidates/merged_final.json``,
+    ``output/errors.jsonl``).  ``prior_metadata`` on the invoke input flips
+    a run to incremental mode; absent, no state check/mark runs (single-shot).
+    """
     script_runner = script_runner or run_skill_script
     extract_fn = extract_fn or functools.partial(
         _default_extract,
@@ -359,9 +415,16 @@ def build_job_discovery_graph(
         script_runner=script_runner,
         candidates_dir=candidates_dir,
     )
+    candidates_dir = _resolve_candidates_dir(candidates_dir)
+    state_dir = _resolve_state_dir(state_dir)
+    fetch_fn = fetch_fn or functools.partial(
+        _default_fetch, state_dir=str(state_dir)
+    )
     if wechat_fn is None:
         # default: the real Task 9 slice, run through the same runner seam
-        # (name resolution at call time keeps the seam monkeypatchable)
+        # (name resolution at call time keeps the seam monkeypatchable);
+        # the stable store path rides along so the slice's deep-crawl
+        # hand-off lands at <state_dir>/output/errors.jsonl
         def default_wechat_fn(url: str) -> WechatResult:
             context = ToolContext(
                 user_id="", run_id="", metadata={"observed_public_evidence": []}
@@ -373,16 +436,39 @@ def build_job_discovery_graph(
                 url,
                 runner=script_runner,
                 out_dir=_WECHAT_OUT_DIR,
+                state_dir=str(state_dir),
                 context=context,
                 extract_fn=extract_observed_job_details,
                 llm_extractor=llm_extractor,
             )
 
         wechat_fn = default_wechat_fn
-    candidates_dir = _resolve_candidates_dir(candidates_dir)
 
     def fetch_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
-        pages = fetch_fn(state["urls"])
+        urls = state["urls"]
+        prior_metadata = state.get("prior_metadata")
+        skipped: dict[str, dict[str, Any]] = {}
+        pending = urls
+        if prior_metadata is not None:
+            # Task 10 incremental: check before each URL's fetch — a URL
+            # the state store already marks extracted at this update_time
+            # is skipped (its per-URL entry carries the skip status, no
+            # fetch runs); everything else fetches as before
+            update_time = str(prior_metadata.get("update_time", ""))
+            pending = []
+            for url in urls:
+                if state_check(
+                    url, update_time, runner=script_runner, state_dir=str(state_dir)
+                ):
+                    skipped[url] = {
+                        "url": url,
+                        "source_url": url,
+                        "status": "skipped",
+                        "reason": "update_time unchanged",
+                    }
+                else:
+                    pending.append(url)
+        pages = fetch_fn(pending)
         per_url: list[dict[str, Any]] = []
         wechat_candidates: list[dict[str, Any]] = []
         wechat_index = 0
@@ -404,6 +490,24 @@ def build_job_discovery_graph(
                         None,
                         False,
                         "wechat_slice_error",
+                    )
+                if (
+                    prior_metadata is not None
+                    and result.status == "needs_manual_review"
+                ):
+                    # Task 10: errors.jsonl accumulates needs_manual_review
+                    # entries at the stable store across runs (the slice
+                    # itself persists needs_deep_crawl the same way)
+                    append_errors_jsonl(
+                        {
+                            "url": page.get("url"),
+                            "cause": "needs_manual_review",
+                            "status": "needs_manual_review",
+                            "reason": result.reason,
+                            "channel": result.channel,
+                        },
+                        runner=script_runner,
+                        state_dir=str(state_dir),
                     )
                 page_id = f"page_wechat_{wechat_index:02d}"
                 wechat_index += 1
@@ -471,6 +575,10 @@ def build_job_discovery_graph(
                     "blocked_reason": page.get("blocked_reason"),
                 }
             )
+        if skipped:
+            # state-skipped URLs surface as per-URL entries too (original
+            # batch order), so every input URL has exactly one entry
+            per_url.extend(skipped[url] for url in urls if url in skipped)
         return {
             "pages": pages,
             # materialize the error channel (LangGraph omits channels never
@@ -485,6 +593,25 @@ def build_job_discovery_graph(
         # the fetch node) merge into the per-run candidate set ahead of the
         # regular page candidates; dedup/coverage see both flows.
         wechat_candidates = state.get("wechat_candidates") or []
+        prior_metadata = state.get("prior_metadata")
+        if prior_metadata is not None:
+            # Task 10: mark after extraction — every URL this run processed
+            # (per-URL status succeeded/partial_success with evidence) is
+            # marked in the state store with the run's file/sheet ids, so
+            # the next run's update_time check skips it
+            for entry in state.get("per_url_results") or []:
+                if (
+                    entry.get("status") in {"succeeded", "partial_success"}
+                    and entry.get("content_hash")
+                ):
+                    state_mark(
+                        entry["url"],
+                        _entry_ids(entry["url"], entry["content_hash"]),
+                        runner=script_runner,
+                        state_dir=str(state_dir),
+                        file_id=str(prior_metadata.get("file_id", "")),
+                        sheet_id=str(prior_metadata.get("sheet_id", "")),
+                    )
         pages = [
             page
             for page in state.get("pages", [])
@@ -501,9 +628,8 @@ def build_job_discovery_graph(
     def validate_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
         if not state["candidates"]:
             return {}
-        with tempfile.TemporaryDirectory(dir=SKILL_DIR):
-            path = _write_candidates(state["candidates"])
-            out = script_runner("validate", str(path))
+        path = _write_candidates(state["candidates"], state_dir=state_dir)
+        out = script_runner("validate", str(path))
         if "ERROR" in out:
             return {"error": f"validate failed: {out[:500]}"}
         return {}
@@ -517,9 +643,24 @@ def build_job_discovery_graph(
             # in-memory candidates flow through un-deduped and merged_count
             # stays at its tool default (0) - an honest "no merge ran"
             return {}
+        inputs = page_files
+        if state.get("prior_metadata") is not None:
+            # Task 10: merged_final accumulates across runs — the prior
+            # store is staged via write_candidates --append (identity-merge;
+            # re-appending the same candidates is a no-op) and deduplicate
+            # merges prior + new into merged_final.json
+            prior = load_prior_candidates(state_dir=str(state_dir))
+            if prior:
+                prior_file = candidates_dir / "prior_merged.json"
+                script_runner(
+                    "write_candidates",
+                    f"--out {prior_file} --append",
+                    stdin=json.dumps(prior, ensure_ascii=False),
+                )
+                inputs = [prior_file, *inputs]
         merged = candidates_dir / "merged_final.json"
         out = script_runner(
-            "deduplicate", " ".join(str(f) for f in page_files) + f" --out {merged}"
+            "deduplicate", " ".join(str(f) for f in inputs) + f" --out {merged}"
         )
         if "ERROR" in out:
             return {"error": f"deduplicate failed: {out[:500]}"}
@@ -557,23 +698,34 @@ def build_job_discovery_graph(
             "dedup_stats": stats,
         }
 
+    def normalize_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
+        # Task 10: comparison keys via normalize.py --json (keys only, the
+        # script's contract — stored titles are never altered); they enter
+        # the tool output as the normalize_keys map
+        if not state["candidates"]:
+            return {}
+        return {
+            "normalize_keys": normalize_candidates(
+                state["candidates"], runner=script_runner
+            )
+        }
+
     def coverage_node(state: JobDiscoveryWorkflowState) -> dict[str, Any]:
         pages = [
             page for page in state.get("pages", []) if page.get("status") == "succeeded"
         ]
         page_urls = " ".join(page.get("url", "") for page in pages)
-        with tempfile.TemporaryDirectory(dir=SKILL_DIR):
-            path = _write_candidates(state["candidates"])
-            # real coverage_gate.py (non-manifest path) emits
-            # coverage_verified/page_count/.../reasons and always reports
-            # missing_terminal_evidence when --terminal-evidence is absent;
-            # the subgraph's best terminal signal is the last captured page
-            # hash (browse's end-of-list marker is not available in-graph)
-            cli = f"{path} --pages {page_urls}".strip() if page_urls else str(path)
-            terminal = pages[-1].get("content_hash") if pages else None
-            if terminal:
-                cli += f" --terminal-evidence {terminal}"
-            out = script_runner("coverage_gate", cli)
+        path = _write_candidates(state["candidates"], state_dir=state_dir)
+        # real coverage_gate.py (non-manifest path) emits
+        # coverage_verified/page_count/.../reasons and always reports
+        # missing_terminal_evidence when --terminal-evidence is absent;
+        # the subgraph's best terminal signal is the last captured page
+        # hash (browse's end-of-list marker is not available in-graph)
+        cli = f"{path} --pages {page_urls}".strip() if page_urls else str(path)
+        terminal = pages[-1].get("content_hash") if pages else None
+        if terminal:
+            cli += f" --terminal-evidence {terminal}"
+        out = script_runner("coverage_gate", cli)
         try:
             coverage = json.loads(out)
         except ValueError:
@@ -590,11 +742,13 @@ def build_job_discovery_graph(
     graph.add_node("extract", extract_node)
     graph.add_node("validate", validate_node)
     graph.add_node("dedup", dedup_node)
+    graph.add_node("normalize", normalize_node)
     graph.add_node("coverage", coverage_node)
     graph.add_edge(START, "fetch")
     graph.add_edge("fetch", "extract")
     graph.add_edge("extract", "validate")
     graph.add_edge("validate", "dedup")
-    graph.add_edge("dedup", "coverage")
+    graph.add_edge("dedup", "normalize")
+    graph.add_edge("normalize", "coverage")
     graph.add_edge("coverage", END)
     return graph

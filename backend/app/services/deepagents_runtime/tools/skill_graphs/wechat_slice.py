@@ -51,6 +51,10 @@ from backend.app.services.career_skills.job_discovery import (
     PublicJobFetchError,
 )
 from backend.app.services.deepagents_runtime.tools.extract_gate import extract_with_gate
+from backend.app.services.deepagents_runtime.tools.skill_graphs.persistence import (
+    _append_errors_jsonl_at,
+    append_errors_jsonl,
+)
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     run_skill_script,
 )
@@ -553,36 +557,6 @@ def _enrich_candidates(
         candidate.normalization_warnings.extend(channel_warnings)
 
 
-# ------------------------------------------------------ errors.jsonl (L6 S4)
-
-
-def append_errors_jsonl(entry: dict, *, runner=None, out_dir: str) -> None:
-    """Append one line to ``<out_dir>/errors.jsonl`` (idempotent by url+cause).
-
-    A duplicate (same ``url`` AND same ``cause``) is skipped, so retried
-    runs never grow the file; unparsable or non-dict existing lines are
-    ignored.  ``runner`` is accepted for interface parity with the
-    skill-script seam (Task 10 moves this to persistence); the file is
-    written directly.
-    """
-    path = Path(out_dir) / "errors.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                existing = json.loads(line)
-            except ValueError:
-                continue
-            if (
-                isinstance(existing, dict)
-                and existing.get("url") == entry.get("url")
-                and existing.get("cause") == entry.get("cause")
-            ):
-                return
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
 # ---------------------------------------------------------------- pipeline
 
 
@@ -595,14 +569,15 @@ def _no_images(
     llm_extractor: Callable | None,
     out_dir: str,
     runner: Callable | None,
+    state_dir: str | None = None,
 ) -> WechatResult:
     """L1 end-state for an article with no usable images.
 
     ``text < 200 chars`` -> needs_manual_review "article has no content"
     (doc L1); otherwise the normal channel triage runs on the article text
     alone (a career URL in a text-only article still triggers the doc's
-    deep-crawl hand-off, which is why ``out_dir``/``runner`` are threaded
-    through).
+    deep-crawl hand-off, which is why ``out_dir``/``runner``/``state_dir``
+    are threaded through).
     """
     if len(article_text) < _ARTICLE_TEXT_MIN_CHARS:
         return WechatResult(
@@ -617,6 +592,7 @@ def _no_images(
         llm_extractor=llm_extractor,
         out_dir=out_dir,
         runner=runner,
+        state_dir=state_dir,
     )
 
 
@@ -630,6 +606,7 @@ def _classify_and_extract(
     llm_extractor: Callable | None,
     out_dir: str,
     runner: Callable | None,
+    state_dir: str | None = None,
 ) -> WechatResult:
     """Channel triage -> extraction (REPLACE-OCR for B) -> enrichment.
 
@@ -638,8 +615,10 @@ def _classify_and_extract(
     OCR text alone.  Every A/B candidate is enriched with per-image OCR
     evidence + the application-channel JSON; a career URL marks
     ``needs_deep_crawl`` and appends the doc's hand-off entry to
-    errors.jsonl.  ``partial_success`` (doc L3) when the article is
-    image-heavy AND every OCR text is under 100 chars.
+    ``<state_dir>/output/errors.jsonl`` (stable store, Task 10) or
+    ``<out_dir>/errors.jsonl`` in single-shot mode.
+    ``partial_success`` (doc L3) when the article is image-heavy AND every
+    OCR text is under 100 chars.
     """
     channel, reason = classify_wechat_channel(
         article_text=article_text,
@@ -692,25 +671,27 @@ def _classify_and_extract(
         else "succeeded"
     )
     if deep_crawl:
-        append_errors_jsonl(
-            {
-                "url": url,
-                "cause": "needs_deep_crawl",
-                "career_url": career_url,
-                "status": "needs_deep_crawl",
-                "reason": (
-                    "Career URL present - the article is an index; real JDs live "
-                    "at the career site and require a downstream deep crawl"
-                ),
-                "ocr_extracted_titles": [c.title for c in candidates if c.title],
-                "retry_strategy": (
-                    "Use playwright skill to click into each category → each "
-                    "position → capture detail page text"
-                ),
-            },
-            runner=runner,
-            out_dir=out_dir,
-        )
+        entry = {
+            "url": url,
+            "cause": "needs_deep_crawl",
+            "career_url": career_url,
+            "status": "needs_deep_crawl",
+            "reason": (
+                "Career URL present - the article is an index; real JDs live "
+                "at the career site and require a downstream deep crawl"
+            ),
+            "ocr_extracted_titles": [c.title for c in candidates if c.title],
+            "retry_strategy": (
+                "Use playwright skill to click into each category → each "
+                "position → capture detail page text"
+            ),
+        }
+        if state_dir is not None:
+            # incremental mode: hand off at the stable store
+            # (<state_dir>/output/errors.jsonl, idempotent by url+cause)
+            append_errors_jsonl(entry, runner=runner, state_dir=state_dir)
+        else:
+            _append_errors_jsonl_at(Path(out_dir) / "errors.jsonl", entry)
     return WechatResult(
         url,
         status,
@@ -734,6 +715,7 @@ def run_wechat_slice(
     llm_extractor: Callable | None = None,
     fetch_html_fn: Callable[[str], str] | None = None,
     download_fn: Callable[[str], bytes] | None = None,
+    state_dir: str | None = None,
 ) -> WechatResult:
     """Run the Level 1-6 WeChat image-article pipeline for one URL.
 
@@ -755,6 +737,11 @@ def run_wechat_slice(
     The ``fetch_html_fn`` / ``download_fn`` / ``runner`` seams keep unit
     tests deterministic (never live HTTP, Playwright, or LLM); the defaults
     are the real guarded fetch / download / ``ocr_image`` invocation.
+
+    ``state_dir`` is the incremental-mode stable store: when set, the
+    ``needs_deep_crawl`` hand-off appends to
+    ``<state_dir>/output/errors.jsonl``; when None (single-shot), it lands
+    at ``<out_dir>/errors.jsonl`` as before.
     """
     guard_reason = _l1_guard(url)
     if guard_reason is not None:
@@ -788,6 +775,7 @@ def run_wechat_slice(
             llm_extractor=llm_extractor,
             out_dir=out_dir,
             runner=runner,
+            state_dir=state_dir,
         )
     download = download_fn or _default_download_image
     ocr_dir = Path(out_dir) / "ocr"
@@ -823,6 +811,7 @@ def run_wechat_slice(
             llm_extractor=llm_extractor,
             out_dir=out_dir,
             runner=runner,
+            state_dir=state_dir,
         )
     if not ocr_items:
         # images were downloaded but OCR produced no usable text: a
@@ -839,6 +828,7 @@ def run_wechat_slice(
                 llm_extractor=llm_extractor,
                 out_dir=out_dir,
                 runner=runner,
+                state_dir=state_dir,
             )
         return WechatResult(
             url,
@@ -858,4 +848,5 @@ def run_wechat_slice(
         llm_extractor=llm_extractor,
         out_dir=out_dir,
         runner=runner,
+        state_dir=state_dir,
     )

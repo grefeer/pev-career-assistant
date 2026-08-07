@@ -29,7 +29,6 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_gr
 )
 from backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice import (
     WechatResult,
-    append_errors_jsonl,
     classify_wechat_channel,
     run_wechat_slice,
 )
@@ -153,36 +152,35 @@ def test_channel_d_non_job_promotional() -> None:
 # ------------------------------------------------------------ errors.jsonl
 
 
-def test_needs_deep_crawl_appends_errors_jsonl(tmp_path) -> None:
-    def fake_runner(script, *, cli_args="", stdin=""):
-        return json.dumps({"ok": True})  # state/ocr scripts are faked in unit tests
-
-    append_errors_jsonl(
-        {"url": "https://mp.weixin.qq.com/s/abc", "cause": "needs_deep_crawl"},
-        runner=fake_runner, out_dir=str(tmp_path),
+def test_run_wechat_slice_deep_crawl_handoff_at_state_dir(tmp_path) -> None:
+    # incremental mode (state_dir set): the deep-crawl hand-off lands at the
+    # stable store <state_dir>/output/errors.jsonl, never <out_dir>/errors.jsonl
+    html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    ocr_text = (
+        "招聘：后端工程师，投递：jereh.zhiye.com/campus。岗位职责：负责后端服务开发与"
+        "性能优化，参与架构设计，保障系统稳定可靠。任职要求：精通 Python 与分布式系统，"
+        "3 年以上经验，本科及以上学历，良好的团队协作能力。"
     )
-    lines = (tmp_path / "errors.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(text=ocr_text),
+        out_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract({}),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.needs_deep_crawl is True
+    lines = (
+        (tmp_path / "output" / "errors.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    )
     assert len(lines) == 1
-    assert json.loads(lines[0])["url"] == "https://mp.weixin.qq.com/s/abc"
-
-
-def test_append_errors_jsonl_idempotent_by_url_and_cause(tmp_path) -> None:
-    entry = {"url": _WECHAT_URL, "cause": "needs_deep_crawl", "status": "needs_deep_crawl"}
-    append_errors_jsonl(entry, out_dir=str(tmp_path))
-    append_errors_jsonl(entry, out_dir=str(tmp_path))  # same url + cause -> skip
-    append_errors_jsonl({**entry, "cause": "another_cause"}, out_dir=str(tmp_path))
-    lines = (tmp_path / "errors.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
-
-
-def test_append_errors_jsonl_creates_dirs_and_tolerates_corrupt_lines(tmp_path) -> None:
-    out_dir = tmp_path / "nested" / "dir"
-    (out_dir).mkdir(parents=True)
-    (out_dir / "errors.jsonl").write_text("not json\n", encoding="utf-8")
-    append_errors_jsonl({"url": _WECHAT_URL, "cause": "needs_deep_crawl"}, out_dir=str(out_dir))
-    lines = (out_dir / "errors.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    assert json.loads(lines[1])["url"] == _WECHAT_URL
+    assert json.loads(lines[0])["cause"] == "needs_deep_crawl"
+    assert not (tmp_path / "errors.jsonl").exists()
 
 
 # ------------------------------------------------------ full pipeline (B)
@@ -1206,16 +1204,6 @@ def test_parse_article_skips_whitespace_only_text_nodes() -> None:
     assert article_text.splitlines() == ["职位：后端", "职责：接口"]
 
 
-def test_append_errors_jsonl_tolerates_non_dict_lines(tmp_path) -> None:
-    (tmp_path / "errors.jsonl").write_text("not json\n42\n", encoding="utf-8")
-    append_errors_jsonl(
-        {"url": _WECHAT_URL, "cause": "needs_deep_crawl"}, out_dir=str(tmp_path)
-    )
-    lines = (tmp_path / "errors.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 3
-    assert json.loads(lines[2])["url"] == _WECHAT_URL
-
-
 # -------------------------------------- default fetch / guard internals
 
 
@@ -1503,6 +1491,7 @@ def test_graph_routes_wechat_pending_through_slice(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": [_WECHAT_URL]})
     per_url = final["per_url_results"][0]
@@ -1535,6 +1524,7 @@ def test_graph_surfaces_needs_manual_review_and_blocked(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=lambda url: outcomes[url],
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": list(outcomes)})
     by_url = {r["url"]: r for r in final["per_url_results"]}
@@ -1559,6 +1549,7 @@ def test_graph_wechat_slice_crash_is_recoverable(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": [_WECHAT_URL]})
     per_url = final["per_url_results"][0]
@@ -1607,6 +1598,7 @@ def test_graph_wechat_candidates_merge_with_page_candidates(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs", _WECHAT_URL]})
     titles = {c["title"] for c in final["candidates"]}
@@ -1639,6 +1631,7 @@ def test_graph_wechat_partial_success_candidates_flow(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": [_WECHAT_URL]})
     assert final["per_url_results"][0]["status"] == "partial_success"
@@ -1671,7 +1664,10 @@ def test_graph_default_wechat_seam_invokes_slice(monkeypatch, tmp_path) -> None:
         return [{"url": u, "source_url": u, "status": "wechat_pending"} for u in urls]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch, script_runner=_graph_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch,
+        script_runner=_graph_fake_runner,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": [_WECHAT_URL]})
     assert captured["url"] == _WECHAT_URL
@@ -1709,6 +1705,7 @@ def test_graph_default_wechat_seam_honors_llm_flag(monkeypatch, tmp_path) -> Non
         script_runner=_graph_fake_runner,
         settings=settings_override(deepagents_llm_extraction_enabled=True),
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     graph.invoke({"urls": [_WECHAT_URL]})
     assert captured["llm_extractor"] is marker
@@ -1737,6 +1734,7 @@ def test_graph_wechat_non_success_candidates_not_persisted(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": [_WECHAT_URL]})
     assert not (tmp_path / "page_wechat_00.json").exists()
@@ -1770,6 +1768,7 @@ def test_graph_wechat_entry_carries_evidence_projection(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     entry = graph.invoke({"urls": [_WECHAT_URL]})["per_url_results"][0]
     assert entry["content_hash"] == "sha256_wechat_evidence"
@@ -1791,7 +1790,53 @@ def test_graph_wechat_entry_without_text_has_empty_projection(tmp_path) -> None:
         script_runner=_graph_fake_runner,
         wechat_fn=wechat_fn,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     entry = graph.invoke({"urls": [_WECHAT_URL]})["per_url_results"][0]
     assert entry["content_hash"] is None
     assert entry["visible_text"] == ""
+
+
+def test_graph_incremental_appends_needs_manual_review_errors(tmp_path) -> None:
+    # Task 10 incremental mode (prior_metadata present): a needs_manual_review
+    # slice result is handed off to the stable store — errors.jsonl at
+    # <state_dir>/output/ accumulates the entry across runs
+    def fetch(urls: list[str]) -> list[dict]:
+        return [{"url": u, "source_url": u, "status": "wechat_pending"} for u in urls]
+
+    def wechat_fn(url: str) -> WechatResult:
+        return WechatResult(
+            url, "needs_manual_review", "C", [], None, False, "仅含联系方式"
+        )
+
+    graph = build_job_discovery_graph(
+        fetch_fn=fetch,
+        script_runner=_graph_fake_runner,
+        wechat_fn=wechat_fn,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    ).compile()
+    final = graph.invoke(
+        {
+            "urls": [_WECHAT_URL],
+            "prior_metadata": {
+                "file_id": "f1",
+                "sheet_id": "s1",
+                "update_time": "2026-08-07",
+            },
+        }
+    )
+    assert final["per_url_results"][0]["status"] == "needs_manual_review"
+    lines = (
+        (tmp_path / "output" / "errors.jsonl")
+        .read_text(encoding="utf-8")
+        .strip()
+        .splitlines()
+    )
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["url"] == _WECHAT_URL
+    assert entry["cause"] == "needs_manual_review"
+    assert entry["status"] == "needs_manual_review"
+    assert entry["reason"] == "仅含联系方式"
+    assert entry["channel"] == "C"

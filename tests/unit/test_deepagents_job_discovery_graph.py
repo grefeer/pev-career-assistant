@@ -134,7 +134,8 @@ def _seed_page_file(tmp_path: Path) -> None:
 
 def test_workflow_runs_end_to_end_with_seams(tmp_path) -> None:
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["per_url_results"][0]["status"] == "succeeded"
@@ -151,7 +152,8 @@ def test_fetch_failure_recorded_per_url_not_fatal(tmp_path) -> None:
         return [{"url": url, "status": "failed", "error_code": "blocked"} for url in urls]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://a.com", "https://b.com"]})
     assert final["per_url_results"][0]["status"] == "failed"
@@ -171,6 +173,7 @@ def test_extract_failure_records_error(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=failing_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "extract failed: evidence not found"
@@ -186,7 +189,8 @@ def test_default_extract_handles_missing_evidence(monkeypatch, tmp_path) -> None
 
     monkeypatch.setattr(jdg, "extract_observed_job_details_batch", raising_batch)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] is not None
@@ -200,7 +204,8 @@ def test_script_error_recorded_not_fatal(tmp_path) -> None:
         return _fake_runner(script, cli_args, stdin)
 
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=failing_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=failing_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] is not None
@@ -212,7 +217,8 @@ def test_fetch_page_missing_status_defaults_failed(tmp_path) -> None:
         return [{"url": url, "content_hash": "h"} for url in urls]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://a.com"]})
     assert final["per_url_results"][0]["status"] == "failed"
@@ -226,7 +232,8 @@ def test_dedup_error_recorded_not_fatal(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=failing_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=failing_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate failed: ERROR: dedup crashed"
@@ -249,7 +256,8 @@ def test_dedup_no_merged_file_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=no_output_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=no_output_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate produced no merged file"
@@ -268,7 +276,8 @@ def test_dedup_merged_unparsable_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=unparsable_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=unparsable_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output unparsable"
@@ -282,7 +291,8 @@ def test_dedup_stdout_unparsable_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=garbage_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=garbage_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output unparsable"
@@ -296,7 +306,8 @@ def test_dedup_stdout_non_object_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=list_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=list_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output unparsable"
@@ -310,7 +321,8 @@ def test_dedup_no_stats_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=no_stats_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=no_stats_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output has no stats"
@@ -324,7 +336,8 @@ def test_dedup_no_output_count_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=no_count_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=no_count_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output has no output_count"
@@ -345,7 +358,8 @@ def test_dedup_dict_with_candidates_accepted(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=dict_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=dict_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["candidates"][0]["title"] == "前端工程师"
@@ -364,7 +378,8 @@ def test_dedup_scalar_merged_has_no_candidates_list(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=scalar_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=scalar_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output has no candidates list"
@@ -381,7 +396,8 @@ def test_dedup_dict_without_candidates_recorded(tmp_path) -> None:
 
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=bad_dict_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=bad_dict_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["error"] == "deduplicate output has no candidates list"
@@ -390,7 +406,8 @@ def test_dedup_dict_without_candidates_recorded(tmp_path) -> None:
 def test_dedup_success_reports_merged_count_and_stats(tmp_path) -> None:
     _seed_page_file(tmp_path)
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["candidates"][0]["title"] == "后端工程师"
@@ -408,7 +425,8 @@ def test_coverage_unparsable_output_falls_back(tmp_path) -> None:
         return _fake_runner(script, cli_args, stdin)
 
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=garbage_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=garbage_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["coverage"] == {
@@ -424,7 +442,8 @@ def test_coverage_non_object_output_falls_back(tmp_path) -> None:
         return _fake_runner(script, cli_args, stdin)
 
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=list_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=list_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["coverage"] == {
@@ -446,7 +465,8 @@ def test_coverage_passes_terminal_evidence_and_maps_real_keys(tmp_path) -> None:
         return _fake_runner(script, cli_args, stdin)
 
     graph = build_job_discovery_graph(
-        fetch_fn=_fake_fetch, script_runner=recording_runner, candidates_dir=str(tmp_path)
+        fetch_fn=_fake_fetch, script_runner=recording_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert "--terminal-evidence hash-0" in recorded["coverage_gate"]
@@ -464,7 +484,8 @@ def test_coverage_without_content_hash_omits_terminal_evidence(tmp_path) -> None
         ]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch_without_hash, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch_without_hash, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://a.com"]})
     assert final["candidates"] == []
@@ -497,7 +518,7 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         jdg,
         "browse_fetch_urls",
-        lambda urls: [
+        lambda urls, **kwargs: [
             UrlFetchResult(
                 url="https://example.com/jobs",
                 site_class="list",
@@ -573,7 +594,9 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
         ),
     )
 
-    graph = build_job_discovery_graph(candidates_dir=str(tmp_path)).compile()
+    graph = build_job_discovery_graph(
+        candidates_dir=str(tmp_path), state_dir=str(tmp_path)
+    ).compile()
     final = graph.invoke(
         {
             "urls": [
@@ -632,7 +655,7 @@ def test_default_fetch_page_file_edges(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         jdg,
         "browse_fetch_urls",
-        lambda urls: [
+        lambda urls, **kwargs: [
             UrlFetchResult(
                 url="https://cached.example.com",
                 site_class="list",
@@ -812,6 +835,7 @@ def test_per_page_fanout_writes_and_merges_page_files(monkeypatch, tmp_path) -> 
         fetch_fn=lambda urls: pages,
         script_runner=recording_runner,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": ["https://job0.example.com"]})
 
@@ -901,6 +925,7 @@ def test_per_page_llm_gate_triggered_through_graph(monkeypatch, tmp_path) -> Non
         script_runner=_fake_runner,
         settings=settings_override(deepagents_llm_extraction_enabled=True),
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert calls == ["page-hash-0"]
@@ -934,7 +959,8 @@ def test_default_extract_page_file_missing_on_disk(tmp_path) -> None:
         ]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["candidates"] == []
@@ -967,7 +993,8 @@ def test_default_extract_zero_candidates_page(tmp_path) -> None:
         ]
 
     graph = build_job_discovery_graph(
-        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path)
+        fetch_fn=fetch, script_runner=_fake_runner, candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path)
     ).compile()
     final = graph.invoke({"urls": ["https://example.com/jobs"]})
     assert final["candidates"] == []
@@ -976,3 +1003,146 @@ def test_default_extract_zero_candidates_page(tmp_path) -> None:
     # the faithful coverage fake derives its verdict from evidence, not
     # candidate existence: terminal evidence is present, so no reasons
     assert final["coverage"]["reasons"] == []
+
+
+# ---------------------------------------------------------------------------
+# Task 10 incremental mode: state check/mark + merged accumulation
+# ---------------------------------------------------------------------------
+
+
+def test_graph_incremental_state_check_skip_and_mark(tmp_path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def incremental_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        calls.append((script, cli_args))
+        if script == "state" and cli_args.startswith("check "):
+            # a.com is already extracted at this update_time -> skip;
+            # b.com needs extraction (real state.py exits 0/1)
+            return json.dumps({"exit_code": 0 if "https://a.com" in cli_args else 1})
+        if script == "state":
+            return json.dumps({"marked": True})
+        return _fake_runner(script, cli_args, stdin)
+
+    graph = build_job_discovery_graph(
+        fetch_fn=_fake_fetch,
+        script_runner=incremental_runner,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    ).compile()
+    final = graph.invoke(
+        {
+            "urls": ["https://a.com", "https://b.com"],
+            "prior_metadata": {
+                "file_id": "f1",
+                "sheet_id": "s1",
+                "update_time": "2026-08-07",
+            },
+        }
+    )
+    by_url = {r["url"]: r for r in final["per_url_results"]}
+    assert by_url["https://a.com"]["status"] == "skipped"
+    assert by_url["https://a.com"]["reason"] == "update_time unchanged"
+    assert by_url["https://b.com"]["status"] == "succeeded"
+    # one check per input URL, carrying the run's update_time
+    checks = [a for s, a in calls if s == "state" and a.startswith("check ")]
+    assert checks == [
+        "check https://a.com 2026-08-07",
+        "check https://b.com 2026-08-07",
+    ]
+    # mark after extraction: only the processed URL, entry-id format
+    # content_hash[:16]_url_hash8, with the run's file/sheet flags
+    marks = [a for s, a in calls if s == "state" and a.startswith("mark ")]
+    assert len(marks) == 1
+    assert marks[0].startswith("mark https://b.com ")
+    assert "--file-id f1" in marks[0] and "--sheet-id s1" in marks[0]
+    entry_id = marks[0].split()[2]
+    assert entry_id == "hash-0"[:16] + "_" + hashlib.sha256(
+        b"https://b.com"
+    ).hexdigest()[:8]
+    # comparison keys from the normalize node (empty with the {} fake)
+    assert final["normalize_keys"] == {}
+
+
+def test_graph_incremental_dedup_accumulates_prior(tmp_path) -> None:
+    # seed the cumulative store: prior candidates at the state store's
+    # output/candidates/merged_final.json
+    out = tmp_path / "output" / "candidates"
+    out.mkdir(parents=True)
+    (out / "merged_final.json").write_text(
+        json.dumps([{"title": "历史职位", "company": "老公司"}]), encoding="utf-8"
+    )
+    # this run's per-page files (the dedup node globs page_*.json)
+    _seed_page_file(tmp_path)
+    (tmp_path / "page_00.json").write_text(
+        json.dumps([{"title": "新职位", "company": "新公司"}]), encoding="utf-8"
+    )
+    calls: list[tuple[str, str, str]] = []
+
+    def recording_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        calls.append((script, cli_args, stdin))
+        if script == "state":
+            return json.dumps({"exit_code": 1})
+        if script == "normalize":
+            return json.dumps({"input": "x", "normalized": "x"})
+        return _fake_runner(script, cli_args, stdin)
+
+    graph = build_job_discovery_graph(
+        fetch_fn=_fake_fetch,
+        script_runner=recording_runner,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    ).compile()
+    final = graph.invoke(
+        {
+            "urls": ["https://example.com/jobs"],
+            "prior_metadata": {
+                "file_id": "f",
+                "sheet_id": "s",
+                "update_time": "2026-08-07",
+            },
+        }
+    )
+    # the prior store is staged via write_candidates --append (identity-merge
+    # semantics: re-appending the same candidates is a no-op)
+    appends = [
+        (cli, stdin)
+        for s, cli, stdin in calls
+        if s == "write_candidates" and "--append" in cli
+    ]
+    assert len(appends) == 1
+    assert "--out " + str(tmp_path / "prior_merged.json") in appends[0][0]
+    assert json.loads(appends[0][1]) == [{"title": "历史职位", "company": "老公司"}]
+    assert (tmp_path / "prior_merged.json").exists()
+    # deduplicate consumes prior + this run's per-page files
+    dedup_cli = [cli for s, cli, _stdin in calls if s == "deduplicate"][0]
+    assert str(tmp_path / "prior_merged.json") in dedup_cli
+    assert str(tmp_path / "page_00.json") in dedup_cli
+    assert str(tmp_path / "page_01.json") in dedup_cli
+    assert final["merged_count"] == 1
+    assert final["error"] is None
+
+
+def test_build_resolves_default_state_dir_to_skill_dir() -> None:
+    # Task 10: state_dir=None resolves to the skill dir itself (the stable
+    # store lands at SKILL_DIR/output/...); build-only, never invoked, so no
+    # writes touch the repo tree
+    from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+        job_discovery_graph as jdg,
+    )
+
+    graph = build_job_discovery_graph().compile()
+    assert graph is not None
+    assert jdg._resolve_state_dir(None) == jdg.SKILL_DIR
+
+
+def test_build_resolves_relative_state_dir_under_skill_dir(tmp_path) -> None:
+    # Task 10: a relative state_dir resolves under the skill dir too;
+    # absolute paths (tests) pass through untouched
+    from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+        job_discovery_graph as jdg,
+    )
+
+    graph = build_job_discovery_graph(state_dir="rel/state").compile()
+    assert graph is not None
+    assert jdg._resolve_state_dir("rel/state") == jdg.SKILL_DIR / "rel/state"
+    assert jdg._resolve_state_dir(str(tmp_path)) == tmp_path

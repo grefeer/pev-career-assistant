@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -164,6 +165,7 @@ def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     # no thread bound -> config = {} branch (single-shot, no checkpointer)
     out = json.loads(
@@ -183,6 +185,7 @@ def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
         "coverage",
         "merged_count",
         "dedup_stats",
+        "normalize_keys",
     }
     assert results["per_url_results"][0]["status"] == "succeeded"
     # evidence promotion contract: succeeded per-url entries carry both
@@ -213,6 +216,7 @@ def test_job_discovery_tool_threaded_invocation(tmp_path) -> None:
         extract_fn=_fake_extract,
         checkpointer=InMemorySaver(),
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     with workflow_thread_id("run-1:0:workflow"):
         first = json.loads(
@@ -235,6 +239,7 @@ def test_job_discovery_tool_dict_input_path(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     out = json.loads(tool.invoke({"payload": json.dumps(["https://example.com/jobs"])}))
     assert [r["url"] for r in out["output"]["per_url_results"]] == [
@@ -250,6 +255,7 @@ def test_job_discovery_tool_folds_invalid_payload(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     out = json.loads(tool.invoke(json.dumps({"payload": "not json"})))
     assert out["status"] == "failed"
@@ -266,6 +272,7 @@ def test_job_discovery_tool_folds_graph_crash(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     out = json.loads(
         tool.invoke(json.dumps({"payload": json.dumps(["https://a.com"])}))
@@ -280,6 +287,7 @@ def test_job_discovery_tool_observation_is_always_str(tmp_path) -> None:
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     raw = tool.invoke(json.dumps({"payload": json.dumps(["https://example.com/jobs"])}))
     assert isinstance(raw, str)
@@ -295,6 +303,7 @@ def test_job_discovery_tool_success_parses_as_tool_observation(tmp_path) -> None
         script_runner=_fake_runner,
         extract_fn=_fake_extract,
         candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
     )
     raw = tool.invoke(json.dumps({"payload": json.dumps(["https://example.com/jobs"])}))
     obs = ToolObservation.model_validate(json.loads(raw))
@@ -633,3 +642,130 @@ def test_write_page_candidates_relative_dir_resolved_under_skill(tmp_path) -> No
     assert str(SKILL_DIR / "output" / "candidates" / "page_01.json") in captured[
         "cli_args"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Task 10 incremental mode: {"urls", "prior_metadata"} tool input
+# ---------------------------------------------------------------------------
+
+
+def test_job_discovery_tool_incremental_prior_metadata(tmp_path) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def incremental_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        calls.append((script, cli_args))
+        if script == "state" and cli_args.startswith("check "):
+            # url a.com is already extracted at this update_time -> skip;
+            # b.com needs extraction (real script would exit 0/1)
+            return json.dumps({"exit_code": 0 if "https://a.com" in cli_args else 1})
+        if script == "state":
+            return json.dumps({"marked": True})
+        if script == "normalize":
+            return json.dumps({"input": "后端工程师", "normalized": "backend-engineer"})
+        return _fake_runner(script, cli_args=cli_args, stdin=stdin)
+
+    def incremental_extract(pages: list[dict]) -> tuple[list[dict], None]:
+        # the injected extract_fn never writes per-page files; persist the
+        # candidate to a page file so the dedup node's page_*.json glob
+        # sees it and the merge path actually runs
+        (tmp_path / "page_00.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "title": "后端工程师",
+                        "responsibilities": "负责后端服务开发",
+                        "requirements": "精通 Python",
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        return _fake_extract(pages)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=incremental_runner,
+        extract_fn=incremental_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(
+            json.dumps(
+                {
+                    "payload": json.dumps(
+                        {
+                            "urls": ["https://a.com", "https://b.com"],
+                            "prior_metadata": {
+                                "file_id": "f1",
+                                "sheet_id": "s1",
+                                "update_time": "2026-08-07",
+                            },
+                        }
+                    )
+                }
+            )
+        )
+    )
+    assert out["status"] == "succeeded"
+    results = out["output"]
+    by_url = {r["url"]: r for r in results["per_url_results"]}
+    # state check before fetch: a.com skipped (its per-URL entry reflects
+    # the skip status), b.com fetched and processed
+    assert by_url["https://a.com"]["status"] == "skipped"
+    assert by_url["https://a.com"]["reason"] == "update_time unchanged"
+    assert by_url["https://b.com"]["status"] == "succeeded"
+    # skipped entries extend after the fetched ones (every input URL still
+    # has exactly one entry)
+    assert [r["url"] for r in results["per_url_results"]] == [
+        "https://b.com",
+        "https://a.com",
+    ]
+    # one check per URL, carrying the run's update_time
+    checks = [a for s, a in calls if s == "state" and a.startswith("check ")]
+    assert checks == [
+        "check https://a.com 2026-08-07",
+        "check https://b.com 2026-08-07",
+    ]
+    # mark after extraction: only the processed URL, entry-id format
+    # content_hash[:16]_url_hash8, with the run's file/sheet flags
+    marks = [a for s, a in calls if s == "state" and a.startswith("mark ")]
+    assert len(marks) == 1
+    assert marks[0].startswith("mark https://b.com ")
+    assert "--file-id f1" in marks[0] and "--sheet-id s1" in marks[0]
+    entry_id = marks[0].split()[2]
+    assert entry_id == "hash-0"[:16] + "_" + hashlib.sha256(
+        b"https://b.com"
+    ).hexdigest()[:8]
+    # comparison keys from the normalize node enter the tool output only
+    assert results["normalize_keys"]["后端工程师"] == "backend-engineer"
+    # the page-file merge still ran (single-shot semantics preserved under
+    # incremental mode)
+    assert results["merged_count"] == 1
+
+
+def test_job_discovery_tool_dict_input_without_prior_metadata(tmp_path) -> None:
+    # Task 10: a {"urls": [...]} object input without prior_metadata takes the
+    # single-shot path — no state check/mark, no merged accumulation
+    calls: list[str] = []
+
+    def recording_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        calls.append(f"{script} {cli_args}")
+        return _fake_runner(script, cli_args=cli_args, stdin=stdin)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=recording_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(
+            json.dumps({"payload": json.dumps({"urls": ["https://a.com"]})})
+        )
+    )
+    assert out["status"] == "succeeded"
+    # absent prior_metadata -> the workflow never touches the state store
+    assert not any(c.startswith("state ") for c in calls)

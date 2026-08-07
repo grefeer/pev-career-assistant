@@ -624,3 +624,46 @@ def test_default_runner_used_when_none(monkeypatch, tmp_path) -> None:
     assert "--wait 5000" not in recorded[2]
     assert sum("--mode search-interact" in c for c in recorded) == 1
     assert results[0].status == "failed"
+
+
+def test_state_dir_resolves_evidence_out_dir(tmp_path) -> None:
+    # Task 10: without an explicit out_dir, page evidence resolves under the
+    # stable state store (output/evidence/run-0); an explicit out_dir wins
+    # over state_dir; with neither, the skill's default evidence dir applies.
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    calls: list[str] = []
+
+    def fake_runner(script, *, cli_args="", stdin=""):
+        calls.append(cli_args)
+        return json.dumps({
+            "status": "ok", "url": "https://jobs.feishu.cn/abc", "mode": "list",
+            "content_hash": "sha256_1", "page_files": [], "page_count": 1,
+            "text_length": 100,
+        })
+
+    # state_dir only -> stable evidence store under the state root
+    results = browse_fetch_urls(
+        ["https://jobs.feishu.cn/abc"], runner=fake_runner, state_dir=str(tmp_path)
+    )
+    out_token = calls[0].split("--out", 1)[1].split()[0]
+    assert out_token == str(tmp_path / "output" / "evidence" / "run-0")
+    assert results[0].status == "succeeded"
+
+    # explicit out_dir wins over state_dir
+    calls.clear()
+    explicit = tmp_path / "custom"
+    results = browse_fetch_urls(
+        ["https://jobs.feishu.cn/abc"], runner=fake_runner,
+        out_dir=str(explicit), state_dir=str(tmp_path),
+    )
+    out_token = calls[0].split("--out", 1)[1].split()[0]
+    assert out_token == str(explicit)
+    assert results[0].status == "succeeded"
+
+    # neither -> the skill's default evidence directory
+    calls.clear()
+    results = browse_fetch_urls(["https://jobs.feishu.cn/abc"], runner=fake_runner)
+    out_token = calls[0].split("--out", 1)[1].split()[0]
+    assert out_token == bf._DEFAULT_OUT_DIR
+    assert results[0].status == "succeeded"

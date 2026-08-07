@@ -383,17 +383,24 @@ def browse_fetch_urls(
     runner: Callable[..., str] | None = None,
     out_dir: str | None = None,
     cache_mode: str = "use",
+    state_dir: str | None = None,
 ) -> list[UrlFetchResult]:
     """Browse a batch of URLs through the classify -> mode -> fallback chain.
 
     ``runner=None`` runs the real allowlisted ``browse`` script;
     ``out_dir=None`` resolves page evidence under the stable
-    ``output/evidence/run-0`` directory; ``cache_mode`` is forwarded to
-    ``browse`` for list mode only (URL-keyed caching is list-only in
-    browse.py).  WeChat URLs are reported ``wechat_pending`` without any
-    browse call.
+    ``output/evidence/run-0`` directory of the incremental state store
+    when ``state_dir`` is given (Task 10), else the skill's default
+    output directory; ``cache_mode`` is forwarded to ``browse`` for list
+    mode only (URL-keyed caching is list-only in browse.py).  WeChat URLs
+    are reported ``wechat_pending`` without any browse call.
     """
-    resolved_out_dir = out_dir or _DEFAULT_OUT_DIR
+    if out_dir is not None:
+        resolved_out_dir = out_dir
+    elif state_dir is not None:
+        resolved_out_dir = str(Path(state_dir) / "output" / "evidence" / "run-0")
+    else:
+        resolved_out_dir = _DEFAULT_OUT_DIR
     results: list[UrlFetchResult] = []
     for url in urls:
         site_class = classify_url(url)
