@@ -1701,6 +1701,61 @@ class AgentArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DeepAgentsRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One completed deepagents PEV run (MySQL-authoritative snapshot).
+
+    Written once at run completion by ``checkpoints/sink.py``; Redis holds
+    only the in-flight execution checkpoint (security gate #5 exception,
+    spec §12).  Payload JSON is constrained to safe summaries and artifact
+    references; raw prompts, resume bytes and secrets must not be stored.
+    """
+
+    __tablename__ = "deepagents_runs"
+
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    goal: Mapped[str] = mapped_column(Text, nullable=False)
+    allowed_skills_json: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    budget_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[RunStatus] = mapped_column(
+        Enum(RunStatus, name="deepagents_run_status", **enum_kwargs),
+        nullable=False,
+        index=True,
+    )
+    plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    decisions_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, default=list, nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    final_summary: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DeepAgentsArtifact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One evidence/artifact produced by a deepagents run (authoritative copy)."""
+
+    __tablename__ = "deepagents_artifacts"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id", "artifact_id", name="uq_deepagents_artifacts_run_artifact"
+        ),
+    )
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("deepagents_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    artifact_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_url: Mapped[str | None] = mapped_column(String(2048))
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
 class AgentTurn(Base):
     """A role decision summary, excluding raw prompts and private material."""
 
