@@ -10,6 +10,9 @@ sink to MySQL.
 from backend.app.services.deepagents_runtime.checkpoints.factory import (
     create_checkpointer,
 )
+from backend.app.services.deepagents_runtime.checkpoints.sink import (
+    flush_run_with_retry,
+)
 from backend.app.services.deepagents_runtime.state import DeepAgentsState
 
-__all__ = ["DeepAgentsState", "create_checkpointer"]
+__all__ = ["DeepAgentsState", "create_checkpointer", "flush_run_with_retry"]

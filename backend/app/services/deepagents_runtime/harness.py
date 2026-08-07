@@ -33,6 +33,9 @@ from backend.app.services.deepagents_runtime.budgets import (
     DeepAgentsBudgets,
     TurnBudgetExhausted,
 )
+from backend.app.services.deepagents_runtime.checkpoints.sink import (
+    flush_run_with_retry,
+)
 from backend.app.services.deepagents_runtime.middleware import current_budgets
 from backend.app.services.deepagents_runtime.state import (
     DeepAgentsState,
@@ -125,6 +128,25 @@ def _is_non_progress(decision: dict[str, Any]) -> bool:
     return decision.get("error_code") in {"duplicate_tool_call", "blocked"}
 
 
+def _evidence_artifacts(evidence_store: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Map evidence-store entries to artifact rows (bounded, sanitized).
+
+    Evidence entries always carry ``content_hash`` (only tool-produced
+    evidence is stored); ``artifact_id`` defaults to the hash and
+    ``visible_text`` is excerpted to 1,200 chars.
+    """
+    return [
+        {
+            "artifact_id": item.get("artifact_id") or item["content_hash"],
+            "kind": "public_page_evidence",
+            "source_url": item.get("source_url"),
+            "content_hash": item["content_hash"],
+            "payload": {"text": (item.get("visible_text") or "")[:1200]},
+        }
+        for item in evidence_store
+    ]
+
+
 def _sole_skill(allowed_skills: list[str]) -> str:
     if len(allowed_skills) != 1:
         raise ValueError("each plan step must allow exactly one skill")
@@ -165,10 +187,12 @@ class DeepAgentsHarness:
         model_factory: Callable[[str], Any],
         tool_factory: Callable[[str], Sequence[Any]] | None = None,
         checkpointer: Any = None,
+        session_factory: Callable[[], Any] | None = None,
     ) -> None:
         self._model_factory = model_factory
         self._tool_factory = tool_factory
         self._checkpointer = checkpointer
+        self._session_factory = session_factory
         self._tracker = DuplicateCallTracker()
         self._graph = self._build_graph()
 
@@ -224,17 +248,21 @@ class DeepAgentsHarness:
             context=request.context,
             budgets=budgets,
         )
+        started_at = time.time()
         final = self._graph.invoke(initial, {"configurable": {"thread_id": run_id}})
+        self._flush_if_configured(final, started_at)
         return dict(final)
 
     def resume(self, run_id: str) -> dict[str, Any]:
         snapshot = self._graph.get_state({"configurable": {"thread_id": run_id}})
         budgets = DeepAgentsBudgets.from_dict(snapshot.values["budget"])
         budgets.refresh_window()
+        started_at = time.time()
         final = self._graph.invoke(
             {"budget": budgets.to_dict()},
             {"configurable": {"thread_id": run_id}},
         )
+        self._flush_if_configured(final, started_at)
         return dict(final)
 
     # -- nodes -------------------------------------------------------------
@@ -411,6 +439,29 @@ class DeepAgentsHarness:
             "error_code": "verification_failed",
             "finished_at": time.time(),
         }
+
+    def _flush_if_configured(self, state: dict[str, Any], started_at: float) -> None:
+        """Flush the completed snapshot to MySQL when a factory is wired."""
+        if self._session_factory is None:
+            return
+        flush_run_with_retry(
+            self._session_factory,
+            run_id=state["run_id"],
+            user_id=state["user_id"],
+            thread_id=state["run_id"],
+            goal=state["goal"],
+            allowed_skills=state["allowed_skills"],
+            budget_dict=state["budget"],
+            # graph terminal states always set run_status (never None here)
+            status=state["run_status"],
+            plan_json=state["plan_json"],
+            decisions=state["decisions"],
+            error_code=state["error_code"],
+            final_summary=state["final_summary"],
+            started_at=started_at,
+            finished_at=state["finished_at"],
+            artifacts=_evidence_artifacts(state["evidence_store"]),
+        )
 
     # -- routing -----------------------------------------------------------
 
