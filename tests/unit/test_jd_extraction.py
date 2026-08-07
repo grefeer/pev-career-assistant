@@ -14,6 +14,7 @@ import pytest
 
 from backend.app.services.job_discovery.tools import jd_extraction
 from backend.app.services.job_discovery.tools.jd_extraction import (
+    _card_meta_cities,
     _detect_recruitment_types,
     _extract_apply_method,
     _extract_company,
@@ -109,6 +110,116 @@ def test_split_multi_job_page_single_job_returns_self() -> None:
     assert _split_multi_job_page(text) == [text]
 
 
+def test_split_multi_job_page_feishu_card_list() -> None:
+    """Feishu card listings split per card with injected title/location headers."""
+    text = (
+        "座舱Agent Harness算法工程师\n"
+        "北京、上海校招正式技术提前批职位 ID：A33756\n"
+        "* 探索 agent harness\n"
+        "Agent编排平台工程师\n"
+        "上海校招正式职位 ID：A33757\n"
+        "* 调度与编排\n"
+        "多模态研究实习生\n"
+        "深圳、杭州实习职位 ID：A33758\n"
+        "* 多模态理解\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 3
+    assert segments[0].startswith(
+        "职位名称：座舱Agent Harness算法工程师\n工作地点：北京、上海"
+    )
+    assert "A33756" in segments[0]
+    assert "探索 agent harness" in segments[0]
+    assert segments[1].startswith("职位名称：Agent编排平台工程师\n工作地点：上海")
+    assert "A33757" in segments[1]
+    assert segments[2].startswith("职位名称：多模态研究实习生\n工作地点：深圳、杭州")
+    assert "A33758" in segments[2]
+
+
+def test_split_multi_job_page_single_card_normalizes() -> None:
+    """A lone card still becomes a single normalized segment."""
+    text = "大模型Agent研发工程师\n北京校招职位 ID：A100\n* 研究\n"
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 1
+    assert segments[0].startswith("职位名称：大模型Agent研发工程师\n工作地点：北京")
+
+
+def test_split_multi_job_page_card_without_city_lead_skips_location_header() -> None:
+    """A meta line without a city lead (e.g. digit-led 2027届) omits 工作地点."""
+    text = "Agent调度工程师\n2027届校招正式职位 ID：A200\n* 调度\n"
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 1
+    assert segments[0] == (
+        "职位名称：Agent调度工程师\n"
+        "Agent调度工程师\n"
+        "2027届校招正式职位 ID：A200\n"
+        "* 调度"
+    )
+
+
+def test_split_multi_job_page_card_title_with_trailing_detail() -> None:
+    """Titles trailing detail after the role token (（AI平台）/-NOMI) still match."""
+    text = (
+        "提前批-AI产品经理（AI平台）\n"
+        "上海校招正式产品 - 产品经理本科及以上2027届校园招聘-技术提前批职位 ID：A400\n"
+        "* 负责产品规划\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 1
+    assert segments[0].startswith("职位名称：提前批-AI产品经理（AI平台）\n工作地点：上海")
+
+
+def test_split_multi_job_page_chrome_above_meta_is_not_a_title() -> None:
+    """A chrome line (推荐投递) above a meta must never become a card title."""
+    text = (
+        "提前批-Agent开发工程师-NOMI\n"
+        "北京、上海校招正式数字技术 - 算法本科及以上2027届职位 ID：A500\n"
+        "* 负责座舱\n"
+        "推荐投递\n"
+        "上海、合肥校招正式数字技术 - 软件研发硕士及以上2027届职位 ID：A501\n"
+        "提前批-AI软件研发工程师（产研&企业治理领域）\n"
+        "上海、合肥校招正式数字技术 - 软件研发硕士及以上2027届职位 ID：A502\n"
+        "* 负责研发\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert [s.split("\n", 1)[0] for s in segments] == [
+        "职位名称：提前批-Agent开发工程师-NOMI",
+        "职位名称：提前批-AI软件研发工程师（产研&企业治理领域）",
+    ]
+    candidates = extract_jd_candidates(text, "https://nio.jobs.feishu.cn/x")
+    assert [c.title for c in candidates] == [
+        "提前批-Agent开发工程师-NOMI",
+        "提前批-AI软件研发工程师（产研&企业治理领域）",
+    ]
+    assert all("推荐投递" not in (c.title or "") for c in candidates)
+
+
+def test_card_meta_cities_guard_rejects_non_city_lead() -> None:
+    """The meta-line city read accepts real cities, rejects non-city leads."""
+    assert _card_meta_cities("北京、上海校招正式技术提前批职位 ID：A1") == "北京、上海"
+    assert _card_meta_cities("上海校招正式职位 ID：A2") == "上海"
+    assert _card_meta_cities("北京市社招职位 ID：A3") == "北京市"
+    # All-Chinese non-city lead: too long to be a lone city, no 、, no suffix.
+    assert _card_meta_cities("本科及以上校招职位 ID：A4") is None
+    # Digit-led lead fails the character class.
+    assert _card_meta_cities("2027届校招职位 ID：A5") is None
+    # No 校招/社招/实习 marker at all.
+    assert _card_meta_cities("职位 ID：A6") is None
+
+
+def test_card_meta_cities_reads_etc_city_count_format() -> None:
+    """Feishu's ``武汉、合肥、上海等 4 个城市校招...`` lead reads as cities."""
+    assert (
+        _card_meta_cities(
+            "武汉、合肥、上海等 4 个城市校招正式数字技术 - 软件研发硕士及以上2027届职位 ID：A7"
+        )
+        == "武汉、合肥、上海"
+    )
+    # The 等 marker alone must not smuggle a non-city lead past the guard.
+    assert _card_meta_cities("本科及以上等校招职位 ID：A8") is None
+
+
 # ---------------------------------------------------------------------------
 # individual extractors
 # ---------------------------------------------------------------------------
@@ -130,9 +241,9 @@ def test_extract_department() -> None:
 
 
 def test_extract_section_with_next_header() -> None:
-    text = "岗位职责:\n负责Agent开发\n任职要求:\nPython熟练"
+    text = "岗位职责:\n负责Agent应用开发与评测\n任职要求:\nPython熟练"
     section = _extract_section(text, jd_extraction._RESPONSIBILITIES_HEADERS)
-    assert "Agent开发" in section
+    assert "Agent应用开发与评测" in section
     assert "任职要求" not in section
 
 
@@ -375,6 +486,48 @@ def test_extract_jd_candidates_returns_normalized_job_candidate_type() -> None:
     candidates = extract_jd_candidates("岗位名称: 测试岗\n", "https://x.com")
     assert candidates
     assert isinstance(candidates[0], NormalizedJobCandidate)
+
+
+def test_extract_jd_candidates_feishu_card_list() -> None:
+    """A card listing produces one candidate per card from injected headers."""
+    text = (
+        "座舱Agent Harness算法工程师\n"
+        "北京、上海校招正式技术提前批职位 ID：A33756\n"
+        "* 探索 agent harness\n"
+        "Agent编排平台工程师\n"
+        "上海校招正式职位 ID：A33757\n"
+        "* 调度与编排\n"
+        "多模态研究实习生\n"
+        "深圳、杭州实习职位 ID：A33758\n"
+        "* 多模态理解\n"
+    )
+    candidates = extract_jd_candidates(text, "https://nio.jobs.feishu.cn/x")
+    assert len(candidates) == 3
+    assert [c.title for c in candidates] == [
+        "座舱Agent Harness算法工程师",
+        "Agent编排平台工程师",
+        "多模态研究实习生",
+    ]
+    # A single 、 does not split (_extract_locations needs 2+ delimiters).
+    assert candidates[0].locations == ["北京、上海"]
+    assert candidates[0].recruitment_types == ["campus_recruitment"]
+    assert candidates[1].locations == ["上海"]
+    assert candidates[2].recruitment_types == ["internship"]
+    assert all(c.company_name is None for c in candidates)
+
+
+def test_extract_jd_candidates_caps_at_max_per_page() -> None:
+    """A 101-card Feishu listing stops at the 100-candidate page ceiling."""
+    cards = [
+        f"Agent{i:03d}算法工程师\n"
+        f"上海校招正式职位 ID：A{i:05d}\n"
+        f"* 职责 {i}\n"
+        for i in range(101)
+    ]
+    candidates = extract_jd_candidates("".join(cards), "https://nio.jobs.feishu.cn/x")
+    assert len(candidates) == 100
+    assert candidates[0].title == "Agent000算法工程师"
+    assert candidates[-1].title == "Agent099算法工程师"
 
 
 # ---------------------------------------------------------------------------

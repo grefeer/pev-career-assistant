@@ -18,6 +18,7 @@ def test_harness_is_the_default_personal_assistant_path_and_has_positive_budgets
     assert settings.agent_harness_max_agent_turns >= 1
     assert settings.agent_harness_max_tool_calls >= 1
     assert settings.agent_harness_max_replans >= 0
+    assert settings.agent_harness_max_wall_clock_seconds >= 10
 
 
 def test_harness_rejects_an_unexecutable_turn_budget() -> None:

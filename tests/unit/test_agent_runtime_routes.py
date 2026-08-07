@@ -89,7 +89,11 @@ def test_post_agent_run_returns_only_safe_run_summary() -> None:
         "error_code": None,
     }
     assert service.queue_run.call_args.kwargs["user_id"] == "user-a"
-    assert service.queue_run.call_args.kwargs["task"].budget.max_agent_turns == 12
+    budget = service.queue_run.call_args.kwargs["task"].budget
+    assert budget.max_agent_turns == 12
+    # wall_clock is wired from settings (default 300); it is the one budget
+    # ceiling that previously had no knob and was stuck on the schema default.
+    assert budget.max_wall_clock_seconds == 300
 
 
 def test_post_agent_run_scales_hard_turn_ceiling_for_multi_skill_work() -> None:

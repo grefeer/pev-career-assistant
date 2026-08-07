@@ -115,10 +115,16 @@ class EvidenceResponse(BaseModel):
     confidence: int
     status: str = "pending"
     diff_action: str | None = None
+    corrected_value: Any | None = None
 
     @classmethod
     def from_orm_model(
-        cls, obj: Any, *, status: str = "pending", diff_action: str | None = None
+        cls,
+        obj: Any,
+        *,
+        status: str = "pending",
+        diff_action: str | None = None,
+        corrected_value: Any | None = None,
     ) -> EvidenceResponse:
         return cls(
             id=obj.id,
@@ -129,6 +135,7 @@ class EvidenceResponse(BaseModel):
             confidence=obj.confidence,
             status=status,
             diff_action=diff_action,
+            corrected_value=corrected_value,
         )
 
 
@@ -139,6 +146,7 @@ class ProfileResponse(BaseModel):
     evidence: list[EvidenceResponse] = []
     local_sensitive_references: dict[str, Any] = {}
     latest_version: dict[str, Any] | None = None
+    active_version_id: str | None = None
 
     @classmethod
     def from_profile(
@@ -160,6 +168,7 @@ class ProfileResponse(BaseModel):
             }
             if latest_version
             else None,
+            active_version_id=profile.active_version_id,
         )
 
 

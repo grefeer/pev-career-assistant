@@ -113,6 +113,20 @@ async function handleStartImport(assetId: string) {
   }
 }
 
+async function handleDelete(assetId: string) {
+  if (!window.confirm("确定删除该简历？关联的解析证据将一并删除。")) return;
+  try {
+    loading.value = true;
+    await profileApi.deleteResumeAsset(props.token, assetId);
+    successMessage.value = "简历已删除";
+    await loadProfile();
+  } catch (error: any) {
+    errorMessage.value = error.message || "删除失败";
+  } finally {
+    loading.value = false;
+  }
+}
+
 function setDecision(evidenceId: string, action: "confirm" | "ignore" | "correct") {
   const newMap = new Map(localDecisions.value);
   if (newMap.has(evidenceId) && newMap.get(evidenceId) === action) {
@@ -135,6 +149,13 @@ function parseCorrection(value: string): unknown {
   } catch {
     return value;
   }
+}
+
+function formatValue(value: unknown): string {
+  if (typeof value === "object" && value !== null) {
+    return JSON.stringify(value);
+  }
+  return String(value);
 }
 
 async function handleSaveDecisions() {
@@ -194,6 +215,20 @@ async function handleCreateVersion() {
     } else {
       errorMessage.value = error.message || "创建版本失败";
     }
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function handleActivate(versionId: string) {
+  if (!profile.value) return;
+  try {
+    loading.value = true;
+    const result = await profileApi.activateProfileVersion(props.token, versionId);
+    profile.value.active_version_id = result.active_version_id;
+    successMessage.value = "已设为当前版本";
+  } catch (error: any) {
+    errorMessage.value = error.message || "切换失败";
   } finally {
     loading.value = false;
   }
@@ -276,6 +311,14 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
             >
               解析
             </button>
+            <button
+              class="ghost-button danger"
+              data-test="delete-asset"
+              :disabled="loading"
+              @click="handleDelete(asset.id)"
+            >
+              删除
+            </button>
           </div>
         </div>
       </div>
@@ -318,6 +361,9 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
             </span>
           </div>
           <div class="evidence-excerpt">{{ ev.evidence_excerpt }}</div>
+          <div v-if="ev.status === 'corrected' && ev.corrected_value != null" class="evidence-corrected">
+            更正后：{{ formatValue(ev.corrected_value) }}
+          </div>
           <div class="evidence-status">{{ statusLabel(ev) }}</div>
           <div class="evidence-decisions">
             <button
@@ -347,13 +393,18 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
               更正
             </button>
           </div>
-          <textarea
+          <div
             v-if="localDecisions.get(ev.id) === 'correct'"
-            :data-test="`correction-${ev.id}`"
-            :value="correctionValues.get(ev.id) ?? ''"
-            placeholder="输入更正后的 JSON 或文本"
-            @input="setCorrection(ev.id, ($event.target as HTMLTextAreaElement).value)"
-          />
+            class="correction-block"
+          >
+            <div class="correction-hint">当前值：{{ formatValue(ev.candidate_value) }}</div>
+            <textarea
+              :data-test="`correction-${ev.id}`"
+              :value="correctionValues.get(ev.id) ?? ''"
+              placeholder="输入更正后的值（文本或 JSON）"
+              @input="setCorrection(ev.id, ($event.target as HTMLTextAreaElement).value)"
+            />
+          </div>
         </div>
       </div>
     </section>
@@ -364,10 +415,29 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
       </div>
       <div v-if="versions.length === 0" class="display-box">暂无确认版本。</div>
       <div v-else class="version-list">
-        <div v-for="v in versions" :key="v.id" class="version-item">
-          <strong>版本 {{ v.version_number }}</strong>
-          <span>聚合版本 {{ v.aggregate_version }}</span>
-          <span>{{ v.created_at }}</span>
+        <div
+          v-for="v in versions"
+          :key="v.id"
+          class="version-item"
+          :class="{ active: profile?.active_version_id === v.id }"
+        >
+          <div class="version-info">
+            <strong>版本 {{ v.version_number }}</strong>
+            <span>聚合版本 {{ v.aggregate_version }}</span>
+            <span>{{ v.created_at }}</span>
+          </div>
+          <div class="version-actions">
+            <span v-if="profile?.active_version_id === v.id" class="active-badge">当前</span>
+            <button
+              v-else
+              class="ghost-button"
+              data-test="activate-version"
+              :disabled="loading"
+              @click="handleActivate(v.id)"
+            >
+              设为当前
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -459,6 +529,10 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
   border: 1px solid #dbe3ea;
 }
 
+.ghost-button.danger {
+  color: #b91c1c;
+}
+
 .primary-button:disabled,
 .ghost-button:disabled {
   opacity: 0.5;
@@ -507,7 +581,7 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
 }
 
 .asset-info,
-.version-item {
+.version-info {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
@@ -517,6 +591,26 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
 .version-item span {
   color: #6b7280;
   font-size: 0.85rem;
+}
+
+.version-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.version-item.active {
+  border-color: #14b8a6;
+  background: #f0fdfa;
+}
+
+.active-badge {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: white;
+  background: #0f766e;
+  border-radius: 999px;
+  padding: 0.2rem 0.6rem;
 }
 
 .asset-actions {
@@ -581,6 +675,42 @@ defineExpose({ handleSaveDecisions, handleCreateVersion });
 .evidence-status {
   font-size: 0.85rem;
   color: #6b7280;
+}
+
+.evidence-corrected {
+  flex-basis: 100%;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+  border-radius: 12px;
+  padding: 0.45rem 0.65rem;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+.correction-block {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.correction-hint {
+  font-size: 0.8rem;
+  color: #6b7280;
+  word-break: break-all;
+}
+
+.correction-block textarea {
+  width: 100%;
+  border: 1px solid #dbe3ea;
+  border-radius: 12px;
+  padding: 0.6rem 0.75rem;
+  background: #fbfcfd;
+  font-family: inherit;
+  font-size: 0.88rem;
+  resize: vertical;
+  min-height: 4rem;
 }
 
 .evidence-decisions {

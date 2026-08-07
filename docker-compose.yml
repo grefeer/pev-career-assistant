@@ -90,6 +90,15 @@ services:
       REVIEWER_MODEL: ${REVIEWER_MODEL:-deepseek-v4-pro}
       OPTIMIZER_MODEL: ${OPTIMIZER_MODEL:-deepseek-v4-pro}
       COACH_MODEL: ${COACH_MODEL:-deepseek-v4-pro}
+      # PEV job-discovery: render SPA career sites (Feishu/NIO etc.) that return
+      # an empty shell to plain requests. Off by default so unit suites never
+      # launch a browser; opt in via .env for deployments that need it.
+      JOB_DISCOVERY_PLAYWRIGHT_FALLBACK_ENABLED: ${JOB_DISCOVERY_PLAYWRIGHT_FALLBACK_ENABLED:-false}
+      # Adaptive PEV hard ceilings (defaults match the schema; override per
+      # deployment for heavier I/O-bound work such as full-page SPA extraction).
+      AGENT_HARNESS_MAX_TOOL_CALLS: ${AGENT_HARNESS_MAX_TOOL_CALLS:-24}
+      AGENT_HARNESS_MAX_AGENT_TURNS: ${AGENT_HARNESS_MAX_AGENT_TURNS:-12}
+      AGENT_HARNESS_MAX_WALL_CLOCK_SECONDS: ${AGENT_HARNESS_MAX_WALL_CLOCK_SECONDS:-300}
 
   backend:
     image: platform-foundation-backend:latest

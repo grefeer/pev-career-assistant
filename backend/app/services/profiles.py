@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,8 @@ ALLOWED_SUFFIX_CONTENT_TYPES: dict[str, set[str]] = {
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     },
 }
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,37 @@ class ResumeAssetService:
         except Exception:
             pass
         raise ResumeAssetStateConflict("cannot reconcile asset")
+
+    def delete_asset(
+        self, db: Any, *, user_id: str, asset_id: str
+    ) -> str:
+        """Delete a resume asset and its imports/evidence/decisions.
+
+        Returns the object_key of the deleted asset so the caller can purge the
+        encrypted object *after* the DB transaction commits. The object delete
+        is best-effort and must run post-commit so a commit failure cannot leave
+        a dangling asset row pointing at a deleted object.
+        """
+        asset = profile_repository.get_owned_asset(db, user_id, asset_id)
+        if asset is None:
+            raise OwnedProfileResourceNotFound("asset not found")
+        object_key = asset.object_key
+        profile = profile_repository.get_profile_for_update(db, user_id)
+        profile_repository.delete_asset(db, asset)
+        profile_repository.update_profile_version(db, profile)
+        return object_key
+
+    def purge_object(self, object_key: str) -> None:
+        """Best-effort delete of the encrypted object; never raises.
+
+        A failure here leaves an orphan encrypted object, which is harmless
+        (no row references it) and preferable to failing an already-committed
+        DB delete.
+        """
+        try:
+            self._object_store.delete(object_key)
+        except Exception:
+            logger.warning("object store delete failed for key=%s", object_key)
 
 
 class ResumeImportService:
@@ -349,8 +383,26 @@ class ProfileService:
             local_sensitive_references=profile.local_sensitive_references,
         )
 
+        # A newly confirmed version becomes the active version the runtime
+        # consumes; latest-by-created_at remains the fallback when this is null.
+        profile_repository.set_active_version(db, profile, confirmed.id)
         profile_repository.update_profile_version(db, profile)
         return confirmed
+
+    def activate_version(
+        self, db: Any, *, user_id: str, version_id: str
+    ) -> str:
+        """Select the confirmed version the runtime should consume.
+
+        Does not bump ``profile.version`` -- this is a selection, not a facts
+        mutation, so it does not interact with the optimistic-lock guard.
+        """
+        version = profile_repository.get_owned_version(db, user_id, version_id)
+        if version is None:
+            raise OwnedProfileResourceNotFound("version not found")
+        profile = profile_repository.get_profile_for_update(db, user_id)
+        profile_repository.set_active_version(db, profile, version_id)
+        return version_id
 
     def update_local_sensitive_reference(
         self,

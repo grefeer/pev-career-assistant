@@ -92,6 +92,7 @@ def _build_evidence_response(
     for ev in evidence_list:
         decision = decisions.get(ev.id)
         status = "pending"
+        corrected_value: Any | None = None
         if decision:
             action = (
                 decision.action.value
@@ -103,6 +104,8 @@ def _build_evidence_response(
                 "correct": "corrected",
                 "ignore": "ignored",
             }[action]
+            if action == "correct":
+                corrected_value = decision.resolved_value
         diff_action = diff_map.get(ev.field_path)
         result.append(
             EvidenceResponse.from_orm_model(
@@ -111,6 +114,7 @@ def _build_evidence_response(
                 diff_action=diff_action.value
                 if hasattr(diff_action, "value")
                 else diff_action,
+                corrected_value=corrected_value,
             )
         )
     return result
@@ -225,6 +229,26 @@ def reconcile_resume_asset(
         db.rollback()
         raise _profile_http_error(exc) from exc
     return ResumeAssetResponse.from_orm_model(asset).model_dump()
+
+
+@router.delete("/resume-assets/{asset_id}")
+def delete_resume_asset(
+    asset_id: str,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+    object_store: Annotated[EncryptedObjectStore, Depends(get_object_store)],
+) -> dict[str, Any]:
+    service = ResumeAssetService(object_store)
+    try:
+        object_key = service.delete_asset(
+            db, user_id=current_user.id, asset_id=asset_id
+        )
+        db.commit()
+    except OwnedProfileResourceNotFound as exc:
+        db.rollback()
+        raise _profile_http_error(exc) from exc
+    service.purge_object(object_key)
+    return {"deleted": True}
 
 
 # --- Resume Imports ---
@@ -415,3 +439,21 @@ def get_profile_version(
     if version is None:
         raise HTTPException(404)
     return ProfileVersionDetail.from_orm_model(version).model_dump()
+
+
+@router.post("/profile-versions/{version_id}/activate")
+def activate_profile_version(
+    version_id: str,
+    db: Annotated[Session, Depends(_get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> dict[str, Any]:
+    service = ProfileService()
+    try:
+        active_id = service.activate_version(
+            db, user_id=current_user.id, version_id=version_id
+        )
+        db.commit()
+    except OwnedProfileResourceNotFound as exc:
+        db.rollback()
+        raise _profile_http_error(exc) from exc
+    return {"active_version_id": active_id}

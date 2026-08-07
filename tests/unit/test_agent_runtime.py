@@ -1425,6 +1425,96 @@ def test_runtime_bounds_public_evidence_context_to_the_configured_character_limi
     assert evidence[0]["visible_text"] == "x" * 48_000
 
 
+def test_tool_context_projects_structured_job_candidates_from_extract_artifacts(db_session) -> None:
+    """Matching tools see per-job units from extract outputs, never one aggregated page."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    run_repository.create_evidence_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        source_url="https://jobs.example/list",
+        content_hash="e" * 64,
+        content_json={"title": "蔚来校招", "visible_text": "岗位列表正文"},
+    )
+    structured = run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="structured_job_details",
+        source_url="https://jobs.example/list",
+        content_hash="s" * 64,
+        content_json={"candidates": [
+            {
+                "title": "提前批-Agent开发工程师-NOMI",
+                "apply_url": "https://jobs.example/apply/1",
+                "locations": ["北京、上海"],
+                "company_name": "自研 Agent harness 框架的全链路设计与开发",
+                "responsibilities": "x" * 700,
+                "requirements": "负责 Agent 开发。",
+            },
+            "not-a-dict",
+            {
+                "title": "无链接岗位",
+                "locations": ["上海"],
+            },
+            {
+                "title": 123,
+                "apply_url": "https://jobs.example/apply/3",
+                "locations": "上海",
+                "responsibilities": "负责测试。",
+            },
+        ]},
+    )
+
+    context = AgentRuntime._tool_context(
+        user_id=user.id, run_id=run.id, task=task, db=db_session
+    )
+
+    candidates = context.metadata["structured_job_candidates"]
+    assert [c["artifact_id"] for c in candidates] == [structured.id, structured.id, structured.id]
+    assert candidates[0]["title"] == "提前批-Agent开发工程师-NOMI"
+    assert candidates[0]["source_url"] == "https://jobs.example/apply/1"
+    assert candidates[0]["locations"] == ["北京、上海"]
+    assert candidates[0]["company_name"] == "自研 Agent harness 框架的全链路设计与开发"
+    assert len(candidates[0]["responsibilities"]) == 600  # bounded section
+    assert candidates[0]["requirements"] == "负责 Agent 开发。"
+    # Missing apply_url falls back to the artifact's own source_url.
+    assert candidates[1]["source_url"] == "https://jobs.example/list"
+    # Non-str title becomes None; non-list locations / non-str sections stay safe.
+    assert candidates[2]["title"] is None
+    assert candidates[2]["locations"] == []
+    assert candidates[2]["responsibilities"] == "负责测试。"
+    # The raw page evidence artifact contributes no candidates.
+    assert all(c["content_hash"] == "s" * 64 for c in candidates)
+
+
+def test_tool_context_structured_candidates_empty_without_extract_artifacts(db_session) -> None:
+    """Runs without a structured extraction keep the raw-evidence fallback path."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, _step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+
+    context = AgentRuntime._tool_context(
+        user_id=user.id, run_id=run.id, task=task, db=db_session
+    )
+
+    assert context.metadata["structured_job_candidates"] == []
+
+
 def test_runtime_persists_every_page_from_one_batch_fetch_observation(db_session) -> None:
     user = User(
         id="user-a", account="user-a@example.test", nickname="user-a",

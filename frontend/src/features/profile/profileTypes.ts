@@ -12,6 +12,7 @@ export interface ProfileEvidence {
   confidence: number;
   status: "pending" | "confirmed" | "corrected" | "ignored";
   diff_action: "add" | "replace" | "unchanged" | "conflict";
+  corrected_value: unknown | null;
 }
 
 export interface ResumeAssetMetadata {
@@ -44,6 +45,7 @@ export interface ProfileDetail {
   evidence: ProfileEvidence[];
   local_sensitive_references: Record<string, unknown>;
   latest_version: { id: string; version_number: number; created_at: string } | null;
+  active_version_id: string | null;
 }
 
 export interface ConfirmedProfileVersionSummary {

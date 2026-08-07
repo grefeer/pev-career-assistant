@@ -711,6 +711,10 @@ class Profile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     local_sensitive_references: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False, default=dict
     )
+    active_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("confirmed_profile_versions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
 
 class ResumeAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):

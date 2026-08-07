@@ -149,6 +149,12 @@ class Settings(BaseSettings):
     agent_harness_max_agent_turns: int = Field(default=12, ge=1, le=100)
     agent_harness_max_tool_calls: int = Field(default=24, ge=1, le=200)
     agent_harness_max_replans: int = Field(default=2, ge=0, le=10)
+    # Hard wall-clock ceiling per run (seconds). Unlike turn/tool budgets this
+    # one is a transport/resource pause: exhausting it degrades to a recoverable
+    # ``waiting_user`` (the clock window refreshes on resume) rather than a hard
+    # failure. Defaults to 300s; raise for I/O-bound work (e.g. many Playwright
+    # renders of SPA career sites).
+    agent_harness_max_wall_clock_seconds: int = Field(default=300, ge=10, le=3_600)
     agent_harness_max_event_payload_bytes: int = Field(
         default=16_384, ge=1_024, le=262_144
     )

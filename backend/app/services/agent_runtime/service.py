@@ -51,6 +51,7 @@ def build_adaptive_agent_budget(settings: Settings, allowed_skills: list[str]) -
         max_agent_turns=min(100, adaptive_turn_ceiling),
         max_tool_calls=settings.agent_harness_max_tool_calls,
         max_replans=settings.agent_harness_max_replans,
+        max_wall_clock_seconds=settings.agent_harness_max_wall_clock_seconds,
     )
 
 
@@ -127,12 +128,26 @@ class AgentRunService:
     def _with_confirmed_profile_facts(
         db: Session, *, user_id: str, task: AgentTaskRequest
     ) -> AgentTaskRequest:
-        """Supply only owner-confirmed profile facts as non-persisted run context."""
+        """Supply only owner-confirmed profile facts as non-persisted run context.
+
+        Consumes the profile's active version when set; otherwise falls back to
+        the latest confirmed version (latest by created_at). A dangling
+        active_version_id (e.g. a version deleted out of band) also falls back
+        to the latest rather than failing the run.
+        """
         versions = profile_repository.list_versions(db, user_id)
         if not versions:
             return task
+        profile = profile_repository.get_profile_by_user(db, user_id)
+        active_id = profile.active_version_id if profile is not None else None
+        active_version = (
+            next((v for v in versions if v.id == active_id), None)
+            if active_id
+            else None
+        )
+        chosen = active_version if active_version is not None else versions[0]
         private_context = dict(task.private_context)
-        private_context["confirmed_profile_facts"] = versions[0].facts_snapshot
+        private_context["confirmed_profile_facts"] = chosen.facts_snapshot
         return task.model_copy(update={"private_context": private_context})
 
     def get_run(self, db: Session, *, user_id: str, run_id: str) -> AgentRun:

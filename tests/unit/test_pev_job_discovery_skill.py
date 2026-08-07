@@ -614,6 +614,105 @@ Agent研发工程师
     assert "No location information found" not in candidate.normalization_warnings
 
 
+def test_extract_observed_job_details_keeps_per_card_sections_on_multi_candidate_pages() -> None:
+    """A card listing must not have the page's first section copied to every card."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-list",
+            "source_url": "https://nio.jobs.feishu.cn/campus/list",
+            "content_hash": "d" * 64,
+            "title": "校招职位",
+            "visible_text": """
+座舱Agent Harness算法工程师
+北京、上海校招正式职位 ID：A33756
+岗位职责：负责座舱 Agent harness 的设计。
+Agent编排平台工程师
+上海校招正式职位 ID：A33757
+工作职责：负责 Agent 编排平台。
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-list"),
+    )
+
+    assert [c.title for c in result.candidates] == [
+        "座舱Agent Harness算法工程师",
+        "Agent编排平台工程师",
+    ]
+    # Each candidate keeps the section from its own card, never the page's
+    # first 岗位职责 match (which would otherwise bleed onto both).
+    assert result.candidates[0].responsibilities == "负责座舱 Agent harness 的设计。"
+    assert result.candidates[1].responsibilities == "负责 Agent 编排平台。"
+
+
+def test_extract_observed_job_details_keeps_candidate_section_when_page_section_misses() -> None:
+    """Labels only the segment extractor knows (职责描述/requirements) survive."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-alt",
+            "source_url": "https://jobs.example/alt",
+            "content_hash": "e" * 64,
+            "title": "招聘详情",
+            "visible_text": """
+岗位名称：AI Agent 开发工程师
+公司：示例科技
+职责描述：
+负责 Agent 工具链开发。
+requirements:
+熟悉 Python 与 Agent 框架。
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-alt"),
+    )
+
+    candidate = result.candidates[0]
+    assert candidate.responsibilities == "负责 Agent 工具链开发。"
+    assert candidate.requirements == "熟悉 Python 与 Agent 框架。"
+
+
+def test_extract_observed_job_details_enriches_feishu_style_sections() -> None:
+    """Feishu detail pages label responsibilities as 你将负责 / 岗位定位."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-feishu-detail",
+            "source_url": "https://nio.jobs.feishu.cn/detail/1",
+            "content_hash": "f" * 64,
+            "title": "职位详情",
+            "visible_text": """
+座舱Agent Harness算法工程师
+你将负责：
+- 探索 agent harness 在座舱中的应用
+- 落地工具调用与编排
+岗位定位：座舱内智能体平台
+岗位要求：熟悉 Python
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-feishu-detail"),
+    )
+
+    candidate = result.candidates[0]
+    assert "探索 agent harness" in candidate.responsibilities
+    assert "落地工具调用与编排" in candidate.responsibilities
+    assert candidate.requirements == "熟悉 Python"
+
+
 def test_bing_result_parser_ignores_non_content_start_tags_inside_a_result() -> None:
     """A <div> inside <li> hits no h2/p/a-in-heading branch and is ignored."""
     parser = _BingSearchResultParser()
@@ -745,12 +844,16 @@ class _FakePage:
         goto_result: object | None = ...,
         goto_error: Exception | None = None,
         inner_text_error: Exception | None = None,
+        body_sequence: list[str] | None = None,
     ) -> None:
         self._body = body
         self._title = title
         self._goto_result = goto_result
         self._goto_error = goto_error
         self._inner_text_error = inner_text_error
+        #: Successive ``inner_text`` values simulating a late-rendering SPA;
+        #: once exhausted the last value repeats.
+        self._body_sequence = list(body_sequence) if body_sequence else None
         self.handler = None
         self.closed = False
 
@@ -768,6 +871,10 @@ class _FakePage:
     def inner_text(self, selector: str) -> str:
         if self._inner_text_error is not None:
             raise self._inner_text_error
+        if self._body_sequence:
+            if len(self._body_sequence) > 1:
+                return self._body_sequence.pop(0)
+            return self._body_sequence[0]
         return self._body
 
     def title(self) -> str:
@@ -1180,6 +1287,29 @@ def test_render_with_playwright_renders_and_guards_every_request(monkeypatch) ->
     assert public_route.continued and not public_route.aborted
     assert private_route.aborted and not private_route.continued
     assert error_route.aborted
+
+
+def test_render_with_playwright_polls_until_a_late_spa_stops_growing(monkeypatch) -> None:
+    """A portal that paints its job list long after domcontentloaded is polled
+    until the body text stabilizes above the usable threshold, not returned as
+    an empty shell."""
+    long_text = "岗位职责：" + "AI Agent 开发工程师。" * 60
+    page = _FakePage(
+        body_sequence=["", "加载中…", long_text],
+        title="蔚来校招",
+        goto_result=SimpleNamespace(),
+    )
+    pw = _FakePlaywright(_FakeBrowser(page))
+    _install_fake_playwright(monkeypatch, pw)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+    )
+
+    body, title = _render_with_playwright("https://nio.jobs.feishu.cn/campus/")
+
+    assert body == long_text
+    assert title == "蔚来校招"
+    assert page.closed is True
 
 
 def test_render_with_playwright_reuses_an_already_launched_runtime(monkeypatch) -> None:

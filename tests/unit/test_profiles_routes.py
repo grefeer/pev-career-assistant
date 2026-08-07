@@ -49,6 +49,8 @@ ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
 # A resume body whose parsed evidence spans name + email + skills so that the
 # CONFIRM / CORRECT / IGNORE decision branches can all be exercised together.
 MULTI_FIELD_RESUME = "张三\nzhangsan@example.com\n技能\nPython\n".encode("utf-8")
+# A distinct resume body used when a second confirmed version is needed.
+RESUME_VARIANT = "李四\nlisi@example.com\n技能\nJava\n".encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +168,21 @@ def _confirm_all_evidence(env) -> None:
         },
     )
     assert response.status_code == 200, response.text
+
+
+def _create_confirmed_version(env, *, content=MULTI_FIELD_RESUME) -> dict:
+    """Full flow: upload -> import -> confirm all -> create version. Returns body."""
+    asset_id = _ready_asset_id(env, content=content)
+    import_id = _create_import(env, asset_id).json()["id"]
+    _confirm_all_evidence(env)
+    version = _profile_version(env)
+    response = env.client.post(
+        "/api/profile-versions",
+        headers=env.headers,
+        json={"expected_version": version, "resume_import_id": import_id},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +387,78 @@ def test_reconcile_resume_asset_returns_409_when_object_missing(env) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resume asset delete
+# ---------------------------------------------------------------------------
+
+
+def test_delete_resume_asset_returns_404_for_unknown(env) -> None:
+    response = env.client.delete(
+        f"/api/resume-assets/{uuid.uuid4()}", headers=env.headers
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "profile_resource_not_found"
+
+
+def test_delete_resume_asset_removes_asset_and_object(env) -> None:
+    asset_id = _ready_asset_id(env)
+    object_key = f"users/{USER_ID}/resume-assets/{asset_id}"
+    assert object_key in env.blob_store.objects
+
+    response = env.client.delete(
+        f"/api/resume-assets/{asset_id}", headers=env.headers
+    )
+    assert response.status_code == 200
+    assert response.json() == {"deleted": True}
+    # Asset is gone from the listing and its encrypted object is purged.
+    assets = env.client.get("/api/resume-assets", headers=env.headers).json()["assets"]
+    assert all(a["id"] != asset_id for a in assets)
+    assert object_key not in env.blob_store.objects
+
+
+def test_delete_resume_asset_cascades_import_evidence_and_decisions(env) -> None:
+    asset_id = _ready_asset_id(env)
+    import_id = _create_import(env, asset_id).json()["id"]
+    evidence = _evidence_list(env)
+    version = _profile_version(env)
+    env.client.patch(
+        "/api/profiles/evidence",
+        headers=env.headers,
+        json={
+            "expected_version": version,
+            "decisions": [{"evidence_id": evidence[0]["id"], "action": "confirm"}],
+        },
+    )
+    assert _evidence_list(env)
+
+    response = env.client.delete(
+        f"/api/resume-assets/{asset_id}", headers=env.headers
+    )
+    assert response.status_code == 200
+    # Import is gone, and the cascaded evidence no longer projects.
+    assert env.client.get(
+        f"/api/resume-imports/{import_id}", headers=env.headers
+    ).status_code == 404
+    assert _evidence_list(env) == []
+
+
+def test_delete_resume_asset_swallows_object_delete_failure(env, monkeypatch) -> None:
+    """An object-store failure during purge must not fail the committed delete."""
+    asset_id = _ready_asset_id(env)
+
+    def _raise(*, key):
+        raise OSError("delete failed")
+
+    monkeypatch.setattr(env.blob_store, "delete", _raise)
+    response = env.client.delete(
+        f"/api/resume-assets/{asset_id}", headers=env.headers
+    )
+    # DB delete already committed; best-effort purge failure is swallowed.
+    assert response.status_code == 200
+    assets = env.client.get("/api/resume-assets", headers=env.headers).json()["assets"]
+    assert all(a["id"] != asset_id for a in assets)
+
+
+# ---------------------------------------------------------------------------
 # Resume imports
 # ---------------------------------------------------------------------------
 
@@ -532,6 +621,39 @@ def test_apply_evidence_decisions_applies_confirm_and_correct(env) -> None:
     )
     assert response.status_code == 200
     assert response.json()["version"] == version + 1
+
+
+def test_corrected_value_is_surfaced_in_evidence_projection(env) -> None:
+    """A CORRECT decision's resolved_value is projected back as corrected_value."""
+    asset_id = _ready_asset_id(env)
+    _create_import(env, asset_id)
+    evidence = {ev["field_path"]: ev for ev in _evidence_list(env)}
+    version = _profile_version(env)
+    env.client.patch(
+        "/api/profiles/evidence",
+        headers=env.headers,
+        json={
+            "expected_version": version,
+            "decisions": [
+                {"evidence_id": evidence["basics.name"]["id"], "action": "confirm"},
+                {
+                    "evidence_id": evidence["skills"]["id"],
+                    "action": "correct",
+                    "corrected_value": ["Go", "Rust"],
+                },
+                {"evidence_id": evidence["basics.email"]["id"], "action": "ignore"},
+            ],
+        },
+    )
+    projected = {ev["field_path"]: ev for ev in _evidence_list(env)}
+    # CORRECT surfaces the resolved value verbatim.
+    assert projected["skills"]["status"] == "corrected"
+    assert projected["skills"]["corrected_value"] == ["Go", "Rust"]
+    # CONFIRM and IGNORE never carry a corrected value.
+    assert projected["basics.name"]["status"] == "confirmed"
+    assert projected["basics.name"]["corrected_value"] is None
+    assert projected["basics.email"]["status"] == "ignored"
+    assert projected["basics.email"]["corrected_value"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +840,36 @@ def test_get_profile_version_returns_version(env) -> None:
     )
     assert response.status_code == 200
     assert response.json()["id"] == created["id"]
+
+
+def test_create_profile_version_sets_active_version(env) -> None:
+    """Creating a confirmed version pins it as the version the runtime consumes."""
+    created = _create_confirmed_version(env)
+    profile = env.client.get("/api/profiles", headers=env.headers).json()
+    assert profile["active_version_id"] == created["id"]
+
+
+def test_activate_profile_version_switches_active(env) -> None:
+    """Activating an older confirmed version re-points the runtime's active version."""
+    first = _create_confirmed_version(env)
+    second = _create_confirmed_version(env, content=RESUME_VARIANT)
+    # Each creation auto-pins the version as active; the second wins.
+    assert env.client.get("/api/profiles", headers=env.headers).json()["active_version_id"] == second["id"]
+
+    response = env.client.post(
+        f"/api/profile-versions/{first['id']}/activate", headers=env.headers
+    )
+    assert response.status_code == 200
+    assert response.json() == {"active_version_id": first["id"]}
+    assert env.client.get("/api/profiles", headers=env.headers).json()["active_version_id"] == first["id"]
+
+
+def test_activate_profile_version_returns_404_for_unknown(env) -> None:
+    response = env.client.post(
+        f"/api/profile-versions/{uuid.uuid4()}/activate", headers=env.headers
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "profile_resource_not_found"
 
 
 # ---------------------------------------------------------------------------

@@ -68,7 +68,16 @@ def destructive_mysql_url() -> str:
 
 
 def settings_override(**values: Any) -> Settings:
-    """Build test settings with deterministic, service-free defaults."""
+    """Build test settings with deterministic, service-free defaults.
+
+    Hermetic by construction: ``_env_file=None`` silences the project ``.env``
+    file source, and the PEV budgets are pinned to schema defaults so they
+    survive ``os.environ`` pollution. ``main.py`` imports call
+    ``load_project_env()`` -> ``load_dotenv()``, which copies every ``.env``
+    var (including ``AGENT_HARNESS_MAX_*``) into ``os.environ``; the
+    ``env_settings`` source reads that and is NOT disabled by ``_env_file``.
+    Init kwargs outrank every source, so pinning here wins regardless.
+    """
     settings_values: dict[str, Any] = {
         "app_env": "test",
         "app_auth_secret": "test-secret-with-at-least-32-characters",
@@ -76,6 +85,13 @@ def settings_override(**values: Any) -> Settings:
         "database_url": "sqlite+pysqlite:///:memory:",
         "redis_url": "redis://localhost:6379/15",
         "checkpoint_backend": "sqlite",
+        # Pin PEV budgets to schema defaults so route/service assertions stay
+        # deterministic even when a prior test imported ``main`` and polluted
+        # ``os.environ`` with a developer's loosened ``.env`` values.
+        "agent_harness_max_agent_turns": 12,
+        "agent_harness_max_tool_calls": 24,
+        "agent_harness_max_replans": 2,
+        "agent_harness_max_wall_clock_seconds": 300,
     }
     settings_values.update(values)
-    return Settings(**settings_values)
+    return Settings(_env_file=None, **settings_values)

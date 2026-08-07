@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from sqlalchemy import select, func
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from backend.app.db.models import (
@@ -51,6 +51,19 @@ def get_profile_for_update(db: Session, user_id: str) -> Profile:
     return profile
 
 
+def get_profile_by_user(db: Session, user_id: str) -> Profile | None:
+    """Read-only profile lookup; returns None when the profile does not exist."""
+    return db.scalar(select(Profile).where(Profile.user_id == user_id))
+
+
+def set_active_version(
+    db: Session, profile: Profile, version_id: str | None
+) -> None:
+    """Point the profile at the confirmed version the runtime should consume."""
+    profile.active_version_id = version_id
+    db.flush()
+
+
 def get_owned_asset(db: Session, user_id: str, asset_id: str) -> ResumeAsset | None:
     return db.scalar(
         select(ResumeAsset)
@@ -66,6 +79,48 @@ def list_owned_assets(db: Session, user_id: str) -> Sequence[ResumeAsset]:
         .where(Profile.user_id == user_id)
         .order_by(ResumeAsset.created_at.desc())
     ).all()
+
+
+def list_imports_for_asset(db: Session, asset_id: str) -> Sequence[ResumeImport]:
+    return db.scalars(
+        select(ResumeImport).where(ResumeImport.asset_id == asset_id)
+    ).all()
+
+
+def delete_asset(db: Session, asset: ResumeAsset) -> None:
+    """Delete an asset with its imports, evidence, and decisions.
+
+    Dependents are removed explicitly so deletion is correct whether or not the
+    backend enforces ON DELETE CASCADE (production MySQL does; the in-memory
+    SQLite used in tests does not). ``ResumeImport.asset_id`` is ON DELETE
+    RESTRICT, so imports must be removed before the asset row.
+    """
+    imports = list_imports_for_asset(db, asset.id)
+    if imports:
+        import_ids = [imp.id for imp in imports]
+        evidence_rows = db.scalars(
+            select(ProfileFieldEvidence).where(
+                ProfileFieldEvidence.resume_import_id.in_(import_ids)
+            )
+        ).all()
+        if evidence_rows:
+            db.execute(
+                delete(ProfileFieldDecision).where(
+                    ProfileFieldDecision.evidence_id.in_(
+                        [ev.id for ev in evidence_rows]
+                    )
+                )
+            )
+        db.execute(
+            delete(ProfileFieldEvidence).where(
+                ProfileFieldEvidence.resume_import_id.in_(import_ids)
+            )
+        )
+        db.execute(
+            delete(ResumeImport).where(ResumeImport.asset_id == asset.id)
+        )
+    db.execute(delete(ResumeAsset).where(ResumeAsset.id == asset.id))
+    db.flush()
 
 
 def get_owned_import(db: Session, user_id: str, import_id: str) -> ResumeImport | None:

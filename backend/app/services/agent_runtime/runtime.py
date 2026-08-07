@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import time
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -39,6 +40,10 @@ from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 #: identifier-only summary lines so early-link evidence is preserved as a
 #: pointer rather than silently dropped.
 _EVIDENCE_BUDGET_CHARS = 48_000
+
+#: Per-candidate section truncation when projecting extract outputs into the
+#: tool context: keyword scoring needs representative text, not full JD text.
+_STRUCTURED_SECTION_CHARS = 600
 
 
 @dataclass(frozen=True)
@@ -104,7 +109,7 @@ class AgentRuntime:
             consumed_turns = run_repository.count_turns(db, run.id)
             consumed_tool_calls = run_repository.count_tool_decisions(db, run.id)
             task = self._with_observed_public_evidence(db, task, run.id)
-        context = self._tool_context(user_id=user_id, run_id=run.id, task=task)
+        context = self._tool_context(user_id=user_id, run_id=run.id, task=task, db=db)
         tool_budget = ToolCallBudget(
             task.budget.max_tool_calls, used=consumed_tool_calls
         )
@@ -197,7 +202,7 @@ class AgentRuntime:
                     db, planning_task, run.id
                 )
                 context = self._tool_context(
-                    user_id=user_id, run_id=run.id, task=planning_task
+                    user_id=user_id, run_id=run.id, task=planning_task, db=db
                 )
             if replan_feedback is not None:
                 replans += 1
@@ -497,7 +502,10 @@ class AgentRuntime:
                         db, execution_task, run_id
                     )
                     context = self._tool_context(
-                        user_id=context.user_id, run_id=run_id, task=execution_task
+                        user_id=context.user_id,
+                        run_id=run_id,
+                        task=execution_task,
+                        db=db,
                     )
                     continue
                 # Same-step retries cannot satisfy the verifier: more retries
@@ -668,9 +676,17 @@ class AgentRuntime:
 
     @staticmethod
     def _tool_context(
-        *, user_id: str, run_id: str, task: AgentTaskRequest
+        *, user_id: str, run_id: str, task: AgentTaskRequest, db: Session
     ) -> ToolContext:
-        """Project only verified public evidence into deterministic tool authority."""
+        """Project only verified public evidence into deterministic tool authority.
+
+        Raw page evidence flows through the bounded ``observed_public_evidence``
+        context; structured job candidates are read from the run's persisted
+        ``structured_job_details`` artifacts (extract outputs) so skill tools
+        (e.g. ``match-observed-jobs``) rank real per-job units instead of one
+        aggregated page. Candidates are tool-side authority only: they never
+        enter ``task.context``, so model prompts stay unchanged.
+        """
         evidence = task.context.get("observed_public_evidence", [])
         profile_facts = task.private_context.get("confirmed_profile_facts", {})
         return ToolContext(
@@ -678,6 +694,7 @@ class AgentRuntime:
             run_id=run_id,
             metadata={
                 "observed_public_evidence": evidence if isinstance(evidence, list) else [],
+                "structured_job_candidates": _structured_job_candidates(db, run_id),
                 "confirmed_profile_facts": profile_facts
                 if isinstance(profile_facts, dict)
                 else {},
@@ -1083,3 +1100,55 @@ def _skill_artifact_source_url(
             if isinstance(source_url, str) and source_url:
                 return source_url
     return None
+
+
+def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]:
+    """Flatten the run's persisted ``structured_job_details`` into candidate units.
+
+    Each extract artifact's ``candidates`` list becomes one compact dict
+    (title / locations / bounded sections) carrying the artifact's identity.
+    Returns [] when the run has no structured extraction yet, so the matching
+    tool falls back to raw page evidence.
+    """
+    items: list[dict[str, Any]] = []
+    for artifact in run_repository.list_evidence_artifacts(db, run_id):
+        raw_candidates = artifact.content_json.get("candidates")
+        if not isinstance(raw_candidates, list):
+            continue
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            source_url = candidate.get("apply_url")
+            if not isinstance(source_url, str) or not source_url:
+                source_url = artifact.source_url
+            title = candidate.get("title")
+            items.append(
+                {
+                    "artifact_id": artifact.id,
+                    "source_url": source_url,
+                    "content_hash": artifact.content_hash,
+                    "title": title if isinstance(title, str) else None,
+                    "locations": _string_list(candidate.get("locations")),
+                    # Card-list extraction can land JD snippets in company_name
+                    # (Feishu campus cards) — carry it as bounded evidence so the
+                    # match tool can score on it, never as a trusted company fact.
+                    "company_name": _bounded_section(candidate.get("company_name")),
+                    "responsibilities": _bounded_section(candidate.get("responsibilities")),
+                    "requirements": _bounded_section(candidate.get("requirements")),
+                }
+            )
+    return items
+
+
+def _string_list(value: object) -> list[str]:
+    """Return the string items of a list value, or [] for non-list input."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str) and item]
+
+
+def _bounded_section(value: object) -> str:
+    """Return a string section truncated to the structured-candidate budget."""
+    if not isinstance(value, str):
+        return ""
+    return value[:_STRUCTURED_SECTION_CHARS]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from backend.app.db.models import ConfirmedProfileVersion, Profile, User, UserRole
@@ -333,6 +335,62 @@ def test_service_preserves_task_private_context_when_no_profile_version_exists(d
     )
 
     assert projected is task
+
+
+def _owner_with_two_versions(db_session):
+    """A user with a profile + two confirmed versions; returns (profile, old_v, latest_v).
+
+    ``latest_v`` is newer (``created_at`` greater) so the harness fallback picks it.
+    """
+    user = _user("user-a", "user-a@example.test")
+    db_session.add(user)
+    db_session.commit()
+    profile = Profile(user_id=user.id, version=1, local_sensitive_references={})
+    db_session.add(profile)
+    db_session.flush()
+    old_v = ConfirmedProfileVersion(
+        profile_id=profile.id, version_number=1, aggregate_version=1,
+        facts_snapshot={"skills": ["old-version-fact"]}, evidence_refs={},
+        local_sensitive_references={},
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    latest_v = ConfirmedProfileVersion(
+        profile_id=profile.id, version_number=2, aggregate_version=2,
+        facts_snapshot={"skills": ["latest-version-fact"]}, evidence_refs={},
+        local_sensitive_references={},
+        created_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+    )
+    db_session.add_all([old_v, latest_v])
+    db_session.commit()
+    return profile, old_v, latest_v
+
+
+def test_with_confirmed_profile_facts_uses_active_version_when_set(db_session) -> None:
+    """The active version is consumed even when it is not the latest."""
+    profile, old_v, _latest_v = _owner_with_two_versions(db_session)
+    profile.active_version_id = old_v.id
+    db_session.commit()
+    task = AgentTaskRequest(goal="修改简历", allowed_skills=["resume-tailoring"])
+
+    projected = AgentRunService._with_confirmed_profile_facts(
+        db_session, user_id=profile.user_id, task=task
+    )
+
+    assert projected.private_context["confirmed_profile_facts"] == {"skills": ["old-version-fact"]}
+
+
+def test_with_confirmed_profile_facts_falls_back_to_latest_when_active_unset(db_session) -> None:
+    """With no active version pinned, the latest confirmed version is used."""
+    profile, _old_v, _latest_v = _owner_with_two_versions(db_session)
+    profile.active_version_id = None
+    db_session.commit()
+    task = AgentTaskRequest(goal="修改简历", allowed_skills=["resume-tailoring"])
+
+    projected = AgentRunService._with_confirmed_profile_facts(
+        db_session, user_id=profile.user_id, task=task
+    )
+
+    assert projected.private_context["confirmed_profile_facts"] == {"skills": ["latest-version-fact"]}
 
 
 def test_service_blocks_resume_and_recovery_when_harness_is_disabled(db_session) -> None:

@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from backend.app.db.base import Base
 from backend.app.db.models import (
     Profile,
+    ProfileFieldDecision,
     ProfileFieldEvidence,
     ResumeAsset,
     ResumeAssetStatus,
+    ResumeImport,
     ResumeImportStatus,
 )
 from backend.app.domain.profiles import (
@@ -217,3 +219,59 @@ def test_profile_evidence_list_does_not_duplicate_append_only_decisions(
     rows = profiles.get_profile_evidence_with_decisions(profile_db, owner.id)
 
     assert [row.id for row in rows] == [evidence.id]
+
+
+def test_delete_asset_removes_imports_evidence_and_decisions(
+    profile_db: Session, seeded_profiles: tuple[Profile, Profile, ResumeAsset]
+) -> None:
+    """Deleting an asset cascades to its imports, evidence, and decisions."""
+    owner, _other, asset = seeded_profiles
+    import_row = profiles.create_import(
+        profile_db, asset=asset, parser_version="profile-v1"
+    )
+    evidence = profiles.append_evidence(
+        profile_db,
+        profile_id=owner.id,
+        import_id=import_row.id,
+        candidates=(EvidenceCandidate("skills", ["Python"], "Python", 90),),
+    )[0]
+    profiles.append_decision(
+        profile_db,
+        profile_id=owner.id,
+        evidence_id=evidence.id,
+        actor_user_id=owner.user_id,
+        action=EvidenceDecisionAction.CONFIRM,
+    )
+    profile_db.flush()
+
+    profiles.delete_asset(profile_db, asset)
+
+    assert profile_db.get(ResumeAsset, asset.id) is None
+    assert profile_db.get(ResumeImport, import_row.id) is None
+    assert profile_db.get(ProfileFieldEvidence, evidence.id) is None
+    assert profile_db.scalar(select(func.count(ProfileFieldDecision.id))) == 0
+
+
+def test_delete_asset_handles_import_without_evidence(
+    profile_db: Session, seeded_profiles: tuple[Profile, Profile, ResumeAsset]
+) -> None:
+    """An import that produced no evidence still has its import row removed."""
+    _owner, _other, asset = seeded_profiles
+    import_row = profiles.create_import(
+        profile_db, asset=asset, parser_version="profile-v1"
+    )
+    profile_db.flush()
+
+    profiles.delete_asset(profile_db, asset)
+
+    assert profile_db.get(ResumeAsset, asset.id) is None
+    assert profile_db.get(ResumeImport, import_row.id) is None
+
+
+def test_delete_asset_removes_asset_with_no_imports(
+    profile_db: Session, seeded_profiles: tuple[Profile, Profile, ResumeAsset]
+) -> None:
+    """An asset with no imports is removed directly."""
+    _owner, _other, asset = seeded_profiles
+    profiles.delete_asset(profile_db, asset)
+    assert profile_db.get(ResumeAsset, asset.id) is None

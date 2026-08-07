@@ -19,10 +19,12 @@ const mockProfile = {
       confidence: 90,
       status: "pending" as const,
       diff_action: "add" as const,
+      corrected_value: null as unknown | null,
     },
   ],
   local_sensitive_references: {},
   latest_version: null,
+  active_version_id: null as string | null,
 };
 
 beforeEach(() => {
@@ -35,6 +37,8 @@ beforeEach(() => {
   vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({ assets: [] });
   vi.mocked(profileApi.fetchProfileVersions).mockResolvedValue({ versions: [] });
   vi.mocked(profileApi.applyEvidenceDecisions).mockResolvedValue({ version: 1 });
+  vi.mocked(profileApi.deleteResumeAsset).mockResolvedValue({ deleted: true });
+  vi.mocked(profileApi.activateProfileVersion).mockResolvedValue({ active_version_id: "v1" });
   vi.mocked(profileApi.createProfileVersion).mockResolvedValue({
     id: "v1",
     version_number: 1,
@@ -455,5 +459,141 @@ describe("ProfileWorkspace", () => {
     await flushPromises();
     // v-if="ev.diff_action" -> null -> badge not rendered
     expect(wrapper.findAll(".diff-badge").length).toBe(0);
+  });
+
+  it("renders the corrected value for a corrected evidence item", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [
+        {
+          ...mockProfile.evidence[0],
+          status: "corrected",
+          corrected_value: ["Go", "Rust"],
+        },
+      ],
+    });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // status=corrected + corrected_value != null -> "更正后：" plus the JSON-stringified value
+    expect(wrapper.text()).toContain("已更正");
+    expect(wrapper.text()).toContain("更正后：");
+    expect(wrapper.text()).toContain(JSON.stringify(["Go", "Rust"]));
+  });
+
+  it("omits the corrected-value block when a corrected item has no value", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      evidence: [
+        { ...mockProfile.evidence[0], status: "corrected", corrected_value: null },
+      ],
+    });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+    // status=corrected but corrected_value is null -> label shows, value block hidden
+    expect(wrapper.text()).toContain("已更正");
+    expect(wrapper.text()).not.toContain("更正后：");
+  });
+
+  it("deletes an asset after confirmation and refreshes the list", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.deleteResumeAsset).mockResolvedValue({ deleted: true });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="delete-asset"]').trigger("click");
+    await flushPromises();
+
+    expect(profileApi.deleteResumeAsset).toHaveBeenCalledWith("token", "asset-ready");
+    expect(wrapper.text()).toContain("简历已删除");
+  });
+
+  it("aborts deletion when the user cancels the confirmation", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="delete-asset"]').trigger("click");
+    await flushPromises();
+
+    expect(profileApi.deleteResumeAsset).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a delete failure with a default message when none is provided", async () => {
+    vi.mocked(profileApi.fetchResumeAssets).mockResolvedValue({
+      assets: [{
+        id: "asset-ready", original_filename: "resume.pdf", content_type: "application/pdf",
+        plaintext_size: 256, encryption_version: "v1", status: "ready", error_code: null,
+        created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z",
+      }],
+    });
+    vi.mocked(profileApi.deleteResumeAsset).mockRejectedValue(new Error(""));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="delete-asset"]').trigger("click");
+    await flushPromises();
+
+    // error.message || "删除失败" -> "" falsy -> "删除失败"
+    expect(wrapper.text()).toContain("删除失败");
+  });
+
+  it("marks the active version with a badge and offers activation for the others", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      active_version_id: "version-1",
+    });
+    vi.mocked(profileApi.fetchProfileVersions).mockResolvedValue({
+      versions: [
+        { id: "version-1", version_number: 1, aggregate_version: 1, created_at: "2026-08-01" },
+        { id: "version-2", version_number: 2, aggregate_version: 2, created_at: "2026-08-02" },
+      ],
+    });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    // version-1 is active -> badge shown, no activate button for it.
+    expect(wrapper.findAll(".active-badge").length).toBe(1);
+    const activateButtons = wrapper.findAll('[data-test="activate-version"]');
+    expect(activateButtons.length).toBe(1);
+  });
+
+  it("activates a non-active version and re-points the active badge", async () => {
+    vi.mocked(profileApi.fetchProfile).mockResolvedValue({
+      ...mockProfile,
+      active_version_id: "version-1",
+    });
+    vi.mocked(profileApi.fetchProfileVersions).mockResolvedValue({
+      versions: [
+        { id: "version-1", version_number: 1, aggregate_version: 1, created_at: "2026-08-01" },
+        { id: "version-2", version_number: 2, aggregate_version: 2, created_at: "2026-08-02" },
+      ],
+    });
+    vi.mocked(profileApi.activateProfileVersion).mockResolvedValue({ active_version_id: "version-2" });
+    const wrapper = mount(ProfileWorkspace, { props: { token: "token" } });
+    await flushPromises();
+
+    await wrapper.get('[data-test="activate-version"]').trigger("click");
+    await flushPromises();
+
+    expect(profileApi.activateProfileVersion).toHaveBeenCalledWith("token", "version-2");
+    expect(wrapper.text()).toContain("已设为当前版本");
+    // The badge moved to version-2; version-1 now shows the activate button.
+    expect(wrapper.findAll(".active-badge").length).toBe(1);
+    expect(wrapper.findAll('[data-test="activate-version"]').length).toBe(1);
   });
 });

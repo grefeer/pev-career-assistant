@@ -20,7 +20,7 @@ _DEPARTMENT_PATTERNS: list[re.Pattern] = [
 ]
 
 _RESPONSIBILITIES_HEADERS: list[re.Pattern] = [
-    re.compile(r"(?:岗位职责|工作职责|职位描述|工作内容|主要职责|职责描述|responsibilities|job description|what you.?ll do|key responsibilities)", re.IGNORECASE),
+    re.compile(r"(?:岗位职责|工作职责|职位描述|工作内容|主要职责|职责描述|岗位定位|你将负责|responsibilities|job description|what you.?ll do|key responsibilities)", re.IGNORECASE),
 ]
 
 _REQUIREMENTS_HEADERS: list[re.Pattern] = [
@@ -61,13 +61,81 @@ _MULTI_JOB_SEPARATORS: list[re.Pattern] = [
 
 _TITLE_HEADER_RE: re.Pattern = re.compile(r"^(?:岗位名称|职位名称|招聘职位)", re.MULTILINE)
 
+#: Hard ceiling on candidates produced from one page. Card-list portals
+#: (Feishu careers) segment into dozens of openings, so the cap is a reachable
+#: guard rather than the old unreachable 10-limit.
+_MAX_CANDIDATES_PER_PAGE = 100
+
+# Feishu-style career portals render every opening as a card whose first line
+# is the job title and whose second line is a dense meta line carrying the
+# ``职位 ID`` marker (with locations and recruitment type inline). Splitting on
+# title+meta pairs lets a whole listing (e.g. 61 NIO agent roles) extract as
+# individual candidates instead of one undifferentiated blob. The role token
+# may sit anywhere in the title (real titles trail suffixes such as
+# ``（AI安全方向）`` or ``-NOMI``), with at most 30 chars of trailing detail;
+# a chrome line above a meta (e.g. ``推荐投递``) carries no role token and is
+# therefore never misread as a title.
+_CARD_TITLE_ROLE_SUFFIXES = (
+    "工程师|开发|算法|研究员|架构师|科学家|设计师|分析师|顾问|专家|"
+    "运营|产品|经理|管培生|培训生|实习生|专员|助理|PMO"
+)
+_CARD_LIST_SPLIT_RE: re.Pattern = re.compile(
+    rf"(?m)^(?P<title>.{{2,60}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
+    r"(?P<meta>[^\n]*职位\s*ID[^\n]*)$"
+)
+
+
+def _card_meta_cities(meta: str) -> str | None:
+    """Read the city list leading a Feishu card meta line, if present.
+
+    The meta line begins with locations, either directly
+    (``北京、上海校招正式...``) or with a count
+    (``武汉、合肥、上海等 4 个城市校招正式...``); the capture is guarded so a
+    non-city lead such as ``本科及以上校招...`` or a digit-led
+    ``2027届校招...`` is rejected rather than emitted as a location.
+    """
+    m = re.match(
+        r"^([一-鿿·、等]{2,20}?)(?:\s*\d+\s*个城市)?(?:校招|社招|实习)", meta
+    )
+    if m is None:
+        return None
+    candidate = m.group(1)
+    if candidate.endswith("等"):
+        candidate = candidate[:-1]
+    if (
+        "、" not in candidate
+        and len(candidate) > 4
+        and not candidate.endswith(("市", "省", "都", "州"))
+    ):
+        return None
+    return candidate
+
+
+def _normalize_card_segment(card_text: str, match: re.Match, segment_start: int) -> str:
+    """Prefix one Feishu-style card with extractable title/location headers.
+
+    The injected ``职位名称：`` / ``工作地点：`` lines reuse the labeled
+    extraction patterns (``_TITLE_PATTERNS[0]``, ``_LOCATION_PATTERNS``), so
+    per-card titles and cities surface without touching the heuristics that
+    other page layouts rely on. ``match.start()`` is absolute in the source
+    page text; ``card_text`` is the sliced segment, so the offset is rebased.
+    """
+    title = match.group("title").strip()
+    header = f"职位名称：{title}\n"
+    cities = _card_meta_cities(match.group("meta"))
+    if cities is not None:
+        header += f"工作地点：{cities}\n"
+    return header + card_text[match.start() - segment_start:].strip()
+
 
 def _split_multi_job_page(text: str) -> list[str]:
     """Split page text containing multiple job postings into segments.
 
     Detects Chinese multi-job separators like 岗位二： / 职位2：
-    or repeated title headings (岗位名称 appearing twice).
-    Returns up to 2 text segments, each fed separately to extraction.
+    or repeated title headings (岗位名称 appearing twice), or Feishu-style
+    card listings (title line followed by a ``职位 ID`` meta line - each card
+    becomes its own segment). Returns the detected segments, each fed
+    separately to extraction.
     """
     if not text.strip():
         return [text]
@@ -98,6 +166,18 @@ def _split_multi_job_page(text: str) -> list[str]:
             end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else len(text)
             segments.append(text[start:end].strip())
         return segments[:2]
+
+    # Pattern 3: Feishu-style card listings. Every card becomes its own
+    # segment; header/navigation chrome between cards is dropped because it is
+    # not a job posting.
+    card_matches = list(_CARD_LIST_SPLIT_RE.finditer(text))
+    if card_matches:
+        segments = []
+        for i, m in enumerate(card_matches):
+            start = m.start()
+            end = card_matches[i + 1].start() if i + 1 < len(card_matches) else len(text)
+            segments.append(_normalize_card_segment(text[start:end], m, start))
+        return segments
 
     return [text]
 
@@ -161,8 +241,10 @@ def _extract_section(text: str, header_patterns: list[re.Pattern]) -> str:
             else:
                 section_text = remainder
 
-            # Clean up
-            section_text = re.sub(r"\s+", " ", section_text).strip()
+            # Clean up. The capture begins right after the heading label, so it
+            # may still lead with the label's colon/whitespace (the heading
+            # pattern does not consume ``:``) - strip those separators first.
+            section_text = re.sub(r"\s+", " ", section_text.lstrip("：:、，")).strip()
             if len(section_text) > 10:
                 return section_text
     return ""
@@ -262,7 +344,7 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
     """Parse job description text using deterministic keyword heuristics.
 
     This is a pure function — no LLM, no DB, no network.
-    Returns 0-10 NormalizedJobCandidate objects with confidence scores.
+    Returns 0-100 NormalizedJobCandidate objects with confidence scores.
 
     For structured pages (with clear section headers like 岗位职责/任职要求),
     extracts precise fields. For unstructured text (WeChat articles, OCR results),
@@ -287,9 +369,9 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
     seen_dedup_keys: set[str] = set()
 
     for segment in segments:
-        # Unreachable: _split_multi_job_page returns at most 2 segments, so
-        # the 10-candidate cap can never trigger. Retained as a hard guard.
-        if len(results) >= 10:  # pragma: no cover
+        # Hard ceiling per page: Feishu card listings segment into dozens of
+        # openings, so this guard is reachable and covered by tests.
+        if len(results) >= _MAX_CANDIDATES_PER_PAGE:
             break
 
         title, title_conf = _extract_title(segment)

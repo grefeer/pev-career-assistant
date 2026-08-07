@@ -34,6 +34,17 @@ export function reconcileResumeAsset(
   );
 }
 
+export function deleteResumeAsset(
+  token: string,
+  assetId: string,
+): Promise<{ deleted: boolean }> {
+  return request<{ deleted: boolean }>(
+    `/resume-assets/${assetId}`,
+    { method: "DELETE" },
+    token,
+  );
+}
+
 export function startResumeImport(
   token: string,
   assetId: string,
@@ -118,6 +129,17 @@ export function fetchProfileVersions(
   return request<{ versions: ConfirmedProfileVersionSummary[] }>(
     "/profile-versions",
     {},
+    token,
+  );
+}
+
+export function activateProfileVersion(
+  token: string,
+  versionId: string,
+): Promise<{ active_version_id: string }> {
+  return request<{ active_version_id: string }>(
+    `/profile-versions/${versionId}/activate`,
+    { method: "POST" },
     token,
   );
 }

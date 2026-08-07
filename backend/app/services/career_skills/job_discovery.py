@@ -34,6 +34,12 @@ _PLAYWRIGHT_FALLBACK_CODES = frozenset(
 # Visible text below this many chars is a shell (SPA boot stub, "Not Found",
 # anti-bot placeholder) rather than usable job evidence; the renderer decides.
 _MIN_USABLE_TEXT_CHARS = 160
+# Upper bound for the visible-text evidence captured from one page. The Feishu
+# campus portal renders a whole 100-job listing (with inline JD sections) in a
+# single DOM pass (~26k chars for the 61 NIO agent roles), so the cap must
+# comfortably exceed the largest single-portal render while staying far under
+# the 48k per-run evidence budget kept full for recent artifacts.
+_MAX_VISIBLE_TEXT_CHARS = 32_000
 _PLAYWRIGHT_FALLBACK_ENABLED = False
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
@@ -452,8 +458,30 @@ def _render_with_playwright(url: str) -> tuple[str, str | None]:
             response = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
             if response is None:
                 raise PublicJobFetchError("public_fetch_failed")
+            # SPA career portals frequently finish rendering long after
+            # domcontentloaded (deferred data fetch + re-render timers; the
+            # Feishu campus portal paints its job list ~10s late). Poll the
+            # body text until it stops growing above the usable-text threshold,
+            # capped at ~15s, so a late-rendering page is not returned as an
+            # empty shell. A below-threshold shell must NOT break early: it is
+            # exactly the pre-render state we are waiting out.
             page.wait_for_timeout(1_500)
             body_text = page.inner_text("body") or ""
+            stable_samples = 0
+            for _ in range(30):
+                previous_len = len(body_text.strip())
+                page.wait_for_timeout(500)
+                body_text = page.inner_text("body") or ""
+                current_len = len(body_text.strip())
+                if (
+                    current_len >= _MIN_USABLE_TEXT_CHARS
+                    and current_len == previous_len
+                ):
+                    stable_samples += 1
+                    if stable_samples >= 2:
+                        break
+                else:
+                    stable_samples = 0
             return body_text, page.title() or None
         finally:
             page.close()
@@ -482,7 +510,7 @@ def fetch_public_job_page(
         if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
             raise
     rendered_text, rendered_title = _render_with_playwright(payload.url)
-    visible_text = rendered_text.strip()[:12_000]
+    visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
     if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
@@ -511,7 +539,7 @@ def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
     html = response.text
     parser = _VisibleTextParser()
     parser.feed(html)
-    visible_text = "\n".join(parser.text_parts)[:12_000]
+    visible_text = "\n".join(parser.text_parts)[:_MAX_VISIBLE_TEXT_CHARS]
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
@@ -674,8 +702,13 @@ def extract_observed_job_details(
         "source_url": source_url,
         "content_hash": content_hash,
     }
+    extracted = extract_jd_candidates(visible_text, source_url)
+    # A single-JD page is enriched from its own full text; a multi-candidate
+    # page (e.g. a Feishu card listing) must NOT have the page's first
+    # responsibilities/requirements section copied onto every candidate.
+    single_jd_page = len(extracted) <= 1
     candidates = []
-    for candidate in extract_jd_candidates(visible_text, source_url):
+    for candidate in extracted:
         inferred_title = _infer_official_page_title(visible_text)
         title = (
             inferred_title
@@ -693,20 +726,28 @@ def extract_observed_job_details(
             for warning in candidate.normalization_warnings
             if not (locations and warning == "No location information found")
         ]
-        responsibilities = _extract_jd_section(
-            visible_text,
-            labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责"),
+        responsibilities = (
+            _extract_jd_section(
+                visible_text,
+                labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责", "岗位定位", "你将负责"),
+            )
+            if single_jd_page
+            else candidate.responsibilities
         ) or candidate.responsibilities
-        requirements = _extract_jd_section(
-            visible_text,
-            labels=(
-                "任职要求",
-                "职责要求",
-                "岗位要求",
-                "职位要求",
-                "资格要求",
-                "招聘要求",
-            ),
+        requirements = (
+            _extract_jd_section(
+                visible_text,
+                labels=(
+                    "任职要求",
+                    "职责要求",
+                    "岗位要求",
+                    "职位要求",
+                    "资格要求",
+                    "招聘要求",
+                ),
+            )
+            if single_jd_page
+            else candidate.requirements
         ) or candidate.requirements
         candidates.append(
             ExtractedJobDetails(
