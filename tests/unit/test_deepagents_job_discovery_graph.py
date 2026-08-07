@@ -15,7 +15,7 @@ def _fake_fetch(urls: list[str]) -> list[dict]:
             "source_url": url,
             "status": "succeeded",
             "content_hash": f"hash-{index}",
-            "visible_text": "岗位：后端工程师\n任职要求：精通 Python",
+            "visible_text": "岗位：后端工程师\n岗位职责：负责后端服务开发\n任职要求：精通 Python",
         }
         for index, url in enumerate(urls)
     ]
@@ -23,19 +23,66 @@ def _fake_fetch(urls: list[str]) -> list[dict]:
 
 def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
     if script == "coverage_gate":
-        # faithful to the real script: verified mirrors whether candidates exist
+        # faithful to the real coverage_gate.py (non-manifest path): emits
+        # coverage_verified/page_count/.../reasons, never a bare `verified`,
+        # and reports missing_terminal_evidence when --terminal-evidence is
+        # absent (the verdict derives from evidence, not candidate existence)
         parts = cli_args.split()
-        candidates_path = Path(parts[0])
-        candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
+        candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
+        pages: list[str] = []
+        terminal: str | None = None
+        if "--pages" in parts:
+            tail = parts[parts.index("--pages") + 1 :]
+            if "--terminal-evidence" in tail:
+                pages = tail[: tail.index("--terminal-evidence")]
+            else:
+                pages = tail
+        if "--terminal-evidence" in parts:
+            terminal = parts[parts.index("--terminal-evidence") + 1]
+        reasons: list[str] = []
+        if not pages:
+            reasons.append("no_page_evidence")
+        if not terminal:
+            reasons.append("missing_terminal_evidence")
+        body_count = sum(
+            bool(
+                (c.get("responsibilities") or "").strip()
+                or (c.get("requirements") or "").strip()
+            )
+            for c in candidates
+        )
+        if body_count != len(candidates):
+            reasons.append("missing_jd_body")
         return json.dumps(
-            {"verified": bool(candidates), "pages": 1, "candidates": len(candidates)}
+            {
+                "coverage_verified": not reasons,
+                "page_count": len(pages),
+                "candidate_count": len(candidates),
+                "body_candidate_count": body_count,
+                "unique_listing_count": len(candidates),
+                "expected_count": None,
+                "terminal_evidence": terminal,
+                "reasons": reasons,
+            },
+            ensure_ascii=False,
         )
     if script == "validate":
         return json.dumps({"ok": True})
     if script == "deduplicate":
         parts = cli_args.split()
         out_path = Path(parts[parts.index("--out") + 1])
-        out_path.write_text(json.dumps([{"title": "后端工程师"}]), encoding="utf-8")
+        out_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "title": "后端工程师",
+                        "responsibilities": "负责后端服务开发",
+                        "requirements": "精通 Python",
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
         return "ok"
     return "{}"
 
@@ -59,6 +106,9 @@ def test_fetch_failure_recorded_per_url_not_fatal() -> None:
     assert final["per_url_results"][0]["status"] == "failed"
     assert final["candidates"] == []
     assert final["coverage"]["verified"] is False
+    # the real gate reports the evidence gaps it observed
+    assert "no_page_evidence" in final["coverage"]["reasons"]
+    assert "missing_terminal_evidence" in final["coverage"]["reasons"]
 
 
 def test_extract_failure_records_error() -> None:
@@ -204,6 +254,61 @@ def test_coverage_unparsable_output_falls_back() -> None:
         "verified": False,
         "error": "unparsable coverage_gate output",
     }
+
+
+def test_coverage_non_object_output_falls_back() -> None:
+    def list_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        if script == "coverage_gate":
+            return "[]"
+        return _fake_runner(script, cli_args, stdin)
+
+    graph = build_job_discovery_graph(
+        fetch_fn=_fake_fetch, script_runner=list_runner
+    ).compile()
+    final = graph.invoke({"urls": ["https://example.com/jobs"]})
+    assert final["coverage"] == {
+        "verified": False,
+        "error": "non-object coverage_gate output",
+    }
+
+
+def test_coverage_passes_terminal_evidence_and_maps_real_keys() -> None:
+    # regression for the review finding: the graph must pass
+    # --terminal-evidence (the real gate always reports
+    # missing_terminal_evidence without it) and expose the mapped `verified`
+    # bool beside the real script's coverage_verified key
+    recorded: dict[str, str] = {}
+
+    def recording_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        if script == "coverage_gate":
+            recorded["coverage_gate"] = cli_args
+        return _fake_runner(script, cli_args, stdin)
+
+    graph = build_job_discovery_graph(
+        fetch_fn=_fake_fetch, script_runner=recording_runner
+    ).compile()
+    final = graph.invoke({"urls": ["https://example.com/jobs"]})
+    assert "--terminal-evidence hash-0" in recorded["coverage_gate"]
+    assert "--pages https://example.com/jobs" in recorded["coverage_gate"]
+    assert final["coverage"]["coverage_verified"] is True
+    assert final["coverage"]["verified"] is True
+    assert final["coverage"]["reasons"] == []
+    assert final["coverage"]["page_count"] == 1
+
+
+def test_coverage_without_content_hash_omits_terminal_evidence() -> None:
+    def fetch_without_hash(urls: list[str]) -> list[dict]:
+        return [
+            {"url": url, "source_url": url, "status": "succeeded"} for url in urls
+        ]
+
+    graph = build_job_discovery_graph(
+        fetch_fn=fetch_without_hash, script_runner=_fake_runner
+    ).compile()
+    final = graph.invoke({"urls": ["https://a.com"]})
+    assert final["candidates"] == []
+    assert final["coverage"]["verified"] is False
+    assert "missing_terminal_evidence" in final["coverage"]["reasons"]
 
 
 def test_default_seams_used_without_injection(monkeypatch) -> None:

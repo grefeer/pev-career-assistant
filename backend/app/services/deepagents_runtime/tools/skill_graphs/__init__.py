@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel
 
+from backend.app.services.agent_runtime.schemas import ToolObservation
 from backend.app.services.deepagents_runtime.tools.skill_graphs.job_discovery_graph import (
     build_job_discovery_graph,
 )
@@ -44,13 +45,20 @@ def build_job_discovery_tool(
 
     Thread = ``f"{run_id}:{step_index}:workflow"`` (bound by the harness via
     ``workflow_thread_id``), so a mid-crawl crash resumes from the last URL
-    instead of re-fetching.  Returns the structured partial-results
-    contract: ``{per_url_results, candidates, coverage}``.
+    instead of re-fetching.  Returns a ToolObservation (the harness's
+    ``_project_tool_observations`` validates every ToolMessage against that
+    schema — a bare dict would be silently dropped as invalid).
     """
 
     graph = build_job_discovery_graph(
         fetch_fn=fetch_fn, script_runner=script_runner, extract_fn=extract_fn
     ).compile(checkpointer=checkpointer)
+
+    def _observe(status: str, **kwargs: Any) -> str:
+        observation = ToolObservation(
+            tool_name="run-job-discovery-workflow", status=status, **kwargs
+        )
+        return json.dumps(observation.model_dump(exclude_none=True), ensure_ascii=False)
 
     def run(payload: str) -> str:
         try:
@@ -64,21 +72,16 @@ def build_job_discovery_tool(
             config = {"configurable": {"thread_id": thread}} if thread else {}
             final = graph.invoke({"urls": value}, config)
         except Exception as exc:  # noqa: BLE001 - fold into observation, never raise
-            return json.dumps(
-                {
-                    "tool_name": "run-job-discovery-workflow",
-                    "status": "failed",
-                    "error_code": f"workflow_error: {type(exc).__name__}",
-                },
-                ensure_ascii=False,
+            return _observe(
+                "failed", error_code=f"workflow_error: {type(exc).__name__}"
             )
-        return json.dumps(
-            {
+        return _observe(
+            "succeeded",
+            output={
                 "per_url_results": final.get("per_url_results", []),
                 "candidates": final.get("candidates", []),
                 "coverage": final.get("coverage", {"verified": False}),
             },
-            ensure_ascii=False,
         )
 
     return StructuredTool.from_function(

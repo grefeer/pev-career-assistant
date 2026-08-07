@@ -139,6 +139,10 @@ def build_job_discovery_graph(
             "per_url_results": [
                 {
                     "url": page.get("url"),
+                    # source_url + content_hash together let the harness's
+                    # evidence projection promote fetch evidence (both keys
+                    # are required by the evidence-bound tools invariant)
+                    "source_url": page.get("source_url"),
                     "status": page.get("status", "failed"),
                     "error_code": page.get("error_code"),
                     "content_hash": page.get("content_hash"),
@@ -206,11 +210,25 @@ def build_job_discovery_graph(
         page_urls = " ".join(page.get("url", "") for page in pages)
         with tempfile.TemporaryDirectory(dir=SKILL_DIR):
             path = _write_candidates(state["candidates"])
-            out = script_runner("coverage_gate", f"{path} --pages {page_urls}".strip())
+            # real coverage_gate.py (non-manifest path) emits
+            # coverage_verified/page_count/.../reasons and always reports
+            # missing_terminal_evidence when --terminal-evidence is absent;
+            # the subgraph's best terminal signal is the last captured page
+            # hash (browse's end-of-list marker is not available in-graph)
+            cli = f"{path} --pages {page_urls}".strip() if page_urls else str(path)
+            terminal = pages[-1].get("content_hash") if pages else None
+            if terminal:
+                cli += f" --terminal-evidence {terminal}"
+            out = script_runner("coverage_gate", cli)
         try:
             coverage = json.loads(out)
         except ValueError:
-            coverage = {"verified": False, "error": "unparsable coverage_gate output"}
+            coverage = {"error": "unparsable coverage_gate output"}
+        if not isinstance(coverage, dict):
+            coverage = {"error": "non-object coverage_gate output"}
+        # map the real script's coverage_verified to `verified` so the tool
+        # contract always carries a bool and consumers never KeyError
+        coverage.setdefault("verified", bool(coverage.get("coverage_verified", False)))
         return {"coverage": coverage}
 
     graph = StateGraph(JobDiscoveryWorkflowState)
