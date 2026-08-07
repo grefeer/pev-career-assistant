@@ -85,11 +85,16 @@ class WechatResult:
 
     ``status`` is one of ``succeeded`` / ``partial_success`` (weak OCR,
     doc L3) / ``blocked`` (non-public URL or fetch failure) /
-    ``needs_manual_review`` (contact-only, doc L1 no-content, or zero
-    usable OCR) / ``skipped`` (non-job) / ``failed`` (slice crash - the
-    graph folds any exception into this).  ``reason`` carries the
-    doc-verbatim degradation reason; ``application_channel_json`` and
+    ``needs_manual_review`` (contact-only, doc L1 no-content, the doc's
+    Unknown channel, or zero usable OCR on an image-heavy article) /
+    ``skipped`` (non-job) / ``failed`` (slice crash - the graph folds any
+    exception into this).  ``reason`` carries the doc-verbatim
+    degradation reason; ``application_channel_json`` and
     ``needs_deep_crawl`` are the doc L6 Step 4 hand-off values.
+    ``visible_text``/``content_hash`` carry the produced extraction text
+    (bounded to the evidence projection limit) and its sha256 - the
+    per-URL entry's evidence projection, mirroring the regular page
+    contract; slices that produce no text carry ""/None.
     """
 
     url: str
@@ -99,6 +104,10 @@ class WechatResult:
     application_channel_json: dict | None
     needs_deep_crawl: bool
     reason: str | None
+    #: Produced extraction text (bounded) + its sha256; ""/None when the
+    #: slice produced no text (blocked / skipped / manual-review outcomes).
+    visible_text: str = ""
+    content_hash: str | None = None
 
 
 # ------------------------------------------------------------------ Level 1
@@ -174,11 +183,26 @@ def _default_fetch_html(url: str) -> str:
 
 
 def _default_download_image(url: str) -> bytes:
-    """Download one article image through the same public-URL guard."""
-    _assert_public_url(url)
-    response = requests.get(url, timeout=30, headers=_PUBLIC_FETCH_HEADERS)
-    response.raise_for_status()
-    return response.content
+    """Download one article image through the same public-URL guard.
+
+    Mirrors ``_default_fetch_html``: redirects are followed manually and
+    every ``Location`` hop is re-guarded with ``_assert_public_url``
+    (max 5 hops) - a redirect to a private/cloud-metadata target raises
+    ``unsafe_public_url`` and is never fetched, keeping the image path's
+    "non-public URLs never fetched" invariant identical to the article
+    path.
+    """
+    current = url
+    for _ in range(_MAX_PUBLIC_REDIRECTS + 1):
+        _assert_public_url(current)
+        response = requests.get(
+            current, timeout=30, allow_redirects=False, headers=_PUBLIC_FETCH_HEADERS
+        )
+        if not response.is_redirect or not response.headers.get("Location"):
+            response.raise_for_status()
+            return response.content
+        current = urljoin(current, response.headers["Location"])
+    raise PublicJobFetchError("unsafe_public_url")
 
 
 def _safe_download(download_fn: Callable[[str], bytes], image_url: str) -> bytes | None:
@@ -376,11 +400,20 @@ _BARE_CAREER_RE = re.compile(
     r"(?:/[^\s，。；：（）()]*)?",
     re.IGNORECASE,
 )
-#: OCR may corrupt URLs (doc L6 Step 1: ``zhiye`` -> ``zhlye``); a
-#: recognizable-but-garbled career mention is reconstructed per the
-#: doc's pattern table with the uncertainty flagged.
-_CORRUPTED_CAREER_TOKEN_RE = re.compile(r"(?:zhiye|feishu|mokahr)", re.IGNORECASE)
-_CAREER_PATTERNS = {"zhiye": "*.zhiye.com/*", "feishu": "*jobs.feishu.cn/*", "mokahr": "*mokahr.com/*"}
+#: OCR may corrupt URLs (doc L6 Step 1 "Important": ``zhiye`` ->
+#: ``zhlye``); a recognizable-but-garbled career mention - including the
+#: doc's own ``zhlye`` example - is reconstructed per the doc's pattern
+#: table with the uncertainty flagged.
+_CORRUPTED_CAREER_TOKEN_RE = re.compile(
+    r"(?:zhiye|zhlye|feishu|mokahr)", re.IGNORECASE
+)
+_CAREER_PATTERNS = {
+    "zhiye": "*.zhiye.com/*",
+    # doc L6 Step 1 example: OCR corrupts `zhiye` into `zhlye`
+    "zhlye": "*.zhiye.com/*",
+    "feishu": "*jobs.feishu.cn/*",
+    "mokahr": "*mokahr.com/*",
+}
 _QR_RE = re.compile(r"扫码|二维码|QR", re.IGNORECASE)
 
 
@@ -392,16 +425,19 @@ def _is_career_url(raw: str) -> bool:
 
 def _detect_application_channel(
     text: str, *, ocr_contributed: bool
-) -> tuple[dict | None, str | None, bool, list[str]]:
+) -> tuple[dict | None, str | None, bool, list[str], bool]:
     """Scan the text for the doc's L6 Step 1 channel signals.
 
     Returns ``(application_channel_json, career_url, needs_deep_crawl,
-    channel_warnings)``.  A career URL marks ``needs_deep_crawl`` - the
-    article is an index and the real JDs live at the career site (doc L6
-    Step 4 hand-off).  Email + career URL -> primary/alternative
-    (doc Channel D); a scheme-less or garbled career mention is
-    reconstructed (add https:// / the doc's pattern) with the uncertainty
-    flagged in ``normalization_warnings``.
+    channel_warnings, unknown_channel)``.  A career URL marks
+    ``needs_deep_crawl`` - the article is an index and the real JDs live
+    at the career site (doc L6 Step 4 hand-off).  Email + career URL ->
+    primary/alternative (doc Channel D); a scheme-less or garbled career
+    mention is reconstructed (add https:// / the doc's pattern) with the
+    uncertainty flagged in ``normalization_warnings``.  No email/URL/QR
+    signal is the doc's **Unknown** (无渠道) row: ``unknown_channel`` is
+    set so the caller treats it as QR-code only and marks
+    needs_manual_review.
     """
     warnings: list[str] = []
     career_url: str | None = None
@@ -423,6 +459,7 @@ def _detect_application_channel(
             warnings.append(f"OCR可能损坏了URL，已按模式重建：{career_url}")
     email_match = _EMAIL_RE.search(text)
     email = email_match.group(0) if email_match else None
+    unknown_channel = False
     if email is not None and career_url is not None:
         channel_json = {
             "primary": {"type": "url", "value": career_url},
@@ -441,8 +478,11 @@ def _detect_application_channel(
         channel_json = None
         warnings.append("仅支持扫码投递，无邮箱或官网链接")
     else:
+        # doc L6 Step 1 Unknown (无渠道): no email/URL/QR signal - treat
+        # as QR-code only; mark needs_manual_review
         channel_json = None
-    return channel_json, career_url, career_url is not None, warnings
+        unknown_channel = True
+    return channel_json, career_url, career_url is not None, warnings, unknown_channel
 
 
 # ------------------------------------------------------- extraction + enrich
@@ -593,13 +633,13 @@ def _classify_and_extract(
 ) -> WechatResult:
     """Channel triage -> extraction (REPLACE-OCR for B) -> enrichment.
 
-    C (contact-only) and D (non-job) produce no candidates; A extracts
-    from the combined text, B from the OCR text alone.  Every A/B
-    candidate is enriched with per-image OCR evidence + the
-    application-channel JSON; a career URL marks ``needs_deep_crawl`` and
-    appends the doc's hand-off entry to errors.jsonl.  ``partial_success``
-    (doc L3) when the article is image-heavy AND every OCR text is under
-    100 chars.
+    C (contact-only), the doc's Unknown (无渠道) row, and D (non-job)
+    produce no candidates; A extracts from the combined text, B from the
+    OCR text alone.  Every A/B candidate is enriched with per-image OCR
+    evidence + the application-channel JSON; a career URL marks
+    ``needs_deep_crawl`` and appends the doc's hand-off entry to
+    errors.jsonl.  ``partial_success`` (doc L3) when the article is
+    image-heavy AND every OCR text is under 100 chars.
     """
     channel, reason = classify_wechat_channel(
         article_text=article_text,
@@ -609,16 +649,28 @@ def _classify_and_extract(
         return WechatResult(url, "needs_manual_review", channel, [], None, False, reason)
     if channel == "D":
         return WechatResult(url, "skipped", channel, [], None, False, reason)
+    combined = _build_combined(article_text, ocr_items)
+    channel_json, career_url, deep_crawl, channel_warnings, unknown_channel = (
+        _detect_application_channel(combined, ocr_contributed=bool(ocr_items))
+    )
+    if unknown_channel:
+        # doc L6 Step 1 Unknown (无渠道): "treat as QR-code only; mark
+        # needs_manual_review" - no candidates, extraction never runs
+        return WechatResult(
+            url,
+            "needs_manual_review",
+            channel,
+            [],
+            None,
+            False,
+            "未检测到投递渠道（无邮箱、无URL、无二维码），按扫码投递处理，需人工确认投递方式",
+        )
     if channel == "B":
         input_text = _build_ocr_only(ocr_items)
     else:
-        input_text = _build_combined(article_text, ocr_items)
+        input_text = combined
     candidates = _extract_from_text(
         context, input_text, url, extract_fn, llm_extractor
-    )
-    combined = _build_combined(article_text, ocr_items)
-    channel_json, career_url, deep_crawl, channel_warnings = (
-        _detect_application_channel(combined, ocr_contributed=bool(ocr_items))
     )
     ocr_warnings = [
         f"部分或全部内容来自图片OCR提取，置信度: {confidence:.2f}"
@@ -659,7 +711,17 @@ def _classify_and_extract(
             runner=runner,
             out_dir=out_dir,
         )
-    return WechatResult(url, status, channel, candidates, channel_json, deep_crawl, None)
+    return WechatResult(
+        url,
+        status,
+        channel,
+        candidates,
+        channel_json,
+        deep_crawl,
+        None,
+        visible_text=input_text[:_VISIBLE_TEXT_LIMIT],
+        content_hash=hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+    )
 
 
 def run_wechat_slice(
@@ -677,13 +739,18 @@ def run_wechat_slice(
 
     L1: structural public-URL guard, then fetch the article (the default
     fetch follows redirects manually, max 5 hops; a private/cloud-metadata
-    target is blocked and never fetched).  L2/L3: parse ``<img>`` srcs
-    (``data:`` URIs dropped), download each image through the size filters
+    target is blocked and never fetched; the image download follows the
+    same per-hop re-validation).  L2/L3: parse ``<img>`` srcs (``data:``
+    URIs dropped), download each image through the size filters
     (undersized/oversized skipped, never raised), OCR each surviving image
     once with the allowlisted ``ocr_image`` script.  L5: combine article
     text + OCR sections per the doc's format.  L6: channel triage A/B/C/D,
     gated extraction (REPLACE-OCR for B), application-channel enrichment,
-    and the ``needs_deep_crawl`` -> errors.jsonl hand-off.
+    and the ``needs_deep_crawl`` -> errors.jsonl hand-off.  When every
+    image fails OCR, a text-rich article degrades to the text path (OCR
+    is supplementary); the doc's image-heavy reason applies only to
+    text-poor articles.  No email/URL/QR signal is the doc's Unknown
+    (无渠道) row -> needs_manual_review, no candidates.
 
     The ``fetch_html_fn`` / ``download_fn`` / ``runner`` seams keep unit
     tests deterministic (never live HTTP, Playwright, or LLM); the defaults
@@ -758,7 +825,21 @@ def run_wechat_slice(
             runner=runner,
         )
     if not ocr_items:
-        # images were downloaded but OCR produced no usable text (doc L3)
+        # images were downloaded but OCR produced no usable text: a
+        # text-rich article degrades to the text path (doc L1/L2 - OCR is
+        # supplementary, so a dead image CDN must not flip the article to
+        # manual review, exactly like the sibling _no_images path); only an
+        # image-heavy article (text < 200 chars) hits the doc L3 reason
+        if len(article_text) >= _ARTICLE_TEXT_MIN_CHARS:
+            return _no_images(
+                url,
+                article_text,
+                context=context,
+                extract_fn=extract_fn,
+                llm_extractor=llm_extractor,
+                out_dir=out_dir,
+                runner=runner,
+            )
         return WechatResult(
             url,
             "needs_manual_review",

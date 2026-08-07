@@ -425,6 +425,11 @@ def build_job_discovery_graph(
                         "url": page.get("url"),
                         "source_url": page.get("source_url"),
                         "status": result.status,
+                        # source_url + content_hash + visible_text together
+                        # let the harness's evidence projection promote fetch
+                        # evidence, matching the regular page entry contract
+                        "content_hash": result.content_hash,
+                        "visible_text": result.visible_text,
                         # needs_manual_review is a recoverable classification:
                         # the human reviews, the run is never auto-retried
                         "error_code": (

@@ -253,9 +253,13 @@ def test_run_wechat_slice_full_pipeline_channel_b(tmp_path) -> None:
 
 
 def test_run_wechat_slice_channel_a_extracts_from_combined_text(tmp_path) -> None:
-    # ≥ 200 chars -> Level 2 path (images may carry supplementary JDs)
-    article = "岗位：前端工程师。公司：某某科技。负责前端开发。" + (
-        "负责前端开发。团队氛围好，弹性工作，带薪年假。" * 10
+    # ≥ 200 chars -> Level 2 path (images may carry supplementary JDs); the
+    # email keeps the article's channel signal present so the L6 triage
+    # classifies it as email-channel, not Unknown
+    article = (
+        "岗位：前端工程师。公司：某某科技。负责前端开发。"
+        + ("负责前端开发。团队氛围好，弹性工作，带薪年假。" * 10)
+        + "简历投递至 hr@example.com。"
     )
     html = (
         f"<html><body><p>{article}</p>"
@@ -432,6 +436,40 @@ def test_ocr_image_failure_folds(tmp_path) -> None:
     assert result.candidates == []
 
 
+def test_run_wechat_slice_text_rich_ocr_failed_degrades_to_text_path(tmp_path) -> None:
+    # a ≥200-char job article whose images all fail OCR degrades to the
+    # text path (doc L1/L2: OCR is supplementary - a dead image CDN must
+    # not flip the article to needs_manual_review); the image-heavy reason
+    # is reserved for text-poor articles (test_ocr_image_failure_folds)
+    article = (
+        "岗位：前端工程师。公司：某某科技。负责前端开发与性能优化，参与架构设计。"
+        "简历投递至 hr@example.com。团队氛围好，弹性工作，带薪年假。" * 6
+    )
+    html = f"<html><body><p>{article}</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    seen: dict = {}
+
+    def runner(script: str, *, cli_args: str = "", stdin: str = "") -> str:
+        assert script == "ocr_image"
+        return "ERROR: ocr_image timed out after 900s"
+
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=runner,
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract(seen),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.status == "succeeded"
+    assert result.channel == "A"
+    assert result.reason is None
+    assert len(result.candidates) == 1
+    # extraction ran on the article text alone (no OCR sections survived)
+    assert seen["input"].startswith("=== 文章正文 ===")
+    assert "=== 图片1 OCR内容" not in seen["input"]
+
+
 def test_ocr_image_error_status_folds(tmp_path) -> None:
     html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
     result = run_wechat_slice(
@@ -487,9 +525,11 @@ def test_run_wechat_slice_article_no_content(tmp_path) -> None:
 
 def test_run_wechat_slice_partial_success_weak_ocr(tmp_path) -> None:
     html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    # the email keeps the text under 100 chars (weak OCR) while providing
+    # the channel signal the L6 triage needs (not Unknown)
     result = run_wechat_slice(
         _WECHAT_URL,
-        runner=_ocr_runner(text="招聘：后端工程师，详情见图片。", confidence=0.45),
+        runner=_ocr_runner(text="招聘：后端工程师，详情见图片，投递至 hr@x.com。", confidence=0.45),
         out_dir=str(tmp_path),
         context=ToolContext(user_id="", run_id="", metadata={}),
         extract_fn=_fake_extract({}),
@@ -580,6 +620,65 @@ def test_run_wechat_slice_qr_only_channel(tmp_path) -> None:
     assert result.application_channel_json is None
     assert result.needs_deep_crawl is False
     assert "仅支持扫码投递，无邮箱或官网链接" in result.candidates[0].normalization_warnings
+
+
+def test_run_wechat_slice_unknown_channel_marks_manual_review(tmp_path) -> None:
+    # no email/URL/QR signal in the combined text -> doc L6 Step 1 Unknown
+    # (无渠道): treat as QR-code only and mark needs_manual_review with the
+    # doc's reason, no candidates, extraction never runs
+    html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    calls: list[str] = []
+
+    def extract(context, payload) -> ExtractObservedJobDetailsOutput:
+        calls.append(payload.artifact_id)
+        return ExtractObservedJobDetailsOutput(
+            source_artifact_id=payload.artifact_id,
+            source_url=_WECHAT_URL,
+            content_hash=payload.artifact_id,
+            candidates=[_candidate()],
+        )
+
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(
+            text=(
+                "招聘：后端工程师。岗位职责：负责后端服务开发与性能优化，参与架构设计，"
+                "保障系统稳定可靠。任职要求：精通 Python 与分布式系统，3 年以上经验，"
+                "本科及以上学历，良好的团队协作能力。"
+            )
+        ),
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=extract,
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.status == "needs_manual_review"
+    assert result.reason is not None
+    assert "扫码投递" in result.reason  # doc: treat as QR-code only
+    assert result.candidates == []
+    assert calls == []  # extraction never ran
+
+
+def test_run_wechat_slice_unknown_channel_text_rich_manual_review(tmp_path) -> None:
+    # a ≥200-char job article with no email/URL/QR signal is Unknown too -
+    # the doc's L6 Step 1 row applies to the article body text as well
+    article = (
+        "岗位：前端工程师。公司：某某科技。负责前端开发与性能优化，参与架构设计。" * 6
+    )
+    html = f"<html><body><p>{article}</p></body></html>"
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(),
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract({}),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.status == "needs_manual_review"
+    assert "扫码投递" in result.reason
+    assert result.candidates == []
 
 
 # --------------------------------------------------------- image handling
@@ -746,6 +845,7 @@ def test_run_wechat_slice_llm_gate_path(tmp_path) -> None:
     article = (
         "岗位：后端工程师。欢迎关注我们的招聘公众号，每天更新技术资讯、团队动态和"
         "职业发展内容，涵盖软件开发、工程效率、团队协作等多个方向，期待你的加入。"
+        "简历投递至 hr@example.com。"
     ) * 3
     html = f"<html><body><p>{article}</p></body></html>"
     calls: list[str] = []
@@ -905,6 +1005,73 @@ def test_run_wechat_slice_corrupted_career_token_reconstructed(tmp_path) -> None
     assert result.needs_deep_crawl is True
 
 
+def test_run_wechat_slice_doc_zhlye_corrupted_example_reconstructed(tmp_path) -> None:
+    # the doc's canonical corrupted-URL example (doc L6 Step 1 "Important":
+    # zhiye -> zhlye) is recognized and reconstructed to the doc's
+    # *.zhiye.com/* pattern with the uncertainty flagged
+    ocr_text = (
+        "招聘：后端工程师，投递：jereh.zhlye.com/campus。岗位职责：负责后端服务开发与"
+        "性能优化，参与架构设计，保障系统稳定可靠。任职要求：精通 Python 与分布式系统，"
+        "3 年以上经验，本科及以上学历，良好的团队协作能力。"
+    )
+    html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(text=ocr_text),
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract({}),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.application_channel_json == {"type": "url", "value": "*.zhiye.com/*"}
+    assert result.needs_deep_crawl is True
+    assert any(
+        "OCR可能损坏了URL，已按模式重建" in w
+        for w in result.candidates[0].normalization_warnings
+    )
+
+
+def test_run_wechat_slice_result_exposes_visible_text_and_content_hash(tmp_path) -> None:
+    html = "<html><body><p>欢迎转发</p><img src='https://mmbiz.qpic.cn/a'></body></html>"
+    seen: dict = {}
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(),
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract(seen),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    # the per-URL evidence projection: the produced extraction text
+    # (bounded to ≤1200 chars) + its sha256, matching the observed
+    # evidence the slice registered for the extraction
+    assert result.visible_text == seen["input"]
+    assert len(result.visible_text) <= 1200
+    assert result.content_hash == hashlib.sha256(
+        result.visible_text.encode("utf-8")
+    ).hexdigest()
+
+
+def test_run_wechat_slice_result_without_text_has_empty_projection(tmp_path) -> None:
+    # blocked / needs_manual_review / skipped outcomes produce no text:
+    # the projection fields stay empty ("" / None)
+    html = "<html><body><p>hi</p></body></html>"  # < 200 chars, no images
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        runner=_ocr_runner(),
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="", run_id="", metadata={}),
+        extract_fn=_fake_extract({}),
+        fetch_html_fn=_fake_fetch_html(html),
+        download_fn=_fake_download(),
+    )
+    assert result.status == "needs_manual_review"
+    assert result.visible_text == ""
+    assert result.content_hash is None
+
+
 def test_ocr_image_non_dict_output_folds(tmp_path) -> None:
     def runner(script: str, *, cli_args: str = "", stdin: str = "") -> str:
         return "[1, 2]"
@@ -988,7 +1155,7 @@ def test_ocr_evidence_meta_dimensions_variants(tmp_path) -> None:
                 "status": "ok",
                 "full_text": (
                     "招聘：后端工程师。岗位职责：负责后端服务开发与性能优化。"
-                    "任职要求：精通 Python。"
+                    "任职要求：精通 Python。投递至 hr@x.com。"
                 ),
                 "confidence": 0.9,
                 "engine": "paddleocr",
@@ -1191,7 +1358,16 @@ def test_default_download_image_guards_private_target(monkeypatch) -> None:
 
 
 class _FakeImageResponse:
-    content = b"imgdata"
+    def __init__(
+        self,
+        *,
+        redirect: bool = False,
+        location: str | None = None,
+        content: bytes = b"imgdata",
+    ) -> None:
+        self.is_redirect = redirect
+        self.headers = {"Location": location} if location else {}
+        self.content = content
 
     def raise_for_status(self) -> None:
         return None
@@ -1200,6 +1376,62 @@ class _FakeImageResponse:
 def test_default_download_image_success(monkeypatch) -> None:
     monkeypatch.setattr(ws.requests, "get", lambda url, **kwargs: _FakeImageResponse())
     assert ws._default_download_image("http://93.184.216.34/img.png") == b"imgdata"
+
+
+def test_default_download_image_rejects_private_redirect_target(monkeypatch) -> None:
+    # a public-origin image that redirects to a private target is rejected
+    # before the target is fetched (mirror of the article-fetch posture)
+    responses = [
+        _FakeImageResponse(redirect=True, location="http://127.0.0.1/steal"),
+        _FakeImageResponse(),
+    ]
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeImageResponse:
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    with pytest.raises(PublicJobFetchError) as exc:
+        ws._default_download_image("http://93.184.216.34/img.png")
+    assert exc.value.code == "unsafe_public_url"
+    assert calls == ["http://93.184.216.34/img.png"]  # the target is never fetched
+
+
+def test_default_download_image_follows_public_redirect_chain(monkeypatch) -> None:
+    responses = [
+        _FakeImageResponse(redirect=True, location="https://93.184.216.34/final.png"),
+        _FakeImageResponse(content=b"final-img"),
+    ]
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeImageResponse:
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._default_download_image("http://93.184.216.34/img.png") == b"final-img"
+    assert calls == ["http://93.184.216.34/img.png", "https://93.184.216.34/final.png"]
+
+
+def test_default_download_image_redirect_without_location(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ws.requests, "get", lambda url, **kwargs: _FakeImageResponse(redirect=True)
+    )
+    assert ws._default_download_image("http://93.184.216.34/img.png") == b"imgdata"
+
+
+def test_default_download_image_too_many_redirects(monkeypatch) -> None:
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeImageResponse(
+            redirect=True, location="http://93.184.216.34/r1"
+        ),
+    )
+    with pytest.raises(PublicJobFetchError) as exc:
+        ws._default_download_image("http://93.184.216.34/img.png")
+    assert exc.value.code == "unsafe_public_url"
 
 
 # ------------------------------------------------------ graph wiring
@@ -1511,3 +1743,55 @@ def test_graph_wechat_non_success_candidates_not_persisted(tmp_path) -> None:
     assert final["candidates"] == []
     assert final["per_url_results"][0]["status"] == "skipped"
     assert final["per_url_results"][0]["reason"] == "推广"
+
+
+def test_graph_wechat_entry_carries_evidence_projection(tmp_path) -> None:
+    # the wechat per-URL entry surfaces content_hash + visible_text exactly
+    # like a regular succeeded page, so the harness's evidence projection
+    # treats both flows uniformly
+    def fetch(urls: list[str]) -> list[dict]:
+        return [{"url": u, "source_url": u, "status": "wechat_pending"} for u in urls]
+
+    def wechat_fn(url: str) -> WechatResult:
+        return WechatResult(
+            url=url,
+            status="succeeded",
+            channel="B",
+            candidates=[_candidate("微信职位")],
+            application_channel_json=None,
+            needs_deep_crawl=False,
+            reason=None,
+            visible_text="=== 图片1 OCR内容 ===\n招聘：后端工程师",
+            content_hash="sha256_wechat_evidence",
+        )
+
+    graph = build_job_discovery_graph(
+        fetch_fn=fetch,
+        script_runner=_graph_fake_runner,
+        wechat_fn=wechat_fn,
+        candidates_dir=str(tmp_path),
+    ).compile()
+    entry = graph.invoke({"urls": [_WECHAT_URL]})["per_url_results"][0]
+    assert entry["content_hash"] == "sha256_wechat_evidence"
+    assert entry["visible_text"] == "=== 图片1 OCR内容 ===\n招聘：后端工程师"
+
+
+def test_graph_wechat_entry_without_text_has_empty_projection(tmp_path) -> None:
+    # a needs_manual_review outcome carries no produced text: the entry
+    # still carries both keys, empty (None / ""); the 7-positional fold
+    # constructor also stays valid with the new defaulted fields
+    def fetch(urls: list[str]) -> list[dict]:
+        return [{"url": u, "source_url": u, "status": "wechat_pending"} for u in urls]
+
+    def wechat_fn(url: str) -> WechatResult:
+        return WechatResult(url, "needs_manual_review", "C", [], None, False, "仅含联系方式")
+
+    graph = build_job_discovery_graph(
+        fetch_fn=fetch,
+        script_runner=_graph_fake_runner,
+        wechat_fn=wechat_fn,
+        candidates_dir=str(tmp_path),
+    ).compile()
+    entry = graph.invoke({"urls": [_WECHAT_URL]})["per_url_results"][0]
+    assert entry["content_hash"] is None
+    assert entry["visible_text"] == ""
