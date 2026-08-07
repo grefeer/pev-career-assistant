@@ -133,11 +133,13 @@ def build_job_discovery_tool(
                 # Task 11: the merged/persisted candidates snapshot the
                 # coverage gate read ("" when neither node produced one)
                 "candidates_file": final.get("candidates_file") or "",
-                # dedup node output (U10): merged_count = the deduplicate
-                # script's output_count, dedup_stats = its stats dict; both
-                # default to the no-merge sentinels when the node skipped
-                # (batch fast-path wrote no per-page files)
-                "merged_count": final.get("merged_count", 0),
+                # dedup node output (U10 + review I1-1): merged_count = the
+                # deduplicate script's output_count when dedup ran; when the
+                # batch fast-path skipped it (no per-page files, the node
+                # default 0), len(candidates) is the honest real count —
+                # never 0 alongside a non-empty candidates channel
+                "merged_count": final.get("merged_count")
+                or len(final.get("candidates", [])),
                 # Task 11: observed browse terminal markers (never
                 # synthesized), exactly what the coverage manifest recorded
                 "terminal_evidence": final.get("terminal_evidence", []),
@@ -175,6 +177,7 @@ def build_job_discovery_tools(
     budgets=None,
     tracker=None,
     run_id: str | None = None,
+    script_runner=None,
 ) -> list[Any]:
     """Harness tool_factory: job-discovery -> the workflow tool, else the
     existing career-skills tools.
@@ -184,15 +187,18 @@ def build_job_discovery_tools(
     production defaults (real browse orchestration + real per-page
     extraction + in-memory subgraph checkpointer) and — when ``run_id`` is
     given — run-scoped output dirs so eval runs never touch the shared
-    defaults (controller D1).  Other skills fall back to
-    ``build_skill_tools`` (budgets/tracker forwarded as-is).
+    defaults (controller D1).  ``script_runner`` is a hermeticity seam for
+    tests (Task 11 review M1-2): default ``None`` resolves to the real
+    ``run_skill_script`` (byte-identical production shape); tests pass a
+    fake so no skill script ever executes as a subprocess.  Other skills
+    fall back to ``build_skill_tools`` (budgets/tracker forwarded as-is).
     """
     if skill_name == "job-discovery":
         dirs = resolve_run_output_dirs(run_id) if run_id else {}
         return [
             build_job_discovery_tool(
                 fetch_fn=None,
-                script_runner=run_skill_script,
+                script_runner=script_runner or run_skill_script,
                 extract_fn=None,
                 checkpointer=None,
                 **dirs,

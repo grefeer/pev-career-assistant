@@ -175,6 +175,34 @@ def test_state_default_runner_resolves_run_skill_script(monkeypatch) -> None:
     assert captured["cwd"] == "x"
 
 
+def test_state_provided_module_runner_binds_run_scoped_cwd(monkeypatch) -> None:
+    # Task 11 review M1-1: the graph always passes runner=script_runner,
+    # which in production resolves to the module-level run_skill_script (the
+    # factory binds it into the graph closure) — so the run-scoped cwd must
+    # bind for the PROVIDED runner too (identity match), not only the
+    # runner=None path.  The spy stands in for the module global (same
+    # identity, so no real subprocess ever runs) and records the cwd the
+    # real state.py would receive.
+    captured: dict = {}
+    spy = lambda script, cli_args="", stdin="", cwd=None: (  # noqa: E731 - spy identity
+        captured.update(script=script, cli_args=cli_args, cwd=cwd)
+        or json.dumps({"exit_code": 0})
+    )
+    monkeypatch.setattr(persistence, "run_skill_script", spy)
+    assert state_check("https://a/1", "2026-01-01", state_dir="x", runner=spy) is True
+    assert captured == {
+        "script": "state",
+        "cli_args": "check https://a/1 2026-01-01",
+        "cwd": "x",
+    }
+    state_mark(
+        "https://a/1", ["h1"], state_dir="x",
+        file_id="f", sheet_id="s", update_time="2026-01-01", runner=spy,
+    )
+    assert captured["cli_args"] == "mark h1 https://a/1 2026-01-01 --file-id f --sheet-id s"
+    assert captured["cwd"] == "x"
+
+
 # ---------------------------------------------------------------------------
 # load_prior_candidates shape variants
 # ---------------------------------------------------------------------------

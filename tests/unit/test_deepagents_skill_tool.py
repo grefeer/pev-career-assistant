@@ -224,9 +224,11 @@ def test_job_discovery_tool_returns_valid_tool_observation(tmp_path) -> None:
     assert results["terminal_evidence"] == ["next_control_absent"]
     assert results["errors"] == []
     # the injected extract wrote no per-page files, so the dedup node has
-    # nothing to merge: counts stay at their no-merge defaults and
+    # nothing to merge: merged_count honestly reports the real candidate
+    # count (review I1-1, never 0 alongside a non-empty candidates
+    # channel), dedup_stats stays at its no-merge default and
     # candidates_file honestly points at the snapshot the gate read
-    assert results["merged_count"] == 0
+    assert results["merged_count"] == len(results["candidates"]) == 1
     assert results["dedup_stats"] == {}
     assert results["candidates_file"] == str(
         tmp_path / "output" / "work" / "candidates.json"
@@ -1071,6 +1073,86 @@ def test_tool_output_contract_merged_count_present(tmp_path) -> None:
     assert results["candidates_file"] == str(tmp_path / "merged_final.json")
 
 
+def test_tool_output_contract_merged_count_batch_fastpath(tmp_path) -> None:
+    # I1-1: succeeded pages WITHOUT per-page files -> the dedup node skips
+    # (batch fast-path, no merge ran); merged_count must report the real
+    # len(candidates) instead of the no-merge sentinel 0 while the
+    # candidates channel is non-empty
+    tool = build_job_discovery_tool(
+        fetch_fn=lambda urls: [
+            {
+                "url": url,
+                "source_url": url,
+                "status": "succeeded",
+                "content_hash": f"hash-{index}",
+                "mode": "list",
+                "visible_text": (
+                    "招聘岗位：后端工程师\n岗位职责：负责后端服务开发\n"
+                    "任职要求：硕士及以上"
+                ),
+            }
+            for index, url in enumerate(urls)
+        ],
+        script_runner=_fake_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
+    )
+    results = out["output"]
+    assert results["status"] == "succeeded"
+    assert len(results["candidates"]) == 1
+    assert results["merged_count"] == len(results["candidates"])
+    # honest: no dedup ran -> the coverage manifest's listing count stays
+    # unknown (None), never fabricated from the candidate count
+    assert results["coverage"]["expected_count"] is None
+
+
+def test_tool_output_contract_errors_carries_node_message(tmp_path) -> None:
+    # I1-3: the graph's error channel must surface in the tool output's
+    # errors list — a failing deduplicate is never swallowed
+    def extract_with_pages(pages: list[dict]) -> tuple[list[dict], None]:
+        for index, page in enumerate(pages):
+            (tmp_path / f"page_{index:02d}.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "title": f"职位{index}",
+                            "responsibilities": "负责后端服务开发",
+                            "requirements": "精通 Python",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return _fake_extract(pages)
+
+    def failing_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        if script == "deduplicate":
+            return "ERROR: boom"
+        return _fake_runner(script, cli_args=cli_args, stdin=stdin)
+
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
+        script_runner=failing_runner,
+        extract_fn=extract_with_pages,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
+    )
+    assert out["status"] == "succeeded"
+    results = out["output"]
+    assert results["errors"] == ["deduplicate failed: ERROR: boom"]
+    # the run still completes with candidates (per-URL flow never aborts on
+    # a node error) and the persisted snapshot the gate would have read
+    assert len(results["candidates"]) == 1
+    assert results["candidates_file"]
+
+
 def test_build_job_discovery_tools_run_scoped_dirs(monkeypatch) -> None:
     # D1: two factory calls with different run_ids yield different,
     # non-default dirs, keyed under the skill output (never the shared
@@ -1121,8 +1203,11 @@ def test_build_job_discovery_tools_run_scoped_dirs(monkeypatch) -> None:
 
 
 def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
-    # D1: the tool built from the factory writes merged_final.json into the
-    # run-scoped candidates dir (not the shared default store)
+    # D1 + Task 11 review M1-2: the tool built from the factory writes
+    # merged_final.json into the run-scoped candidates dir (not the shared
+    # default store), and the factory's script_runner seam keeps the flow
+    # hermetic — every skill script the workflow needs is served by the
+    # fake (recorded below), never a real subprocess
     from backend.app.services.deepagents_runtime.tools import skill_graphs as sg
     from backend.app.services.deepagents_runtime.tools.skill_graphs import (
         browse_fetch as bf,
@@ -1133,11 +1218,14 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
     evidence_dir = Path(sg.resolve_run_output_dirs(run_id)["evidence_dir"])
     shutil.rmtree(state_dir, ignore_errors=True)
     shutil.rmtree(evidence_dir, ignore_errors=True)
+    served: list[str] = []
     try:
-        # production script seam (real run_skill_script would launch
-        # Playwright): mirror the real scripts' contracts for the scripts
-        # the run-scoped workflow invokes
+        # mirror the real scripts' contracts for the scripts the run-scoped
+        # workflow invokes; served records every script that actually ran
+        # (browse rides the browse_fetch runner seam, the rest arrive via
+        # the factory's script_runner seam)
         def fake_script(script: str, cli_args: str = "", stdin: str = "", **kwargs):
+            served.append(script)
             if script == "browse":
                 parts = cli_args.split()
                 out_dir = Path(parts[parts.index("--out") + 1])
@@ -1240,11 +1328,14 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
                 )
             return "{}"
 
-        monkeypatch.setattr(jdg, "run_skill_script", fake_script)
         monkeypatch.setattr(bf, "run_skill_script", fake_script)
 
         tool = sg.build_job_discovery_tools(
-            "job-discovery", run_id=run_id, budgets=None, tracker=None
+            "job-discovery",
+            run_id=run_id,
+            budgets=None,
+            tracker=None,
+            script_runner=fake_script,
         )[0]
         out = json.loads(
             tool.invoke(
@@ -1258,6 +1349,17 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
         assert out["output"]["candidates_file"] == str(merged_file)
         # the shared default store was never touched
         assert not (SKILL_DIR / "output" / "candidates" / "merged_final.json").exists()
+        # hermeticity (M1-2): every script the flow needs was served by the
+        # fake seam — the real run_skill_script never executed a subprocess
+        for script in (
+            "browse",
+            "write_candidates",
+            "validate",
+            "deduplicate",
+            "normalize",
+            "coverage_gate",
+        ):
+            assert script in served, f"script {script} escaped the fake seam"
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
         shutil.rmtree(evidence_dir, ignore_errors=True)

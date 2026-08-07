@@ -26,11 +26,19 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runne
 def _state_invoke(runner, state_dir: str):
     """Bind the state script to the run-scoped cwd (never the shared skill
     cwd) so each run's ``output/state.json`` lives under its own state dir.
-    Test runners stay untouched (they receive the plain 3-arg call).
+
+    The graph always passes ``runner=script_runner``, which in production
+    resolves to the module-level ``run_skill_script`` itself (the factory
+    binds it into the graph closure — Task 11 review M1-1) — so the binding
+    applies when the provided runner is None OR is exactly that function
+    (identity match); any other runner (test fakes) keeps the plain 3-arg
+    call.  Only state.py check/mark get the run-scoped cwd — coverage_gate's
+    evidence-root containment must keep resolving against the shared skill
+    cwd (``SKILL_DIR/output/evidence``).
     """
-    if runner is not None:
-        return runner
-    return functools.partial(run_skill_script, cwd=state_dir)
+    if runner is None or runner is run_skill_script:
+        return functools.partial(run_skill_script, cwd=state_dir)
+    return runner
 
 
 def state_check(url: str, update_time: str, *, runner=None, state_dir: str) -> bool:
