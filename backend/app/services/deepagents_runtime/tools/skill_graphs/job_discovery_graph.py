@@ -196,6 +196,9 @@ def build_job_discovery_graph(
                     "mode": page.get("mode"),
                     "page_files": page.get("page_files"),
                     "visible_text": page.get("visible_text"),
+                    # blocked_reason lets manual-review triage see
+                    # login/captcha/anti-bot/unsafe-url on blocked URLs
+                    "blocked_reason": page.get("blocked_reason"),
                 }
                 for page in pages
             ],

@@ -424,10 +424,12 @@ def test_default_seams_used_without_injection(monkeypatch, tmp_path) -> None:
     assert ok["page_files"] == [str(page_file)]
     assert ok["visible_text"] == page_text[:1200]
     assert len(ok["visible_text"]) <= 1200
-    # error folding: blocked URLs map to per-url error_code="blocked"
+    # error folding: blocked URLs map to per-url error_code="blocked" and
+    # forward blocked_reason so manual-review triage sees the block cause
     blocked = by_url["https://blocked.example.com"]
     assert blocked["status"] == "blocked"
     assert blocked["error_code"] == "blocked"
+    assert blocked["blocked_reason"] == "captcha"
     # wechat_pending carried through untouched (Task 9)
     wechat = by_url["https://mp.weixin.qq.com/s/x"]
     assert wechat["status"] == "wechat_pending"

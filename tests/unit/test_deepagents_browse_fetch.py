@@ -6,8 +6,9 @@ The chain under test never launches Playwright: every test fakes the
 monkeypatched ``run_skill_script``.  The JSON contracts returned by the
 fakes mirror the real ``skill/job-discovery/scripts/browse.py`` output
 (status keys ``ok``/``error``/``blocked``, reason under ``reason``/``error``,
-``used_path`` markers ``spa_shell_empty_no_evidence`` /
-``click_fallback_fetch_error (...)``, cache hits carrying ``cached: true``).
+``used_path`` markers ``spa_shell_empty_no_evidence`` (hard block) /
+``click_fallback_fetch_error (...)`` (thin fallback), cache hits carrying
+``cached: true`` + ``text_path``).
 """
 
 from __future__ import annotations
@@ -112,40 +113,39 @@ def test_parallel_fetch_success_contract(tmp_path) -> None:
     assert result.page_files[1].text_length == len("职位 B".encode("utf-8"))
 
 
-def test_spa_shell_empty_falls_back_to_search_interact_once(tmp_path) -> None:
+def test_spa_shell_empty_is_terminal_block(tmp_path) -> None:
     calls: list[str] = []
 
     def fake_runner(script, *, cli_args="", stdin=""):
         assert script == "browse"
         calls.append(cli_args)
-        if "--mode parallel-fetch" in cli_args:
-            # exact browse.py blocked contract for a 0-char SPA shell
-            return json.dumps({
-                "status": "blocked", "url": "https://job.mokahr.com/abc",
-                "mode": "parallel-fetch", "used_path": "spa_shell_empty_no_evidence",
-                "reason": "page rendered 0 chars of body text and no public job JSON evidence",
-                "title": "", "content_hash": "sha256_abcd", "text_path": "",
-                "screenshot_path": "", "text_length": 0, "page_count": 0,
-                "page_files": [],
-            })
-        (tmp_path / "pages").mkdir(exist_ok=True)
-        page = tmp_path / "pages" / "page_01.txt"
-        page.write_text("职位列表", encoding="utf-8")
+        # exact browse.py blocked contract for a 0-char SPA shell: browse.py
+        # documents this as a HARD anti-bot block (headless can't render the
+        # shell, so a ~45s search-interact retry cannot succeed)
         return json.dumps({
-            "status": "ok", "url": "https://job.mokahr.com/abc", "mode": "search-interact",
-            "title": "职位", "content_hash": "sha256_zzz",
-            "text_path": "", "page_files": ["pages/page_01.txt"],
-            "page_count": 1, "text_length": 4,
+            "status": "blocked", "url": "https://job.mokahr.com/abc",
+            "mode": "parallel-fetch", "used_path": "spa_shell_empty_no_evidence",
+            "reason": "page rendered 0 chars of body text and no public job JSON evidence",
+            "title": "", "content_hash": "sha256_abcd", "text_path": "",
+            "screenshot_path": "", "text_length": 0, "page_count": 0,
+            "page_files": [],
         })
 
     results = browse_fetch_urls(
         ["https://job.mokahr.com/abc"], runner=fake_runner, out_dir=str(tmp_path)
     )
-    assert len(calls) == 2
-    assert sum("--mode search-interact" in c for c in calls) == 1
+    # hard block: exactly one parallel-fetch call, never retried, never
+    # fallen back to search-interact, blocked_reason forwarded
+    assert len(calls) == 1
+    assert "--mode parallel-fetch" in calls[0]
     result = results[0]
-    assert result.status == "succeeded"
-    assert result.mode == "search-interact"
+    assert result.status == "blocked"
+    assert result.error_code == "blocked"
+    assert (
+        result.blocked_reason
+        == "page rendered 0 chars of body text and no public job JSON evidence"
+    )
+    assert result.page_files == []
 
 
 def test_blocked_never_retried(tmp_path) -> None:
@@ -340,10 +340,11 @@ def test_cached_list_result_is_terminal_success(tmp_path) -> None:
 
     def fake_runner(script, *, cli_args="", stdin=""):
         calls.append(cli_args)
-        # exact browse.py cache-hit contract: no mode/page_files/page_count
+        # exact browse.py cache-hit contract: no mode/page_files/page_count;
+        # no text_path edge -> no page evidence
         return json.dumps({
             "status": "ok", "url": "https://jobs.feishu.cn/abc",
-            "content_hash": "sha256_cached", "text_path": "output/evidence/run-0/xyz.txt",
+            "content_hash": "sha256_cached", "text_path": "",
             "text_length": 300, "cached": True,
         })
 
@@ -356,6 +357,37 @@ def test_cached_list_result_is_terminal_success(tmp_path) -> None:
     assert result.status == "succeeded"
     assert result.page_files == []
     assert result.mode == "list"
+
+
+def test_cached_list_result_uses_text_path_as_page_file(tmp_path) -> None:
+    calls: list[str] = []
+    cached_text = tmp_path / "sha256_cached.txt"
+    cached_text.write_text("职位 癸", encoding="utf-8")
+
+    def fake_runner(script, *, cli_args="", stdin=""):
+        calls.append(cli_args)
+        # exact browse.py cache-hit contract: cache hits omit page_files but
+        # keep text_path (resolved to out_dir/<content_hash>.txt)
+        return json.dumps({
+            "status": "ok", "url": "https://jobs.feishu.cn/abc",
+            "content_hash": "sha256_cached", "text_path": str(cached_text),
+            "text_length": 300, "cached": True,
+        })
+
+    results = browse_fetch_urls(
+        ["https://jobs.feishu.cn/abc"], runner=fake_runner, out_dir=str(tmp_path)
+    )
+    assert len(calls) == 1
+    result = results[0]
+    assert result.cached is True
+    assert result.status == "succeeded"
+    assert result.mode == "list"
+    # the cached render's text file is re-hashed as the single page evidence
+    assert len(result.page_files) == 1
+    assert result.page_files[0].path == str(cached_text)
+    assert result.page_files[0].content_hash == hashlib.sha256(
+        cached_text.read_bytes()
+    ).hexdigest()
 
 
 def test_parallel_fetch_page_count_zero_falls_back(tmp_path) -> None:
@@ -487,6 +519,63 @@ def test_probe_rich_list_succeeds_without_fallback(tmp_path) -> None:
     assert result.status == "succeeded"
     assert result.mode == "list"
     assert "--cache-mode use" in calls[0]
+
+
+def test_stderr_suffixed_output_parses_cleanly(tmp_path) -> None:
+    calls: list[str] = []
+
+    def fake_runner(script, *, cli_args="", stdin=""):
+        calls.append(cli_args)
+        (tmp_path / "pages").mkdir(exist_ok=True)
+        (tmp_path / "pages" / "page_01.txt").write_text("职位 壬", encoding="utf-8")
+        # the real _default_runner appends "\n[stderr]\n" + stderr[-2000:]
+        # whenever stderr is non-empty, and browse.py unconditionally writes
+        # an audit line to stderr for search/search-interact modes - so a
+        # real search-interact result carries a JSON + "[stderr]" suffix
+        return (
+            json.dumps({
+                "status": "ok", "url": "https://www.zhipin.com/job/1",
+                "mode": "search-interact", "content_hash": "sha256_1",
+                "page_files": ["pages/page_01.txt"], "page_count": 1,
+                "text_length": 100,
+            })
+            + "\n[stderr]\n[search-interact] terms=agent strategy=default fallback=None"
+        )
+
+    # exercised through the real run_skill_script split path: the runner seam
+    # receives the shlex-split parts, so the stderr-append contract is pinned
+    results = browse_fetch_urls(
+        ["https://www.zhipin.com/job/1"], runner=fake_runner, out_dir=str(tmp_path)
+    )
+    assert len(calls) == 1
+    result = results[0]
+    # the first JSON value wins; the [stderr] suffix is ignored, not an error
+    assert result.status == "succeeded"
+    assert result.mode == "search-interact"
+
+
+def test_windows_absolute_out_dir_round_trips_unquoted(tmp_path) -> None:
+    calls: list[str] = []
+    windows_out_dir = r"D:\Python\skill\job-discovery\output\evidence\run-1"
+
+    def fake_runner(script, *, cli_args="", stdin=""):
+        calls.append(cli_args)
+        return json.dumps({
+            "status": "ok", "url": "https://jobs.feishu.cn/abc", "mode": "list",
+            "content_hash": "sha256_1", "page_files": [], "page_count": 1,
+            "text_length": 100,
+        })
+
+    browse_fetch_urls(
+        ["https://jobs.feishu.cn/abc"], runner=fake_runner, out_dir=windows_out_dir
+    )
+    # shlex.join would single-quote the backslash path; the raw join must
+    # round-trip through run_skill_script's split (posix=False on Windows)
+    # and the runner seam without quote characters in the token
+    assert len(calls) == 1
+    out_token = calls[0].split("--out", 1)[1].split()[0]
+    assert out_token == windows_out_dir
+    assert "'" not in out_token and '"' not in out_token
 
 
 def test_search_interact_class_success(tmp_path) -> None:

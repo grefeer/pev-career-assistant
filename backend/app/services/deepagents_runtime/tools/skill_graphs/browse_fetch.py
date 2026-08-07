@@ -10,11 +10,15 @@ evidence.  Every browse call goes through the allowlisted
 Output contract mirrors the real ``skill/job-discovery/scripts/browse.py``:
 - status ``ok`` / ``error`` (with ``error`` str) / ``blocked`` (reason under
   ``reason`` or ``error``) / ``empty`` (treated as an error here);
-- thin-result markers under ``used_path``:
-  ``spa_shell_empty_no_evidence`` (blocked-status 0-char SPA shell) and
-  ``click_fallback_fetch_error ...`` (parallel-fetch serial-click fallback
-  failed) both route to the single ``search-interact`` fallback;
-- cache hits carry ``cached: true`` and omit ``mode``/``page_files``;
+- thin-result marker under ``used_path``: ``click_fallback_fetch_error ...``
+  (parallel-fetch serial-click fallback failed) routes to the single
+  ``search-interact`` fallback.  The ``spa_shell_empty_no_evidence`` marker
+  is a HARD anti-bot block in browse.py (0-char SPA shell, status
+  ``blocked``) and is treated as terminal here — never retried, never
+  fallen back, blocked_reason forwarded;
+- cache hits carry ``cached: true`` and omit ``mode``/``page_files`` but
+  keep ``text_path`` (the prior render's text file); that file is re-hashed
+  as the page evidence;
 - page files are hashed as full ``sha256(file bytes).hexdigest()`` — the
   manifest/evidence hash.  browse's own ``sha256_<16>`` ``content_hash`` is
   never used as evidence hash.
@@ -24,7 +28,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -51,10 +54,13 @@ _FEISHU_MAX_PAGES = 3
 #: Modes with a hard per-URL cap of ONE invocation across the whole chain.
 _CAP_ONCE_MODES = frozenset({"parallel-fetch", "search-interact"})
 
-#: browse.py marks a 0-char SPA shell (blocked status) and a failed parallel
-#: fetch's serial-click fallback via these used_path markers; both mean the
-#: URL needs the search-interact fallback, not a hard block.
-_THIN_USED_PATHS = ("spa_shell_empty_no_evidence", "click_fallback_fetch_error")
+#: browse.py marks a failed parallel fetch's serial-click fallback with this
+#: used_path prefix; the URL needs the single search-interact fallback, not a
+#: hard block.  (The ``spa_shell_empty_no_evidence`` marker is NOT here:
+#: browse.py emits it on a blocked-status 0-char SPA shell — a hard anti-bot
+#: block that must stay terminal, never converted into a no-evidence
+#: "succeeded".)
+_THIN_USED_PATHS = ("click_fallback_fetch_error",)
 
 #: browse.py cache-hit results carry no mode/page_files/page_count keys; the
 #: ``cached`` flag alone marks them, and a hit is a terminal success.
@@ -171,8 +177,11 @@ def _wrap_runner(runner: Callable[..., str] | None) -> Callable[..., str] | None
         stdin: str | None,
         timeout: int,
     ) -> str:
-        # the simple seam addresses scripts by allowlisted name ("browse")
-        return runner(script_path.stem, cli_args=shlex.join(parts), stdin=stdin or "")
+        # the simple seam addresses scripts by allowlisted name ("browse");
+        # parts are joined raw (no shlex quoting): run_skill_script already
+        # split them with posix=(os.name != "nt") semantics, so re-quoting
+        # would re-inject quote chars around backslash paths on Windows
+        return runner(script_path.stem, cli_args=" ".join(parts), stdin=stdin or "")
 
     return adapted
 
@@ -186,7 +195,16 @@ def _build_cli(
     wait_ms: int | None,
     max_pages: int | None,
 ) -> str:
-    """Assemble the allowlisted ``browse`` CLI args (--cache-mode is list-only)."""
+    """Assemble the allowlisted ``browse`` CLI args (--cache-mode is list-only).
+
+    Parts are joined raw with no shlex quoting (dedup_node/validate_node
+    style): on Windows ``run_skill_script`` splits with ``posix=False``,
+    which keeps literal quote chars in tokens — shlex.join's single-quoted
+    absolute ``D:\\...`` paths would reach browse's argparse with the quotes
+    intact and evidence would be written into a quote-named directory.
+    Paths are SKILL_DIR/out_dir-derived (no spaces in this project layout),
+    matching the runner layer's existing space limitation.
+    """
     parts = [url, "--mode", mode, "--out", out_dir]
     if max_pages is not None:
         parts += ["--max-pages", str(max_pages)]
@@ -194,7 +212,7 @@ def _build_cli(
         parts += ["--cache-mode", cache_mode]
     if wait_ms is not None:
         parts += ["--wait", str(wait_ms)]
-    return shlex.join(parts)
+    return " ".join(parts)
 
 
 def _run_browse(
@@ -214,7 +232,11 @@ def _run_browse(
     )
     raw = run_skill_script("browse", cli_args=cli, runner=_wrap_runner(runner))
     try:
-        parsed = json.loads(raw)
+        # the real runner appends "\n[stderr]\n<stderr tail>" to stdout
+        # whenever stderr is non-empty (browse.py writes audit lines there
+        # for search/search-interact modes); parse only the first JSON value
+        # so the suffix is ignored instead of misparsed as an error
+        parsed = json.JSONDecoder().raw_decode(raw, 0)[0]
     except ValueError:
         return dict(_ERROR_OUTPUT)
     if not isinstance(parsed, dict):
@@ -229,7 +251,12 @@ def _collect_page_files(output: dict[str, Any], out_dir: str) -> list[PageFile]:
     ``sha256_<16>`` content_hash is not used.
     """
     page_files: list[PageFile] = []
-    for relative in output.get("page_files") or []:
+    paths = list(output.get("page_files") or [])
+    if output.get("cached") and output.get("text_path"):
+        # cache hits omit page_files but keep text_path (browse.py resolves
+        # it to out_dir/<content_hash>.txt); re-hash it as the page evidence
+        paths.append(output["text_path"])
+    for relative in paths:
         path = Path(relative)
         if not path.is_absolute():
             path = Path(out_dir) / path
@@ -293,11 +320,14 @@ def _browse_one_url(
       (error/empty results do NOT get the --wait retry — the cap is a hard
       ceiling, enforced by the invocation counter map);
     - ``list`` errors are retried once with ``--wait 5000``;
-    - ``blocked`` is never retried and never falls back, except the
-      parallel-fetch ``spa_shell_empty_no_evidence`` marker which is a
+    - ``blocked`` is never retried and never falls back; the
+      parallel-fetch ``spa_shell_empty_no_evidence`` marker arrives on a
+      blocked-status 0-char SPA shell and is a hard anti-bot block
+      (terminal), while the ``click_fallback_fetch_error`` marker is the
       thin-result trigger for the single search-interact fallback;
     - cache hits are terminal successes (browse only caches completed list
-      renders, so a hit is never "thin").
+      renders, so a hit is never "thin"); their text_path is re-hashed as
+      the page evidence.
     """
     invocations: dict[str, int] = {}
     for mode in _chain_modes(site_class):
