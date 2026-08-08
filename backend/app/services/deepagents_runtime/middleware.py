@@ -34,6 +34,14 @@ _current_budgets: ContextVar[DeepAgentsBudgets | None] = ContextVar(
     "deepagents_current_budgets", default=None
 )
 
+#: The harness's per-run DuplicateCallTracker, bound around one executor
+#: invocation so the workflow tool (reached via the tool_factory seam, which
+#: cannot carry budgets/tracker without breaking the ``(skill)`` contract)
+#: applies the same dedup invariant as the adapters.
+_current_tracker: ContextVar[Any | None] = ContextVar(
+    "deepagents_current_tracker", default=None
+)
+
 
 @contextmanager
 def current_budgets(budgets: DeepAgentsBudgets | None):
@@ -43,6 +51,26 @@ def current_budgets(budgets: DeepAgentsBudgets | None):
         yield
     finally:
         _current_budgets.reset(token)
+
+
+@contextmanager
+def current_tracker(tracker: Any | None):
+    """Bind the per-run DuplicateCallTracker for one agent invocation."""
+    token = _current_tracker.set(tracker)
+    try:
+        yield
+    finally:
+        _current_tracker.reset(token)
+
+
+def active_budgets() -> DeepAgentsBudgets | None:
+    """Return the budget bound by the harness, or None outside an invocation."""
+    return _current_budgets.get()
+
+
+def active_tracker() -> Any:
+    """Return the DuplicateCallTracker bound by the harness, or None."""
+    return _current_tracker.get()
 
 
 def _tool_name(tool: Any) -> str | None:

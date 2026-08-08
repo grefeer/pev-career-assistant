@@ -14,6 +14,10 @@ from backend.app.services.career_skills.job_discovery import (
     ExtractedJobDetails,
     PublicJobFetchError,
 )
+from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
+from backend.app.services.deepagents_runtime.tools.adapters import (
+    DuplicateCallTracker,
+)
 from backend.app.services.deepagents_runtime.tools.skill_graphs import (
     build_job_discovery_tool,
     workflow_thread_id,
@@ -1018,7 +1022,10 @@ def test_tool_output_contract_blocked_all_urls(tmp_path) -> None:
     assert out["status"] == "succeeded"
     results = out["output"]
     # ToolObservation itself rejects "blocked" as a status - the contract
-    # status lives inside the output dict (documented deviation)
+    # status lives inside the output dict (documented deviation); the
+    # observation-level error_code maps the all-blocked outcome so the
+    # harness's _is_non_progress classifies it as no-progress (I3)
+    assert out["error_code"] == "blocked"
     assert results["status"] == "blocked"
     assert len(results["per_url_results"]) == 2
     assert all(r["error_code"] == "blocked" for r in results["per_url_results"])
@@ -1456,3 +1463,169 @@ def test_build_manifest_skips_page_when_stat_raises_oserror(
     )
     assert manifest["page_files"] == [str(real)]
     assert manifest["pages_collected"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Final review I1-I4: settings/budgets/dedup/checkpointer wiring on the
+# workflow tool path (the deepagents Executor reaches this tool only via the
+# harness tool_factory, which previously cut every one of these invariants).
+# ---------------------------------------------------------------------------
+
+
+def test_build_job_discovery_tools_threads_review_wiring(monkeypatch) -> None:
+    # I1/I2/I4: the factory forwards settings/budgets/tracker/checkpointer
+    # into the workflow tool — previously dead wiring (settings unreachable,
+    # the tool never saw budgets/tracker, checkpointer was hardcoded None)
+    from backend.app.services.deepagents_runtime.tools import skill_graphs as sg
+
+    captured: list[dict] = []
+    real_build = sg.build_job_discovery_tool
+
+    def fake_build(**kwargs):
+        captured.append(kwargs)
+        return real_build(**kwargs)
+
+    monkeypatch.setattr(sg, "build_job_discovery_tool", fake_build)
+
+    budgets = DeepAgentsBudgets(
+        max_agent_turns=12, max_tool_calls=24, max_replans=2, max_wall_clock_seconds=300
+    )
+    tracker = DuplicateCallTracker()
+    saver = InMemorySaver()
+    settings = object()
+    tools = sg.build_job_discovery_tools(
+        "job-discovery",
+        run_id="eval-wire",
+        budgets=budgets,
+        tracker=tracker,
+        checkpointer=saver,
+        settings=settings,
+    )
+    assert len(tools) == 1
+    kwargs = captured[-1]
+    assert kwargs["budgets"] is budgets
+    assert kwargs["tracker"] is tracker
+    assert kwargs["checkpointer"] is saver
+    assert kwargs["settings"] is settings
+
+
+def test_job_discovery_tool_settings_reaches_graph_llm_gate(
+    tmp_path, monkeypatch
+) -> None:
+    # I1: settings threaded through the tool into the graph — the spec §4.3
+    # LLM extraction gate (build_llm_extractor(settings)) is reachable from
+    # a real tool build.  The recorder replaces the extractor constructor,
+    # so no model client is ever constructed (hermetic).
+    captured: dict = {}
+
+    def recording_build(settings):
+        captured["settings"] = settings
+        return None
+
+    monkeypatch.setattr(jdg, "build_llm_extractor", recording_build)
+    settings = object()
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch_with_pages(tmp_path),
+        script_runner=_fake_runner,
+        settings=settings,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    out = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://job0.example.com"])}))
+    )
+    assert out["status"] == "succeeded"
+    # the gate was consulted with the threaded settings (never None), and
+    # the default extraction still ran deterministically without an LLM
+    assert captured["settings"] is settings
+    assert out["output"]["coverage"]["verified"] is True
+
+
+def test_job_discovery_tool_consumes_one_tool_budget_unit_per_invocation(
+    tmp_path,
+) -> None:
+    # I2: one agent tool call = one budget unit — a second invocation past
+    # the ceiling folds to tool_budget_exhausted instead of re-running the
+    # full crawl (spec §5 hard ceiling on the workflow-tool path)
+    budgets = DeepAgentsBudgets(
+        max_agent_turns=12, max_tool_calls=1, max_replans=2, max_wall_clock_seconds=300
+    )
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=_fake_runner,
+        extract_fn=_fake_extract,
+        budgets=budgets,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    first = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://a.com"])}))
+    )
+    assert first["status"] == "succeeded"
+    assert budgets.tool_calls_used == 1
+    second = json.loads(
+        tool.invoke(json.dumps({"payload": json.dumps(["https://b.com"])}))
+    )
+    assert second["status"] == "failed"
+    assert second["error_code"] == "tool_budget_exhausted"
+    assert budgets.tool_calls_used == 1  # ceiling never exceeded
+
+
+def test_job_discovery_tool_duplicate_identical_call_deduped(tmp_path) -> None:
+    # I3: consecutive identical workflow invocations fold to
+    # duplicate_tool_call (executor-thrash breaker, same shape as adapters);
+    # a different payload resets the tracker slot
+    tracker = DuplicateCallTracker()
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=_fake_runner,
+        extract_fn=_fake_extract,
+        tracker=tracker,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    payload_a = json.dumps({"payload": json.dumps(["https://a.com"])})
+    payload_b = json.dumps({"payload": json.dumps(["https://b.com"])})
+    assert json.loads(tool.invoke(payload_a))["status"] == "succeeded"
+    dup = json.loads(tool.invoke(payload_a))
+    assert dup["status"] == "failed"
+    assert dup["error_code"] == "duplicate_tool_call"
+    # a different invocation is not a duplicate
+    assert json.loads(tool.invoke(payload_b))["status"] == "succeeded"
+
+
+def test_job_discovery_tool_contextvar_budget_and_tracker(tmp_path) -> None:
+    # I2/I3 harness path: the harness binds budgets + the DuplicateCallTracker
+    # via contextvars around agent.invoke (harness.py _executor_node); the
+    # workflow tool reads them, so a live run consumes one unit per call and
+    # consecutive identical calls fold to duplicate_tool_call.  Outside the
+    # harness context the tool reverts to its unguarded default shape.
+    from backend.app.services.deepagents_runtime.middleware import (
+        current_budgets,
+        current_tracker,
+    )
+
+    budgets = DeepAgentsBudgets(
+        max_agent_turns=12, max_tool_calls=5, max_replans=2, max_wall_clock_seconds=300
+    )
+    tracker = DuplicateCallTracker()
+    tool = build_job_discovery_tool(
+        fetch_fn=_fake_fetch,
+        script_runner=_fake_runner,
+        extract_fn=_fake_extract,
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    payload = json.dumps({"payload": json.dumps(["https://a.com"])})
+    with current_budgets(budgets), current_tracker(tracker):
+        first = json.loads(tool.invoke(payload))
+        second = json.loads(tool.invoke(payload))
+    assert first["status"] == "succeeded"
+    assert second["status"] == "failed"
+    assert second["error_code"] == "duplicate_tool_call"
+    # budget consumed once per invocation (including the duplicate), matching
+    # the adapters order: budget first, then dedup
+    assert budgets.tool_calls_used == 2
+    # contextvars reset after the with-block: the tool is unguarded again
+    third = json.loads(tool.invoke(payload))
+    assert third["status"] == "succeeded"

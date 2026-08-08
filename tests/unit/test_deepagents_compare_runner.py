@@ -518,6 +518,7 @@ def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
     class _FakeHarnessClass:
         def __init__(self, *, model_factory, checkpointer, tool_factory=None):
             captured["tool_factory"] = tool_factory
+            captured["checkpointer"] = checkpointer
             model_factory("planner")
             model_factory("executor")
 
@@ -543,8 +544,9 @@ def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
     monkeypatch.setattr(sg, "build_job_discovery_tool", fake_jd_tool)
     monkeypatch.setattr(sg, "build_skill_tools", fake_skill_tools)
 
+    settings = _Settings()
     metrics = run_deepagents_question(
-        _question(), settings=_Settings(), run_id="eval-Q001"
+        _question(), settings=settings, run_id="eval-Q001"
     )
     assert metrics.status == "succeeded"
     factory = captured["tool_factory"]
@@ -555,7 +557,10 @@ def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
     assert kwargs["fetch_fn"] is None
     assert kwargs["script_runner"] is sg.run_skill_script
     assert kwargs["extract_fn"] is None
-    assert kwargs["checkpointer"] is None
+    # I1/I4: the live wiring threads settings (the §4.3 LLM gate) and the
+    # harness's own checkpointer (mid-crawl resume) into the workflow tool
+    assert kwargs["settings"] is settings
+    assert kwargs["checkpointer"] is captured["checkpointer"]
     # run-scoped output dirs keyed by the question's run_id
     assert kwargs["state_dir"] == sg.resolve_run_output_dirs("eval-Q001")["state_dir"]
     assert kwargs["candidates_dir"] == sg.resolve_run_output_dirs("eval-Q001")[

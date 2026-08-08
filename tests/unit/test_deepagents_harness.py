@@ -581,3 +581,80 @@ def test_build_skill_tools_returns_catalog_tools_and_binds_context() -> None:
         assert tool_context() is ctx
     with pytest.raises(RuntimeError):
         tool_context()  # reset after the bind exits
+
+
+def test_workflow_tool_calls_consume_budget_and_stall_as_no_progress(tmp_path) -> None:
+    # Final review I2/I3 end-to-end through the harness: the executor's
+    # workflow-tool calls (reached via the tool_factory seam) consume one
+    # tool-budget unit per invocation and consecutive identical repeats fold
+    # to duplicate_tool_call; an all-URLs-blocked crawl maps to observation
+    # error_code="blocked".  Both are no-progress for the stall-breaker, so
+    # the run degrades to waiting_user instead of re-running the full crawl
+    # up to the turn ceiling.
+    from backend.app.services.deepagents_runtime.tools.skill_graphs import (
+        build_job_discovery_tool,
+    )
+
+    def blocked_fetch(urls: list[str]) -> list[dict]:
+        return [
+            {
+                "url": url,
+                "source_url": url,
+                "status": "blocked",
+                "error_code": "blocked",
+                "blocked_reason": "captcha",
+            }
+            for url in urls
+        ]
+
+    def permissive_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
+        return json.dumps({"ok": True})
+
+    workflow_tool = build_job_discovery_tool(
+        fetch_fn=blocked_fetch,
+        script_runner=permissive_runner,
+        extract_fn=lambda pages: ([], None),
+        candidates_dir=str(tmp_path),
+        state_dir=str(tmp_path),
+    )
+    payload = json.dumps({"payload": json.dumps(["https://blocked.example.com"])})
+    tool_call = {
+        "name": "run-job-discovery-workflow",
+        "args": {"payload": payload},
+        "id": "call_workflow",
+    }
+
+    harness = DeepAgentsHarness(
+        model_factory=_scripted_factory(
+            {
+                "planner": [PLAN_JSON, PLAN_JSON, PLAN_JSON],
+                "executor": [
+                    AIMessage(content="", tool_calls=[tool_call]),
+                    "evidence collected",
+                ],
+                "verifier": [REPLAN_JSON, REPLAN_JSON, REPLAN_JSON],
+            }
+        ),
+        tool_factory=lambda skill: (
+            [workflow_tool] if skill == "job-discovery" else []
+        ),
+    )
+    request = _request()
+    request.budget = request.budget.model_copy(update={"max_replans": 3})
+    final = harness.run(request, run_id="run-workflow-stall")
+    # 1st call: all URLs blocked -> error_code="blocked" (no progress);
+    # 2nd/3rd: identical repeat -> duplicate_tool_call (no progress) ->
+    # stall-breaker hands the run to the human on the 3rd entry
+    assert final["run_status"] == "waiting_user"
+    assert final["error_code"] == "stalled_no_progress"
+    budgets = DeepAgentsBudgets.from_dict(final["budget"])
+    # the workflow tool consumed one tool-budget unit per invocation (spec
+    # §5 hard ceiling) and the units survived the per-node budget
+    # round-trip through the graph state (>= 2: the stall path returns
+    # _degrade(...), which writes no "budget" channel, so the persisted
+    # snapshot is the planner's turn-9 write — the 3rd unit was consumed
+    # on executor #3's per-node budget copy and discarded with the
+    # degrade; the stall itself is the proof of the 3rd invocation, and
+    # exact one-unit-per-invocation consumption is pinned at tool level
+    # in test_job_discovery_tool_consumes_one_tool_budget_unit_per_invocation)
+    assert budgets.tool_calls_used >= 2

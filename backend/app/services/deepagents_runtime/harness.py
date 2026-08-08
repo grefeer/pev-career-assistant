@@ -36,7 +36,10 @@ from backend.app.services.deepagents_runtime.budgets import (
 from backend.app.services.deepagents_runtime.checkpoints.sink import (
     flush_run_with_retry,
 )
-from backend.app.services.deepagents_runtime.middleware import current_budgets
+from backend.app.services.deepagents_runtime.middleware import (
+    current_budgets,
+    current_tracker,
+)
 from backend.app.services.deepagents_runtime.state import (
     DeepAgentsState,
     build_initial_state,
@@ -360,10 +363,11 @@ class DeepAgentsHarness:
                     _agent_thread(state["run_id"], state["step_index"], "workflow")
                 ):
                     with current_budgets(budgets):
-                        result = agent.invoke(
-                            {"messages": [HumanMessage(step.objective)]},
-                            {"configurable": {"thread_id": _agent_thread(state["run_id"], state["step_index"], "executor")}},
-                        )
+                        with current_tracker(self._tracker):
+                            result = agent.invoke(
+                                {"messages": [HumanMessage(step.objective)]},
+                                {"configurable": {"thread_id": _agent_thread(state["run_id"], state["step_index"], "executor")}},
+                            )
         except TurnBudgetExhausted as exc:
             return _degrade(state, str(exc))
         decisions, evidence = _project_tool_observations(result["messages"])

@@ -153,6 +153,9 @@ def run_deepagents_question(
     captures the run_id, which the harness cannot read from the workflow
     thread ContextVar — it binds the thread after the factory call) so
     job-discovery tools run with run-scoped output dirs (controller D1).
+    Final-review wiring (I1/I4): the closure also captures ``settings``
+    (spec §4.3 LLM-extraction gate) and the harness's own checkpointer
+    (mid-crawl resume) — the same instance the harness graph uses.
     """
     if harness is None:
         from langchain_openai import ChatOpenAI
@@ -164,11 +167,15 @@ def run_deepagents_question(
                 max_tokens=4096 if role == "planner" else 2048,
             )
 
+        checkpointer = create_checkpointer(settings)
         harness = DeepAgentsHarness(
             model_factory=model_factory,
-            checkpointer=create_checkpointer(settings),
+            checkpointer=checkpointer,
             tool_factory=lambda skill: build_job_discovery_tools(
-                skill, run_id=run_id
+                skill,
+                run_id=run_id,
+                settings=settings,
+                checkpointer=checkpointer,
             ),
         )
     request = AgentTaskRequest(
