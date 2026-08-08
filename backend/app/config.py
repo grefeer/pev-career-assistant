@@ -131,8 +131,9 @@ class Settings(BaseSettings):
     # skill/job-discovery/scripts/adapters/endpoint_allowlist.json with
     # review_status == "reviewed") are fetched adapter-first and never fall
     # back to browse (adapter failure is an explicit blocked terminal).
-    # Default off until the allowlist has been human-reviewed and smoke-run.
-    use_public_api_adapters: bool = False
+    # Reviewed 2026-08-08 (allowlist review_status=reviewed, reviewed_by
+    # recorded) + live smoke of all three companies passed, so default on.
+    use_public_api_adapters: bool = True
     job_discovery_planner_max_inspection_pages: int = Field(default=3, ge=1, le=5)
     # Hard wall-clock deadline (seconds) for a SnapshotPlan whose steps run
     # real network fetches (WeChat ``fetch_wechat_article``). When > 0 the

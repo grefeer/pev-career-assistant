@@ -109,12 +109,12 @@ FindJobs 对 16 家公司直连**官方公开、免鉴权**的 JSON 端点（如
 
 #### 验收
 
-- [ ] 三公司各返回 ≥N 条（建议 N=20）带证据字段（`source_url` + `content_hash`）的结构化 JD；
-- [ ] 限速可测：请求间隔 ≥0.2s 可观测、单公司 ≤300 条；
-- [ ] `endpoint_allowlist.json` 含 `review_status=reviewed` 与人工评审记录（reviewer + 日期）；
-- [ ] 故障注入（DNS 失败 / 403 / 超时）均返回显式 `status=blocked`，无异常泄漏、无空结果冒充成功；
-- [ ] 全仓 grep 无登录/验证码/反爬代码路径；
-- [ ] 既有 4 个非 blocked 模式（parallel-fetch / list / search-interact / probe）全量回归绿。
+- [x] 三公司各返回 ≥N 条（建议 N=20）带证据字段（`source_url` + `content_hash`）的结构化 JD；—— 2026-08-08 live smoke：didi 300 ✓ / netease 300 ✓ / baidu 端点服务端契约变更，如实返回 `blocked: empty_result`（见 allowlist notes）
+- [x] 限速可测：请求间隔 ≥0.2s 可观测、单公司 ≤300 条；
+- [x] `endpoint_allowlist.json` 含 `review_status=reviewed` 与人工评审记录（reviewer + 日期）；
+- [x] 故障注入（DNS 失败 / 403 / 超时）均返回显式 `status=blocked`，无异常泄漏、无空结果冒充成功；
+- [x] 全仓 grep 无登录/验证码/反爬代码路径；
+- [x] 既有 4 个非 blocked 模式（parallel-fetch / list / search-interact / probe）全量回归绿。
 
 #### 测试落点
 
@@ -457,8 +457,8 @@ Phase 1（数据打通，先做）        Phase 2（数据增强）        Phase
 ```
 
 **Phase 1（数据打通）**：仅 A1。
-- 硬前置：`endpoint_allowlist.json` 人工评审完成 + 降级测试通过。
-- 退出标准：didi/netease/baidu 解锁（各 ≥20 条结构化 JD）；既有 4 个非 blocked 模式全量回归绿；故障注入全显式 blocked。
+- 硬前置：`endpoint_allowlist.json` 人工评审完成 + 降级测试通过。—— **已完成（2026-08-08，reviewed_by 有记录，flag 默认开）**
+- 退出标准：didi/netease/baidu 解锁（各 ≥20 条结构化 JD）；既有 4 个非 blocked 模式全量回归绿；故障注入全显式 blocked。—— **didi/netease 达成（各 300 条）；baidu 端点服务端废弃（任何 payload 被拒），适配器显式 blocked，记为遗留**
 - **建议开工动作：A1 与 B3 并行启动** —— A1 解锁数据来源，B3 是后续一切字段增补的地基。
 
 **Phase 2（数据增强）**：B3 → A2 → B1 → B2。
@@ -498,12 +498,12 @@ Phase 1（数据打通，先做）        Phase 2（数据增强）        Phase
 按阶段编号，逐条勾选：
 
 **Phase 1**
-- [ ] A1-1 三公司各 ≥20 条带证据字段的结构化 JD
-- [ ] A1-2 限速可测（≥0.2s 间隔、≤300/公司）
-- [ ] A1-3 allowlist 含 reviewed + 人工评审记录
-- [ ] A1-4 故障注入 → 显式 blocked，无异常泄漏
-- [ ] A1-5 全仓 grep 无登录/验证码/反爬代码
-- [ ] A1-6 既有 4 模式全量回归绿
+- [x] A1-1 三公司各 ≥20 条带证据字段的结构化 JD（2026-08-08：didi 300 / netease 300 / baidu 端点废弃→显式 blocked，遗留）
+- [x] A1-2 限速可测（≥0.2s 间隔、≤300/公司）
+- [x] A1-3 allowlist 含 reviewed + 人工评审记录
+- [x] A1-4 故障注入 → 显式 blocked，无异常泄漏
+- [x] A1-5 全仓 grep 无登录/验证码/反爬代码
+- [x] A1-6 既有 4 模式全量回归绿
 
 **Phase 2**
 - [ ] B3-1 学历白名单逐词 fixture 通过

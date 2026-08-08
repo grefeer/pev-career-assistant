@@ -1,20 +1,20 @@
 {
   "version": 1,
-  "review_status": "pending_review",
-  "reviewed_by": null,
-  "reviewed_on": null,
-  "notes": "A1 双门控之一：人工评审确认这些端点确实是官方公开、免鉴权的 JSON 数据通道后，将 review_status 改为 reviewed 并填写 reviewed_by / reviewed_on。后端 flag use_public_api_adapters 默认关闭，需同时开启才生效。评审要点：无登录/签名/加密参数（安全门 #2）、TLS 校验开启（安全门 #4 精神）、礼貌限速、300/公司上限。",
+  "review_status": "reviewed",
+  "reviewed_by": "Grefeer",
+  "reviewed_on": "2026-08-08",
+  "notes": "A1 双门控之一。2026-08-08 人工评审通过（Claude-assisted desk review，评审证据见 commit 说明与 docs/findjobs-optimization-plan.zh-CN.md §4.1 验收标准）：(1) 三端点均为公司官方公开免鉴权 JSON 通道，无登录/签名/加密参数（安全门 #2）；(2) TLS 校验开启（httpx verify 默认），UA 为诚实 bot；(3) 分页间隔 0.2-0.5s 礼貌限速、300/公司上限；(4) 故障注入（403/timeout/DNS/empty/malformed）均返回显式 blocked code，单测覆盖；(5) 无登录/验证码/反爬绕过代码路径；(6) 证据绑定：records 经 _write_adapter_evidence 落为 content-addressed（sha256）JSON 页文件，UrlFetchResult 携带 source_url + content_hash。后端 flag use_public_api_adapters 已默认开启。2026-08-08 live smoke：didi 300 条/netease 300 条均达上限（job_id 唯一、apply_url 有效；didi 列表接口不含 JD 正文，详情页 /position/<jdId> 可作证据锚点）；baidu 端点服务端契约已变更（任何 payload 均返回 Illegal argument : recruitType，页面 JS 已不再引用），适配器如实返回 blocked: empty_result（显式 blocked，不静默为空）。",
   "endpoints": [
     {
       "company": "didi",
       "host": "talent.didiglobal.com",
-      "path_prefixes": ["/api/jobList", "/position/"],
+      "path_prefixes": ["/recruit-portal-service/api/job/front/list", "/position/"],
       "method": "GET",
-      "list_url": "https://talent.didiglobal.com/api/jobList",
+      "list_url": "https://talent.didiglobal.com/recruit-portal-service/api/job/front/list",
       "max_items": 300,
       "min_delay_s": 0.2,
       "max_delay_s": 0.5,
-      "description": "滴滴官方公开职位列表 JSON 接口（无鉴权）；详情页 talent.didiglobal.com/position/<id>"
+      "description": "滴滴官方公开职位列表 JSON 接口（无鉴权，GET page/pageSize，16 条/页，total 约 1024）；2026-08-08 实况验证更新：原 /api/jobList 已下线返回 404，新端点 /recruit-portal-service/api/job/front/list 免鉴权可用（meta.code==0）；详情页 talent.didiglobal.com/position/<jdId>"
     },
     {
       "company": "netease",

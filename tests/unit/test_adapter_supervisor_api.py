@@ -42,7 +42,10 @@ def _reviewed_allowlist(tmp_path: Path) -> Path:
             {
                 "company": "didi",
                 "host": "talent.didiglobal.com",
-                "path_prefixes": ["/api/jobList", "/position/"],
+                "path_prefixes": [
+                    "/recruit-portal-service/api/job/front/list",
+                    "/position/",
+                ],
                 "max_items": 300,
                 "min_delay_s": 0.2,
                 "max_delay_s": 0.5,
@@ -78,7 +81,7 @@ def _handler(pages: list[dict[str, Any]], status: int = 200) -> Any:
         if state["index"] < len(pages):
             payload = pages[state["index"]]
         else:
-            payload = {"data": {"list": [], "total": 0}}
+            payload = {"data": {"items": [], "total": 0}}
         state["index"] += 1
         return httpx.Response(status, json=payload)
 
@@ -93,12 +96,18 @@ def _didi(allowlist: Path, handler: Any, **kwargs: Any) -> DidiAdapter:
 
 
 def _didi_page(records: list[dict[str, Any]], total: int) -> dict[str, Any]:
-    return {"data": {"list": records, "total": total}}
+    return {"data": {"items": records, "total": total}}
 
 
 def _raw_didi(count: int, start: int = 0) -> list[dict[str, Any]]:
     return [
-        {"id": start + i, "name": f"职位{start + i}", "city": "北京"}
+        {
+            "jdId": start + i,
+            "jobName": f"职位{start + i}",
+            "workArea": "北京",
+            "jobDuty": f"职责{start + i}",
+            "jobQualification": "要求本科",
+        }
         for i in range(count)
     ]
 
@@ -144,12 +153,12 @@ def test_validate_false_when_allowlist_not_reviewed(tmp_path) -> None:
     data["reviewed_by"] = None
     allowlist.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     adapter = _didi(allowlist, _handler([]))
-    assert adapter.validate("https://talent.didiglobal.com/api/jobList") is False
+    assert adapter.validate("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list") is False
 
 
 def test_validate_accepts_only_allowlisted_host_and_prefix(tmp_path) -> None:
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler([]))
-    assert adapter.validate("https://talent.didiglobal.com/api/jobList") is True
+    assert adapter.validate("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list") is True
     assert adapter.validate("https://talent.didiglobal.com/position/7") is True
     assert adapter.validate("https://other.example.com/api/jobList") is False
     assert adapter.validate("https://talent.didiglobal.com/other/path") is False
@@ -159,13 +168,13 @@ def test_validate_rejects_private_or_unsafe_targets(tmp_path) -> None:
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler([]))
     assert adapter.validate("http://127.0.0.1/api/jobList") is False
     assert adapter.validate("http://10.0.0.5/api/jobList") is False
-    assert adapter.validate("http://talent.didiglobal.com/api/jobList") is True
+    assert adapter.validate("http://talent.didiglobal.com/recruit-portal-service/api/job/front/list") is True
 
 
 def test_missing_allowlist_raises_allowlist_code(tmp_path) -> None:
     adapter = _didi(tmp_path / "nope.json", _handler([]))
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "allowlist_missing"
 
 
@@ -187,7 +196,7 @@ def test_execute_returns_records_with_stable_job_id(tmp_path) -> None:
         _didi_page([], total=2),
     ]
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler(pages))
-    result = adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+    result = adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert result["company"] == "didi"
     records = result["records"]
     assert [r["job_id"] for r in records] == ["DD_10", "DD_11"]
@@ -206,7 +215,7 @@ def test_execute_fails_on_non_allowlisted_url(tmp_path) -> None:
 def test_execute_empty_result_is_explicit_blocked(tmp_path) -> None:
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler([{"data": {"list": [], "total": 0}}]))
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "empty_result"
 
 
@@ -214,7 +223,7 @@ def test_execute_malformed_payload_is_explicit_blocked(tmp_path) -> None:
     handler = lambda request: httpx.Response(200, json={"unexpected": "shape"})  # noqa: E731
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "empty_result"
 
 
@@ -227,7 +236,7 @@ def test_http_403_maps_to_http_error_code(tmp_path) -> None:
     handler = lambda request: httpx.Response(403)  # noqa: E731
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "http_error:403"
 
 
@@ -237,7 +246,7 @@ def test_timeout_maps_to_timeout_code(tmp_path) -> None:
 
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "timeout"
 
 
@@ -250,7 +259,7 @@ def test_transport_error_retries_then_maps_to_transport_code(tmp_path) -> None:
 
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "transport_error"
     assert len(attempts) == 3  # retry window exhausted
 
@@ -259,7 +268,7 @@ def test_non_json_response_is_malformed_payload(tmp_path) -> None:
     handler = lambda request: httpx.Response(200, text="<html>not json</html>")  # noqa: E731
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+        adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert exc.value.code == "malformed_payload"
 
 
@@ -286,7 +295,7 @@ def test_pacing_sleep_is_invoked_between_pages(tmp_path) -> None:
     adapter = DidiAdapter(
         allowlist_path=_reviewed_allowlist(tmp_path), client=client, sleep=record_sleep
     )
-    adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+    adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert len(sleeps) == 4  # one pace before each page after the first
     assert all(0.2 <= delay <= 0.5 for delay in sleeps)
 
@@ -306,7 +315,7 @@ def test_cap_enforces_max_items_per_company(tmp_path) -> None:
     adapter = DidiAdapter(
         allowlist_path=_reviewed_allowlist(tmp_path), client=client, sleep=lambda s: None
     )
-    result = adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+    result = adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert len(result["records"]) == 300
     assert result["records"][-1]["job_id"] == "DD_299"
 
@@ -327,7 +336,7 @@ def test_didi_pages_until_total_exhausted(tmp_path) -> None:
         return httpx.Response(200, json=_didi_page(_raw_didi(50, start=(page - 1) * 50), total=100))
 
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
-    result = adapter.execute("https://talent.didiglobal.com/api/jobList", None, None)
+    result = adapter.execute("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list", None, None)
     assert len(result["records"]) == 100
     assert [r["page"] for r in requests] == ["1", "2"]
 
@@ -434,7 +443,7 @@ def test_validate_rejects_malformed_url_and_wrong_host(tmp_path, monkeypatch) ->
     monkeypatch.setattr(
         base_mod, "urlparse", lambda value: (_ for _ in ()).throw(ValueError("bad url"))
     )
-    assert adapter.validate("https://talent.didiglobal.com/api/jobList") is False
+    assert adapter.validate("https://talent.didiglobal.com/recruit-portal-service/api/job/front/list") is False
     monkeypatch.undo()
     assert adapter.validate("https://hr.163.com/api/jobList") is False
 
@@ -481,7 +490,7 @@ def test_request_json_rejects_non_object_json(tmp_path) -> None:
     )
     adapter._client = client
     with pytest.raises(AdapterError) as exc:
-        adapter._request_json(method="GET", url="https://talent.didiglobal.com/api/jobList")
+        adapter._request_json(method="GET", url="https://talent.didiglobal.com/recruit-portal-service/api/job/front/list")
     assert exc.value.code == "malformed_payload"
 
 
@@ -491,7 +500,7 @@ def test_request_json_dns_gaierror_is_stable(tmp_path) -> None:
 
     adapter = _didi(_reviewed_allowlist(tmp_path), handler)
     with pytest.raises(AdapterError) as exc:
-        adapter._request_json(method="GET", url="https://talent.didiglobal.com/api/jobList")
+        adapter._request_json(method="GET", url="https://talent.didiglobal.com/recruit-portal-service/api/job/front/list")
     assert exc.value.code == "dns_error"
 
 
@@ -509,7 +518,7 @@ def test_execute_accepts_task_like_object_with_url(tmp_path) -> None:
     # resolves it the same way as a bare url string
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler([_didi_page(_raw_didi(1), 1)]))
     result = adapter.execute(
-        SimpleNamespace(url="https://talent.didiglobal.com/api/jobList"), None, None
+        SimpleNamespace(url="https://talent.didiglobal.com/recruit-portal-service/api/job/front/list"), None, None
     )
     assert result["records"][0]["job_id"] == "DD_0"
 
@@ -628,7 +637,7 @@ def test_smoke_cli_usage_and_bad_company(capsys) -> None:
     assert smoke.main([]) == 2
     assert "usage:" in capsys.readouterr().out
     assert smoke.main(["didi"]) == 2
-    assert smoke.main(["ghost", "https://talent.didiglobal.com/api/jobList"]) == 1
+    assert smoke.main(["ghost", "https://talent.didiglobal.com/recruit-portal-service/api/job/front/list"]) == 1
     assert "blocked: adapter_unknown" in capsys.readouterr().out
 
 
@@ -638,7 +647,7 @@ def test_smoke_cli_prints_records_json(tmp_path, capsys, monkeypatch) -> None:
     adapter = _didi(_reviewed_allowlist(tmp_path), _handler([_didi_page(_raw_didi(1), 1)]))
     # smoke imports load_company_adapter at module load; patch that binding
     monkeypatch.setattr(smoke, "load_company_adapter", lambda company: adapter)
-    assert smoke.main(["didi", "https://talent.didiglobal.com/api/jobList"]) == 0
+    assert smoke.main(["didi", "https://talent.didiglobal.com/recruit-portal-service/api/job/front/list"]) == 0
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert payload["company"] == "didi" and payload["records"][0]["job_id"] == "DD_0"
@@ -654,7 +663,7 @@ def test_smoke_cli_blocked_on_execute_failure(tmp_path, capsys, monkeypatch) -> 
             raise AdapterError("captcha", "human review required")
 
     monkeypatch.setattr(smoke, "load_company_adapter", lambda company: BoomAdapter())
-    assert smoke.main(["didi", "https://talent.didiglobal.com/api/jobList"]) == 1
+    assert smoke.main(["didi", "https://talent.didiglobal.com/recruit-portal-service/api/job/front/list"]) == 1
     assert "blocked: captcha" in capsys.readouterr().out
 
 
