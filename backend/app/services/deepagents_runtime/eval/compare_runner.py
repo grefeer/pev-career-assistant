@@ -540,6 +540,11 @@ def run_comparison(
                 if metrics_dict is not None:
                     bucket.append(RunMetrics(**metrics_dict))
             per_question.append(entry)
+            print(
+                f"DONE {entry['id']}: chain deepagents={entry.get('deepagents', {}).get('status', 'leg-error')} "
+                f"legacy={entry.get('legacy', {}).get('status', 'leg-error')}",
+                flush=True,
+            )
             continue
         entry: dict = {"id": item.id, "goal": item.goal}
         errors: list[str] = []
@@ -564,6 +569,11 @@ def run_comparison(
         if errors:
             entry["error"] = "; ".join(errors)
         per_question.append(entry)
+        print(
+            f"DONE {entry['id']}: deepagents={entry.get('deepagents', {}).get('status', 'leg-error')} "
+            f"legacy={entry.get('legacy', {}).get('status', 'leg-error')}",
+            flush=True,
+        )
     summary = summarize_comparison(
         legacy=legacy_metrics, deepagents=deepagents_metrics
     )
