@@ -442,8 +442,19 @@ def _role_action_contract(role: AgentRole) -> str:
     )
 
 
-def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
-    """Build the live OpenAI-compatible decision provider for all three roles."""
+def build_agent_chat_model(
+    settings: Settings, *, max_tokens: int | None = None
+) -> tuple[ChatOpenAI, str]:
+    """OpenAI-compatible chat model wired for the live PEV provider.
+
+    Returns ``(model, structured_method)``: deepseek-v4 (the current live
+    provider) gets thinking disabled plus ``json_mode``; any other provider
+    keeps the plain ``json_schema`` transport.  ``max_tokens`` is optional:
+    the decision gateways rely on the provider default, while long-output
+    callers (the JD extractor, C1) cap it explicitly.  Raises
+    ``AgentModelGatewayConfigError`` when the API key is missing, so a
+    keyless construction never fabricates a model.
+    """
     from backend.app.services.agent_runtime.provider_config import get_api_key, get_base_url
 
     api_key = get_api_key()
@@ -458,14 +469,22 @@ def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
         "api_key": api_key,
         "base_url": base_url,
     }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     is_deepseek_v4 = "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
         "deepseek-v4"
     )
     if is_deepseek_v4:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     structured_method = "json_mode" if is_deepseek_v4 else "json_schema"
+    return ChatOpenAI(**kwargs), structured_method
+
+
+def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
+    """Build the live OpenAI-compatible decision provider for all three roles."""
+    model, structured_method = build_agent_chat_model(settings)
     return LangChainModelGateway(
-        ChatOpenAI(**kwargs),
+        model,
         prefer_local_json_validation=False,
         catalog_in_system_prompt=settings.agent_harness_catalog_in_system_prompt,
         structured_method=structured_method,
