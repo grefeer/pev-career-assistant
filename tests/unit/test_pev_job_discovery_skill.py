@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -219,6 +220,186 @@ def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job
         "url": "https://careers.example/jobs/agent",
         "snippet": None,
     }]
+
+
+def test_search_qualifies_the_query_with_recruiting_site_operators(monkeypatch) -> None:
+    """P2/B4: the provider query is biased toward recruiting domains (unless the
+    agent already steers with site:), while the reported query stays verbatim."""
+    requested: list[str] = []
+
+    def fake_get(url: str, *args, **kwargs) -> SimpleNamespace:
+        requested.append(url)
+        return SimpleNamespace(
+            text="""
+            <html><body>
+              <li class="b_algo"><h2><a href="https://careers.example/jobs/agent">AI Agent 开发工程师</a></h2><p>招聘详情。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="Java 后端开发工程师 公开 JD", max_results=5),
+    )
+
+    sent_query = parse_qs(urlsplit(requested[0]).query)["q"][0]
+    assert "site:liepin.com" in sent_query
+    assert "site:jobs.bytedance.com" in sent_query
+    assert "site:juejin.cn" in sent_query
+    assert result.query == "Java 后端开发工程师 公开 JD"
+
+
+def test_search_keeps_an_agent_supplied_site_operator_verbatim(monkeypatch) -> None:
+    """An existing site: steering is never clobbered by the default operators."""
+    requested: list[str] = []
+
+    def fake_get(url: str, *args, **kwargs) -> SimpleNamespace:
+        requested.append(url)
+        return SimpleNamespace(
+            text="<html><body></body></html>", encoding="utf-8",
+            apparent_encoding="utf-8", raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="Java 岗位 site:liepin.com", max_results=5),
+    )
+
+    sent_query = parse_qs(urlsplit(requested[0]).query)["q"][0]
+    assert "site:liepin.com" in sent_query
+    assert "site:iguopin.com" not in sent_query
+    assert result.results == []
+
+
+def test_search_drops_text_only_matches_on_unknown_hosts(monkeypatch) -> None:
+    """P2/B4: a tutorial/encyclopedia page that merely mentions 招聘/岗位 in its
+    title is not discovery evidence when its host is not a recruiting domain."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class="b_algo"><h2><a href="https://tutorial.example/ai-agent-guide">Java 后端开发工程师 面试教程</a></h2><p>涵盖常见面试题与答案。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="Java 后端开发工程师 公开 JD", max_results=5),
+    )
+
+    assert result.results == []
+
+
+def test_search_keeps_unknown_host_with_a_job_shaped_url_and_whitelisted_host_text_match(monkeypatch) -> None:
+    """P2/B4: an unlisted host still passes on a job-shaped URL path; whitelisted
+    recruiting hosts keep the loose text-signal check."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class="b_algo"><h2><a href="https://company-a.example/jobs/backend-engineer">后端开发</a></h2><p>负责服务端。</p></li>
+              <li class="b_algo"><h2><a href="https://www.liepin.com/guide">Java 后端开发工程师 求职指南</a></h2><p>求职建议。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="Java 后端开发工程师 公开 JD", max_results=5),
+    )
+
+    assert [item.url for item in result.results] == [
+        "https://company-a.example/jobs/backend-engineer",
+        "https://www.liepin.com/guide",
+    ]
+
+
+def test_search_whitelist_exact_host_match_and_double_negative_drop(monkeypatch) -> None:
+    """P2/B4 edge branches: an exact whitelist host (no subdomain) passes on a
+    text signal; a whitelisted host with neither a job-shaped URL nor JD wording
+    is still dropped."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class="b_algo"><h2><a href="https://liepin.com/intro">Java 后端开发工程师 内推</a></h2><p>内推信息。</p></li>
+              <li class="b_algo"><h2><a href="https://www.liepin.com/plain-page">无相关内容</a></h2><p>。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="Java 后端开发工程师 公开 JD", max_results=5),
+    )
+
+    assert [item.url for item in result.results] == ["https://liepin.com/intro"]
+
+
+def test_search_keeps_juejin_pins_and_drops_non_job_posts(monkeypatch) -> None:
+    """Q143/R032/R033 regression: 稀土掘金 招聘帖 pins (/pin/<id>) carry no
+    job-shaped URL token, so juejin.cn must stay whitelisted and pass on the
+    text signal; a juejin post without job wording is still dropped."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="""
+            <html><body>
+              <li class="b_algo"><h2><a href="https://juejin.cn/pin/6931214116753244174">【招聘】前端开发工程师（2年经验）</a></h2><p>坐标杭州，双休。</p></li>
+              <li class="b_algo"><h2><a href="https://juejin.cn/post/7290000000000000000">前端进阶学习笔记</a></h2><p>记录学习心得。</p></li>
+            </body></html>
+            """,
+            encoding="utf-8", apparent_encoding="utf-8", raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        SearchPublicJobPagesInput(query="稀土掘金 前端开发工程师 招聘", max_results=5),
+    )
+
+    assert [item.url for item in result.results] == [
+        "https://juejin.cn/pin/6931214116753244174"
+    ]
 
 
 def test_fetch_public_job_page_rejects_loopback_before_network_access() -> None:

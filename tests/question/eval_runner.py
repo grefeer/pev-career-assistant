@@ -74,8 +74,10 @@ DEFAULT_BUDGET = AgentBudget(
 )
 
 # ---------------------------------------------------------------- seed bank
-# Every URL below was probe-verified fetchable by fetch_public_job_pages
-# (requests-based) on 2026-08-04, with the character counts shown.
+# Every URL below was probe-verified fetchable by fetch_public_job_pages on
+# 2026-08-04 (requests-based, with the character counts shown); iguopin SPA
+# search pages (IGUOPIN_SEARCH, render-verified 2026-08-08) are the one
+# exception: they need the eval's playwright fallback to yield job cards.
 
 BAIDU_TALENT_URLS = [  # 546-1026ch each, real JD detail pages
     "https://talent.baidu.com/jobs/detail/GRADUATE/4f1cbc80-8332-4a92-b8fa-c0132b17d47e",
@@ -110,7 +112,18 @@ CAMPUS_EVIDENCE = [  # campus sources (1034-3074ch)
 ]
 # NOTE: v2ex.com is unreachable from this machine (2026-08-05, ConnectTimeout),
 # so V2EX-seeded questions were re-pointed at liepin role landing pages.
-IGUOPIN_HOME = "https://www.iguopin.com/"  # 国聘网首页, 200 public (央国企聚合)
+# iguopin is a CRA SPA: homepage and search pages return an HTML shell to
+# requests and only yield usable text through the eval's playwright fallback
+# (render-verified 2026-08-08: /job/list?keyword=* -> real per-job cards with
+# 「城市」city lines, e.g. "Java后端开发工程师" -> 18 cards). Seeds point at
+# keyword search pages (not the homepage), so the executor sees role-matched
+# job cards instead of an announcement stream.
+IGUOPIN_SEARCH = {  # https://www.iguopin.com/job/list?keyword=<kw>, URL-encoded
+    "java": "https://www.iguopin.com/job/list?keyword=Java%E5%90%8E%E7%AB%AF%E5%BC%80%E5%8F%91%E5%B7%A5%E7%A8%8B%E5%B8%88",  # Java后端开发工程师
+    "frontend": "https://www.iguopin.com/job/list?keyword=%E5%89%8D%E7%AB%AF%E5%BC%80%E5%8F%91%E5%B7%A5%E7%A8%8B%E5%B8%88",  # 前端开发工程师
+    "ai": "https://www.iguopin.com/job/list?keyword=AI%E7%AE%97%E6%B3%95%E5%B7%A5%E7%A8%8B%E5%B8%88",  # AI算法工程师
+    "pm": "https://www.iguopin.com/job/list?keyword=%E4%BA%A7%E5%93%81%E7%BB%8F%E7%90%86",  # 产品经理
+}
 
 # question id -> (urls, seed note)
 # 2026-08-05 redesigned set: B-class (seed-disconnect) questions deleted
@@ -122,7 +135,7 @@ SEED_URLS: dict[str, tuple[list[str], str]] = {
     "Q013": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin LLM-dev landing page (sgcc seeds removed)"),
     "Q017": ([*BAIDU_TALENT_URLS, CAMPUS_EVIDENCE[0]], "campus GRADUATE JDs + cofco campus post"),
     "Q028": (CAMPUS_EVIDENCE, "campus job pages (probe-verified)"),
-    "Q034": ([IGUOPIN_HOME], "iguopin.com homepage (200 public, 央国企聚合)"),
+    "Q034": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
     "Q040": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
     "Q045": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "Q046": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
@@ -131,14 +144,14 @@ SEED_URLS: dict[str, tuple[list[str], str]] = {
     # R001-R010 (台账时间窗) / R011-R014 (大厂 AIGC PM) / R041/R042 (台账):
     # no seeds -- smartsheet query is the primary path; official SPA sites
     # degrade via search (bytedance/tencent), same as Q081/Q103/Q144.
-    "R015": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R016": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R017": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R018": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R019": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R020": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R021": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R022": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
+    "R015": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
+    "R016": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
+    "R017": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
+    "R018": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
+    "R019": ([IGUOPIN_SEARCH["ai"]], "iguopin AI 算法搜索页 (render-verified job cards)"),
+    "R020": ([IGUOPIN_SEARCH["pm"]], "iguopin 产品经理搜索页 (render-verified job cards)"),
+    "R021": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
+    "R022": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
     "R023": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "R024": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "R025": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
@@ -146,8 +159,8 @@ SEED_URLS: dict[str, tuple[list[str], str]] = {
     "R027": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "R028": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
     "R029": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
-    "R030": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
-    "R031": ([IGUOPIN_HOME], "iguopin.com homepage (央国企聚合)"),
+    "R030": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
+    "R031": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
     "R040": (BAIDU_TALENT_URLS, "baidu talent role-matched JDs"),
     "R043": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "R044": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),

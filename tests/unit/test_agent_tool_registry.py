@@ -110,6 +110,56 @@ def test_invalid_input_and_unknown_tool_become_safe_observations() -> None:
     assert (missing.status, missing.error_code) == ("failed", "unknown_tool")
 
 
+def test_invalid_tool_input_reports_failing_field_for_agent_recovery() -> None:
+    """``invalid_tool_input`` must name the field and constraint that failed.
+
+    The Executor only learns how to fix its call from the observation; a bare
+    error code makes it retry the identical payload until it stalls (the B2
+    waiting_user class). The message carries the field path and pydantic
+    constraint type but never the submitted value (which may embed secrets).
+    """
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read-job",
+            input_model=JobInput,
+            output_model=JobOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda context, payload: {
+                "job_id": payload.job_id,
+                "owner_id": context.user_id,
+            },
+        )
+    )
+    context = ToolContext(user_id="user-a", run_id="run-a")
+
+    empty = registry.invoke(
+        role=AgentRole.executor,
+        name="read-job",
+        context=context,
+        payload={"job_id": ""},
+    )
+    assert empty.error_code == "invalid_tool_input"
+    assert empty.error_message is not None
+    assert "job_id" in empty.error_message
+    assert "string_too_short" in empty.error_message
+
+    # Model-level errors (wrong top-level type) have no field loc.
+    wrong_type = registry.invoke(
+        role=AgentRole.executor,
+        name="read-job",
+        context=context,
+        payload="not-a-dict",
+    )
+    assert wrong_type.error_code == "invalid_tool_input"
+    assert wrong_type.error_message is not None
+    assert wrong_type.error_message.startswith("invalid input:")
+    assert "model_type" in wrong_type.error_message
+
+    # The submitted value never leaks into the observation.
+    assert "not-a-dict" not in (wrong_type.error_message or "")
+
+
 def test_registry_rejects_invalid_registration_and_catalog_filters_skill_authority() -> None:
     registry = ToolRegistry()
     definition = ToolDefinition(

@@ -195,6 +195,254 @@ def test_split_multi_job_page_chrome_above_meta_is_not_a_title() -> None:
     assert all("推荐投递" not in (c.title or "") for c in candidates)
 
 
+def test_split_multi_job_page_liepin_card_feed_splits_per_job() -> None:
+    """Liepin feeds (title + 【城市】 + salary/company lines) split per card."""
+    text = (
+        "大模型应用开发工程师\n"
+        "【\n"
+        "江宁区\n"
+        "】\n"
+        "20-30k·14薪\n"
+        "2年以上\n"
+        "硕士\n"
+        "五险一金\n"
+        "中科南京人工智能创新研究院\n"
+        "徐女士\n"
+        "HR\n"
+        "大模型应用开发工程师\n"
+        "【\n"
+        "苏州-枫桥\n"
+        "】\n"
+        "30-50k\n"
+        "1-3年\n"
+        "学历不限\n"
+        "昆山晟成光电科技有限公司\n"
+        "蒋女士\n"
+        "HR\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert segments[0].startswith("职位名称：大模型应用开发工程师\n工作地点：江宁区")
+    assert "20-30k·14薪" in segments[0]
+    assert "徐女士" in segments[0]
+    assert segments[1].startswith("职位名称：大模型应用开发工程师\n工作地点：苏州-枫桥")
+    assert "昆山晟成光电科技有限公司" in segments[1]
+
+
+def test_split_multi_job_page_liepin_single_card_stays_whole() -> None:
+    """A lone title + 【城市】 pair is a normal JD page, not a card feed."""
+    text = (
+        "大模型应用开发工程师\n"
+        "【\n"
+        "江宁区\n"
+        "】\n"
+        "20-30k·14薪\n"
+        "岗位职责：\n"
+        "负责大模型应用落地\n"
+    )
+    assert _split_multi_job_page(text) == [text]
+
+
+def test_split_multi_job_page_liepin_empty_city_skips_location_header() -> None:
+    """A malformed empty 【】 block still splits, but omits 工作地点."""
+    text = (
+        "AI应用开发工程师\n"
+        "【\n"
+        "\n"
+        "】\n"
+        "15-25k\n"
+        "某知名公司\n"
+        "大模型应用开发工程师\n"
+        "【\n"
+        "杭州\n"
+        "】\n"
+        "30-55k·16薪\n"
+        "5-10年\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert segments[0] == (
+        "职位名称：AI应用开发工程师\n"
+        "AI应用开发工程师\n"
+        "【\n"
+        "\n"
+        "】\n"
+        "15-25k\n"
+        "某知名公司"
+    )
+    assert segments[1].startswith("职位名称：大模型应用开发工程师\n工作地点：杭州")
+
+
+def test_split_multi_job_page_liepin_title_with_trailing_detail() -> None:
+    """Liepin titles carrying trailing detail still anchor the card split."""
+    text = (
+        "AI大模型应用开发工程师（python程序编码）+国企\n"
+        "【\n"
+        "广州\n"
+        "】\n"
+        "15-25k\n"
+        "某国企\n"
+        "AI大模型应用开发工程师（python程序编码）+国企\n"
+        "【\n"
+        "深圳\n"
+        "】\n"
+        "18-30k\n"
+        "某国企\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert segments[0].startswith(
+        "职位名称：AI大模型应用开发工程师（python程序编码）+国企\n工作地点：广州"
+    )
+    assert segments[1].startswith(
+        "职位名称：AI大模型应用开发工程师（python程序编码）+国企\n工作地点：深圳"
+    )
+
+
+def test_split_multi_job_page_iguopin_feed_splits_per_job() -> None:
+    """Iguopin listings (title + 「城市」 + dense salary/company lines) split."""
+    text = (
+        "Java后端开发工程师\n"
+        "「上海」\n"
+        "面议社招3-5年本科\n"
+        "数字后端工程师\n"
+        "中远海运科技股份有限公司\n"
+        "中远海运科技股份有限公司\n"
+        "国企\n"
+        "500-1000人\n"
+        "水上运输业\n"
+        "后端开发工程师\n"
+        "「珠海市-横琴粤澳深度合作区」\n"
+        "20~30K社招5-10年大专\n"
+        "数据库开发工程师\n"
+        "横琴人才集团有限公司\n"
+        "横琴人才集团有限公司\n"
+        "国企\n"
+        "50-100人\n"
+        "其他\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert segments[0].startswith("职位名称：Java后端开发工程师\n工作地点：上海")
+    assert "中远海运科技股份有限公司" in segments[0]
+    assert segments[1].startswith(
+        "职位名称：后端开发工程师\n工作地点：珠海市-横琴粤澳深度合作区"
+    )
+    assert "横琴人才集团有限公司" in segments[1]
+
+
+def test_split_multi_job_page_iguopin_single_card_stays_whole() -> None:
+    """A lone title + 「城市」 pair is a normal JD page, not a card feed."""
+    text = (
+        "Java后端开发工程师\n"
+        "「上海」\n"
+        "面议社招3-5年本科\n"
+        "岗位职责：\n"
+        "负责支付系统\n"
+    )
+    assert _split_multi_job_page(text) == [text]
+
+
+def test_split_multi_job_page_liepin_beats_iguopin_when_both_brackets_match() -> None:
+    """Liepin 【】 cards take precedence over Iguopin 「」 cards on one page."""
+    text = (
+        "大模型应用开发工程师\n"
+        "【\n"
+        "江宁区\n"
+        "】\n"
+        "20-30k·14薪\n"
+        "徐女士\n"
+        "AI平台工程师\n"
+        "【\n"
+        "杭州\n"
+        "】\n"
+        "30-55k·16薪\n"
+        "某知名公司\n"
+        "Java后端开发工程师\n"
+        "「上海」\n"
+        "面议社招3-5年本科\n"
+        "中远海运科技股份有限公司\n"
+        "后端开发工程师\n"
+        "「珠海市」\n"
+        "20~30K社招5-10年大专\n"
+        "横琴人才集团有限公司\n"
+    )
+    segments = _split_multi_job_page(text)
+    assert len(segments) == 2
+    assert segments[0].startswith("职位名称：大模型应用开发工程师\n工作地点：江宁区")
+    assert segments[1].startswith("职位名称：AI平台工程师\n工作地点：杭州")
+    # The 「」 cards carry no 【】 block, so they merge into the last segment.
+    assert "Java后端开发工程师" in segments[1]
+
+
+def test_extract_jd_candidates_from_iguopin_feed_produces_per_job_candidates() -> None:
+    """An Iguopin listing extracts one candidate per card with company names."""
+    text = (
+        "Java后端开发工程师\n"
+        "「上海」\n"
+        "面议社招3-5年本科\n"
+        "数字后端工程师\n"
+        "中远海运科技股份有限公司\n"
+        "中远海运科技股份有限公司\n"
+        "国企\n"
+        "500-1000人\n"
+        "水上运输业\n"
+        "后端开发工程师\n"
+        "「珠海市-横琴粤澳深度合作区」\n"
+        "20~30K社招5-10年大专\n"
+        "数据库开发工程师\n"
+        "横琴人才集团有限公司\n"
+        "横琴人才集团有限公司\n"
+        "国企\n"
+        "50-100人\n"
+        "其他\n"
+    )
+    candidates = extract_jd_candidates(text, "https://www.iguopin.com/job/list?keyword=x")
+    assert [c.title for c in candidates] == [
+        "Java后端开发工程师",
+        "后端开发工程师",
+    ]
+    assert candidates[0].locations == ["上海"]
+    assert candidates[0].company_name == "中远海运科技股份有限公司"
+    assert candidates[1].locations == ["珠海市-横琴粤澳深度合作区"]
+
+
+def test_extract_jd_candidates_from_liepin_feed_produces_per_job_candidates() -> None:
+    """A Liepin feed extracts one candidate per card, not one page-level blob."""
+    text = (
+        "本期新增2997个职位\n"
+        "大模型应用开发工程师\n"
+        "【\n"
+        "江宁区\n"
+        "】\n"
+        "20-30k·14薪\n"
+        "2年以上\n"
+        "硕士\n"
+        "五险一金\n"
+        "中科南京人工智能创新研究院\n"
+        "徐女士\n"
+        "HR\n"
+        "AI平台工程师\n"
+        "【\n"
+        "杭州\n"
+        "】\n"
+        "30-55k·16薪\n"
+        "5-10年\n"
+        "本科\n"
+        "某知名公司\n"
+        "罗先生\n"
+        "高级猎头顾问\n"
+    )
+    candidates = extract_jd_candidates(text, "https://www.liepin.com/zpdmxyykfgcsz24g/")
+    assert [c.title for c in candidates] == [
+        "大模型应用开发工程师",
+        "AI平台工程师",
+    ]
+    assert candidates[0].locations == ["江宁区"]
+    assert candidates[1].locations == ["杭州"]
+    assert all("本期新增" not in (c.title or "") for c in candidates)
+
+
 def test_card_meta_cities_guard_rejects_non_city_lead() -> None:
     """The meta-line city read accepts real cities, rejects non-city leads."""
     assert _card_meta_cities("北京、上海校招正式技术提前批职位 ID：A1") == "北京、上海"
