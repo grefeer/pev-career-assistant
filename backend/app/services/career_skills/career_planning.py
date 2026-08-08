@@ -1,4 +1,10 @@
-"""JD-grounded preparation planning for the PEV ``career-planning`` Skill."""
+"""JD-grounded preparation planning for the PEV ``career-planning`` Skill.
+
+C2 (docs/findjobs-optimization-plan.zh-CN.md §6.2): the tool additionally
+accepts optional extra JD artifact ids + resume skills and reports the
+cross-JD top-N missing-skill gaps (FindJobs ``top_skill_gaps`` port).  The
+single-JD path is unchanged: aggregation runs only when extra ids are given.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +14,10 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.job_discovery.tools.skill_validator import (
+    normalize_skill,
+    skills_from_text,
+)
 
 
 class CareerPlanningError(RuntimeError):
@@ -19,12 +29,19 @@ class CareerPlanningError(RuntimeError):
 
 
 class BuildPreparationPlanInput(BaseModel):
-    """One evidence-backed target JD plus topics the Agent wants validated."""
+    """One evidence-backed target JD plus topics the Agent wants validated.
+
+    C2: ``additional_target_artifact_ids`` / ``resume_skills`` / ``gap_limit``
+    are optional; leaving them empty keeps the exact pre-C2 single-JD path.
+    """
 
     target_artifact_id: str = Field(min_length=1, max_length=80)
     focus_keywords: list[str] = Field(min_length=1, max_length=30)
     time_budget_hours: int = Field(default=6, ge=1, le=80)
     target_date: date | None = None
+    additional_target_artifact_ids: list[str] = Field(default_factory=list, max_length=20)
+    resume_skills: list[str] = Field(default_factory=list, max_length=50)
+    gap_limit: int = Field(default=5, ge=1, le=20)
 
     @field_validator("focus_keywords")
     @classmethod
@@ -42,6 +59,13 @@ class BuildPreparationPlanInput(BaseModel):
         return cleaned
 
 
+class SkillGap(BaseModel):
+    """One cross-JD missing-skill aggregation row (C2, FindJobs port)."""
+
+    skill: str
+    job_count: int
+
+
 class PreparationPlanOutput(BaseModel):
     """Concise interview preparation plan with public-JD provenance."""
 
@@ -51,6 +75,7 @@ class PreparationPlanOutput(BaseModel):
     actions: list[str]
     schedule_assumption: str
     plan_items: list["PreparationPlanItem"]
+    skill_gaps: list[SkillGap] = Field(default_factory=list)
 
 
 class PreparationPlanItem(BaseModel):
@@ -106,6 +131,14 @@ def build_preparation_plan(
         )
         for index, (display, normalized) in enumerate(topic_pairs)
     ]
+    skill_gaps: list[SkillGap] = []
+    if payload.additional_target_artifact_ids:
+        skill_gaps = _aggregate_skill_gaps(
+            context.metadata.get("observed_public_evidence"),
+            (payload.target_artifact_id, *payload.additional_target_artifact_ids),
+            payload.resume_skills,
+            payload.gap_limit,
+        )
     return PreparationPlanOutput(
         target_artifact_id=payload.target_artifact_id,
         source_url=source_url,
@@ -113,7 +146,50 @@ def build_preparation_plan(
         actions=actions,
         schedule_assumption=schedule_assumption,
         plan_items=plan_items,
+        skill_gaps=skill_gaps,
     )
+
+
+def _aggregate_skill_gaps(
+    raw_evidence: object,
+    artifact_ids: tuple[str, ...],
+    resume_skills: list[str],
+    gap_limit: int,
+) -> list[SkillGap]:
+    """Cross-JD top-N missing-skill gaps (C2, FindJobs ``top_skill_gaps``).
+
+    Every JD (target + extra ids, in input order) contributes its closed-set
+    demanded skills (``skills_from_text``, deterministic, LLM-free); a skill
+    the resume already names (closed-set spelling or curated alias, exact
+    match) is not a gap.  Each JD counts a skill at most once.  Ranking:
+    job_count descending, then skill name ascending - stable across calls.
+    Evidence items that are missing or lack a non-empty ``visible_text`` are
+    skipped (a lost extra JD silently contributes nothing).
+    """
+    texts: list[str] = []
+    for artifact_id in artifact_ids:
+        item = _find_target(raw_evidence, artifact_id)
+        if item is None:
+            continue
+        visible_text = item.get("visible_text")
+        if isinstance(visible_text, str) and visible_text:
+            texts.append(visible_text)
+    if not texts:
+        return []
+    owned = {
+        normalize_skill(skill) or skill.strip().lower()
+        for skill in resume_skills
+        if skill.strip()
+    }
+    counts: dict[str, int] = {}
+    for text in texts:
+        for skill in set(skills_from_text(text)) - owned:
+            counts[skill] = counts.get(skill, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [
+        SkillGap(skill=skill, job_count=count)
+        for skill, count in ranked[:gap_limit]
+    ]
 
 
 def _find_target(raw_evidence: object, artifact_id: str) -> dict[str, Any] | None:
