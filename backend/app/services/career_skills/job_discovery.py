@@ -69,6 +69,46 @@ _JOB_RESULT_TEXT_RE = re.compile(
     r"engineer|developer|intern|hiring|career|job)",
     re.IGNORECASE,
 )
+# P2 (B4): known recruiting hosts pass on the loose URL-token OR text-signal
+# check; any other host must carry a job-shaped URL path. This rejects the
+# tutorial/encyclopedia noise that merely mentions 招聘/岗位 in its title.
+# Patterns ending in "." match the first label (careers.example,
+# career.hebut.edu.cn, jobs.bytedance.com); plain domains match by suffix.
+_JOB_SEARCH_ALLOWED_HOST_PATTERNS = (
+    "careers.",
+    "jobs.",
+    "campus.",
+    "talent.",
+    "recruit.",
+    "hr.",
+    "job.",
+    "liepin.com",
+    "iguopin.com",
+    "zhaopin.com",
+    "shixiseng.com",
+    "lagou.com",
+    "mokahr.com",
+    "feishu.cn",
+    "ncss.cn",
+    "fenbi.com",
+    "juejin.cn",
+)
+# site: operators appended to the Bing query (skipped when the agent already
+# steers with "site:") so the provider itself biases toward recruiting domains
+# instead of returning 教程/百科/官网首页 noise.
+_JOB_SEARCH_SITE_OPERATORS = (
+    "site:liepin.com",
+    "site:iguopin.com",
+    "site:zhaopin.com",
+    "site:shixiseng.com",
+    "site:lagou.com",
+    "site:job.ncss.cn",
+    "site:talent.baidu.com",
+    "site:jobs.bytedance.com",
+    "site:careers.tencent.com",
+    "site:campus.tencent.com",
+    "site:juejin.cn",
+)
 
 
 class PublicJobFetchError(RuntimeError):
@@ -571,10 +611,21 @@ def fetch_public_job_pages(
 def search_public_job_pages(
     context: ToolContext, payload: SearchPublicJobPagesInput
 ) -> SearchPublicJobPagesOutput:
-    """Search a fixed public provider and return only direct, safe career URLs."""
+    """Search a fixed public provider and return only direct, safe career URLs.
+
+    The query is qualified with recruiting-domain ``site:`` operators unless it
+    already steers with one, and results are filtered by the recruiting-host
+    whitelist (unknown hosts need a job-shaped URL path, not just JD wording in
+    the title), so tutorial/encyclopedia/official-homepage noise (P2/B4) never
+    becomes discovery evidence. The 360 fallback runs the raw query: it stays
+    the unconstrained escape hatch, with the result filter still applied.
+    """
     del context
+    query = payload.query
+    if "site:" not in query:
+        query = query + " " + " OR ".join(_JOB_SEARCH_SITE_OPERATORS)
     search_parameters = {
-        "q": payload.query,
+        "q": query,
         "mkt": "zh-CN",
         "setlang": "zh-hans",
         "cc": "CN",
@@ -603,7 +654,7 @@ def search_public_job_pages(
             or parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.hostname.endswith("bing.com")
-            or not _is_plausible_public_job_result(raw_result, result_url)
+            or not _is_plausible_public_job_result(raw_result, result_url, parsed.hostname)
         ):
             return
         try:
@@ -647,19 +698,44 @@ def search_public_job_pages(
     )
 
 
+def _is_allowed_job_host(hostname: str) -> bool:
+    """True when ``hostname`` is a known recruiting domain (P2/B4 whitelist).
+
+    This is a result-quality filter only -- ``_assert_public_url`` remains the
+    security gate. Patterns ending in "." match the first label (careers.example,
+    career.hebut.edu.cn); plain domains match by suffix (www.liepin.com,
+    job.ncss.cn).
+    """
+    lowered = hostname.lower()
+    for pattern in _JOB_SEARCH_ALLOWED_HOST_PATTERNS:
+        if pattern.endswith("."):
+            if lowered.startswith(pattern):
+                return True
+        elif lowered == pattern or lowered.endswith("." + pattern):
+            return True
+    return False
+
+
 def _is_plausible_public_job_result(
-    result: dict[str, str], result_url: str
+    result: dict[str, str], result_url: str, hostname: str
 ) -> bool:
-    """Keep search evidence useful for job discovery without trusting generic pages."""
+    """Keep search evidence useful for job discovery without trusting generic pages.
+
+    Whitelisted recruiting hosts pass on the loose URL-token OR text-signal
+    check (their pages are already job-shaped). Any other host must carry a
+    job token in its URL path: a tutorial or encyclopedia page rarely does,
+    even though its title often mentions 招聘/岗位 -- exactly the noise this
+    rejects.
+    """
     searchable_text = " ".join(
         value for value in (result.get("title"), result.get("snippet"))
         if isinstance(value, str)
     )
     lowered_url = result_url.lower()
-    return (
-        any(token in lowered_url for token in _JOB_RESULT_URL_TOKENS)
-        or _JOB_RESULT_TEXT_RE.search(searchable_text) is not None
-    )
+    url_token_match = any(token in lowered_url for token in _JOB_RESULT_URL_TOKENS)
+    if _is_allowed_job_host(hostname):
+        return url_token_match or _JOB_RESULT_TEXT_RE.search(searchable_text) is not None
+    return url_token_match
 
 
 def _direct_bing_result_url(url: str) -> str | None:

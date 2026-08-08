@@ -23,6 +23,29 @@ def _sanitize_error_message(text: str, max_length: int = 500) -> str:
     stripped = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^@]+@", r"\1[redacted]@", text)
     return stripped[:max_length]
 
+
+def _validation_error_summary(exc: ValidationError, max_length: int = 500) -> str:
+    """Condense schema validation failures into actionable field guidance.
+
+    pydantic error entries carry ``loc`` (the failing field path), ``type``
+    (the violated constraint) and ``msg`` (a human description). Joining them
+    lets the Executor fix its call instead of blindly retrying the same
+    invalid payload until it stalls. Submitted values (``entry["input"]``) are
+    deliberately never echoed: a payload may embed tokens or credentials,
+    which must not reach the agent or logs.
+    """
+    entries: list[str] = []
+    for entry in exc.errors():
+        loc = ".".join(str(part) for part in entry.get("loc", ()))
+        etype = entry.get("type", "validation_error")
+        msg = entry.get("msg", "")
+        if loc:
+            entries.append(f"{loc}: {etype} ({msg})")
+        else:
+            # Model-level errors (e.g. wrong top-level type) have no field loc.
+            entries.append(f"{etype} ({msg})")
+    return _sanitize_error_message("invalid input: " + "; ".join(entries), max_length=max_length)
+
 ToolHandler = Callable[[ToolContext, BaseModel], BaseModel | Mapping[str, Any]]
 
 
@@ -139,11 +162,12 @@ class ToolRegistry:
             )
         try:
             validated_input = definition.input_model.model_validate(payload)
-        except ValidationError:
+        except ValidationError as exc:
             return ToolObservation(
                 tool_name=name,
                 status="failed",
                 error_code="invalid_tool_input",
+                error_message=_validation_error_summary(exc),
             )
         try:
             result = definition.handler(context, validated_input)

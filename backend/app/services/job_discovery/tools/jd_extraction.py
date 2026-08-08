@@ -84,6 +84,29 @@ _CARD_LIST_SPLIT_RE: re.Pattern = re.compile(
     r"(?P<meta>[^\n]*职位\s*ID[^\n]*)$"
 )
 
+# Iguopin (国聘) search listings render every opening as a card whose title
+# line is followed by a corner-bracket city block (``「城市」``), then a dense
+# salary/type/experience/degree line and the company block. No ``职位 ID``
+# meta line, no 【】 block -- a third distinct listing layout. ``city`` may be
+# empty (malformed bracket) and still anchors the split.
+_IGUOPIN_CARD_SPLIT_RE: re.Pattern = re.compile(
+    rf"(?m)^(?P<title>.{{2,60}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
+    r"「\s*(?P<city>[^「」\n]{0,30})\s*」"
+)
+
+# Liepin-style portals render every opening as a card whose title line is
+# immediately followed by a bracket-wrapped city block (``【\n城市\n】``),
+# then salary / experience / education / benefits / company / recruiter
+# lines. There is no ``职位 ID`` meta line, so ``_CARD_LIST_SPLIT_RE`` never
+# fires and a whole listing (e.g. a "本期新增 2997 个职位" feed) degrades to
+# one page-level blob. Splitting on title + city-bracket pairs turns the feed
+# into per-opening segments. ``city`` is optional: a malformed empty bracket
+# (``【】``) still splits at the title and simply loses the location.
+_LIEPIN_CARD_SPLIT_RE: re.Pattern = re.compile(
+    rf"(?m)^(?P<title>.{{2,60}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
+    r"【\s*(?P<city>[^】\n]{0,20})\s*】"
+)
+
 
 def _card_meta_cities(meta: str) -> str | None:
     """Read the city list leading a Feishu card meta line, if present.
@@ -128,14 +151,37 @@ def _normalize_card_segment(card_text: str, match: re.Match, segment_start: int)
     return header + card_text[match.start() - segment_start:].strip()
 
 
+def _normalize_bracket_card_segment(
+    card_text: str, match: re.Match, segment_start: int
+) -> str:
+    """Prefix one bracket-city card (Liepin 【】 / Iguopin 「」) with headers.
+
+    Both layouts render each opening as ``title`` followed by a city block --
+    Liepin wraps it in full-width brackets (``【\n城市\n】``), Iguopin in
+    corner brackets (``「城市」``). Injecting the same labeled headers as
+    ``_normalize_card_segment`` (``职位名称：`` / ``工作地点：``) reuses
+    ``_TITLE_PATTERNS`` / ``_LOCATION_PATTERNS`` without touching the
+    Feishu-specific meta parser. The city captured by the split regex may be
+    empty (malformed bracket), in which case only the title header is emitted.
+    """
+    title = match.group("title").strip()
+    header = f"职位名称：{title}\n"
+    city = match.group("city").strip()
+    if city:
+        header += f"工作地点：{city}\n"
+    return header + card_text[match.start() - segment_start:].strip()
+
+
 def _split_multi_job_page(text: str) -> list[str]:
     """Split page text containing multiple job postings into segments.
 
     Detects Chinese multi-job separators like 岗位二： / 职位2：
     or repeated title headings (岗位名称 appearing twice), or Feishu-style
     card listings (title line followed by a ``职位 ID`` meta line - each card
-    becomes its own segment). Returns the detected segments, each fed
-    separately to extraction.
+    becomes its own segment), or bracket-city card feeds (title line followed
+    by a ``【城市】`` Liepin block or a ``「城市」`` Iguopin block, at least
+    two cards). Returns the detected segments, each fed separately to
+    extraction.
     """
     if not text.strip():
         return [text]
@@ -177,6 +223,25 @@ def _split_multi_job_page(text: str) -> list[str]:
             start = m.start()
             end = card_matches[i + 1].start() if i + 1 < len(card_matches) else len(text)
             segments.append(_normalize_card_segment(text[start:end], m, start))
+        return segments
+
+    # Pattern 4/5: bracket-city card feeds (Liepin 【】 / Iguopin 「」). At
+    # least two cards are required: a lone ``title + [城市]`` pair is
+    # indistinguishable from a normal single JD page that mentions a bracketed
+    # location, which must stay on the unchanged single-segment path.
+    bracket_matches = list(_LIEPIN_CARD_SPLIT_RE.finditer(text))
+    if not bracket_matches:
+        bracket_matches = list(_IGUOPIN_CARD_SPLIT_RE.finditer(text))
+    if len(bracket_matches) >= 2:
+        segments = []
+        for i, m in enumerate(bracket_matches):
+            start = m.start()
+            end = (
+                bracket_matches[i + 1].start()
+                if i + 1 < len(bracket_matches)
+                else len(text)
+            )
+            segments.append(_normalize_bracket_card_segment(text[start:end], m, start))
         return segments
 
     return [text]
