@@ -6,6 +6,10 @@ from backend.app.services.agent_runtime.schemas import AgentTaskRequest
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.registry import build_career_tool_registry
 from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
+from backend.app.services.deepagents_runtime.middleware import (
+    current_budgets,
+    current_tracker,
+)
 from backend.app.services.deepagents_runtime.tools.adapters import (
     DuplicateCallTracker,
     bind_tool_context,
@@ -145,6 +149,41 @@ def test_invalid_json_payload_folded_to_observation() -> None:
     result = tools[0].invoke({"payload": "{not json"})
     obs = json.loads(result)
     assert obs["status"] == "failed"
+
+
+def test_seam_built_tools_fall_back_to_context_budgets() -> None:
+    # the tool_factory seam (compare_runner) passes no budgets/tracker; the
+    # handler must resolve them from the harness-bound context vars instead
+    # of crashing with AttributeError on the first call
+    tools = build_skill_tools(
+        skill_name="job-discovery",
+        context_factory=_context_factory,
+    )
+    budgets = _budgets()
+    tracker = DuplicateCallTracker()
+    payload = json.dumps({"artifact_id": "a1"})
+    with current_budgets(budgets):
+        with current_tracker(tracker):
+            assert budgets.tool_calls_used == 0
+            tools[0].invoke({"payload": payload})  # consumes context budget
+            assert budgets.tool_calls_used == 1
+            result = tools[0].invoke({"payload": payload})  # identical -> thrash
+    obs = json.loads(result)
+    assert obs["status"] == "failed"
+    assert obs["error_code"] == "duplicate_tool_call"
+
+
+def test_seam_built_tools_unguarded_outside_harness_invocation() -> None:
+    # no explicit budgets/tracker AND no bound context vars -> the guard
+    # degrades to unguarded (observation, never an AttributeError crash)
+    tools = build_skill_tools(
+        skill_name="job-discovery",
+        context_factory=_context_factory,
+    )
+    result = tools[0].invoke({"payload": "{not json"})
+    obs = json.loads(result)
+    assert obs["status"] == "failed"
+    assert obs["error_code"] == "invalid_tool_input"
 
 
 def test_harness_executor_uses_registry_adapters_by_default() -> None:

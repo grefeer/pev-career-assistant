@@ -14,10 +14,11 @@ eval_runner contract (link N+1 only starts when N succeeded; the previous
 link's collected artifact URLs become the next link's ``candidate_urls`` +
 a ``chain_context`` note).
 
-The legacy leg runs through the real AgentRunService so both sides execute
-their full production code paths; the deepagents leg runs the harness with
-a real ChatOpenAI (DeepSeek via the same environment provider as the
-legacy gateway).  Live only — never unit-tested end to end.
+The legacy leg runs through the real AgentRuntime (the eval_runner live
+path) so both sides execute their full production code paths; the
+deepagents leg runs the harness with a real ChatOpenAI (DeepSeek via the
+same environment provider as the legacy gateway).  Live only — never
+unit-tested end to end.
 """
 
 from __future__ import annotations
@@ -43,7 +44,6 @@ from backend.app.services.agent_runtime.model_gateway import build_agent_model_g
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.runtime import AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentTaskRequest
-from backend.app.services.agent_runtime.service import AgentRunService
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 from backend.app.services.career_skills.registry import build_career_tool_registry
 from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
@@ -147,14 +147,23 @@ def _run_legacy_link(
                 verifier=VerifierAgent(gateway=gateway, tools=tools),
                 agent_version="pev-1",
             )
-            service = AgentRunService(settings, runtime=runtime)
             task = AgentTaskRequest(
                 goal=question.goal,
                 allowed_skills=question.allowed_skills,
                 context={**(question.context or {}), **(extra_context or {})},
             )
-            with session_factory.begin() as db:  # commit so the counters can read it
-                return service.create_run(db, user_id="eval-user", task=task)
+            # plain session + explicit commit, not session_factory.begin():
+            # the runtime commits/ends its own transaction internally, which
+            # trips begin()'s exit with "closed transaction inside context
+            # manager"; the commit here makes the run visible to the fresh
+            # counter session below (the eval_runner live shape + commit)
+            db = session_factory()
+            try:
+                result = runtime.run(db, user_id="eval-user", task=task)
+                db.commit()
+            finally:
+                db.close()
+            return result
 
         runner = default_runner
     started = time.monotonic()
@@ -263,11 +272,37 @@ def _run_deepagents_link(
         from langchain_openai import ChatOpenAI
 
         def model_factory(role: str) -> ChatOpenAI:
-            return ChatOpenAI(
-                model=settings.agent_harness_model,
-                temperature=0,
-                max_tokens=4096 if role == "planner" else 2048,
+            # mirror the legacy gateway's provider wiring (model_gateway.py
+            # build_agent_model_gateway): without an explicit base_url the
+            # OpenAI-compatible client defaults to api.openai.com and
+            # rejects the DeepSeek key with 401; get_api_key/get_base_url
+            # resolve the same .env provider values as the legacy leg
+            from backend.app.services.agent_runtime.model_gateway import (
+                AgentModelGatewayConfigError,
             )
+            from backend.app.services.agent_runtime.provider_config import (
+                get_api_key,
+                get_base_url,
+            )
+
+            api_key = get_api_key()
+            if not api_key:
+                raise AgentModelGatewayConfigError("missing_api_key")
+            base_url = get_base_url()
+            kwargs: dict[str, object] = {
+                "model": settings.agent_harness_model,
+                "temperature": 0,
+                "request_timeout": 120,
+                "max_retries": 2,
+                "api_key": api_key,
+                "base_url": base_url,
+                "max_tokens": 4096 if role == "planner" else 2048,
+            }
+            if "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
+                "deepseek-v4"
+            ):
+                kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            return ChatOpenAI(**kwargs)
 
         checkpointer = create_checkpointer(settings)
         harness = DeepAgentsHarness(

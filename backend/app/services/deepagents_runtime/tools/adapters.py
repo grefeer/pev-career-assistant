@@ -7,6 +7,13 @@ langchain tool surface.  Hard invariants enforced here:
 - duplicate-call dedup: a consecutive identical successful call is folded
   into a ``duplicate_tool_call`` observation (executor-thrash breaker);
 - failures never escape: handler exceptions become failed observations.
+
+``budgets``/``tracker`` resolve at call time: explicit args win (the
+harness default path), otherwise the harness-bound context vars
+(``active_budgets``/``active_tracker``) — the ``tool_factory`` seam passes
+neither, so without the fallback every seam-built tool crashes on its first
+call (both stay ``None`` outside a harness invocation and the guards below
+degrade to unguarded, matching ``skill_graphs.build_job_discovery_tool``).
 """
 
 from __future__ import annotations
@@ -25,6 +32,10 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
 from backend.app.services.career_skills.registry import build_career_tool_registry
 from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
+from backend.app.services.deepagents_runtime.middleware import (
+    active_budgets,
+    active_tracker,
+)
 
 
 class _JsonPayload(BaseModel):
@@ -81,12 +92,18 @@ def _failed_observation(tool_name: str, error_code: str) -> str:
 def build_skill_tools(
     *,
     skill_name: str,
-    budgets: DeepAgentsBudgets,
-    tracker: DuplicateCallTracker,
+    budgets: DeepAgentsBudgets | None = None,
+    tracker: DuplicateCallTracker | None = None,
     context_factory: Callable[[], ToolContext] | None = None,
     registry: ToolRegistry | None = None,
 ) -> Sequence[BaseTool]:
-    """Wrap every registry tool of ``skill_name`` as a JSON-string @tool."""
+    """Wrap every registry tool of ``skill_name`` as a JSON-string @tool.
+
+    ``budgets``/``tracker`` fall back to the harness-bound context vars when
+    None (the tool_factory seam passes neither); outside a harness
+    invocation both resolve to None and the guards below treat the tool as
+    unguarded (matching ``skill_graphs.build_job_discovery_tool``).
+    """
     registry = registry or build_career_tool_registry()
     catalog = registry.tool_catalog(
         role=AgentRole.executor, allowed_skills=frozenset({skill_name})
@@ -100,13 +117,17 @@ def build_skill_tools(
         def _handler(
             payload: str, *, _name: str = name, _desc: str = description
         ) -> str:
-            if not budgets.try_consume_tool():
+            run_budgets = budgets or active_budgets()
+            run_tracker = tracker or active_tracker()
+            if run_budgets is not None and not run_budgets.try_consume_tool():
                 return _failed_observation(_name, "tool_budget_exhausted")
             try:
                 payload_dict = json.loads(payload)
             except json.JSONDecodeError:
                 return _failed_observation(_name, "invalid_tool_input")
-            if tracker.is_duplicate(_name, payload_dict):
+            if run_tracker is not None and run_tracker.is_duplicate(
+                _name, payload_dict
+            ):
                 return _failed_observation(_name, "duplicate_tool_call")
             observation = registry.invoke(
                 role=AgentRole.executor,

@@ -526,16 +526,13 @@ def test_main_runs_comparison(tmp_path, monkeypatch) -> None:
 
 
 def test_run_legacy_question_default_runner_path(monkeypatch, db_session) -> None:
-    import contextlib
-
     import backend.app.services.deepagents_runtime.eval.compare_runner as cr
 
-    class _FakeAgentRunService:
-        def __init__(self, settings, *, runtime):
-            self.settings = settings
-            self.runtime = runtime
+    class _FakeRuntime:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
 
-        def create_run(self, db, *, user_id, task):
+        def run(self, db, *, user_id, task):
             assert user_id == "eval-user"
             assert task.goal == "帮我找后端岗位"
             return _FakeResult(run_id="legacy-default", status=RunStatus.succeeded)
@@ -547,9 +544,6 @@ def test_run_legacy_question_default_runner_path(monkeypatch, db_session) -> Non
         def __call__(self):
             return self._session
 
-        def begin(self):
-            return contextlib.nullcontext(self._session)
-
     # the default runner closure resolves these names in the cr module
     # namespace at call time, so patching them covers the real assembly
     monkeypatch.setattr(cr, "build_agent_model_gateway", lambda settings: object())
@@ -557,8 +551,7 @@ def test_run_legacy_question_default_runner_path(monkeypatch, db_session) -> Non
     monkeypatch.setattr(cr, "PlannerAgent", lambda gateway, tools: object())
     monkeypatch.setattr(cr, "ExecutorAgent", lambda gateway, tools: object())
     monkeypatch.setattr(cr, "VerifierAgent", lambda gateway, tools: object())
-    monkeypatch.setattr(cr, "AgentRuntime", lambda **kwargs: object())
-    monkeypatch.setattr(cr, "AgentRunService", _FakeAgentRunService)
+    monkeypatch.setattr(cr, "AgentRuntime", _FakeRuntime)
     metrics = run_legacy_question(
         _question(),
         settings=None,
@@ -586,9 +579,11 @@ def test_run_deepagents_question_default_harness_path(monkeypatch) -> None:
         "error_code": None,
     }
 
+    captured: dict = {}
+
     class _FakeChatOpenAI:
         def __init__(self, **kwargs):
-            self.kwargs = kwargs
+            captured.update(kwargs)
 
     class _FakeHarnessClass:
         def __init__(self, *, model_factory, checkpointer, tool_factory=None):
@@ -600,11 +595,24 @@ def test_run_deepagents_question_default_harness_path(monkeypatch) -> None:
             return final
 
     monkeypatch.setattr("langchain_openai.ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key",
+        lambda: "test-api-key",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.deepseek.com/v1",
+    )
     monkeypatch.setattr(cr, "DeepAgentsHarness", _FakeHarnessClass)
     monkeypatch.setattr(cr, "create_checkpointer", lambda settings: object())
     metrics = run_deepagents_question(
         _question(), settings=_Settings(), run_id="eval-default"
     )
+    # provider parity with the legacy gateway: the model factory must reach
+    # ChatOpenAI with the resolved DeepSeek key + base_url (the 401 fix)
+    assert captured["api_key"] == "test-api-key"
+    assert captured["base_url"] == "https://api.deepseek.com/v1"
+    assert captured["model"] == "deepseek-chat"
     assert metrics.status == "succeeded"
     assert metrics.steps == 0
     assert metrics.turns == 0
@@ -696,6 +704,14 @@ def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
             return final
 
     monkeypatch.setattr("langchain_openai.ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key",
+        lambda: "test-api-key",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.deepseek.com/v1",
+    )
     monkeypatch.setattr(cr, "DeepAgentsHarness", _FakeHarnessClass)
     monkeypatch.setattr(cr, "create_checkpointer", lambda settings: object())
 
