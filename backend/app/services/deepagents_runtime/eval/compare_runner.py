@@ -5,6 +5,15 @@ Writes ``report.json`` and ``report.md`` under ``out_dir``: success
 distribution (succeeded / waiting_user / failed), avg turns, tool calls,
 replans, wall-clock and error codes, per question.
 
+The comparison set is the redesign archive (spec §7): 21 kept Q-docs + 47
+R-docs + 15 chain C-docs from ``tests/question/redesign``.  Ids resolve
+root-first (``tests/question/{id}.json``) then fall back to
+``tests/question/redesign/{id}.json``; chain docs expand into one
+ChainQuestion whose links run under ``C###-L<n>`` ids with the
+eval_runner contract (link N+1 only starts when N succeeded; the previous
+link's collected artifact URLs become the next link's ``candidate_urls`` +
+a ``chain_context`` note).
+
 The legacy leg runs through the real AgentRunService so both sides execute
 their full production code paths; the deepagents leg runs the harness with
 a real ChatOpenAI (DeepSeek via the same environment provider as the
@@ -21,7 +30,14 @@ from pathlib import Path
 from sqlalchemy import func, select
 
 from backend.app.config import Settings
-from backend.app.db.models import AgentEvent, AgentPlan, AgentStep, AgentTurn
+from backend.app.db.models import (
+    AgentArtifact,
+    AgentEvent,
+    AgentPlan,
+    AgentRun,
+    AgentStep,
+    AgentTurn,
+)
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import build_agent_model_gateway
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
@@ -44,6 +60,20 @@ class Question:
     goal: str
     allowed_skills: list[str]
     context: dict
+
+
+@dataclass
+class ChainQuestion:
+    """A chained question doc (``{"chain": [link...]}``), links as Questions.
+
+    Each link is its own Question under ``C###-L<n>`` (the link's own
+    ``meta.skills`` / ``profile``); the chain contract lives in
+    ``run_chain_comparison`` (link N+1 only when N succeeded; N's collected
+    artifact URLs become N+1's ``candidate_urls``).
+    """
+
+    id: str
+    links: list[Question]
 
 
 @dataclass
@@ -71,6 +101,31 @@ def run_legacy_question(
     ``error_code`` attributes.  Defaults to the real service assembly (live
     eval only — the default path is unit-covered by monkeypatching the
     ``cr.*`` assembly names, see ``test_run_legacy_question_default_runner_path``).
+    Delegates to ``_run_legacy_link``, discarding the collected URLs.
+    """
+    metrics, _, _ = _run_legacy_link(
+        question, settings=settings, session_factory=session_factory, runner=runner
+    )
+    return metrics
+
+
+def _run_legacy_link(
+    question: Question,
+    *,
+    settings: Settings,
+    session_factory,
+    runner=None,
+    extra_context: dict | None = None,
+) -> tuple[RunMetrics, list[str], str | None]:
+    """Run one legacy question; also return its artifact URLs + summary.
+
+    ``collected_urls`` = the run's persisted AgentArtifact source_urls
+    (evidence-bound tool output only); ``summary`` = the run's
+    AgentRun.final_summary.  Chain links hand both to the next link (URLs as
+    its candidate set, summary quoted in the chain_context note).
+    ``extra_context`` merges over the question's own context (candidate_urls
+    inherited from a previous chain link).  Assembly/seam identical to
+    ``run_legacy_question``, which delegates here.
     """
     if runner is None:
 
@@ -87,7 +142,7 @@ def run_legacy_question(
             task = AgentTaskRequest(
                 goal=question.goal,
                 allowed_skills=question.allowed_skills,
-                context=question.context,
+                context={**(question.context or {}), **(extra_context or {})},
             )
             with session_factory.begin() as db:  # commit so the counters can read it
                 return service.create_run(db, user_id="eval-user", task=task)
@@ -125,14 +180,26 @@ def run_legacy_question(
         tool_calls = sum(
             1 for event in events if (event.payload_json or {}).get("tool")
         )
-    return RunMetrics(
-        status=result.status.value,
-        steps=steps,
-        turns=turns,
-        tool_calls=tool_calls,
-        replans=replans,
-        wall_clock_s=round(elapsed, 2),
-        error_code=result.error_code,
+        urls = db.scalars(
+            select(AgentArtifact.source_url).where(
+                AgentArtifact.run_id == result.run_id
+            )
+        ).all()
+        summary = db.scalar(
+            select(AgentRun.final_summary).where(AgentRun.id == result.run_id)
+        )
+    return (
+        RunMetrics(
+            status=result.status.value,
+            steps=steps,
+            turns=turns,
+            tool_calls=tool_calls,
+            replans=replans,
+            wall_clock_s=round(elapsed, 2),
+            error_code=result.error_code,
+        ),
+        [url for url in urls if url],
+        summary,
     )
 
 
@@ -148,6 +215,32 @@ def run_deepagents_question(
     default path is unit-covered by monkeypatching ``cr.DeepAgentsHarness``
     and ``langchain_openai.ChatOpenAI``, see
     ``test_run_deepagents_question_default_harness_path``).
+    Delegates to ``_run_deepagents_link``, discarding the collected URLs.
+    """
+    metrics, _, _ = _run_deepagents_link(
+        question, settings=settings, run_id=run_id, harness=harness
+    )
+    return metrics
+
+
+def _run_deepagents_link(
+    question: Question,
+    *,
+    settings: Settings,
+    run_id: str,
+    harness=None,
+    extra_context: dict | None = None,
+) -> tuple[RunMetrics, list[str], str | None]:
+    """Run one deepagents question; also return its evidence URLs + summary.
+
+    ``collected_urls`` = the run's in-memory evidence-store ``source_url``
+    entries (only tool-produced evidence is stored; the compare runner wires
+    no session_factory so nothing flushes to MySQL); ``summary`` = the
+    graph's ``final_summary``.  Chain links hand both to the next link (URLs
+    as its candidate set, summary quoted in the chain_context note).
+    ``extra_context`` merges over the question's own context (candidate_urls
+    inherited from a previous chain link).  Assembly/seam identical to
+    ``run_deepagents_question``, which delegates here.
 
     Task 11 wiring: the harness receives a ``tool_factory`` (closure
     captures the run_id, which the harness cannot read from the workflow
@@ -181,7 +274,7 @@ def run_deepagents_question(
     request = AgentTaskRequest(
         goal=question.goal,
         allowed_skills=question.allowed_skills,
-        context=question.context,
+        context={**(question.context or {}), **(extra_context or {})},
     )
     started = time.monotonic()
     final = harness.run(request, run_id=run_id)
@@ -189,15 +282,181 @@ def run_deepagents_question(
     budgets = DeepAgentsBudgets.from_dict(final["budget"])
     plan_json = final.get("plan_json") or {}
     steps = len(plan_json.get("steps", [])) if isinstance(plan_json, dict) else 0
-    return RunMetrics(
-        status=final["run_status"] or "unknown",
-        steps=steps,
-        turns=budgets.turns_used,
-        tool_calls=budgets.tool_calls_used,
-        replans=budgets.replans_used,
-        wall_clock_s=round(elapsed, 2),
-        error_code=final.get("error_code"),
+    urls = [
+        item["source_url"]
+        for item in final.get("evidence_store") or []
+        if isinstance(item.get("source_url"), str)
+    ]
+    return (
+        RunMetrics(
+            status=final["run_status"] or "unknown",
+            steps=steps,
+            turns=budgets.turns_used,
+            tool_calls=budgets.tool_calls_used,
+            replans=budgets.replans_used,
+            wall_clock_s=round(elapsed, 2),
+            error_code=final.get("error_code"),
+        ),
+        urls,
+        final.get("final_summary"),
     )
+
+
+def _chain_metrics(metrics: list[RunMetrics]) -> RunMetrics | None:
+    """Aggregate a chain leg's executed links into one chain-level metric.
+
+    Status/error_code come from the LAST executed link (eval_runner chain
+    semantics: the chain result reports the last link's outcome); the other
+    counters sum across links.
+    """
+    if not metrics:
+        return None
+    last = metrics[-1]
+    return RunMetrics(
+        status=last.status,
+        steps=sum(m.steps for m in metrics),
+        turns=sum(m.turns for m in metrics),
+        tool_calls=sum(m.tool_calls for m in metrics),
+        replans=sum(m.replans for m in metrics),
+        wall_clock_s=round(sum(m.wall_clock_s for m in metrics), 2),
+        error_code=last.error_code,
+    )
+
+
+def _chain_extra(records: list[dict]) -> dict | None:
+    """Build the extra context a chain link inherits from its predecessor.
+
+    Mirrors eval_runner.run_chain: the previous link's collected URLs become
+    ``candidate_urls``, plus a ``chain_context`` note quoting the previous
+    summary — the chain answers with real evidence instead of a fresh
+    session pretending earlier steps happened (the next link is a new
+    session with no persisted evidence, so it must re-capture the candidates
+    itself).
+    """
+    if not records:
+        return None
+    prev = records[-1]
+    extra: dict | None = None
+    prev_urls = prev["urls"]
+    if prev_urls:
+        extra = {"candidate_urls": prev_urls}
+    summary = (prev.get("summary") or "").strip()
+    if summary:
+        note = (
+            f"上一环节（{prev['id']}）已完成岗位收集，但本环节是全新会话，"
+            f"上一环节的证据工件在当前会话中不存在，必须基于 "
+            f"candidate_urls 中的 URL 重新抓取岗位页面获取 JD 证据后，"
+            f"才能进行本环节的任务。上一环节成果参考：{summary[:200]}"
+        )
+        extra = {**(extra or {}), "chain_context": note}
+    return extra
+
+
+def _run_chain_leg(
+    links: list[Question],
+    *,
+    run_link,
+) -> dict:
+    """Run one runtime's side of a chain (eval_runner contract).
+
+    ``run_link(link, *, extra_context) -> (RunMetrics, urls, summary)`` is
+    the leg's per-link runner (``_run_deepagents_link`` / ``_run_legacy_link``
+    bound with the leg's own settings/session wiring).  Link N+1 only starts
+    when N succeeded; N's collected URLs + summary become N+1's
+    ``candidate_urls`` + ``chain_context`` note.  Returns the executed link
+    records and their metrics (stops at the first non-succeeded link).
+    """
+    records: list[dict] = []
+    metrics: list[RunMetrics] = []
+    for link in links:
+        extra_context = _chain_extra(records)
+        link_metrics, urls, summary = run_link(
+            link, extra_context=extra_context
+        )
+        metrics.append(link_metrics)
+        records.append(
+            {
+                "id": link.id,
+                "goal": link.goal,
+                "metrics": asdict(link_metrics),
+                "url_count": len(urls),
+                "urls": urls,
+                "summary": summary or "",
+            }
+        )
+        if link_metrics.status != "succeeded":
+            break
+    return {"links": records, "metrics": metrics}
+
+
+def run_chain_comparison(
+    chain: ChainQuestion, *, settings: Settings, session_factory
+) -> dict:
+    """Run a chained question on both runtimes; return its report entry.
+
+    Each leg follows the eval_runner chain contract independently (link N+1
+    only when N succeeded on that leg, N's collected URLs become N+1's
+    candidates).  Chain-level metrics aggregate over the executed links; a
+    leg exception is recorded in ``error`` and the surviving leg still
+    contributes its metrics.
+    """
+    errors: list[str] = []
+
+    def deepagents_link(link, *, extra_context):
+        return _run_deepagents_link(
+            link,
+            settings=settings,
+            run_id=f"eval-{link.id}",
+            extra_context=extra_context,
+        )
+
+    def legacy_link(link, *, extra_context):
+        return _run_legacy_link(
+            link,
+            settings=settings,
+            session_factory=session_factory,
+            extra_context=extra_context,
+        )
+
+    try:
+        deepagents_leg = _run_chain_leg(chain.links, run_link=deepagents_link)
+    except Exception as exc:  # noqa: BLE001 - leg isolation per question
+        errors.append(f"deepagents: {type(exc).__name__}: {exc}")
+        deepagents_leg = {"links": [], "metrics": []}
+    try:
+        legacy_leg = _run_chain_leg(chain.links, run_link=legacy_link)
+    except Exception as exc:  # noqa: BLE001 - leg isolation per question
+        errors.append(f"legacy: {type(exc).__name__}: {exc}")
+        legacy_leg = {"links": [], "metrics": []}
+    d_links = deepagents_leg["links"]
+    l_links = legacy_leg["links"]
+    links = [
+        {
+            "id": chain.links[index].id,
+            "goal": chain.links[index].goal,
+            "deepagents": d_links[index]["metrics"] if index < len(d_links) else None,
+            "deepagents_urls": d_links[index]["url_count"] if index < len(d_links) else 0,
+            "legacy": l_links[index]["metrics"] if index < len(l_links) else None,
+            "legacy_urls": l_links[index]["url_count"] if index < len(l_links) else 0,
+        }
+        for index in range(max(len(d_links), len(l_links)))
+    ]
+    entry: dict = {
+        "id": chain.id,
+        "type": "chain",
+        "chain_length": len(chain.links),
+        "goal": chain.links[0].goal if chain.links else "",
+        "links": links,
+    }
+    deepagents_chain = _chain_metrics(deepagents_leg["metrics"])
+    legacy_chain = _chain_metrics(legacy_leg["metrics"])
+    if deepagents_chain is not None:
+        entry["deepagents"] = asdict(deepagents_chain)
+    if legacy_chain is not None:
+        entry["legacy"] = asdict(legacy_chain)
+    if errors:
+        entry["error"] = "; ".join(errors)
+    return entry
 
 
 def _avg(values: list[float]) -> float:
@@ -236,9 +495,17 @@ def summarize_comparison(
 
 
 def run_comparison(
-    questions: list[Question], *, out_dir: Path, settings: Settings, session_factory
+    questions: list[Question | ChainQuestion],
+    *,
+    out_dir: Path,
+    settings: Settings,
+    session_factory,
 ) -> dict:
     """Run both runtimes over the questions and write report.json + report.md.
+
+    Plain questions run per-question; chain docs run via
+    ``run_chain_comparison`` (per-link runs, link N+1 only when N succeeded)
+    and count as one entry per leg with chain-level aggregated metrics.
 
     Per-question isolation (Task 6 review minor c): each leg of each
     question is wrapped in ``try/except`` — a failing leg is recorded as
@@ -251,13 +518,26 @@ def run_comparison(
     legacy_metrics: list[RunMetrics] = []
     deepagents_metrics: list[RunMetrics] = []
     per_question: list[dict] = []
-    for question in questions:
-        entry: dict = {"id": question.id, "goal": question.goal}
+    for item in questions:
+        if isinstance(item, ChainQuestion):
+            entry = run_chain_comparison(
+                item, settings=settings, session_factory=session_factory
+            )
+            for leg_name, bucket in (
+                ("deepagents", deepagents_metrics),
+                ("legacy", legacy_metrics),
+            ):
+                metrics_dict = entry.get(leg_name)
+                if metrics_dict is not None:
+                    bucket.append(RunMetrics(**metrics_dict))
+            per_question.append(entry)
+            continue
+        entry: dict = {"id": item.id, "goal": item.goal}
         errors: list[str] = []
         try:
             deepagents_metrics.append(
                 run_deepagents_question(
-                    question, settings=settings, run_id=f"eval-{question.id}"
+                    item, settings=settings, run_id=f"eval-{item.id}"
                 )
             )
             entry["deepagents"] = asdict(deepagents_metrics[-1])
@@ -266,7 +546,7 @@ def run_comparison(
         try:
             legacy_metrics.append(
                 run_legacy_question(
-                    question, settings=settings, session_factory=session_factory
+                    item, settings=settings, session_factory=session_factory
                 )
             )
             entry["legacy"] = asdict(legacy_metrics[-1])
@@ -307,30 +587,84 @@ def _render_markdown(report: dict) -> str:
     return "\n".join(lines)
 
 
-def _load_questions(ids: list[str]) -> list[Question]:
-    """Load Q###.json / C###.json docs from tests/question (schema verified)."""
+def _seed_urls(qid: str) -> list[str]:
+    """Question-seed URLs from the eval_runner seed bank (live eval only).
+
+    The bank is probe-verified on the legacy side; seeding both legs from it
+    keeps the comparison apples-to-apples with the archived baseline runs.
+    Lazy import so unit tests that only exercise loading stay light.
+    """
+    from tests.question.eval_runner import SEED_URLS  # live eval only
+
+    return list(SEED_URLS.get(qid, ([], ""))[0])
+
+
+def _question_from_doc(doc: dict) -> Question:
+    """One question doc -> Question (context carries profile/meta + seeds)."""
+    meta = doc.get("meta") or {}
+    context: dict = {"profile": doc.get("profile"), "meta": meta}
+    urls = _seed_urls(doc["id"])
+    if urls:
+        context["candidate_urls"] = urls
+    return Question(
+        id=doc["id"],
+        goal=doc["question"],
+        allowed_skills=meta.get("skills") or [],
+        context=context,
+    )
+
+
+def _chain_from_doc(cid: str, doc: dict) -> ChainQuestion | None:
+    """A chain doc -> ChainQuestion; None when no link has usable skills.
+
+    Each link becomes its own Question under ``C###-L<n>`` (the link's own
+    ``meta.skills`` / ``profile``; link 1 seeds from the seed bank, links 2+
+    inherit candidate_urls at run time).
+    """
+    links = doc.get("chain")
+    if not isinstance(links, list) or not links:
+        return None
+    chain_links: list[Question] = []
+    for index, link_doc in enumerate(links, start=1):
+        if not ((link_doc.get("meta") or {}).get("skills")):
+            return None
+        chain_links.append(_question_from_doc({**link_doc, "id": f"{cid}-L{index}"}))
+    return ChainQuestion(id=cid, links=chain_links)
+
+
+def _load_questions(ids: list[str]) -> list[Question | ChainQuestion]:
+    """Load Q/R/C docs, root-first + redesign fallback; chains expand.
+
+    ``ids`` resolve root-first (``tests/question/{id}.json``) then fall back
+    to ``tests/question/redesign/{id}.json``; chain docs expand into one
+    ChainQuestion (each link its own Question under ``C###-L<n>``, running
+    per the eval_runner chain contract).  An empty ``ids`` defaults to the
+    root-directory glob only (backward compatible — the root set is
+    Q001-Q151, no chains).
+    """
     question_dir = Path(__file__).resolve().parents[5] / "tests" / "question"
+    redesign_dir = question_dir / "redesign"
     all_ids = sorted(path.stem for path in question_dir.glob("*.json"))
-    questions: list[Question] = []
+    questions: list[Question | ChainQuestion] = []
     for qid in ids or all_ids:
         doc_path = question_dir / f"{qid}.json"
+        if not doc_path.exists():
+            doc_path = redesign_dir / f"{qid}.json"
         if not doc_path.exists():
             print(f"SKIP {qid}: {doc_path.name} missing")
             continue
         doc = json.loads(doc_path.read_text(encoding="utf-8"))
-        meta = doc.get("meta") or {}
-        skills = meta.get("skills") or []
-        if not skills or "chain" in doc:
-            print(f"SKIP {qid}: needs meta.skills (chain docs run via eval_runner)")
+        if "chain" in doc:
+            chain = _chain_from_doc(qid, doc)
+            if chain is None:
+                print(f"SKIP {qid}: chain with no usable links")
+                continue
+            questions.append(chain)
             continue
-        questions.append(
-            Question(
-                id=doc["id"],
-                goal=doc["question"],
-                allowed_skills=skills,
-                context={"profile": doc.get("profile"), "meta": meta},
-            )
-        )
+        if not ((doc.get("meta") or {}).get("skills")):
+            print(f"SKIP {qid}: needs meta.skills")
+            continue
+        questions.append(_question_from_doc(doc))
     return questions
 
 

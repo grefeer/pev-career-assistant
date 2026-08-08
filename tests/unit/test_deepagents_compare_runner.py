@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 
 import pytest
 from sqlalchemy import select
@@ -16,10 +17,12 @@ from backend.app.db.models import (
 from backend.app.domain.agent_runtime import ComplexityLevel, RunStatus
 from backend.app.services.deepagents_runtime.budgets import DeepAgentsBudgets
 from backend.app.services.deepagents_runtime.eval.compare_runner import (
+    ChainQuestion,
     Question,
     RunMetrics,
     _load_questions,
     main,
+    run_chain_comparison,
     run_comparison,
     run_deepagents_question,
     run_legacy_question,
@@ -309,7 +312,8 @@ def test_load_questions_skips_missing_docs() -> None:
     assert _load_questions(["NO_SUCH_QUESTION"]) == []
 
 
-def test_load_questions_skips_chain_docs(monkeypatch) -> None:
+def test_load_questions_skips_chain_without_usable_links(monkeypatch) -> None:
+    # a chain doc whose link lacks meta.skills cannot run -> skipped
     import backend.app.services.deepagents_runtime.eval.compare_runner as cr
 
     chain_doc = json.dumps(
@@ -318,6 +322,172 @@ def test_load_questions_skips_chain_docs(monkeypatch) -> None:
     )
     monkeypatch.setattr(cr.Path, "read_text", lambda self, **kwargs: chain_doc)
     assert _load_questions(["Q001"]) == []
+
+
+def test_load_questions_redesign_fallback() -> None:
+    # R-docs live only in tests/question/redesign — root-first resolution
+    # must fall back there
+    questions = _load_questions(["R001"])
+    assert len(questions) == 1
+    assert questions[0].id == "R001"
+    assert questions[0].allowed_skills == ["job-discovery"]
+    assert questions[0].context["profile"]["id"] == "R1"
+
+
+def test_load_questions_expands_chain_from_redesign() -> None:
+    # C-docs live only in tests/question/redesign and expand into one
+    # ChainQuestion whose links run under C###-L<n> ids with the link's own
+    # skills/profile; link 1 carries the seed-bank candidate_urls, links 2+
+    # inherit candidates at run time (no seeds of their own)
+    questions = _load_questions(["C001"])
+    assert len(questions) == 1
+    chain = questions[0]
+    assert isinstance(chain, ChainQuestion)
+    assert chain.id == "C001"
+    assert [link.id for link in chain.links] == ["C001-L1", "C001-L2"]
+    assert chain.links[0].allowed_skills == ["job-discovery"]
+    assert chain.links[1].allowed_skills == ["job-matching"]
+    assert chain.links[0].context["candidate_urls"]  # seed bank entry for C001-L1
+    assert "candidate_urls" not in chain.links[1].context  # inherited at run time
+
+
+def _chain_question() -> ChainQuestion:
+    return ChainQuestion(
+        id="C001",
+        links=[
+            Question(
+                id="C001-L1",
+                goal="收集岗位",
+                allowed_skills=["job-discovery"],
+                context={"profile": {"id": "R1"}},
+            ),
+            Question(
+                id="C001-L2",
+                goal="排序匹配",
+                allowed_skills=["job-matching"],
+                context={"profile": {"id": "R1"}},
+            ),
+            Question(
+                id="C001-L3",
+                goal="再收集",
+                allowed_skills=["job-discovery"],
+                context={"profile": {"id": "R1"}},
+            ),
+        ],
+    )
+
+
+def _succeeded_metrics(question_id: str) -> RunMetrics:
+    return RunMetrics(
+        "succeeded", steps=1, turns=1, tool_calls=1, replans=0, wall_clock_s=1.0, error_code=None
+    )
+
+
+def test_run_chain_comparison_inherits_candidates_and_stops(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    deepagents_calls: list[tuple[str, dict | None]] = []
+    legacy_calls: list[tuple[str, dict | None]] = []
+
+    def fake_deepagents(question, *, settings, run_id, harness=None, extra_context=None):
+        deepagents_calls.append((question.id, extra_context))
+        if question.id == "C001-L3":
+            return (
+                RunMetrics(
+                    "failed", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code="verification_failed"
+                ),
+                [],
+                "S3",
+            )
+        return _succeeded_metrics(question.id), ["https://x.example/job"], f"S{question.id}"
+
+    def fake_legacy(question, *, settings, session_factory, runner=None, extra_context=None):
+        legacy_calls.append((question.id, extra_context))
+        if question.id == "C001-L3":
+            return (
+                RunMetrics(
+                    "waiting_user", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code="blocked"
+                ),
+                [],
+                "S3",
+            )
+        return _succeeded_metrics(question.id), ["https://x.example/job"], f"S{question.id}"
+
+    monkeypatch.setattr(cr, "_run_deepagents_link", fake_deepagents)
+    monkeypatch.setattr(cr, "_run_legacy_link", fake_legacy)
+    entry = run_chain_comparison(_chain_question(), settings=None, session_factory=None)
+
+    # each leg ran all 3 links (link 3's non-success stops the chain after it)
+    assert [qid for qid, _ in deepagents_calls] == ["C001-L1", "C001-L2", "C001-L3"]
+    assert [qid for qid, _ in legacy_calls] == ["C001-L1", "C001-L2", "C001-L3"]
+    # link 2 inherits link 1's collected URLs + a chain_context note
+    _, l2_extra = deepagents_calls[1]
+    assert l2_extra["candidate_urls"] == ["https://x.example/job"]
+    assert "chain_context" in l2_extra and "C001-L1" in l2_extra["chain_context"]
+    # link 3 inherits from link 2 as well
+    assert deepagents_calls[2][1]["candidate_urls"] == ["https://x.example/job"]
+    # chain-level metrics: status from the last executed link, counters summed
+    assert entry["deepagents"]["status"] == "failed"
+    assert entry["deepagents"]["steps"] == 3
+    assert entry["deepagents"]["turns"] == 3
+    assert entry["deepagents"]["error_code"] == "verification_failed"
+    assert entry["legacy"]["status"] == "waiting_user"
+    assert entry["legacy"]["steps"] == 3
+    # per-link records merge both legs
+    assert len(entry["links"]) == 3
+    assert entry["links"][0]["deepagents_urls"] == 1
+    assert entry["links"][2]["legacy_urls"] == 0
+
+
+def test_run_chain_comparison_leg_exception_isolated(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    def boom(question, *, settings, run_id, harness=None, extra_context=None):
+        raise RuntimeError("harness blew up")
+
+    def ok_legacy(question, *, settings, session_factory, runner=None, extra_context=None):
+        return _succeeded_metrics(question.id), ["https://x.example/job"], "done"
+
+    monkeypatch.setattr(cr, "_run_deepagents_link", boom)
+    monkeypatch.setattr(cr, "_run_legacy_link", ok_legacy)
+    entry = run_chain_comparison(_chain_question(), settings=None, session_factory=None)
+    assert "error" in entry and "deepagents" in entry["error"]
+    assert "deepagents" not in entry  # failed leg contributes no metrics
+    assert entry["legacy"]["status"] == "succeeded"
+    assert entry["links"][0]["deepagents"] is None
+    assert entry["links"][0]["legacy"] is not None
+
+
+def test_run_comparison_dispatches_chain_question(monkeypatch, tmp_path) -> None:
+    # a ChainQuestion in the list is dispatched to run_chain_comparison and
+    # counts as one entry per leg with chain-level aggregated metrics
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    canned = {
+        "id": "C001",
+        "type": "chain",
+        "chain_length": 3,
+        "goal": "收集岗位",
+        "links": [],
+        "deepagents": asdict(_succeeded_metrics("C001")),
+        "legacy": asdict(
+            RunMetrics(
+                "waiting_user", steps=3, turns=3, tool_calls=2, replans=0, wall_clock_s=3.0, error_code="blocked"
+            )
+        ),
+    }
+    monkeypatch.setattr(
+        cr, "run_chain_comparison", lambda chain, *, settings, session_factory: canned
+    )
+    report = run_comparison(
+        [_chain_question()], out_dir=tmp_path, settings=None, session_factory=None
+    )
+    assert report["per_question"][0] == canned
+    assert report["summary"]["deepagents"]["total"] == 1
+    assert report["summary"]["deepagents"]["succeeded"] == 1
+    assert report["summary"]["legacy"]["total"] == 1
+    assert report["summary"]["legacy"]["waiting_user"] == 1
+    assert (tmp_path / "report.json").exists()
 
 
 def test_main_no_questions_returns_1(monkeypatch) -> None:
