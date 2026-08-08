@@ -130,6 +130,15 @@ def _run_legacy_link(
     if runner is None:
 
         def default_runner(question, settings, session_factory):
+            if settings is not None:
+                # mirror production runtime assembly (main.py lifespan): the
+                # requests fast path falls back to a headless-Chromium render
+                # on empty SPA/login shells, per the settings flag
+                from backend.app.services.career_skills import job_discovery as jd_skill
+
+                jd_skill.enable_playwright_fallback(
+                    settings.job_discovery_playwright_fallback_enabled
+                )
             gateway = build_agent_model_gateway(settings)
             tools = build_career_tool_registry()
             runtime = AgentRuntime(
