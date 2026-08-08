@@ -204,10 +204,18 @@ def summarize_comparison(
 
     def bucket(metrics: list[RunMetrics]) -> dict:
         statuses = [m.status for m in metrics]
+        succeeded = statuses.count("succeeded")
+        waiting_user = statuses.count("waiting_user")
+        failed = statuses.count("failed")
         return {
-            "succeeded": statuses.count("succeeded"),
-            "waiting_user": statuses.count("waiting_user"),
-            "failed": statuses.count("failed"),
+            "succeeded": succeeded,
+            "waiting_user": waiting_user,
+            "failed": failed,
+            # any other status (e.g. "unknown" from the harness seam when
+            # run_status is falsy, or stray RunStatus values) closes the
+            # tally: succeeded + waiting_user + failed + unknown == total
+            # always (Task 6 review minor d)
+            "unknown": len(metrics) - succeeded - waiting_user - failed,
             "total": len(metrics),
             "avg_steps": _avg([m.steps for m in metrics]),
             "avg_turns": _avg([m.turns for m in metrics]),
@@ -223,30 +231,43 @@ def summarize_comparison(
 def run_comparison(
     questions: list[Question], *, out_dir: Path, settings: Settings, session_factory
 ) -> dict:
-    """Run both runtimes over the questions and write report.json + report.md."""
+    """Run both runtimes over the questions and write report.json + report.md.
+
+    Per-question isolation (Task 6 review minor c): each leg of each
+    question is wrapped in ``try/except`` — a failing leg is recorded as
+    ``{"error": "<leg>: <exc-type>: <exc>"}`` on that question's
+    ``per_question`` entry and the round continues; a single failing
+    question never kills the round.  Surviving legs still enter the
+    summary metrics; failed legs contribute no metrics.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     legacy_metrics: list[RunMetrics] = []
     deepagents_metrics: list[RunMetrics] = []
     per_question: list[dict] = []
     for question in questions:
-        deepagents_metrics.append(
-            run_deepagents_question(
-                question, settings=settings, run_id=f"eval-{question.id}"
+        entry: dict = {"id": question.id, "goal": question.goal}
+        errors: list[str] = []
+        try:
+            deepagents_metrics.append(
+                run_deepagents_question(
+                    question, settings=settings, run_id=f"eval-{question.id}"
+                )
             )
-        )
-        legacy_metrics.append(
-            run_legacy_question(
-                question, settings=settings, session_factory=session_factory
+            entry["deepagents"] = asdict(deepagents_metrics[-1])
+        except Exception as exc:
+            errors.append(f"deepagents: {type(exc).__name__}: {exc}")
+        try:
+            legacy_metrics.append(
+                run_legacy_question(
+                    question, settings=settings, session_factory=session_factory
+                )
             )
-        )
-        per_question.append(
-            {
-                "id": question.id,
-                "goal": question.goal,
-                "legacy": asdict(legacy_metrics[-1]),
-                "deepagents": asdict(deepagents_metrics[-1]),
-            }
-        )
+            entry["legacy"] = asdict(legacy_metrics[-1])
+        except Exception as exc:
+            errors.append(f"legacy: {type(exc).__name__}: {exc}")
+        if errors:
+            entry["error"] = "; ".join(errors)
+        per_question.append(entry)
     summary = summarize_comparison(
         legacy=legacy_metrics, deepagents=deepagents_metrics
     )
@@ -266,7 +287,8 @@ def _render_markdown(report: dict) -> str:
         lines.append(f"## {runtime}")
         lines.append(
             f"- succeeded={bucket['succeeded']} waiting_user={bucket['waiting_user']} "
-            f"failed={bucket['failed']} total={bucket['total']}"
+            f"failed={bucket['failed']} unknown={bucket['unknown']} "
+            f"total={bucket['total']}"
         )
         lines.append(
             f"- avg_steps={bucket['avg_steps']} avg_turns={bucket['avg_turns']} "

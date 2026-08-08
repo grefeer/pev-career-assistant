@@ -1363,3 +1363,96 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
         shutil.rmtree(evidence_dir, ignore_errors=True)
+
+
+def test_resolve_evidence_dir_relative_resolves_under_skill() -> None:
+    # an explicitly RELATIVE evidence_dir resolves under the skill dir (the
+    # same ruling as the relative candidates_dir branch) — pure path
+    # arithmetic, no disk access, hermetic
+    state_dir = Path("d:/tmp/state")
+    resolved = jdg._resolve_evidence_dir("rel/evidence", state_dir)
+    assert resolved == SKILL_DIR / "rel/evidence"
+
+
+def test_build_manifest_skips_non_string_page_paths(tmp_path) -> None:
+    # page_files entries whose path is not a non-empty str are skipped:
+    # a dict with a non-str path, a dict with an empty path, and a raw
+    # non-dict entry all fall through the guard, never crash the manifest
+    real = tmp_path / "page_00.txt"
+    real.write_text("job body", encoding="utf-8")
+    manifest = jdg.build_manifest(
+        out_dir=str(tmp_path),
+        results=[
+            {
+                "page_files": [
+                    {"path": str(real)},
+                    {"path": 123},
+                    {"path": ""},
+                    42,
+                ],
+                "terminal_evidence": ["next_control_absent"],
+            }
+        ],
+        merged_count=0,
+        listing_count=None,
+    )
+    assert manifest["page_files"] == [str(real)]
+    assert manifest["pages_collected"] == 1
+
+
+def test_build_manifest_dedupes_duplicate_page_paths(tmp_path) -> None:
+    # the same real page file appearing twice appends once (the
+    # ``not in page_files`` guard's skip side) — the merged page list
+    # stays deduplicated, counts stay honest
+    real = tmp_path / "page_00.txt"
+    real.write_text("job body", encoding="utf-8")
+    manifest = jdg.build_manifest(
+        out_dir=str(tmp_path),
+        results=[
+            {
+                "page_files": [{"path": str(real)}],
+                "terminal_evidence": ["next_control_absent"],
+            },
+            {
+                "page_files": [{"path": str(real)}],
+                "terminal_evidence": ["next_control_absent"],
+            },
+        ],
+        merged_count=0,
+        listing_count=None,
+    )
+    assert manifest["page_files"] == [str(real)]
+    assert manifest["pages_collected"] == 1
+
+
+def test_build_manifest_skips_page_when_stat_raises_oserror(
+    tmp_path, monkeypatch
+) -> None:
+    # a page file whose stat() blows up with OSError is skipped, not fatal —
+    # the manifest keeps the surviving page and the run continues
+    real = tmp_path / "page_00.txt"
+    boom = tmp_path / "page_01.txt"
+    real.write_text("job body", encoding="utf-8")
+    boom.write_text("job body", encoding="utf-8")
+
+    original_stat = Path.stat
+
+    def stat_maybe_boom(self: Path):
+        if self == boom:
+            raise OSError("simulated stat failure")
+        return original_stat(self)
+
+    monkeypatch.setattr(Path, "stat", stat_maybe_boom)
+    manifest = jdg.build_manifest(
+        out_dir=str(tmp_path),
+        results=[
+            {
+                "page_files": [{"path": str(real)}, {"path": str(boom)}],
+                "terminal_evidence": ["next_control_absent"],
+            }
+        ],
+        merged_count=0,
+        listing_count=None,
+    )
+    assert manifest["page_files"] == [str(real)]
+    assert manifest["pages_collected"] == 1

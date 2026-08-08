@@ -77,6 +77,28 @@ def test_summarize_comparison_empty_inputs() -> None:
     assert summary["deepagents"]["total"] == 0
 
 
+def test_summarize_comparison_unknown_bucket_closes_tally() -> None:
+    # "unknown" (harness seam: falsy run_status) and any stray status
+    # (e.g. "cancelled") must enter the unknown bucket so the four buckets
+    # always sum to total (review minor d)
+    metrics = [
+        RunMetrics("succeeded", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code=None),
+        RunMetrics("waiting_user", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code=None),
+        RunMetrics("failed", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code=None),
+        RunMetrics("unknown", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code=None),
+        RunMetrics("cancelled", steps=1, turns=1, tool_calls=0, replans=0, wall_clock_s=1.0, error_code=None),
+    ]
+    bucket = summarize_comparison(legacy=metrics, deepagents=[])["legacy"]
+    tally = (
+        bucket["succeeded"]
+        + bucket["waiting_user"]
+        + bucket["failed"]
+        + bucket["unknown"]
+    )
+    assert tally == bucket["total"] == 5
+    assert bucket["unknown"] == 2  # "unknown" + "cancelled"
+
+
 def test_run_legacy_question_counts_db_rows(db_session) -> None:
     # Dev from the brief: the test DB enforces FKs, so the rows need real
     # parents (User -> AgentRun -> AgentPlan -> AgentStep); the brief's
@@ -220,6 +242,67 @@ def test_run_comparison_writes_report_files(tmp_path, monkeypatch) -> None:
     assert (tmp_path / "report.md").exists()
     assert report["summary"]["legacy"]["succeeded"] == 1
     assert "DeepAgents Runtime 对比评测" in (tmp_path / "report.md").read_text(encoding="utf-8")
+
+
+def test_run_comparison_deepagents_leg_failure_isolated_per_question(
+    monkeypatch, tmp_path
+) -> None:
+    # review minor c: one failing question must not kill the round — the
+    # failing leg is recorded as {"error": ...} and the round continues
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    def ok_legacy(q, *, settings, session_factory):
+        return RunMetrics("succeeded", steps=1, turns=2, tool_calls=1, replans=0, wall_clock_s=1.0, error_code=None)
+
+    calls = {"n": 0}
+
+    def flaky_deepagents(q, *, settings, run_id):
+        calls["n"] += 1
+        if calls["n"] == 1:  # first question fails; the round must continue
+            raise RuntimeError("harness blew up")
+        return RunMetrics("succeeded", steps=1, turns=1, tool_calls=1, replans=0, wall_clock_s=0.5, error_code=None)
+
+    monkeypatch.setattr(cr, "run_legacy_question", ok_legacy)
+    monkeypatch.setattr(cr, "run_deepagents_question", flaky_deepagents)
+    report = run_comparison(
+        [_question(), _question()], out_dir=tmp_path, settings=None, session_factory=None
+    )
+    first = report["per_question"][0]
+    assert "error" in first and "deepagents" in first["error"]
+    assert "RuntimeError" in first["error"]
+    assert "deepagents" not in first  # failed leg contributes no metrics
+    assert first["legacy"]  # the surviving leg is still recorded
+    assert "error" not in report["per_question"][1]  # second question unaffected
+    # summary counts only surviving legs; the round completed both questions
+    assert report["summary"]["deepagents"]["total"] == 1
+    assert report["summary"]["legacy"]["total"] == 2
+    # report files still written
+    assert (tmp_path / "report.json").exists()
+
+
+def test_run_comparison_legacy_leg_failure_isolated_per_question(
+    monkeypatch, tmp_path
+) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    def ok_deepagents(q, *, settings, run_id):
+        return RunMetrics("succeeded", steps=1, turns=1, tool_calls=1, replans=0, wall_clock_s=0.5, error_code=None)
+
+    def boom_legacy(q, *, settings, session_factory):
+        raise ValueError("service blew up")
+
+    monkeypatch.setattr(cr, "run_legacy_question", boom_legacy)
+    monkeypatch.setattr(cr, "run_deepagents_question", ok_deepagents)
+    report = run_comparison(
+        [_question()], out_dir=tmp_path, settings=None, session_factory=None
+    )
+    entry = report["per_question"][0]
+    assert "error" in entry and "legacy" in entry["error"]
+    assert "ValueError" in entry["error"]
+    assert "legacy" not in entry  # failed leg contributes no metrics
+    assert entry["deepagents"]  # the surviving leg is still recorded
+    assert report["summary"]["legacy"]["total"] == 0
+    assert report["summary"]["deepagents"]["total"] == 1
 
 
 def test_load_questions_skips_missing_docs() -> None:
