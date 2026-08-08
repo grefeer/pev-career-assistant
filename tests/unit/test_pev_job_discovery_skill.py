@@ -721,6 +721,16 @@ def test_extract_observed_job_details_returns_structured_fields_only_from_captur
             "content_hash": "a" * 64,
         }],
         "normalization_warnings": [],
+        "skills": [],
+        "min_degree": None,
+        "priority": "unknown",
+        "taxonomy": ["开发", "研发工程师"],
+        "strength": {
+            "base_score": 0,
+            "evidence": [{"evidence": "熟悉 Python", "label": "明确技能栈", "weight": 2}],
+            "score": 2,
+            "tier": "low",
+        },
     }]
     batch = extract_observed_job_details_batch(
         context, ExtractObservedJobDetailsBatchInput(artifact_ids=["artifact-ai-agent"])
@@ -1525,3 +1535,21 @@ def test_is_public_url_rejects_schemes_credentials_private_and_unresolvable(monk
         lambda *a, **k: [(None, None, None, None, ("1.2.3.4", 0))],
     )
     assert _is_public_url("https://jobs.example/x") is True
+
+
+def test_fetch_batch_value_none_without_error_is_skipped(monkeypatch) -> None:
+    """A work item that returns neither a value nor an error is dropped."""
+    from backend.app.services.job_discovery.tools.batch_progress import BatchResult
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    monkeypatch.setattr(
+        jd_module,
+        "run_parallel_with_progress",
+        lambda *a, **k: [BatchResult(index=0, item="https://jobs.example/x", value=None)],
+    )
+    result = jd_module.fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(urls=["https://jobs.example/x"]),
+    )
+    assert result.pages == []
+    assert result.failures == []

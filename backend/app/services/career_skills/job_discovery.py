@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, field_validator
 import requests
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.job_discovery.tools.batch_progress import run_parallel_with_progress
 from backend.app.services.job_discovery.tools.jd_extraction import extract_jd_candidates
 
 
@@ -221,6 +222,15 @@ class ExtractedJobDetails(BaseModel):
     confidence: float
     evidence_refs: list[dict[str, str]]
     normalization_warnings: list[str]
+    # FindJobs-derived structured features (optional v1 fields; see
+    # docs/findjobs-optimization-plan.zh-CN.md §6 - no MySQL migration).
+    skills: list[str] = Field(default_factory=list)  # A2: closed-set tags
+    min_degree: str | None = None                    # B3: degree whitelist value
+    priority: str = "unknown"                        # B3: must/preferred/unknown
+    # B1: strength dict {score, tier, base_score, evidence[]}; optional.
+    strength: dict[str, Any] | None = None
+    # B2: taxonomy [level1, level2]; empty list when unclassified.
+    taxonomy: list[str] = Field(default_factory=list)
 
 
 class ExtractObservedJobDetailsOutput(BaseModel):
@@ -597,14 +607,27 @@ def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
 def fetch_public_job_pages(
     context: ToolContext, payload: FetchPublicJobPagesInput
 ) -> FetchPublicJobPagesOutput:
-    """Capture a bounded candidate set without hiding individual public-page errors."""
+    """Capture a bounded candidate set without hiding individual public-page errors.
+
+    Fetches run with bounded concurrency (C5): deterministic input-index
+    ordering, i/n progress lines, and per-item error isolation identical to
+    the sequential loop this replaced.
+    """
     pages: list[FetchPublicJobPageOutput] = []
     failures: list[PublicJobPageFetchFailure] = []
-    for url in payload.urls:
-        try:
-            pages.append(fetch_public_job_page(context, FetchPublicJobPageInput(url=url)))
-        except PublicJobFetchError as error:
-            failures.append(PublicJobPageFetchFailure(source_url=url, error_code=error.code))
+    batch = run_parallel_with_progress(
+        payload.urls,
+        lambda url: fetch_public_job_page(context, FetchPublicJobPageInput(url=url)),
+        label="url",
+        key=lambda url: url,
+    )
+    for result in batch:
+        if result.error is not None:
+            error = result.error
+            code = error.code if isinstance(error, PublicJobFetchError) else "public_fetch_failed"
+            failures.append(PublicJobPageFetchFailure(source_url=result.item, error_code=code))
+        elif result.value is not None:
+            pages.append(result.value)
     return FetchPublicJobPagesOutput(pages=pages, failures=failures)
 
 
@@ -838,6 +861,11 @@ def extract_observed_job_details(
                 confidence=round(candidate.confidence, 4),
                 evidence_refs=[evidence_ref],
                 normalization_warnings=warnings,
+                skills=candidate.skills,
+                min_degree=candidate.min_degree,
+                priority=candidate.priority,
+                strength=candidate.strength,
+                taxonomy=candidate.taxonomy,
             )
         )
     return ExtractObservedJobDetailsOutput(

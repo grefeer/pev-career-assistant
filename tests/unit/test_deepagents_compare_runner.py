@@ -755,3 +755,195 @@ def test_deepagents_leg_wires_job_discovery_tool_factory(monkeypatch) -> None:
     # other skills -> existing build_skill_tools path
     assert factory("resume-tailoring") == ["skill-tool"]
     assert captured["skill_tools"]["skill_name"] == "resume-tailoring"
+
+
+def test_run_legacy_question_default_runner_settings_branch(
+    monkeypatch, db_session
+) -> None:
+    # the settings branch of the default runner calls enable_playwright_fallback
+    # with the settings flag before assembling the runtime (main.py lifespan
+    # parity); settings=None skips it (covered by the other default-runner test)
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+    from backend.app.services.career_skills import job_discovery as jd_skill
+
+    class _Settings:
+        job_discovery_playwright_fallback_enabled = True
+
+    captured: dict = {}
+
+    class _FakeRuntime:
+        def __init__(self, **kwargs):
+            captured["agents"] = kwargs
+
+        def run(self, db, *, user_id, task):
+            assert user_id == "eval-user"
+            assert task.goal == "帮我找后端岗位"
+            return _FakeResult(run_id="legacy-settings", status=RunStatus.succeeded)
+
+    class _FakeSessionFactory:
+        def __init__(self, session):
+            self._session = session
+
+        def __call__(self):
+            return self._session
+
+    monkeypatch.setattr(
+        jd_skill,
+        "enable_playwright_fallback",
+        lambda enabled: captured.setdefault("fallback", enabled),
+    )
+    monkeypatch.setattr(cr, "build_agent_model_gateway", lambda settings: object())
+    monkeypatch.setattr(cr, "build_career_tool_registry", lambda: object())
+    monkeypatch.setattr(cr, "PlannerAgent", lambda gateway, tools: object())
+    monkeypatch.setattr(cr, "ExecutorAgent", lambda gateway, tools: object())
+    monkeypatch.setattr(cr, "VerifierAgent", lambda gateway, tools: object())
+    monkeypatch.setattr(cr, "AgentRuntime", _FakeRuntime)
+    metrics = run_legacy_question(
+        _question(),
+        settings=_Settings(),
+        session_factory=_FakeSessionFactory(db_session),
+    )
+    assert metrics.status == "succeeded"
+    assert captured["fallback"] is True
+
+
+def test_run_deepagents_question_default_harness_missing_api_key_raises(
+    monkeypatch,
+) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+    from backend.app.services.agent_runtime.model_gateway import (
+        AgentModelGatewayConfigError,
+    )
+
+    class _Settings:
+        agent_harness_model = "deepseek-chat"
+
+    class _FakeHarnessClass:
+        def __init__(self, *, model_factory, checkpointer, tool_factory=None):
+            model_factory("planner")
+
+        def run(self, request, *, run_id, budgets=None):
+            return {}
+
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: ""
+    )
+    monkeypatch.setattr(cr, "DeepAgentsHarness", _FakeHarnessClass)
+    monkeypatch.setattr(cr, "create_checkpointer", lambda settings: object())
+    with pytest.raises(AgentModelGatewayConfigError, match="missing_api_key"):
+        run_deepagents_question(_question(), settings=_Settings(), run_id="eval-x")
+
+
+def test_run_deepagents_question_model_factory_v4_disables_thinking(
+    monkeypatch,
+) -> None:
+    # deepseek-v4 model + deepseek base_url -> extra_body thinking disabled
+    # (the deepseek-chat tests cover the condition's false branch)
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    class _Settings:
+        agent_harness_model = "deepseek-v4-0201"
+
+    budgets = DeepAgentsBudgets(
+        max_agent_turns=12, max_tool_calls=20, max_replans=2, max_wall_clock_seconds=600
+    )
+    final = {
+        "run_status": "succeeded",
+        "budget": budgets.to_dict(),
+        "plan_json": None,
+        "error_code": None,
+    }
+    captured: dict = {}
+
+    class _FakeChatOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class _FakeHarnessClass:
+        def __init__(self, *, model_factory, checkpointer, tool_factory=None):
+            model_factory("planner")
+
+        def run(self, request, *, run_id, budgets=None):
+            return final
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", _FakeChatOpenAI)
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key",
+        lambda: "test-api-key",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://api.deepseek.com/v1",
+    )
+    monkeypatch.setattr(cr, "DeepAgentsHarness", _FakeHarnessClass)
+    monkeypatch.setattr(cr, "create_checkpointer", lambda settings: object())
+    metrics = run_deepagents_question(
+        _question(), settings=_Settings(), run_id="eval-v4"
+    )
+    assert metrics.status == "succeeded"
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_chain_extra_skips_empty_urls_and_summary() -> None:
+    # a predecessor with no collected URLs and no summary yields no inherited
+    # context (covers both falsy arcs of _chain_extra)
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    assert cr._chain_extra([{"id": "C001-L1", "urls": [], "summary": ""}]) is None
+
+
+def test_run_chain_comparison_legacy_leg_exception_isolated(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    def ok_deepagents(question, *, settings, run_id, harness=None, extra_context=None):
+        return _succeeded_metrics(question.id), ["https://x.example/job"], "done"
+
+    def boom_legacy(
+        question, *, settings, session_factory, runner=None, extra_context=None
+    ):
+        raise ValueError("legacy blew up")
+
+    monkeypatch.setattr(cr, "_run_deepagents_link", ok_deepagents)
+    monkeypatch.setattr(cr, "_run_legacy_link", boom_legacy)
+    entry = run_chain_comparison(_chain_question(), settings=None, session_factory=None)
+    assert "error" in entry and "legacy" in entry["error"]
+    assert "ValueError" in entry["error"]
+    assert "legacy" not in entry  # failed leg contributes no metrics
+    assert entry["deepagents"]["status"] == "succeeded"
+    # the surviving leg still inherited per-link contexts across links
+    assert entry["links"][1]["deepagents"] is not None
+
+
+def test_run_comparison_chain_entry_missing_leg_metrics(monkeypatch, tmp_path) -> None:
+    # a chain entry whose legacy leg failed carries no "legacy" key -> the
+    # leg bucket is skipped instead of appended
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    canned = {
+        "id": "C001",
+        "type": "chain",
+        "chain_length": 2,
+        "goal": "收集岗位",
+        "links": [],
+        "deepagents": asdict(_succeeded_metrics("C001")),
+    }
+    monkeypatch.setattr(
+        cr, "run_chain_comparison", lambda chain, *, settings, session_factory: canned
+    )
+    report = run_comparison(
+        [_chain_question()], out_dir=tmp_path, settings=None, session_factory=None
+    )
+    assert report["per_question"][0] == canned
+    assert report["summary"]["deepagents"]["total"] == 1
+    assert report["summary"]["legacy"]["total"] == 0
+
+
+def test_load_questions_skips_chain_with_non_list_chain(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.eval.compare_runner as cr
+
+    chain_doc = json.dumps(
+        {"id": "Q001", "question": "g", "chain": "not-a-list"},
+        ensure_ascii=False,
+    )
+    monkeypatch.setattr(cr.Path, "read_text", lambda self, **kwargs: chain_doc)
+    assert _load_questions(["Q001"]) == []
