@@ -21,6 +21,7 @@ __pycache__/
 .venv/
 venv/
 env/
+.venv.broken/
 
 # Tool caches
 .pytest_cache/
@@ -88,3 +89,4 @@ nul
 var/
 settings.json
 tests/question/eval_results/
+docs/study/
