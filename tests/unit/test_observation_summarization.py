@@ -406,6 +406,23 @@ def test_evidence_assembly_preserves_most_recent_full_when_over_budget(db_sessio
             },
         )
 
+    # SQLite stores created_at at second precision: same-second inserts tie
+    # and fall back to the random-UUID id order, so stamp distinct timestamps
+    # (oldest-first) to make "most recent" deterministic
+    from datetime import datetime, timedelta, timezone
+
+    from backend.app.db.models import AgentArtifact
+    from sqlalchemy import select
+
+    artifacts = list(
+        db_session.scalars(select(AgentArtifact).where(AgentArtifact.run_id == run.id))
+    )
+    for index, artifact in enumerate(artifacts):
+        artifact.created_at = datetime.now(timezone.utc) - timedelta(
+            seconds=len(artifacts) - index
+        )
+    db_session.commit()
+
     projected = AgentRuntime._with_observed_public_evidence(db_session, task, run.id)
     evidence = projected.context["observed_public_evidence"]
 

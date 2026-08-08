@@ -60,7 +60,7 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   ├── e2e/                     # E2E Playwright + fixture tests
 │   ├── question/                # 20-question PEV eval harness (eval_runner, merge/compare rounds)
 │   └── manual/                  # Standalone smoke/diagnostic scripts (excluded from pytest)
-├── alembic/versions/            # Database migrations (0001 -> 0019)
+├── alembic/versions/            # Database migrations (0001 -> 0023)
 ├── scripts/                     # Admin/dev scripts (create_admin, seed_strategies, fixtures, etc.)
 └── docker-compose.yml
 ```
@@ -282,7 +282,7 @@ queued -> running -> succeeded / partial_success / needs_manual_review / failed 
 
 ## Database Migrations
 
-Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0022`. Sequence:
+Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0023`. Sequence:
 
 - `0001`: Platform foundation (users, sessions, devices, tasks, audit)
 - `0002`: Device credentials
@@ -297,6 +297,7 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `002
 - `0020`: Agent turn-context manifest
 - `0021`: Profile active version
 - `0022`: DeepAgents runtime runs + artifacts (deepagents_runs / deepagents_artifacts)
+- `0023`: SeenJob cross-run dedup ledger (job-discovery dedup, TTL-pruned)
 - Hotfixes: `7b757ef17d3f` (MatchReport CHECK constraint), `7e8f22313271` (job-discovery tables), `ffc4f5917966` (strategy/trajectory tables)
 
 ## Coverage Policy

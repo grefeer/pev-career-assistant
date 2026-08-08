@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel, RunStatus
 from backend.app.db.models import User, UserRole
 from backend.app.repositories import agent_runtime
@@ -137,6 +139,9 @@ def test_repository_lists_only_owner_runs_in_newest_first_order(db_session) -> N
         db_session, user_id=first_user.id, goal="旧任务", allowed_skills=["job-discovery"],
         context_summary={}, budget_json={}, agent_version="pev-1",
     )
+    # DateTime is second-precision; a same-second tie would fall to the
+    # random-UUID secondary sort key and flake.  Advance past the second.
+    time.sleep(1.05)
     newest = agent_runtime.create_run(
         db_session, user_id=first_user.id, goal="新任务", allowed_skills=["job-discovery"],
         context_summary={}, budget_json={}, agent_version="pev-1",

@@ -1802,3 +1802,33 @@ class AgentEvent(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, nullable=False
     )
+
+
+class SeenJob(Base):
+    """Cross-run job dedup ledger (C3, plan §7).
+
+    Lightweight, FK-free table recording every normalized job identity ever
+    captured, so a later run can skip re-fetching jobs already processed and
+    re-reporting them as new.  ``job_id`` is the same normalized identity the
+    pipeline computes (idempotency-key source); ``content_hash`` additionally
+    lets a caller detect content drift at the same identity.  Rows are
+    pruned by TTL via ``seen_jobs.prune_expired``; MySQL stays the authority
+    for business state (gate #5).
+    """
+
+    __tablename__ = "seen_jobs"
+    __table_args__ = (
+        Index("ix_seen_jobs_source_hash", "source", "content_hash"),
+        Index("ix_seen_jobs_last_seen", "last_seen"),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+    seen_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
