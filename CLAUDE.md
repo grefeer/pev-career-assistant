@@ -282,7 +282,7 @@ queued -> running -> succeeded / partial_success / needs_manual_review / failed 
 
 ## Database Migrations
 
-Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0019`. Sequence:
+Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0022`. Sequence:
 
 - `0001`: Platform foundation (users, sessions, devices, tasks, audit)
 - `0002`: Device credentials
@@ -294,6 +294,9 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `001
 - `0013`: Personalized job discovery v1
 - `0014`–`0016`: Company research reports, interview-prep kits, application-tracking records
 - `0017`–`0019`: Agent runtime runs, artifacts, artifact-type dedup
+- `0020`: Agent turn-context manifest
+- `0021`: Profile active version
+- `0022`: DeepAgents runtime runs + artifacts (deepagents_runs / deepagents_artifacts)
 - Hotfixes: `7b757ef17d3f` (MatchReport CHECK constraint), `7e8f22313271` (job-discovery tables), `ffc4f5917966` (strategy/trajectory tables)
 
 ## Coverage Policy
