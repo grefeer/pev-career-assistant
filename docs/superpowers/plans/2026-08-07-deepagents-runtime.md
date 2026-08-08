@@ -5088,22 +5088,29 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 **Steps:**
 
-- [ ] **Step 1: Fix the 4 Task 6 review minors (recorded in the ledger 2026-08-07):**
+- [x] **Step 1: Fix the 4 Task 6 review minors (recorded in the ledger 2026-08-07):**
   - (a) parity report table rows for `gate`/`SKIP` contradict `parity_run1.log` → fix the report generation to read the log rows (never hardcode).
   - (b) SKIP-path claim overstated: module-level imports execute before the env check → move the imports inside the env-guarded branch (or correct the claim in the log message; pick the code fix if the imports are heavy).
   - (c) `run_comparison` has no per-question isolation: wrap each question's deepagents + legacy legs in `try/except`, record `{"error": …}` in `per_question`, and continue the round (a single failing question must not kill the round).
   - (d) `summarize_comparison` buckets don't close: `unknown` statuses (e.g. `"unknown"` from the harness seam) never enter any tally → add an `"unknown"` bucket so `succeeded + waiting_user + failed + unknown == total` always.
 
-- [ ] **Step 2: Re-run the parity gate** — same 6-URL baseline, same command as Task 6. **Pass** = per the gate: `success ≥ 3` AND `candidates ≥ 797` (no regression vs baseline) AND coverage `verified=True` for the job-discovery step. If the live LLM/browse run needs Playwright + network (the task's known iteration point), follow the Task 6 Step 5 iteration procedure (re-run on transient infra failure; investigate on real regression).
+- [x] **Step 2: Re-run the parity gate** — same 10-URL baseline, same command as Task 6. **Pass** = per the gate: `success ≥ 3` AND `candidates ≥ 797` (no regression vs baseline) AND coverage `verified=True` for the job-discovery step. If the live LLM/browse run needs Playwright + network (the task's known iteration point), follow the Task 6 Step 5 iteration procedure (re-run on transient infra failure; investigate on real regression).
 
-- [ ] **Step 3: Full suite + ruff + commit the minors** — run the full unit suite (100% branch) and ruff; commit the four fixes as one `fix(deepagents-runtime): parity tooling minors` commit (footer convention).
+- [x] **Step 3: Full suite + ruff + commit the minors** — run the full unit suite (100% branch) and ruff; commit the four fixes as one `fix(deepagents-runtime): parity tooling minors` commit (footer convention).
 
-- [ ] **Step 4: Honest conclusion** — write the outcome into the ledger (`.superpowers/sdd/2026-08-07-deepagents-runtime/progress.md`):
+- [x] **Step 4: Honest conclusion** — write the outcome into the ledger (`.superpowers/sdd/2026-08-07-deepagents-runtime/progress.md`):
   - If the gate passes: record the run numbers, name the parity branch (which modes/URLs reached which paths), and list any residual differences from the skill's behavior that are *documented decisions* (e.g. per-URL tool semantics vs the retired Smartsheet L3 flow — the 7 OUT-OF-SUBGRAPH-SCOPE items from the gap inventory) — never claim "100% identical" if the inventory says otherwise.
   - If the gate fails: new honest conclusion per the parity-gate rule (spec §7: "不劣化才通过") — quantify the delta vs baseline, name the root cause with file:line evidence, and state whether the port decision (full port) or the parity baseline needs revisiting. Do NOT paper over the result.
   - Also record: `user_id=""` production flush limitation remains (eval seam only; API wiring is P2+ per spec) — carried, not silently fixed.
 
-- [ ] **Step 5: Commit the conclusion** (docs/ledger-only commit, footer convention) — after this task the branch is ready for the final whole-branch review.
+- [x] **Step 5: Commit the conclusion** (docs/ledger-only commit, footer convention)
+
+**Outcome (2026-08-08):**
+- Step 1 DONE, committed as `03d4338` (`fix(deepagents-runtime): parity tooling minors`): (a) parity report renders from `parity_run*.log` rows only (verdict classes per log content, never hardcoded); (b) SKIP-path heavy imports moved inside the env-guarded branch (importing the module is import-free of runtime); (c) `run_comparison` per-question `try/except` isolation with `{"error": ...}` in `per_question`; (d) `summarize_comparison` "unknown" bucket closes the tally.
+- Step 3 DONE: full unit suite 1006 passed / 100% branch / ruff clean / `skill/job-discovery` git-clean (only gitignored `output/` residue).
+- Step 2 RESULT — parity gate **FAILED** (`parity_run4.log`): `baseline success=3 candidates=797 | ours success=10 candidates=0`; coverage `verified=True` but vacuously (0 candidates == 0 bodies). Fetch layer exceeded baseline (10/10 URLs vs 3/10); the gate fails on candidates=0. Root cause (offline-reproduced, file:line in ledger): the parity runner builds the tool with `settings=None` → the deepagents LLM extraction gate is off (`job_discovery_graph.py:427`, `deepagents_llm_extraction_enabled` default False) → regex-only extraction returns junk on real pages (`{'title': '标签', ...}`, no company/body) → `write_candidates._valid_candidate` (write_candidates.py:240-268) rejects every candidate → all `page_NN.json` = `[]` → merged = `[]` → candidates=0. The B-mode baseline was produced with the LLM extractor ON, so the comparison is same-pipeline-mismatched, not a fetch regression; the LLM-gated workflow path itself is unit-tested with fakes, but no live run has exercised it end-to-end — the parity runner must be revisited to wire settings/flag for a same-mode comparison (or the baseline re-recorded for regex-only). Not transient — no re-run needed.
+- Step 4 DONE (ledger `progress.md`, "Task 12: complete"): gate numbers, modes/URLs, the 7 OUT-OF-SUBGRAPH-SCOPE items (S2, T1, T2, P11, U2, U7, R10) carried, `user_id=""` production flush limitation carried, shared-dir residue contamination documented honestly. Never claims "100% identical".
+- Step 5: this commit. — after this task the branch is ready for the final whole-branch review.
 
 ---
 
