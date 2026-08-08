@@ -1135,6 +1135,9 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     "company_name": _bounded_section(candidate.get("company_name")),
                     "responsibilities": _bounded_section(candidate.get("responsibilities")),
                     "requirements": _bounded_section(candidate.get("requirements")),
+                    # B1: strength dict {score, tier, base_score, evidence[]},
+                    # optional for downstream scoring, carried for audit.
+                    "strength": candidate.get("strength"),
                 }
             )
     return items

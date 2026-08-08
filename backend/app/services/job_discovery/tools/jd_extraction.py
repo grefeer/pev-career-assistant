@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 
 from backend.app.services.job_discovery.schemas import NormalizedJobCandidate
+from backend.app.services.job_discovery.tools.job_strength import analyze_job_strength
+from backend.app.services.job_discovery.tools.taxonomy import taxonomy_tags
 
 # --- Heading / section markers in Chinese and English ---
 
@@ -51,6 +53,29 @@ _DEADLINE_PATTERNS: list[re.Pattern] = [
 _REFERRAL_CODE_PATTERNS: list[re.Pattern] = [
     re.compile(r"(?:内推码|推荐码|内推|referral code|referral)\s*[:：]?\s*(.{0,30})(?:\n|$)", re.IGNORECASE),
 ]
+
+# --- B3: degree + priority structured extraction (FindJobs _normalize_degree) ---
+
+#: Degree whitelist, most-specific first: ``学历不限`` must beat the bare
+#: ``不限``, and a degree mention inside prose (``本科及以上``) is caught by
+#: the keyword itself and normalized to the degree tier.
+_DEGREE_RULES: list[tuple[str, str]] = [
+    ("学历不限", "不限"),
+    ("不限学历", "不限"),
+    ("博士", "博士"),
+    ("硕士", "硕士"),
+    ("本科", "本科"),
+    ("大专", "大专"),
+]
+
+#: Priority semantics: ``must`` beats ``preferred`` when both appear in one
+#: JD (e.g. "必须具备本科以上学历，硕士优先" is a must-degree posting).
+_PRIORITY_MUST_RE: re.Pattern = re.compile(
+    r"(?:必须|必备|硬性要求|须具备|要求具备)", re.IGNORECASE
+)
+_PRIORITY_PREFERRED_RE: re.Pattern = re.compile(
+    r"(?:优先|加分项|加分|preferred|plus)", re.IGNORECASE
+)
 
 # --- Multi-job page separators (Chinese numbered position markers) ---
 
@@ -383,6 +408,33 @@ def _extract_referral_code(text: str) -> str | None:
     return None
 
 
+def _extract_min_degree(text: str) -> str | None:
+    """Extract the minimum degree requirement from JD text (whitelist-first).
+
+    Keywords are scanned most-specific-first so ``学历不限`` beats the bare
+    ``不限`` and ``博士及以上`` is caught by the ``博士`` keyword.  A JD with
+    no degree mention returns None (safe default, never fabricated).
+    """
+    lowered = text.lower()
+    for keyword, normalized in _DEGREE_RULES:
+        if keyword in lowered:
+            return normalized
+    return None
+
+
+def _extract_priority(text: str) -> str:
+    """Classify whether a requirement is must-have or preferred.
+
+    ``must`` wins over ``preferred`` when both appear in one segment; no
+    signal returns the safe ``unknown`` default.
+    """
+    if _PRIORITY_MUST_RE.search(text):
+        return "must"
+    if _PRIORITY_PREFERRED_RE.search(text):
+        return "preferred"
+    return "unknown"
+
+
 def _estimate_confidence(
     title: str | None,
     company: str | None,
@@ -449,6 +501,8 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
         apply_method = _extract_apply_method(segment)
         deadline = _extract_deadline(segment)
         referral_code = _extract_referral_code(segment)
+        min_degree = _extract_min_degree(segment)
+        priority = _extract_priority(segment)
 
         has_section_content = bool(responsibilities or requirements)
 
@@ -517,6 +571,13 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
             referral_code=referral_code,
             confidence=confidence,
             normalization_warnings=warnings,
+            min_degree=min_degree,
+            priority=priority,
+            # B1: strength of the section text (responsibilities + requirements),
+            # serialized as a dict; optional input for downstream scoring.
+            strength=analyze_job_strength(description_text).to_dict(),
+            # B2: deterministic taxonomy [level1, level2], [] when unclassified.
+            taxonomy=taxonomy_tags(f"{title or ''}\n{description_text}"),
         )
 
         results.append(candidate)
@@ -660,6 +721,10 @@ def _extract_from_unstructured_text(text: str, url: str) -> NormalizedJobCandida
         deadline_text=deadline,
         referral_code=referral_code,
         confidence=0.30,
+        min_degree=_extract_min_degree(text),
+        priority=_extract_priority(text),
+        strength=analyze_job_strength(text[:4000]).to_dict(),
+        taxonomy=taxonomy_tags(f"{title or ''}\n{text[:4000]}"),
         normalization_warnings=[
             "Unstructured text extraction — fields may be incomplete",
             "No structured sections found; full text used as description",

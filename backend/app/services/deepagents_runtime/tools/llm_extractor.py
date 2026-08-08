@@ -9,11 +9,19 @@ list + output discipline); parsing is lenient (code fences, surrounding
 prose, truncated JSON all tolerated); every failure mode folds to an
 honest empty output.  The extractor NEVER raises, so a drifting or failing
 model degrades to "no candidates" instead of crashing the run.
+
+C1 (docs/findjobs-optimization-plan.zh-CN.md §6.1): the outbound call is
+wired through ``build_agent_chat_model`` - the same provider transport as
+the PEV decision gateways (deepseek-v4: thinking disabled + json_mode) -
+and invocations climb the gateway's drift ladder: one call, then up to two
+corrective-hint retries, then ``AgentModelGatewayError``, which folds to
+the honest empty output instead of a bare exception.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -21,19 +29,38 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from pydantic import ValidationError
 
-from backend.app.services.agent_runtime.provider_config import get_api_key
+from backend.app.services.agent_runtime.model_gateway import (
+    AgentModelGatewayConfigError,
+    AgentModelGatewayError,
+    build_agent_chat_model,
+)
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.job_discovery import (
     ExtractObservedJobDetailsInput,
     ExtractObservedJobDetailsOutput,
     ExtractedJobDetails,
 )
+from backend.app.services.job_discovery.tools.job_strength import analyze_job_strength
+from backend.app.services.job_discovery.tools.skill_validator import (
+    load_skill_tags,
+    validate_skills,
+)
+from backend.app.services.job_discovery.tools.taxonomy import taxonomy_tags
 
 #: Placeholder api_key so a keyless construction is possible (the harness's
 #: settings never carry an API key; the provider_config read is the single
 #: source).  A real invocation without a configured key fails at call time
 #: and folds to an honest empty output - it never crashes at construction.
 _UNCONFIGURED_API_KEY = "not-configured"
+
+#: C1 corrective hint appended on each malformed-completion retry (same
+#: bounded budget as the gateway's local-JSON ladder: three total attempts).
+_RECOVERY_HINT = (
+    "你上一次的回复没有包含可解析的 JSON 职位数组。请只输出一个 JSON 数组，"
+    "不要任何前后说明文字、代码块标记或结尾标点。"
+)
+
+logger = logging.getLogger(__name__)
 
 #: The extraction-guide.md contract transcribed into the system prompt:
 #: one distinct role per posting, the per-job field list (title,
@@ -52,6 +79,9 @@ _EXTRACTION_PROMPT = """你是一个职位信息结构化提取器。从给定�
 - recruitment_types: 招聘类型（如 ["校园招聘", "提前批"]；无则留空数组）
 - apply_url: 申请链接或详情页 URL（无则省略）
 - deadline_text: 截止日期原文（无则省略）
+- min_degree: 学历要求（仅限：大专/本科/硕士/博士/不限；文本未提学历则省略）
+- priority: 学历/要求是必须还是加分（仅限 "must" / "preferred"；文本出现 "必须/必备/要求具备" 用 must，"优先/加分项" 用 preferred；未提及则省略）
+- skills: 从技能闭集中选择（最多 8 项，只能从下方闭集列表里选，绝不编造；文本明确提到的技能才选；无明确技能则给空数组）
 - confidence: 0.50-0.95 的置信度；职责与要求清晰分节=0.95，整体清晰但需少量推断=0.85，职责/要求需人工拆分=0.75，重度推断或大量字段缺失=0.60，非常模糊（仅标题）需人工复核=0.50
 
 规范：
@@ -167,13 +197,15 @@ def _to_candidate(
     trusted).  A structurally invalid item (wrong field types) is dropped,
     never raised.
     """
+    requirements = item.get("requirements") or ""
+    responsibilities = item.get("responsibilities") or ""
     try:
         return ExtractedJobDetails(
             title=item.get("title"),
             company_name=item.get("company_name"),
             locations=item.get("locations") or [],
-            responsibilities=item.get("responsibilities") or "",
-            requirements=item.get("requirements") or "",
+            responsibilities=responsibilities,
+            requirements=requirements,
             recruitment_types=item.get("recruitment_types") or [],
             apply_url=item.get("apply_url"),
             deadline_text=item.get("deadline_text"),
@@ -186,6 +218,26 @@ def _to_candidate(
                 }
             ],
             normalization_warnings=item.get("normalization_warnings") or [],
+            # A2: closed-set validation with a deterministic JD-text fallback
+            # (FindJobs --min-skills 3); illegal/low-information tags never leak.
+            skills=validate_skills(
+                item.get("skills") or [],
+                fallback_text=f"{responsibilities}\n{requirements}",
+                min_tags=3,
+            ),
+            min_degree=item.get("min_degree"),
+            priority=item.get("priority", "unknown"),
+            # B1: strength is derived deterministically from the extracted
+            # sections (same input as the regex path), never trusted from
+            # the model.
+            strength=analyze_job_strength(
+                f"{responsibilities}\n{requirements}"
+            ).to_dict(),
+            # B2: taxonomy derived deterministically from the model-extracted
+            # sections, never trusted from the model.
+            taxonomy=taxonomy_tags(
+                f"{item.get('title') or ''}\n{responsibilities}\n{requirements}"
+            ),
         )
     except (ValidationError, TypeError, ValueError):
         return None
@@ -211,14 +263,66 @@ class LLMJobExtractor:
     """
 
     def __init__(self, settings) -> None:
-        self._model = ChatOpenAI(
-            model=settings.agent_harness_model,
-            temperature=0,
-            max_tokens=4096,
+        try:
+            # C1: the same provider transport as the PEV decision gateways
+            # (deepseek-v4: thinking disabled + json_mode), with the
+            # extraction-specific output cap.
+            self._model, self._structured_method = build_agent_chat_model(
+                settings, max_tokens=4096
+            )
+        except AgentModelGatewayConfigError:
             # keyless construction must not crash; a real invocation without
             # a configured key fails at call time and folds to empty output
-            api_key=get_api_key() or _UNCONFIGURED_API_KEY,
-        )
+            self._model = ChatOpenAI(
+                model=settings.agent_harness_model,
+                temperature=0,
+                max_tokens=4096,
+                api_key=_UNCONFIGURED_API_KEY,
+            )
+            self._structured_method = "json_mode"
+
+    def _invoke_with_recovery(
+        self, messages: list[SystemMessage | HumanMessage]
+    ) -> Any:
+        """Ordinary-JSON drift ladder (C1): 1 call + up to 2 corrective retries.
+
+        For json_mode providers the wire call carries ``response_format``
+        ``json_object`` (the json_mode protocol).  Transport failures raise
+        ``model_request_failed``; a non-string completion raises
+        ``invalid_model_response``; a completion that still parses to no JSON
+        after the last attempt raises ``invalid_model_response``.  The caller
+        folds every error to an honest empty output, never a bare exception.
+        """
+        attempt = 0
+        while True:
+            try:
+                if self._structured_method == "json_mode":
+                    raw_result = self._model.invoke(
+                        messages, response_format={"type": "json_object"}
+                    )
+                else:
+                    raw_result = self._model.invoke(messages)
+            except Exception as exc:  # noqa: BLE001 - provider boundary.
+                raise AgentModelGatewayError("model_request_failed") from exc
+            content = getattr(raw_result, "content", raw_result)
+            if not isinstance(content, str):
+                raise AgentModelGatewayError("invalid_model_response")
+            try:
+                return _lenient_json(content)
+            except ValueError:
+                if attempt == 2:
+                    logger.warning(
+                        "extractor exhausted recovery ladder; model=%s attempts=3",
+                        getattr(self._model, "model", "?"),
+                    )
+                    raise AgentModelGatewayError("invalid_model_response")
+                logger.warning(
+                    "extractor recovery needed; attempt=%s model=%s",
+                    attempt + 1,
+                    getattr(self._model, "model", "?"),
+                )
+                messages = [*messages, SystemMessage(content=_RECOVERY_HINT)]
+                attempt += 1
 
     def __call__(
         self,
@@ -233,17 +337,23 @@ class LLMJobExtractor:
             return _fold(payload)
         source_url = evidence.get("source_url", "")
         try:
-            response = self._model.invoke(
+            # A2: the reviewed closed set is injected into the system prompt so
+            # the model only ever proposes members (max 8, same as FindJobs).
+            # The join is per-call but load_skill_tags is lru_cached; both sit
+            # inside the try so a missing/corrupt data file folds to empty.
+            closed_set = ", ".join(load_skill_tags())
+            parsed = self._invoke_with_recovery(
                 [
-                    SystemMessage(content=_EXTRACTION_PROMPT),
+                    SystemMessage(
+                        content=(
+                            f"{_EXTRACTION_PROMPT}\n\n"
+                            f"技能闭集（只能从这些标签中选择，最多 8 项）：{closed_set}"
+                        )
+                    ),
                     HumanMessage(content=text),
                 ]
             )
         except Exception:  # noqa: BLE001 - fold, never raise
-            return _fold(payload)
-        try:
-            parsed = _lenient_json(response.content)
-        except ValueError:
             return _fold(payload)
         candidates: list[ExtractedJobDetails] = []
         for item in _normalize_items(parsed):

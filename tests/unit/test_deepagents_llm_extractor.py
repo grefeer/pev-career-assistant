@@ -11,6 +11,7 @@ from backend.app.services.deepagents_runtime.tools.llm_extractor import (
     _EXTRACTION_PROMPT,
     build_llm_extractor,
 )
+from backend.app.services.job_discovery.tools.skill_validator import load_skill_tags
 from tests.conftest import settings_override
 from tests.unit.deepagents_testkit import ScriptedModel
 
@@ -127,7 +128,11 @@ def test_extractor_uses_extraction_guide_prompt() -> None:
     # the page text is passed as the human message, verbatim from the
     # registered observed evidence (never a model-proposed URI)
     assert model.messages is not None
-    assert model.messages[0].content == _EXTRACTION_PROMPT
+    # A2: the reviewed closed set is appended to the contract prompt
+    assert model.messages[0].content == (
+        f"{_EXTRACTION_PROMPT}\n\n技能闭集（只能从这些标签中选择，最多 8 项）："
+        f"{', '.join(load_skill_tags())}"
+    )
     assert model.messages[1].content == _ctx().metadata["observed_public_evidence"][0][
         "visible_text"
     ]
