@@ -126,6 +126,13 @@ class Settings(BaseSettings):
     # low-confidence. Off by default - the regex path stays the only one, so
     # unit suites never construct a model client.
     deepagents_llm_extraction_enabled: bool = False
+    # A1 (docs/findjobs-optimization-plan.zh-CN.md §4.1): when on, URLs owned
+    # by a certified public-JSON adapter host (didi/netease/baidu, gated by
+    # skill/job-discovery/scripts/adapters/endpoint_allowlist.json with
+    # review_status == "reviewed") are fetched adapter-first and never fall
+    # back to browse (adapter failure is an explicit blocked terminal).
+    # Default off until the allowlist has been human-reviewed and smoke-run.
+    use_public_api_adapters: bool = False
     job_discovery_planner_max_inspection_pages: int = Field(default=3, ge=1, le=5)
     # Hard wall-clock deadline (seconds) for a SnapshotPlan whose steps run
     # real network fetches (WeChat ``fetch_wechat_article``). When > 0 the

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -36,6 +37,7 @@ from urllib.parse import urlsplit
 
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
+    quote_arg,
     run_skill_script,
 )
 
@@ -64,6 +66,105 @@ _THIN_USED_PATHS = ("click_fallback_fetch_error",)
 
 #: browse.py cache-hit results carry no mode/page_files/page_count keys; the
 #: ``cached`` flag alone marks them, and a hit is a terminal success.
+
+
+class _AdapterBoundaryError(RuntimeError):
+    """Local stand-in for the skill adapters' AdapterError (code + message).
+
+    Defined here so the fetch layer never imports the skill package just to
+    name an exception; ``code`` mirrors the adapters' stable failure codes
+    (``url_not_allowlisted`` / ``empty_result`` / ...).
+    """
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _adapter_package() -> Any:
+    """Load the skill adapters package (sys.path injection once).
+
+    The adapters live in ``skill/job-discovery/scripts/adapters`` (A1, 方案
+    甲); they are ordinary modules, imported in-process — never executed
+    through the subprocess allowlist (that would be 方案 乙).  The sys.path
+    injection is idempotent and only adds the skill scripts directory.
+    """
+    scripts_dir = str(SKILL_DIR / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import adapters  # noqa: PLC0415 - lazy, guarded by callers
+
+    return adapters
+
+
+def _adapter_company_for_url(url: str) -> str | None:
+    """Adapter company for a URL, or None when the channel is unavailable.
+
+    A missing/broken adapters package degrades to the normal browse chain
+    (None), never crashes the fetch layer.
+    """
+    try:
+        return _adapter_package().company_for_url(url)
+    except Exception:  # noqa: BLE001 - untrusted adapter boundary.
+        return None
+
+
+def _write_adapter_evidence(
+    records: list[dict[str, Any]], out_dir: str
+) -> PageFile:
+    """Serialize adapter records as a JSON evidence file (content-addressed).
+
+    The file is the same shape as a browse page file: a UTF-8 JSON document
+    whose full sha256 is the evidence hash (``content_hash``), so the
+    downstream extraction fan-out treats adapter evidence exactly like
+    browsed page evidence.
+    """
+    data = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+    digest = hashlib.sha256(data).hexdigest()
+    path = Path(out_dir) / f"adapter_{digest[:16]}.json"
+    path.write_bytes(data)
+    return PageFile(path=str(path), content_hash=digest, text_length=len(data))
+
+
+def _run_adapter_url(
+    url: str, company: str, out_dir: str
+) -> UrlFetchResult:
+    """Adapter-first fetch for one URL (A1 方案 甲).
+
+    Success -> one content-addressed page file of records as evidence.
+    Any failure (validation refusal, transport, parse, empty result,
+    unexpected) is an explicit ``blocked`` terminal result — the same
+    semantics as browse's anti-bot block: never retried, never reported as
+    success, never silently empty.
+    """
+    try:
+        package = _adapter_package()
+        adapter = package.load_company_adapter(company)
+        if not adapter.validate(url):
+            raise _AdapterBoundaryError("url_not_allowlisted")
+        result = adapter.execute(url, None, None)
+        records = result.get("records") if isinstance(result, dict) else None
+        if not isinstance(records, list) or not records:
+            raise _AdapterBoundaryError("empty_result")
+        page_file = _write_adapter_evidence(records, out_dir)
+        return UrlFetchResult(
+            url=url,
+            site_class="adapter",
+            mode="adapter",
+            status="succeeded",
+            used_path="adapter",
+            page_files=[page_file],
+        )
+    except Exception as exc:  # noqa: BLE001 - untrusted adapter boundary.
+        code = getattr(exc, "code", "unexpected")
+        return UrlFetchResult(
+            url=url,
+            site_class="adapter",
+            mode="adapter",
+            status="blocked",
+            blocked_reason=f"adapter:{code}",
+            error_code="blocked",
+        )
 
 
 class SiteClass(str, Enum):
@@ -178,10 +279,13 @@ def _wrap_runner(runner: Callable[..., str] | None) -> Callable[..., str] | None
         timeout: int,
     ) -> str:
         # the simple seam addresses scripts by allowlisted name ("browse");
-        # parts are joined raw (no shlex quoting): run_skill_script already
-        # split them with posix=(os.name != "nt") semantics, so re-quoting
-        # would re-inject quote chars around backslash paths on Windows
-        return runner(script_path.stem, cli_args=" ".join(parts), stdin=stdin or "")
+        # tokens are re-joined with quote_arg so the fake runner's
+        # split_cli_args restores spaces-in-path tokens losslessly
+        return runner(
+            script_path.stem,
+            cli_args=" ".join(quote_arg(p) for p in parts),
+            stdin=stdin or "",
+        )
 
     return adapted
 
@@ -197,15 +301,12 @@ def _build_cli(
 ) -> str:
     """Assemble the allowlisted ``browse`` CLI args (--cache-mode is list-only).
 
-    Parts are joined raw with no shlex quoting (dedup_node/validate_node
-    style): on Windows ``run_skill_script`` splits with ``posix=False``,
-    which keeps literal quote chars in tokens — shlex.join's single-quoted
-    absolute ``D:\\...`` paths would reach browse's argparse with the quotes
-    intact and evidence would be written into a quote-named directory.
-    Paths are SKILL_DIR/out_dir-derived (no spaces in this project layout),
-    matching the runner layer's existing space limitation.
+    Tokens with whitespace (paths) are double-quoted via ``quote_arg``; the
+    runner layer splits with ``split_cli_args`` which restores them
+    losslessly on Windows (backslashes literal) — so SKILL_DIR-derived paths
+    under e.g. ``Program Files`` survive the string contract.
     """
-    parts = [url, "--mode", mode, "--out", out_dir]
+    parts = [url, "--mode", mode, "--out", quote_arg(out_dir)]
     if max_pages is not None:
         parts += ["--max-pages", str(max_pages)]
     if mode == "list":
@@ -384,6 +485,7 @@ def browse_fetch_urls(
     out_dir: str | None = None,
     cache_mode: str = "use",
     state_dir: str | None = None,
+    use_public_api_adapters: bool = False,
 ) -> list[UrlFetchResult]:
     """Browse a batch of URLs through the classify -> mode -> fallback chain.
 
@@ -394,6 +496,14 @@ def browse_fetch_urls(
     output directory; ``cache_mode`` is forwarded to ``browse`` for list
     mode only (URL-keyed caching is list-only in browse.py).  WeChat URLs
     are reported ``wechat_pending`` without any browse call.
+
+    ``use_public_api_adapters`` (A1, docs/findjobs-optimization-plan.zh-CN.md
+    §4.1, gated by ``Settings.use_public_api_adapters``, default off): a URL
+    whose host is owned by a certified public-JSON adapter is fetched
+    adapter-first (方案 甲); adapter failure is an explicit ``blocked``
+    terminal, never a browse fallback (those hosts are browse-blocked
+    anyway).  When off, the behaviour is byte-identical to before: the
+    adapter channel never runs.
     """
     if out_dir is not None:
         resolved_out_dir = out_dir
@@ -403,6 +513,11 @@ def browse_fetch_urls(
         resolved_out_dir = _DEFAULT_OUT_DIR
     results: list[UrlFetchResult] = []
     for url in urls:
+        if use_public_api_adapters:
+            company = _adapter_company_for_url(url)
+            if company is not None:
+                results.append(_run_adapter_url(url, company, resolved_out_dir))
+                continue
         site_class = classify_url(url)
         mode = mode_for_class(site_class)
         if mode is None:  # WECHAT: never browsed here, carried for Task 9

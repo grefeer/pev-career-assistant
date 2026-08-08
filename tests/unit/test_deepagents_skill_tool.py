@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -28,6 +29,7 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs import (
 from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch import PageFile
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
+    split_cli_args,
 )
 
 
@@ -75,7 +77,7 @@ def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         # the verdict derives from evidence + JD bodies, not candidate
         # existence.  Manifest containment + evidence_refs checks are skipped
         # here (the real script enforces them; the fakes stay permissive).
-        parts = cli_args.split()
+        parts = split_cli_args(cli_args)
         candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
         manifest_path = Path(parts[parts.index("--manifest") + 1])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -126,7 +128,7 @@ def _fake_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         # faithful to the real script: merge the input files into --out and
         # report output_count = the merged candidate count (the graph re-reads
         # --out for the candidates channel, so the write must be real)
-        parts = cli_args.split()
+        parts = split_cli_args(cli_args)
         out_path = Path(parts[parts.index("--out") + 1])
         inputs = [Path(token) for token in parts[: parts.index("--out")]]
         merged: list[dict] = []
@@ -536,7 +538,7 @@ def test_write_page_candidates_pipes_stdin_and_returns_accepted(tmp_path) -> Non
         captured["cli_args"] = cli_args
         captured["stdin"] = stdin
         # faithful to the real script: persist the batch to --out
-        parts = cli_args.split()
+        parts = split_cli_args(cli_args)
         out_path = Path(parts[parts.index("--out") + 1])
         out_path.write_text(stdin, encoding="utf-8")
         return json.dumps(
@@ -917,7 +919,7 @@ def test_coverage_node_passes_real_manifest(tmp_path) -> None:
 
     def manifest_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         if script == "coverage_gate":
-            parts = cli_args.split()
+            parts = split_cli_args(cli_args)
             assert "--manifest" in parts
             manifest_path = Path(parts[parts.index("--manifest") + 1])
             assert manifest_path.is_file()
@@ -965,7 +967,7 @@ def test_coverage_node_no_synthesized_terminal_evidence(tmp_path) -> None:
 
     def manifest_runner(script: str, cli_args: str = "", stdin: str = "") -> str:
         if script == "coverage_gate":
-            parts = cli_args.split()
+            parts = split_cli_args(cli_args)
             manifest_path = Path(parts[parts.index("--manifest") + 1])
             captured["manifest"] = json.loads(
                 manifest_path.read_text(encoding="utf-8")
@@ -1234,7 +1236,7 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
         def fake_script(script: str, cli_args: str = "", stdin: str = "", **kwargs):
             served.append(script)
             if script == "browse":
-                parts = cli_args.split()
+                parts = split_cli_args(cli_args)
                 out_dir = Path(parts[parts.index("--out") + 1])
                 out_dir.mkdir(parents=True, exist_ok=True)
                 page = out_dir / "pages" / "page_01.txt"
@@ -1253,7 +1255,7 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
                     }
                 )
             if script == "write_candidates":
-                parts = cli_args.split()
+                parts = split_cli_args(cli_args)
                 out_path = Path(parts[parts.index("--out") + 1])
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(stdin, encoding="utf-8")
@@ -1263,7 +1265,7 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
             if script == "validate":
                 return json.dumps({"ok": True})
             if script == "deduplicate":
-                parts = cli_args.split()
+                parts = split_cli_args(cli_args)
                 out_path = Path(parts[parts.index("--out") + 1])
                 inputs = [Path(token) for token in parts[: parts.index("--out")]]
                 merged: list[dict] = []
@@ -1294,7 +1296,7 @@ def test_factory_tool_writes_merged_into_run_scoped_dir(monkeypatch) -> None:
                     {"input": "后端工程师", "normalized": "backend-engineer"}
                 )
             if script == "coverage_gate":
-                parts = cli_args.split()
+                parts = split_cli_args(cli_args)
                 manifest_path = Path(parts[parts.index("--manifest") + 1])
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 candidates = json.loads(Path(parts[0]).read_text(encoding="utf-8"))
@@ -1492,7 +1494,7 @@ def test_build_job_discovery_tools_threads_review_wiring(monkeypatch) -> None:
     )
     tracker = DuplicateCallTracker()
     saver = InMemorySaver()
-    settings = object()
+    settings = SimpleNamespace(use_public_api_adapters=False)
     tools = sg.build_job_discovery_tools(
         "job-discovery",
         run_id="eval-wire",

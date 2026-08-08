@@ -28,6 +28,9 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch imp
     mode_for_class,
     page_file_hash,
 )
+from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
+    split_cli_args,
+)
 
 
 @pytest.mark.parametrize(
@@ -573,7 +576,7 @@ def test_windows_absolute_out_dir_round_trips_unquoted(tmp_path) -> None:
     # round-trip through run_skill_script's split (posix=False on Windows)
     # and the runner seam without quote characters in the token
     assert len(calls) == 1
-    out_token = calls[0].split("--out", 1)[1].split()[0]
+    out_token = split_cli_args(calls[0])[split_cli_args(calls[0]).index("--out") + 1]
     assert out_token == windows_out_dir
     assert "'" not in out_token and '"' not in out_token
 
@@ -646,7 +649,7 @@ def test_state_dir_resolves_evidence_out_dir(tmp_path) -> None:
     results = browse_fetch_urls(
         ["https://jobs.feishu.cn/abc"], runner=fake_runner, state_dir=str(tmp_path)
     )
-    out_token = calls[0].split("--out", 1)[1].split()[0]
+    out_token = split_cli_args(calls[0])[split_cli_args(calls[0]).index("--out") + 1]
     assert out_token == str(tmp_path / "output" / "evidence" / "run-0")
     assert results[0].status == "succeeded"
 
@@ -657,13 +660,190 @@ def test_state_dir_resolves_evidence_out_dir(tmp_path) -> None:
         ["https://jobs.feishu.cn/abc"], runner=fake_runner,
         out_dir=str(explicit), state_dir=str(tmp_path),
     )
-    out_token = calls[0].split("--out", 1)[1].split()[0]
+    out_token = split_cli_args(calls[0])[split_cli_args(calls[0]).index("--out") + 1]
     assert out_token == str(explicit)
     assert results[0].status == "succeeded"
 
     # neither -> the skill's default evidence directory
     calls.clear()
     results = browse_fetch_urls(["https://jobs.feishu.cn/abc"], runner=fake_runner)
-    out_token = calls[0].split("--out", 1)[1].split()[0]
+    out_token = split_cli_args(calls[0])[split_cli_args(calls[0]).index("--out") + 1]
     assert out_token == bf._DEFAULT_OUT_DIR
     assert results[0].status == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# A1 certified public-JSON adapters (方案 甲): adapter-first fetch wiring
+# ---------------------------------------------------------------------------
+
+
+class _FakeAdapter:
+    """Contract-shaped adapter: validate(url) + execute(task, strategy, trajectory)."""
+
+    def __init__(self, records: list[dict] | None = None, error: Exception | None = None) -> None:
+        self._records = records
+        self._error = error
+        self.calls: list[tuple] = []
+
+    def validate(self, url: str) -> bool:
+        return url.startswith("https://talent.didiglobal.com")
+
+    def execute(self, task, strategy=None, trajectory=None):
+        self.calls.append((task, strategy, trajectory))
+        if self._error is not None:
+            raise self._error
+        return {"records": self._records or [], "company": "didi", "url": task}
+
+
+class _FakeAdapterPackage:
+    def __init__(self, adapter: _FakeAdapter) -> None:
+        self._adapter = adapter
+
+    def company_for_url(self, url: str) -> str | None:
+        return "didi" if url.startswith("https://talent.didiglobal.com") else None
+
+    def load_company_adapter(self, company: str) -> _FakeAdapter:
+        return self._adapter
+
+
+def test_adapter_first_fetch_when_flag_on(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    adapter = _FakeAdapter(records=[{"job_id": "DD_1", "title": "测试岗"}])
+    monkeypatch.setattr(bf, "_adapter_package", lambda: _FakeAdapterPackage(adapter))
+    results = browse_fetch_urls(
+        ["https://talent.didiglobal.com/api/jobList"],
+        runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("browse must not run")),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=True,
+    )
+    assert len(results) == 1
+    assert results[0].status == "succeeded"
+    assert results[0].used_path == "adapter"
+    assert results[0].site_class == "adapter"
+    assert len(results[0].page_files) == 1
+    # evidence file is content-addressed and carries the record payload
+    payload = json.loads(Path(results[0].page_files[0].path).read_text(encoding="utf-8"))
+    assert payload[0]["job_id"] == "DD_1"
+    assert results[0].page_files[0].content_hash == page_file_hash(
+        results[0].page_files[0].path, out_dir=str(tmp_path)
+    )[0]
+
+
+def test_adapter_channel_never_runs_when_flag_off(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    called: list[str] = []
+    monkeypatch.setattr(bf, "_adapter_package", lambda: (_ for _ in ()).throw(AssertionError("no adapter package")))
+    browse_fetch_urls(
+        ["https://talent.didiglobal.com/api/jobList"],
+        runner=lambda *a, **k: (
+            called.append("browse") or json.dumps({
+                "status": "ok", "url": "https://talent.didiglobal.com/api/jobList",
+                "mode": "list", "content_hash": "sha256_1", "page_files": [],
+                "page_count": 1, "text_length": 100,
+            })
+        ),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=False,
+    )
+    assert called and set(called) == {"browse"}  # flag off -> browse chain only
+
+
+def test_adapter_failure_is_blocked_terminal_no_fallback(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    adapter = _FakeAdapter(error=RuntimeError("boom"))
+    monkeypatch.setattr(bf, "_adapter_package", lambda: _FakeAdapterPackage(adapter))
+    results = browse_fetch_urls(
+        ["https://talent.didiglobal.com/api/jobList"],
+        runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("browse must not run")),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=True,
+    )
+    assert results[0].status == "blocked"
+    assert results[0].blocked_reason == "adapter:unexpected"  # RuntimeError has no .code
+    assert results[0].error_code == "blocked"
+
+
+def test_adapter_empty_result_is_blocked_terminal(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    adapter = _FakeAdapter(records=[])
+    monkeypatch.setattr(bf, "_adapter_package", lambda: _FakeAdapterPackage(adapter))
+    results = browse_fetch_urls(
+        ["https://talent.didiglobal.com/api/jobList"],
+        runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("browse must not run")),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=True,
+    )
+    assert results[0].status == "blocked"
+    assert results[0].blocked_reason == "adapter:empty_result"
+    assert len(results[0].page_files) == 0
+
+
+def test_non_adapter_host_stays_on_browse_chain(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    adapter = _FakeAdapter(records=[{"job_id": "DD_1"}])
+    monkeypatch.setattr(bf, "_adapter_package", lambda: _FakeAdapterPackage(adapter))
+    results = browse_fetch_urls(
+        ["https://jobs.example.com/jobs"],
+        runner=lambda *a, **k: json.dumps({
+            "status": "ok", "url": "https://jobs.example.com/jobs",
+            "mode": "list", "content_hash": "sha256_1", "page_files": [],
+            "page_count": 1, "text_length": 100,
+        }),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=True,
+    )
+    assert results[0].status == "succeeded"
+    assert results[0].site_class != "adapter"
+    assert adapter.calls == []  # browse chain, adapter untouched
+
+
+def test_adapter_company_lookup_degrades_to_none_on_broken_package(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    monkeypatch.setattr(
+        bf, "_adapter_package", lambda: (_ for _ in ()).throw(RuntimeError("broken"))
+    )
+    assert bf._adapter_company_for_url("https://talent.didiglobal.com/api/jobList") is None
+
+
+def test_adapter_package_syspath_injection_is_idempotent(monkeypatch) -> None:
+    import sys
+
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    scripts_dir = str(bf.SKILL_DIR / "scripts")
+    monkeypatch.delitem(sys.modules, "adapters", raising=False)
+    monkeypatch.setattr(
+        sys, "path", [p for p in sys.path if p != scripts_dir]
+    )  # deterministic start: not present
+    package = bf._adapter_package()
+    assert package is not None
+    assert sys.path.count(scripts_dir) == 1  # injected exactly once
+    package = bf._adapter_package()  # second call: no re-injection
+    assert package is not None
+    assert sys.path.count(scripts_dir) == 1
+
+
+def test_adapter_url_not_allowlisted_is_blocked_terminal(monkeypatch, tmp_path) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.browse_fetch as bf
+
+    class RefusingAdapter(_FakeAdapter):
+        def validate(self, url: str) -> bool:
+            return False
+
+    refusing = RefusingAdapter(records=[{"job_id": "DD_1", "title": "x"}])
+    monkeypatch.setattr(bf, "_adapter_package", lambda: _FakeAdapterPackage(refusing))
+    results = browse_fetch_urls(
+        ["https://talent.didiglobal.com/api/jobList"],
+        runner=lambda *a, **k: (_ for _ in ()).throw(AssertionError("browse must not run")),
+        out_dir=str(tmp_path),
+        use_public_api_adapters=True,
+    )
+    assert results[0].status == "blocked"
+    assert results[0].blocked_reason == "adapter:url_not_allowlisted"
+    assert not results[0].page_files

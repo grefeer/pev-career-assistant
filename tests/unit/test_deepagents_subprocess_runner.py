@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
     run_skill_script,
@@ -108,3 +110,46 @@ def test_default_runner_merges_stderr(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(sr, "SKILL_DIR", tmp_path)
     out = run_skill_script("normalize")
     assert "[stderr]" in out and "boom" in out
+
+
+def test_quote_arg_windows_quoting_and_escaping(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner as sr
+
+    monkeypatch.setattr(sr.os, "name", "nt")
+    assert sr.quote_arg("plain") == "plain"
+    assert sr.quote_arg("Program Files/x") == '"Program Files/x"'
+    assert sr.quote_arg('has "quote"') == '"has \\"quote\\""'
+    assert sr.quote_arg("tab\there") == '"tab\there"'
+
+
+def test_quote_arg_posix_delegates_to_shlex(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner as sr
+
+    monkeypatch.setattr(sr.os, "name", "posix")
+    assert sr.quote_arg("plain") == "plain"
+    assert sr.quote_arg("Program Files/x") == "'Program Files/x'"
+    assert sr.quote_arg('has "quote"') == "'has \"quote\"'"
+
+
+def test_split_cli_args_windows_quote_groups_and_tabs(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner as sr
+
+    monkeypatch.setattr(sr.os, "name", "nt")
+    assert sr.split_cli_args("--out \"Program Files/x\" --flag") == [
+        "--out", "Program Files/x", "--flag",
+    ]
+    assert sr.split_cli_args("a\tb") == ["a", "b"]
+    # repeated whitespace with an empty buffer collapses without a token
+    assert sr.split_cli_args("a  b") == ["a", "b"]
+    assert sr.split_cli_args('a "b c"') == ["a", "b c"]
+    with pytest.raises(ValueError, match="unclosed quote"):
+        sr.split_cli_args('"unclosed')
+    assert sr.split_cli_args("trailing ") == ["trailing"]
+
+
+def test_split_cli_args_posix_delegates_to_shlex(monkeypatch) -> None:
+    import backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner as sr
+
+    monkeypatch.setattr(sr.os, "name", "posix")
+    assert sr.split_cli_args("a b") == ["a", "b"]
+    assert sr.split_cli_args("'a b'") == ["a b"]

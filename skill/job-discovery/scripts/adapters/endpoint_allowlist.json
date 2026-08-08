@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "review_status": "pending_review",
+  "reviewed_by": null,
+  "reviewed_on": null,
+  "notes": "A1 双门控之一：人工评审确认这些端点确实是官方公开、免鉴权的 JSON 数据通道后，将 review_status 改为 reviewed 并填写 reviewed_by / reviewed_on。后端 flag use_public_api_adapters 默认关闭，需同时开启才生效。评审要点：无登录/签名/加密参数（安全门 #2）、TLS 校验开启（安全门 #4 精神）、礼貌限速、300/公司上限。",
+  "endpoints": [
+    {
+      "company": "didi",
+      "host": "talent.didiglobal.com",
+      "path_prefixes": ["/api/jobList", "/position/"],
+      "method": "GET",
+      "list_url": "https://talent.didiglobal.com/api/jobList",
+      "max_items": 300,
+      "min_delay_s": 0.2,
+      "max_delay_s": 0.5,
+      "description": "滴滴官方公开职位列表 JSON 接口（无鉴权）；详情页 talent.didiglobal.com/position/<id>"
+    },
+    {
+      "company": "netease",
+      "host": "hr.163.com",
+      "path_prefixes": ["/api/hr163/position/queryPage", "/position/detail.html"],
+      "method": "POST",
+      "list_url": "https://hr.163.com/api/hr163/position/queryPage",
+      "max_items": 300,
+      "min_delay_s": 0.2,
+      "max_delay_s": 0.5,
+      "description": "网易官方公开职位列表 JSON 接口（无鉴权，POST currentPage/pageSize）；详情页 hr.163.com/position/detail.html?id=<id>"
+    },
+    {
+      "company": "baidu",
+      "host": "talent.baidu.com",
+      "path_prefixes": ["/httservice/getPostListNew", "/jobs/detail/"],
+      "method": "POST",
+      "list_url": "https://talent.baidu.com/httservice/getPostListNew",
+      "max_items": 300,
+      "min_delay_s": 0.2,
+      "max_delay_s": 0.5,
+      "description": "百度官方公开职位列表 JSON 接口（无鉴权，POST recruitType/curPage，SOCIAL+CAMPUS）；详情页 talent.baidu.com/jobs/detail/<postId>"
+    }
+  ]
+}

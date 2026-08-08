@@ -57,6 +57,33 @@ The fallback still uses `parallel-fetch` first, makes only one
 page file, then runs deterministic validation and deduplication.  Treat a
 login/captcha/anti-bot result as manual review, never as a retry target.
 
+## Certified public-JSON adapters (A1, backend-gated)
+
+Three sites that browse.py classifies as anti-bot-blocked (didi, netease,
+baidu) expose official, unauthenticated, public JSON listing endpoints.  The
+`scripts/adapters/` package (one `Adapter` module per company, contract =
+`validate(url)` + `execute(task, strategy, trajectory)` like
+`adapter_supervisor.py`) is a legal public data channel: no bypass, TLS
+verification on, polite 0.2-0.5s pacing, 300 items/company hard cap.  It is a
+**fetch-only channel** - the collector stays passive; adapter output becomes
+ordinary page evidence (source_url + content_hash).
+
+- Every endpoint and apply/detail URL passes `is_safe_public_url` before use.
+- The whole channel is gated twice: `endpoint_allowlist.json` must carry
+  `review_status: "reviewed"` (human-reviewed; see the file's `reviewed_by` /
+  `reviewed_on`), and the backend flag `use_public_api_adapters` must be on
+  (default off).  Adapter hosts are fetched adapter-first only when the flag
+  is on; otherwise the channel never runs.
+- Adapter failure is an explicit `blocked` terminal (`adapter:<code>`), never
+  a browse fallback and never a silent empty result - same semantics as the
+  anti-bot block.  Codes: `url_not_allowlisted`, `empty_result`,
+  `malformed_payload`, `adapter_error`, `adapter_unknown`, `adapter_invalid`,
+  `allowlist_*`, `http_error:*`, `timeout`, `dns_error`, `transport_error`.
+- Human smoke run: `python -m adapters <company> <url>` from `scripts/`
+  (prints the JSON records; `blocked: <code>` on failure).
+- Run `python -m adapters` with no args for usage.  Never modify the
+  allowlist without recording a human review.
+
 ## Quick start
 
 ```bash

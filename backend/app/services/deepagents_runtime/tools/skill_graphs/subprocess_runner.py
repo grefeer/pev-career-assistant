@@ -19,6 +19,50 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parents[6]
 SKILL_DIR = _PROJECT_ROOT / "skill" / "job-discovery"
 
+
+def quote_arg(value: str) -> str:
+    """Quote one cli token so ``split_cli_args`` restores it losslessly.
+
+    Windows: double-quote a token that contains whitespace (inverse of the
+    quote-aware split below; backslashes stay literal, matching cmd.exe).
+    POSIX: ``shlex.quote``.  This lets paths under e.g. ``Program Files``
+    travel through the ``cli_args`` string contract intact.
+    """
+    if os.name != "nt":
+        return shlex.quote(value)
+    if any(ch in value for ch in (" ", "\t")):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
+
+
+def split_cli_args(cli_args: str) -> list[str]:
+    """Losslessly split a cli_args string into tokens.
+
+    Windows: quote-aware whitespace split (double quotes group a segment and
+    are removed; backslashes are literal) — the inverse of ``quote_arg``.
+    POSIX: standard ``shlex.split`` (backslash escaping applies, so POSIX
+    callers must quote with ``quote_arg``).
+    """
+    if os.name != "nt":
+        return shlex.split(cli_args)
+    tokens: list[str] = []
+    buf: list[str] = []
+    in_quotes = False
+    for ch in cli_args:
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch in " \t" and not in_quotes:
+            if buf:
+                tokens.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if in_quotes:
+        raise ValueError("unclosed quote in cli_args")  # keep the refuse-to-run safety
+    if buf:
+        tokens.append("".join(buf))
+    return tokens
+
 _ALLOWED_SCRIPTS = frozenset(
     {
         "browse",
@@ -90,7 +134,7 @@ def run_skill_script(
     if not script_path.exists():
         return f"ERROR: script not found at {script_path}"
     try:
-        parts = shlex.split(cli_args, posix=(os.name != "nt")) if cli_args else []
+        parts = split_cli_args(cli_args) if cli_args else []
     except ValueError as exc:
         return f"ERROR: could not parse cli_args {cli_args!r}: {exc}"
     resolved_cwd = Path(cwd) if cwd is not None else SKILL_DIR

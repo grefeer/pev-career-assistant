@@ -55,6 +55,7 @@ from backend.app.services.deepagents_runtime.tools.skill_graphs.persistence impo
 )
 from backend.app.services.deepagents_runtime.tools.skill_graphs.subprocess_runner import (
     SKILL_DIR,
+    quote_arg,
     run_skill_script,
 )
 from backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice import (
@@ -246,7 +247,11 @@ def _write_manifest(manifest: dict[str, Any], *, state_dir: Path) -> Path:
 
 
 def _default_fetch(
-    urls: list[str], *, state_dir: str | None = None, evidence_dir: str | None = None
+    urls: list[str],
+    *,
+    state_dir: str | None = None,
+    evidence_dir: str | None = None,
+    use_public_api_adapters: bool = False,
 ) -> list[dict[str, Any]]:
     """Browse-backed fetch: classify -> mode fallback chain -> per-URL evidence.
 
@@ -265,9 +270,13 @@ def _default_fetch(
     dir under ``output/evidence`` so the gate's containment check passes).
     """
     if evidence_dir is not None:
-        results = browse_fetch_urls(urls, out_dir=evidence_dir)
+        results = browse_fetch_urls(
+            urls, out_dir=evidence_dir, use_public_api_adapters=use_public_api_adapters
+        )
     else:
-        results = browse_fetch_urls(urls, state_dir=state_dir)
+        results = browse_fetch_urls(
+            urls, state_dir=state_dir, use_public_api_adapters=use_public_api_adapters
+        )
     pages: list[dict[str, Any]] = []
     for result in results:
         if result.status == "succeeded":
@@ -397,7 +406,9 @@ def write_page_candidates(
         [c.model_dump(mode="json") for c in candidates], ensure_ascii=False
     )
     out = (runner or run_skill_script)(
-        "write_candidates", f"--out {out_dir / f'{page_id}.json'}", stdin=payload
+        "write_candidates",
+        f"--out {quote_arg(str(out_dir / f'{page_id}.json'))}",
+        stdin=payload,
     )
     try:
         summary = json.JSONDecoder().raw_decode(out, 0)[0]
@@ -541,6 +552,9 @@ def build_job_discovery_graph(
         _default_fetch,
         state_dir=str(state_dir),
         evidence_dir=str(evidence_dir),
+        use_public_api_adapters=(
+            settings.use_public_api_adapters if settings is not None else False
+        ),
     )
     if wechat_fn is None:
         # default: the real Task 9 slice, run through the same runner seam
@@ -778,13 +792,15 @@ def build_job_discovery_graph(
                 prior_file = candidates_dir / "prior_merged.json"
                 script_runner(
                     "write_candidates",
-                    f"--out {prior_file} --append",
+                    f"--out {quote_arg(str(prior_file))} --append",
                     stdin=json.dumps(prior, ensure_ascii=False),
                 )
                 inputs = [prior_file, *inputs]
         merged = candidates_dir / "merged_final.json"
         out = script_runner(
-            "deduplicate", " ".join(str(f) for f in inputs) + f" --out {merged}"
+            "deduplicate",
+            " ".join(quote_arg(str(f)) for f in inputs)
+            + f" --out {quote_arg(str(merged))}",
         )
         if "ERROR" in out:
             return {"error": f"deduplicate failed: {out[:500]}"}
@@ -854,7 +870,10 @@ def build_job_discovery_graph(
             listing_count=state.get("merged_count") or None,
         )
         manifest_path = _write_manifest(manifest, state_dir=state_dir)
-        out = script_runner("coverage_gate", f"{path} --manifest {manifest_path}")
+        out = script_runner(
+            "coverage_gate",
+            f"{quote_arg(str(path))} --manifest {quote_arg(str(manifest_path))}",
+        )
         try:
             coverage = json.loads(out)
         except ValueError:
