@@ -68,11 +68,26 @@ def build_resume_tailoring_brief(
     target = _find_target(context.metadata.get("observed_public_evidence"), payload.target_artifact_id)
     if target is None:
         raise ResumeTailoringError("target_evidence_not_found")
-    source_url = target.get("source_url")
     visible_text = target.get("visible_text")
-    if not isinstance(source_url, str) or not isinstance(visible_text, str):
-        raise ResumeTailoringError("target_evidence_incomplete")
-    job_text = f"{target.get('title') or ''}\n{visible_text}".lower()
+    if isinstance(visible_text, str) and visible_text.strip():
+        source_url = target.get("source_url")
+        if not isinstance(source_url, str):
+            raise ResumeTailoringError("target_evidence_incomplete")
+        target_title = target.get("title") if isinstance(target.get("title"), str) else None
+        job_text = f"{target_title or ''}\n{visible_text}".lower()
+    else:
+        # The artifact may have been collapsed to an identifier-only pointer
+        # when the decision projection hit its evidence budget. The run's
+        # structured extraction candidates retain the full JD text, so resolve
+        # the pointer against them instead of failing the step.
+        target_title, job_text, source_url = _structured_target_evidence(
+            context.metadata.get("structured_job_candidates"),
+            target,
+            payload.target_artifact_id,
+        )
+        if job_text is None:
+            raise ResumeTailoringError("target_evidence_incomplete")
+        job_text = f"{target_title or ''}\n{job_text}".lower()
     required_keywords = [
         (keyword, keyword.lower())
         for keyword in payload.target_keywords
@@ -115,7 +130,7 @@ def build_resume_tailoring_brief(
     ]
     return ResumeTailoringBriefOutput(
         target_artifact_id=payload.target_artifact_id,
-        target_title=target.get("title") if isinstance(target.get("title"), str) else None,
+        target_title=target_title,
         source_url=source_url,
         supported_keywords=supported,
         missing_keywords=missing,
@@ -131,6 +146,64 @@ def _find_target(raw_evidence: object, artifact_id: str) -> dict[str, Any] | Non
         if isinstance(item, dict) and item.get("artifact_id") == artifact_id:
             return item
     return None
+
+
+def _structured_target_evidence(
+    candidates: object, target: dict[str, Any], artifact_id: str
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve a collapsed target pointer to full JD text via structured candidates.
+
+    ``observed_public_evidence`` entries that fall outside the decision
+    projection budget collapse to identifier-only lines (``artifact_id`` /
+    ``source_url``, never ``visible_text``). The run's structured extraction
+    candidates retain the full JD text, so the pointer is resolved by matching
+    ``artifact_id`` (the candidate's own or the evidence artifact it was
+    derived from) or ``source_url``. Returns ``(title, job_text, source_url)``,
+    or ``(None, None, None)`` when no candidate yields usable text - the caller
+    keeps raising ``target_evidence_incomplete``.
+    """
+    if not isinstance(candidates, list):
+        return None, None, None
+    target_source_url = target.get("source_url")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if not (
+            artifact_id == candidate.get("artifact_id")
+            or artifact_id == candidate.get("source_artifact_id")
+            or (
+                isinstance(target_source_url, str)
+                and target_source_url == candidate.get("source_url")
+            )
+        ):
+            continue
+        source_url = candidate.get("source_url")
+        if not isinstance(source_url, str) or not source_url:
+            return None, None, None
+        title = candidate.get("title")
+        job_text = candidate.get("full_text")
+        if not isinstance(job_text, str) or not job_text.strip():
+            job_text = _candidate_section_text(candidate)
+        if not isinstance(job_text, str) or not job_text.strip():
+            return None, None, None
+        return (
+            title if isinstance(title, str) else None,
+            job_text,
+            source_url,
+        )
+    return None, None, None
+
+
+def _candidate_section_text(candidate: dict[str, Any]) -> str | None:
+    """Concatenate a structured candidate's sections as last-resort job text."""
+    sections = [
+        candidate.get("title"),
+        candidate.get("company_name"),
+        candidate.get("responsibilities"),
+        candidate.get("requirements"),
+    ]
+    text = "\n".join(section for section in sections if isinstance(section, str) and section)
+    return text or None
 
 
 def _flatten_text(value: object) -> str:

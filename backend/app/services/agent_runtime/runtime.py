@@ -56,6 +56,12 @@ _STRUCTURED_SECTION_CHARS = 600
 #: NEED_USER after the replan keeps the human hand-off instead of looping.
 _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
 
+#: Per-candidate cap for the full JD text preserved alongside the bounded
+#: sections (``full_text``). Extraction outputs are already bounded by the
+#: page's visible text (itself capped at 32k), so this engages defensively
+#: only for unusually large pages.
+_STRUCTURED_FULL_TEXT_CHARS = 32_000
+
 
 @dataclass(frozen=True)
 class AgentRunResult:
@@ -1345,6 +1351,10 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
             items.append(
                 {
                     "artifact_id": artifact.id,
+                    #: The evidence artifact this candidate was extracted from
+                    #: (``ExtractedJobDetails.evidence_refs``), so a collapsed
+                    #: page pointer can also resolve by artifact identity.
+                    "source_artifact_id": _evidence_artifact_id(candidate),
                     "source_url": source_url,
                     "content_hash": artifact.content_hash,
                     "title": title if isinstance(title, str) else None,
@@ -1358,9 +1368,55 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     # B1: strength dict {score, tier, base_score, evidence[]},
                     # optional for downstream scoring, carried for audit.
                     "strength": candidate.get("strength"),
+                    # Full candidate JD text for deliverable tools (e.g.
+                    # build-resume-tailoring-brief): the evidence projection may
+                    # collapse an old artifact's visible_text, but the extracted
+                    # sections retain the complete job text. Tool-side authority
+                    # only - never enters model prompts.
+                    "full_text": _full_candidate_text(candidate, title),
                 }
             )
     return items
+
+
+def _evidence_artifact_id(candidate: dict[str, Any]) -> str | None:
+    """Return the evidence artifact a candidate was extracted from, if recorded.
+
+    ``ExtractedJobDetails.evidence_refs`` pins each candidate to the source
+    page artifact; carrying it lets a collapsed ``observed_public_evidence``
+    pointer match by artifact identity even when the extraction found a
+    distinct ``apply_url`` for the candidate.
+    """
+    evidence_refs = candidate.get("evidence_refs")
+    if not isinstance(evidence_refs, list):
+        return None
+    for ref in evidence_refs:
+        if not isinstance(ref, dict):
+            continue
+        value = ref.get("artifact_id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _full_candidate_text(candidate: dict[str, Any], title: object) -> str:
+    """Preserve the complete candidate JD text for deliverable tools.
+
+    Section fields are kept at their persisted length (extraction already
+    bounds them to the page's visible text); only a defensive per-candidate
+    cap applies, so a collapsed page pointer can still resolve the full JD.
+    """
+    company_name = candidate.get("company_name")
+    responsibilities = candidate.get("responsibilities")
+    requirements = candidate.get("requirements")
+    parts = [
+        title if isinstance(title, str) and title else None,
+        company_name if isinstance(company_name, str) and company_name else None,
+        " ".join(_string_list(candidate.get("locations"))),
+        responsibilities if isinstance(responsibilities, str) and responsibilities else None,
+        requirements if isinstance(requirements, str) and requirements else None,
+    ]
+    return "\n".join(part for part in parts if part)[:_STRUCTURED_FULL_TEXT_CHARS]
 
 
 def _string_list(value: object) -> list[str]:
