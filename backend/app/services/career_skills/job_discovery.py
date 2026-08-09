@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import socket
 import sys
+import threading
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
@@ -51,6 +52,14 @@ _PLAYWRIGHT_FALLBACK_ENABLED = False
 # match-observed-jobs sees real JD body instead of an empty card shell.
 _MIN_LIST_LINKS = 2
 _MAX_LIST_EXPANSION = 5
+# Render calls are serialized behind this lock and bounded by a hard
+# watchdog: the C5 batch fetch runs up to 4 worker threads, and playwright's
+# sync API is thread-affine (its event loop binds to the thread that started
+# it), so two threads touching the shared browser at once wedge the driver
+# forever. A wedged render is abandoned at the deadline -- the worker is a
+# daemon and the runtime is orphaned, never torn down from a foreign thread.
+_RENDER_LOCK = threading.Lock()
+_RENDER_TIMEOUT_S = 60
 _JD_SECTION_MARKERS = (
     "岗位职责",
     "岗位要求",
@@ -636,44 +645,73 @@ def _render_with_playwright(
         finally:
             page.close()
 
+    def _run_render() -> tuple[Any, ...]:
+        """Launch-or-reuse the shared browser and render; relaunch once."""
+        global _PLAYWRIGHT_RUNTIME
+        attempt = 0
+        while True:
+            pw, browser = _PLAYWRIGHT_RUNTIME or (None, None)
+            if browser is None:
+                try:
+                    pw = sync_playwright().start()
+                    browser = pw.chromium.launch(headless=True)
+                    _PLAYWRIGHT_RUNTIME = (pw, browser)
+                except Exception:
+                    if pw is not None:
+                        try:
+                            pw.stop()
+                        except Exception:
+                            pass
+                    raise PublicJobFetchError("public_fetch_failed") from None
+            try:
+                return _render_once(browser, url)
+            except PublicJobFetchError:
+                raise
+            except Exception:
+                # The shared browser died mid-render (crash / OOM / CDP
+                # disconnect). Every later attempt against the dead runtime
+                # would fail in ~0.0s, so tear it down and relaunch exactly
+                # once (RC-A). A PublicJobFetchError is never retried:
+                # security/validation rejections and the deliberate
+                # blocked-page path stay final.
+                if attempt >= 1:
+                    raise PublicJobFetchError("public_fetch_failed") from None
+                attempt += 1
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                try:
+                    pw.stop()
+                except Exception:
+                    pass
+                _PLAYWRIGHT_RUNTIME = None
+
+    # Serialize renders (playwright sync is thread-affine; the C5 batch fetch
+    # runs 4 threads) and bound each call with a hard watchdog. A wedged
+    # driver must not hang the whole eval process: the worker is a daemon,
+    # the runtime is orphaned for the next call to replace, and teardown is
+    # never attempted from a foreign thread (that call is itself the hang).
     global _PLAYWRIGHT_RUNTIME
-    attempt = 0
-    while True:
-        pw, browser = _PLAYWRIGHT_RUNTIME or (None, None)
-        if browser is None:
+    with _RENDER_LOCK:
+        boxed: list[tuple[Any, ...]] = []
+        errors: list[BaseException] = []
+
+        def _watchdog_target() -> None:
             try:
-                pw = sync_playwright().start()
-                browser = pw.chromium.launch(headless=True)
-                _PLAYWRIGHT_RUNTIME = (pw, browser)
-            except Exception:
-                if pw is not None:
-                    try:
-                        pw.stop()
-                    except Exception:
-                        pass
-                raise PublicJobFetchError("public_fetch_failed") from None
-        try:
-            return _render_once(browser, url)
-        except PublicJobFetchError:
-            raise
-        except Exception:
-            # The shared browser died mid-render (crash / OOM / CDP disconnect).
-            # Every later attempt against the dead runtime would fail in
-            # ~0.0s, so tear it down and relaunch exactly once (RC-A). A
-            # PublicJobFetchError is never retried: security/validation
-            # rejections and the deliberate blocked-page path stay final.
-            if attempt >= 1:
-                raise PublicJobFetchError("public_fetch_failed") from None
-            attempt += 1
-            try:
-                browser.close()
-            except Exception:
-                pass
-            try:
-                pw.stop()
-            except Exception:
-                pass
+                boxed.append(_run_render())
+            except BaseException as exc:  # noqa: BLE001 - re-raised on caller
+                errors.append(exc)
+
+        worker = threading.Thread(target=_watchdog_target, daemon=True)
+        worker.start()
+        worker.join(timeout=_RENDER_TIMEOUT_S)
+        if worker.is_alive():
             _PLAYWRIGHT_RUNTIME = None
+            raise PublicJobFetchError("public_fetch_failed")
+        if errors:
+            raise errors[0]
+        return boxed[0]
 
 
 def _adapter_company_for_url(url: str) -> str | None:

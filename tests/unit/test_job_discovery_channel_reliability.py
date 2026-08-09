@@ -11,6 +11,7 @@ Covers the four deterministic tool-layer mechanisms:
 from __future__ import annotations
 
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -53,11 +54,13 @@ class _FakePage:
         title: str | None = None,
         goto_result: object | None = None,
         goto_error: Exception | None = None,
+        goto_block: threading.Event | None = None,
     ) -> None:
         self._body = body
         self._title = title
         self._goto_result = goto_result
         self._goto_error = goto_error
+        self._goto_block = goto_block
         self.handler = None
         self.closed = False
 
@@ -65,6 +68,8 @@ class _FakePage:
         self.handler = handler
 
     def goto(self, url: str, **kwargs):
+        if self._goto_block is not None:
+            self._goto_block.wait()  # a wedged driver never returns
         if self._goto_error is not None:
             raise self._goto_error
         return self._goto_result
@@ -239,6 +244,30 @@ def test_render_with_playwright_reuses_live_runtime_without_launch(monkeypatch) 
 
     assert (body, title) == ("岗位职责：ok", "t")
     assert pw.launch_count == 0
+
+
+def test_render_with_playwright_watchdog_abandons_wedged_render(monkeypatch) -> None:
+    """A render that never returns (dead CDP / driver spin) fails bounded.
+
+    The call aborts at the watchdog deadline instead of hanging the whole
+    eval process; the wedged runtime is orphaned (never torn down from a
+    foreign thread -- that teardown call is itself the hang), so the next
+    render starts from a fresh launch.
+    """
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._RENDER_TIMEOUT_S", 0.2
+    )
+    blocked = threading.Event()
+    pw = _FakePlaywright(browser=_FakeBrowser(_FakePage(goto_block=blocked)))
+    _install_fake_playwright(monkeypatch, pw)
+
+    with pytest.raises(PublicJobFetchError) as exc_info:
+        _render_with_playwright("https://jobs.example.com/job/1")
+
+    assert exc_info.value.code == "public_fetch_failed"
+    assert jd._PLAYWRIGHT_RUNTIME is None  # orphaned, not torn down
+    assert pw.stopped is False  # teardown never ran on the foreign thread
+    blocked.set()  # release the daemon worker so the suite exits cleanly
 
 
 # --------------------------------------------------------------------------
