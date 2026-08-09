@@ -18,7 +18,10 @@ from backend.app.services.agent_runtime.observation_projection import (
     _DEFAULT_KEEP_RECENT_OBSERVATIONS,
     _DEFAULT_OBSERVATION_BUDGET_CHARS,
     summarize_observations,
+    summarize_tool_call_history,
+    tool_call_summary,
 )
+from backend.app.services.agent_runtime.schemas import ToolObservation
 from backend.app.services.agent_runtime.runtime import AgentRuntime
 from tests.unit.test_agent_runtime import _create_running_step
 
@@ -267,6 +270,60 @@ def test_summarize_observations_skips_non_string_source_url_and_content_hash() -
         assert "source_url" not in item
         assert "content_hash" not in item
         assert "output" not in item
+
+
+# ---------------------------------------------------------------------------
+# tool_call_summary / summarize_tool_call_history: Verifier cross-agent view
+# ---------------------------------------------------------------------------
+
+
+def test_tool_call_summary_bounds_output_excerpt() -> None:
+    """A deliverable call's output reaches the Verifier, truncated at 200 chars."""
+    summary = tool_call_summary(ToolObservation(
+        tool_name="match-observed-jobs",
+        status="succeeded",
+        output={"matches": [{"job_id": "j1", "score": 0.92}], "note": "x" * 500},
+    ))
+
+    assert summary["tool_name"] == "match-observed-jobs"
+    assert summary["status"] == "succeeded"
+    assert summary["output_excerpt"].startswith('{"matches":')
+    assert len(summary["output_excerpt"]) == 200
+    assert "error_code" not in summary
+
+
+def test_tool_call_summary_omits_output_when_absent() -> None:
+    """A failed call without output stays identity-only (no payload leakage)."""
+    summary = tool_call_summary(ToolObservation(
+        tool_name="deduplicate-observed-jobs",
+        status="failed",
+        error_code="no_candidates",
+    ))
+
+    assert summary == {
+        "tool_name": "deduplicate-observed-jobs",
+        "status": "failed",
+        "error_code": "no_candidates",
+    }
+
+
+def test_summarize_tool_call_history_keeps_only_newest_calls() -> None:
+    calls = [
+        ToolObservation(
+            tool_name="fetch-public-job-pages", status="succeeded",
+            output={"content_hash": f"hash-{i}", "visible_text": "正文"},
+        )
+        for i in range(20)
+    ]
+
+    summaries = summarize_tool_call_history(calls)
+
+    assert [call["tool_name"] for call in summaries] == ["fetch-public-job-pages"] * 15
+    assert summaries[-1]["output_excerpt"].startswith('{"content_hash":"hash-19"')
+
+
+def test_summarize_tool_call_history_empty_list_is_empty() -> None:
+    assert summarize_tool_call_history([]) == []
 
 
 # ---------------------------------------------------------------------------

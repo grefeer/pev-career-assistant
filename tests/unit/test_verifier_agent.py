@@ -16,6 +16,7 @@ from backend.app.services.agent_runtime.schemas import (
     ExecutionPlan,
     ExecutorResult,
     PlanStep,
+    ToolObservation,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
@@ -119,7 +120,74 @@ def test_verifier_calls_evidence_tool_then_routes_executor_retry() -> None:
         "complete": False,
         "missing_fields": ["岗位职责", "任职要求"],
     }
-    assert gateway.states[1]["observations"][0]["tool_name"] == "verify-job-evidence"
+    assert gateway.states[1]["my_tool_calls"][0]["tool_name"] == "verify-job-evidence"
+
+
+def test_verifier_sees_executor_tool_calls_with_bounded_excerpts() -> None:
+    """R002 regression: the Verifier reads execution_tool_calls, not its own list."""
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "decide",
+                "verification_decision": "PASS",
+                "feedback": "匹配调用可见。",
+            }
+        ]
+    )
+    task = AgentTaskRequest(goal="匹配岗位", allowed_skills=["job-matching"])
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L3,
+        success_criteria=["匹配结果"],
+        steps=[
+            PlanStep(
+                step_id="match", objective="匹配", allowed_skills=["job-matching"]
+            )
+        ],
+    )
+    execution = ExecutorResult(
+        status="succeeded",
+        summary="已完成匹配",
+        observations=[
+            ToolObservation(
+                tool_name="match-observed-jobs",
+                status="succeeded",
+                output={
+                    "matches": [{"job_id": "j1", "score": 0.92}],
+                    "note": "长文本省略" * 500,
+                },
+            ),
+            ToolObservation(
+                tool_name="extract-observed-job-details-batch",
+                status="failed",
+                error_code="no_candidates",
+            ),
+        ],
+    )
+    context = ToolContext(user_id="user-a", run_id="run-a")
+
+    result = VerifierAgent(gateway=gateway, tools=ToolRegistry()).run(
+        task=task,
+        plan=plan,
+        step=plan.steps[0],
+        execution=execution,
+        context=context,
+    )
+
+    assert result.decision is VerificationDecision.PASS
+    state = gateway.states[0]
+    assert state["my_tool_calls"] == []
+    calls = state["execution_tool_calls"]
+    assert [call["tool_name"] for call in calls] == [
+        "match-observed-jobs",
+        "extract-observed-job-details-batch",
+    ]
+    assert calls[0]["status"] == "succeeded"
+    assert calls[0]["output_excerpt"].startswith('{"matches":')
+    assert len(calls[0]["output_excerpt"]) == 200
+    assert calls[1]["error_code"] == "no_candidates"
+    assert "output_excerpt" not in calls[1]
 
 
 def test_verifier_enforces_budgets_and_reports_exhausted_tool_loop() -> None:

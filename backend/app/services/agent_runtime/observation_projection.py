@@ -159,6 +159,55 @@ def _summarize_observation(observation: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+#: Maximum tool-call history entries projected for the Verifier (newest kept).
+_MAX_TOOL_CALL_HISTORY = 15
+#: Maximum characters of one tool call's output excerpted for the Verifier.
+_TOOL_CALL_OUTPUT_EXCERPT = 200
+
+
+def tool_call_summary(observation: ToolObservation) -> dict[str, Any]:
+    """Bounded tool-call identity + output excerpt for cross-agent review.
+
+    Non-evidence tool outputs (sheet queries, match rankings, dedup/validate
+    results) carry no page-evidence keys, so the standard projection leaves
+    them opaque to the Verifier: a deliverable call exists in the list but
+    its produced content is invisible (R002 "observations 数组为空" class).
+    This summary exposes the call's identity and a short output excerpt --
+    never the full payload (security hard gate #4) -- so the Verifier can
+    confirm a promised tool-backed deliverable actually ran and see what it
+    produced.
+    """
+    summary: dict[str, Any] = {
+        "tool_name": observation.tool_name,
+        "status": observation.status,
+    }
+    if observation.error_code is not None:
+        summary["error_code"] = observation.error_code
+    output = observation.output
+    if isinstance(output, dict):
+        excerpt = json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+        summary["output_excerpt"] = excerpt[:_TOOL_CALL_OUTPUT_EXCERPT]
+    return summary
+
+
+def summarize_tool_call_history(
+    observations: list[ToolObservation],
+    *,
+    max_calls: int = _MAX_TOOL_CALL_HISTORY,
+) -> list[dict[str, Any]]:
+    """Project the newest tool calls into bounded summaries for the Verifier.
+
+    The Verifier's ``execution_tool_calls`` state is built from the Executor's
+    full tool-call history so the deliverable-tool rule in its instruction can
+    be checked against the actual calls, not against a prose claim. Bounded by
+    ``max_calls`` (newest kept) with each entry bounded by
+    :func:`tool_call_summary`.
+    """
+    return [
+        tool_call_summary(observation) for observation in observations[-max_calls:]
+    ]
+
+
 def _serialized_chars(items: list[dict[str, Any]]) -> int:
     """Measure the serialized character count the model gateway would receive."""
     return len(json.dumps(items, ensure_ascii=False, separators=(",", ":")))

@@ -9,6 +9,7 @@ from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.observation_projection import (
     record_observation,
     summarize_observations,
+    summarize_tool_call_history,
 )
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
@@ -37,7 +38,7 @@ _VERIFIER_INSTRUCTION = (
     "NEED_USER or FAIL. Do not treat an Executor claim as evidence. "
     "\n## 行为规则\n"
     "For a current outcome that promises a ranked recommendation, best treatment, "
-    "or best-fit role, do not return PASS unless its execution observations include "
+    "or best-fit role, do not return PASS unless execution_tool_calls include "
     "match-observed-jobs. For a promised grounded resume change or preparation plan, "
     "require build-resume-tailoring-brief or build-preparation-plan respectively. "
     "Return RETRY_EXECUTOR with the missing tool-backed deliverable as feedback; "
@@ -48,7 +49,12 @@ _VERIFIER_INSTRUCTION = (
     "no structured candidates is still valid evidence: do not RETRY_EXECUTOR "
     "a discovery step solely because structured extraction produced nothing, "
     "as long as raw page text was captured. Return PASS and let the "
-    "deliverable steps operate on the raw observed text."
+    "deliverable steps operate on the raw observed text. "
+    "A sheet-backed step (query-career-sheet-records) has the same contract: "
+    "the evidence is the persisted records artifact carrying content_hash and "
+    "source_url, not page text. Do not RETRY_EXECUTOR a sheet-backed step "
+    "solely because no page text was captured, as long as the sheet records "
+    "were returned with their evidence binding."
 )
 
 
@@ -113,6 +119,9 @@ class VerifierAgent:
                     "step": step_json,
                     "available_tools": available_tools,
                     "execution": execution_json,
+                    "execution_tool_calls": summarize_tool_call_history(
+                        execution.observations
+                    ),
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None
                         else task.budget.max_tool_calls - len(observations)
@@ -122,7 +131,11 @@ class VerifierAgent:
                         if turn_budget is not None
                         else task.budget.max_agent_turns - _turn - 1
                     ),
-                    "observations": summarized_observations,
+                    # The Verifier's own tool calls; the Executor's history is
+                    # exposed separately as execution_tool_calls so the model
+                    # cannot mistake its own (initially empty) list for the
+                    # executed step's evidence (R002 "observations 数组为空").
+                    "my_tool_calls": summarized_observations,
                 },
                 response_model=VerifierDecision,
             )
