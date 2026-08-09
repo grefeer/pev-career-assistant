@@ -16,6 +16,7 @@ import socket
 from pathlib import Path
 
 import pytest
+import requests
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.job_discovery import (
@@ -1840,3 +1841,311 @@ def test_graph_incremental_appends_needs_manual_review_errors(tmp_path) -> None:
     assert entry["status"] == "needs_manual_review"
     assert entry["reason"] == "仅含联系方式"
     assert entry["channel"] == "C"
+
+
+# ------------------------------------------------------------ ReadGZH proxy
+
+
+class _FakeReadgzhResponse:
+    """Minimal requests.Response stand-in with raise_for_status.
+
+    ``content`` mirrors the real response body bytes (UTF-8); pass it
+    explicitly to simulate a proxy that decoded its text as latin-1.
+    """
+
+    def __init__(
+        self,
+        text: str = "",
+        status_code: int = 200,
+        content: bytes | None = None,
+    ) -> None:
+        self.text = text
+        self.content = content if content is not None else text.encode("utf-8")
+        self._status_code = status_code
+
+    def raise_for_status(self) -> None:
+        if self._status_code >= 400:
+            raise requests.RequestException(
+                f"HTTP {self._status_code} from ReadGZH proxy"
+            )
+
+
+#: A ReadGZH-style clean article HTML (text > 200 chars, no images).
+_READGZH_ARTICLE_HTML = (
+    "<html><head><title>某公司招聘</title></head><body>"
+    "<h1>某公司 2026 校园招聘</h1>"
+    "<p>岗位：AI 应用开发工程师。职责：负责大模型应用开发与落地，参与"
+    "RAG/Agent 平台建设，保障系统稳定可靠，参与架构设计。要求：精通"
+    "Python，熟悉大模型与分布式系统，有 RAG/Agent 项目经验者优先，"
+    "3 年以上开发经验，本科及以上学历，计算机相关专业，良好的团队"
+    "协作能力与沟通能力，能够独立解决问题。薪资面议，五险一金齐全。"
+    "简历投递：hr@company.com。</p></body></html>"
+)
+
+
+def test_readgzh_fetch_without_key_returns_none(monkeypatch) -> None:
+    monkeypatch.delenv("READGZH_API_KEY", raising=False)
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        calls.append(url)
+        raise AssertionError("no request without a key")
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+    assert calls == []
+
+
+def test_readgzh_fetch_http_error_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(status_code=429),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_too_short_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(text="<html></html>"),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_json_error_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(
+            text=json.dumps(
+                {
+                    "success": False,
+                    "code": 1001,
+                    "message": "quota exhausted" + "x" * 250,
+                }
+            )
+        ),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_malformed_json_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(text="{" + "x" * 250),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_json_success_returns_raw(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    body = json.dumps({"success": True, "data": {"content": "x" * 250}})
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(text=body),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) == body
+
+
+def test_readgzh_fetch_json_non_dict_returns_raw(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(text=json.dumps(["a"] * 200)),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) == json.dumps(["a"] * 200)
+
+
+def test_readgzh_fetch_verification_wall_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(
+            text="<html><body>环境异常 完成验证后即可继续访问" + "x" * 250 + "</body></html>"
+        ),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_paywall_dashboard_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(
+            text=(
+                "<html><body>标题 原文链接 https://mp.weixin.qq.com/s/x "
+                "Powered by ReadGZH 免费注册获取每天 30 积分 "
+                "readgzh.site/dashboard" + "x" * 250 + "</body></html>"
+            )
+        ),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_paywall_upgrade_pitch_returns_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(
+            text=(
+                "<html><body>标题 原文链接 https://mp.weixin.qq.com/s/x "
+                "Powered by ReadGZH 升级套餐 Lite 9/月 Pro 39/月" + "x" * 250
+                + "</body></html>"
+            )
+        ),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) is None
+
+
+def test_readgzh_fetch_paywall_footer_with_real_body_returns_raw(monkeypatch) -> None:
+    """A footer-marked page with a real article body is not a quota wall -
+    plan-upgraded accounts still attach the proxy footer to genuine pages."""
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    body = (
+        "<html><body><p>"
+        + "某公司招聘 AI 应用开发工程师，负责大模型应用开发与落地，参与"
+        "RAG/Agent 平台建设，保障系统稳定可靠，参与架构设计。" * 10
+        + "</p></body></html>"
+    )
+    with_footer = (
+        body + '<footer><a href="https://readgzh.site/dashboard">'
+        "readgzh.site/dashboard 升级套餐</a></footer>"
+    )
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(text=with_footer),
+    )
+    assert ws._readgzh_fetch_html(_WECHAT_URL) == with_footer
+
+
+def test_readgzh_fetch_decodes_utf8_body_not_latin1_text(monkeypatch) -> None:
+    """The proxy serves text/plain without a charset; requests would decode
+    the body as latin-1 and garble Chinese - the fetch must decode UTF-8
+    from the raw content bytes instead of trusting ``response.text``."""
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    chinese = "新能源AGV全球顶尖人才招募正式启动！" + "x" * 250
+    mojibake = chinese.encode("utf-8").decode("latin-1")
+    monkeypatch.setattr(
+        ws.requests,
+        "get",
+        lambda url, **kwargs: _FakeReadgzhResponse(
+            text=mojibake,
+            content=chinese.encode("utf-8"),
+        ),
+    )
+    result = ws._readgzh_fetch_html(_WECHAT_URL)
+    assert result is not None
+    assert "新能源" in result
+    assert "éæ" not in result  # no latin-1 mojibake
+
+
+def test_readgzh_fetch_success_returns_html(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    captured: dict = {}
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        return _FakeReadgzhResponse(text=_READGZH_ARTICLE_HTML)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._readgzh_fetch_html(_WECHAT_URL) == _READGZH_ARTICLE_HTML
+    assert captured["url"] == ws._READGZH_API_URL
+    assert captured["kwargs"]["params"] == {"url": _WECHAT_URL}
+    assert captured["kwargs"]["headers"]["Authorization"] == "Bearer sk_test_key"
+    # the API key must never leak into the request URL / params
+    assert "sk_test_key" not in json.dumps(captured["kwargs"]["params"])
+
+
+def test_default_fetch_wechat_prefers_readgzh(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        calls.append(url)
+        return _FakeReadgzhResponse(text=_READGZH_ARTICLE_HTML)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._default_fetch_html(_WECHAT_URL) == _READGZH_ARTICLE_HTML
+    assert calls == [ws._READGZH_API_URL]  # the WeChat URL itself is never GET
+
+
+def test_default_fetch_wechat_falls_back_when_proxy_none(monkeypatch) -> None:
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    monkeypatch.setattr(
+        ws.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ],
+    )
+    responses = [
+        _FakeReadgzhResponse(text=json.dumps({"success": False, "code": 2})),
+        _FakeResponse(text="direct wechat html"),
+    ]
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        calls.append(url)
+        return responses.pop(0)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._default_fetch_html(_WECHAT_URL) == "direct wechat html"
+    assert calls == [ws._READGZH_API_URL, _WECHAT_URL]
+
+
+def test_default_fetch_wechat_without_key_skips_proxy(monkeypatch) -> None:
+    monkeypatch.delenv("READGZH_API_KEY", raising=False)
+    monkeypatch.setattr(
+        ws.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ],
+    )
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        calls.append(url)
+        return _FakeResponse(text="direct wechat html")
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    assert ws._default_fetch_html(_WECHAT_URL) == "direct wechat html"
+    assert calls == [_WECHAT_URL]  # no proxy request without a key
+
+
+def test_run_wechat_slice_success_via_readgzh(monkeypatch, tmp_path) -> None:
+    """End-to-end: ReadGZH HTML feeds L1 -> channel A -> extraction."""
+    monkeypatch.setenv("READGZH_API_KEY", "sk_test_key")
+    calls: list[str] = []
+
+    def fake_get(url: str, **kwargs) -> _FakeReadgzhResponse:
+        calls.append(url)
+        return _FakeReadgzhResponse(text=_READGZH_ARTICLE_HTML)
+
+    monkeypatch.setattr(ws.requests, "get", fake_get)
+    seen: dict = {}
+    result = run_wechat_slice(
+        _WECHAT_URL,
+        out_dir=str(tmp_path),
+        context=ToolContext(user_id="tester", run_id="readgzh-e2e"),
+        extract_fn=_fake_extract(seen),
+    )
+    assert result.status == "succeeded"
+    assert result.channel == "A"
+    assert len(result.candidates) == 1
+    assert result.candidates[0].title == "后端工程师"
+    assert calls == [ws._READGZH_API_URL]

@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -81,6 +82,28 @@ _LONG_IMAGE_HEIGHT = 2000
 #: Same public-fetch UA as career_skills job discovery.
 _PUBLIC_FETCH_HEADERS = {"User-Agent": "CareerAssistantPEV/1.0 (+public-job-fetch)"}
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+#: ReadGZH proxy (https://readgzh.site): server-side WeChat article proxy
+#: returning clean, AI-readable article HTML (title + text + image URLs)
+#: past WeChat's client-fingerprint verification wall.  Gated by
+#: READGZH_API_KEY (carried in the Authorization header only — never in a
+#: URL or log line); articles are permanently cached (re-reads cost zero).
+_READGZH_API_URL = "https://api.readgzh.site/rd"
+#: ReadGZH responses under this length are empty/error stubs, never HTML.
+_READGZH_MIN_HTML_CHARS = 200
+#: WeChat verification-wall markers the proxy could not bypass.
+_READGZH_VERIFY_MARKERS = ("环境异常", "完成验证后即可继续访问")
+#: ReadGZH free-tier quota wall: once the daily credit budget is spent, an
+#: uncached article returns a metadata page (title + source link + the
+#: proxy's own upgrade pitch) instead of the article body.  Treating that
+#: page as article content would misclassify real recruiting articles as
+#: channel D (promotional), so it is a fetch failure like any other.
+_READGZH_PAYWALL_MARKERS = ("readgzh.site/dashboard", "升级套餐")
+#: A paywall-marked page is only treated as a quota wall when its parsed
+#: body is nearly empty - a plan-upgraded account can still receive the
+#: cached metadata page for a URL probed while the free quota was spent,
+#: yet genuine article pages (even with the proxy's footer attached) parse
+#: to a real body far beyond this threshold.
+_READGZH_PAYWALL_MIN_BODY_CHARS = 400
 
 
 @dataclass
@@ -164,13 +187,74 @@ def _assert_public_url(url: str) -> None:
             raise PublicJobFetchError("unsafe_public_url")
 
 
+def _readgzh_fetch_html(url: str) -> str | None:
+    """Fetch a WeChat article through the ReadGZH proxy; None on any failure.
+
+    The proxy returns clean article HTML (title + text + image URLs) past
+    WeChat's client-fingerprint verification wall.  A missing API key, an
+    HTTP/network failure, a JSON error response, a verification wall the
+    proxy could not bypass, a spent free-tier quota (paywall/marketing
+    metadata page), or an empty/too-short body all yield None so the
+    caller falls back to the guarded direct fetch — the proxy is an
+    enhancement, never the authority.  The API key travels in the
+    Authorization header only (never in a URL, payload, or log line).
+    """
+    api_key = os.environ.get("READGZH_API_KEY") or None
+    if not api_key:
+        return None
+    try:
+        response = requests.get(
+            _READGZH_API_URL,
+            params={"url": url},
+            timeout=30,
+            headers={
+                "User-Agent": _PUBLIC_FETCH_HEADERS["User-Agent"],
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+    # The proxy serves text/plain without a charset; requests would decode
+    # that as latin-1 and garble every non-ASCII byte, so decode UTF-8 from
+    # the raw body explicitly (the response body is always UTF-8 HTML).
+    raw = response.content.decode("utf-8", errors="replace")
+    if not raw or len(raw) < _READGZH_MIN_HTML_CHARS:
+        return None
+    if raw.lstrip().startswith("{"):
+        try:
+            error_data = json.loads(raw)
+            if isinstance(error_data, dict) and not error_data.get("success", True):
+                return None
+        except json.JSONDecodeError:
+            return None
+    if all(marker in raw for marker in _READGZH_VERIFY_MARKERS):
+        return None
+    if any(marker in raw for marker in _READGZH_PAYWALL_MARKERS):
+        # Footer-marked pages are only quota walls when the parse yields a
+        # nearly empty body (the metadata page's title/source-link/footer);
+        # a real article keeps its full body even with the footer attached.
+        body_text, _ = _parse_article(raw)
+        if len(body_text) < _READGZH_PAYWALL_MIN_BODY_CHARS:
+            return None
+    return raw
+
+
 def _default_fetch_html(url: str) -> str:
     """Fetch a public article, following redirects manually (max 5 hops).
 
-    Every ``Location`` hop is re-guarded before the next GET; a redirect to
-    a private/cloud-metadata target or a redirect chain longer than 5 hops
-    raises ``unsafe_public_url`` (the target is never fetched).
+    WeChat article URLs are tried through the ReadGZH proxy first when
+    READGZH_API_KEY is present (the proxy returns clean HTML past WeChat's
+    client-fingerprint verification wall); any proxy failure falls back to
+    the guarded direct fetch below.  Every ``Location`` hop is re-guarded
+    before the next GET; a redirect to a private/cloud-metadata target or a
+    redirect chain longer than 5 hops raises ``unsafe_public_url`` (the
+    target is never fetched).
     """
+    if "mp.weixin.qq.com" in url:
+        readgzh_html = _readgzh_fetch_html(url)
+        if readgzh_html is not None:
+            return readgzh_html
     current = url
     for _ in range(_MAX_PUBLIC_REDIRECTS + 1):
         _assert_public_url(current)
