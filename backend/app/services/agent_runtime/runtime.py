@@ -18,6 +18,10 @@ from backend.app.domain.agent_runtime import (
     VerificationDecision,
 )
 from backend.app.repositories import agent_runtime as run_repository
+from backend.app.services.agent_runtime.evidence_gate import (
+    has_blocked_evidence,
+    step_contract_met,
+)
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
@@ -360,6 +364,25 @@ class AgentRuntime:
                 }
             )
             if execution.status == "needs_user":
+                if (
+                    step_contract_met(plan_step, execution.observations)
+                    and not has_blocked_evidence(execution.observations)
+                ):
+                    # The executor asked the human even though the step's
+                    # deliverable is already tool-backed (post-deliverable
+                    # stall pattern). The request is a hand-off the agents
+                    # already finished; terminate the step as succeeded with
+                    # an explicit rescue event instead of a spurious
+                    # waiting_user. Blocked evidence (login/captcha/anti-bot/
+                    # OCR-off) always keeps the human hand-off.
+                    return self._rescue_step_succeeded(
+                        db,
+                        run_id,
+                        persisted_step,
+                        execution,
+                        event_type="executor_rescue_succeeded",
+                        reason="needs_user_deliverable_persisted",
+                    )
                 return self._wait_for_user(
                     db,
                     run_id,
@@ -417,6 +440,26 @@ class AgentRuntime:
                 )
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
+                    if (
+                        step_contract_met(plan_step, execution.observations)
+                        and not has_blocked_evidence(execution.observations)
+                    ):
+                        # The verifier transport degraded after the step's
+                        # deliverable was already tool-backed (invalid
+                        # model-output pattern). The contract is the same
+                        # evidence the verifier would have checked; terminate
+                        # the step as succeeded with an explicit rescue event
+                        # instead of a spurious waiting_user. Blocked evidence
+                        # (login/captcha/anti-bot/OCR-off) always keeps the
+                        # human hand-off.
+                        return self._rescue_step_succeeded(
+                            db,
+                            run_id,
+                            persisted_step,
+                            execution,
+                            event_type="verifier_rescue_succeeded",
+                            reason="invalid_model_response_contract_met",
+                        )
                     # The verifier cannot produce a machine decision; route the
                     # step to a human check rather than failing the run.
                     verification = VerifierResult(
@@ -485,6 +528,37 @@ class AgentRuntime:
                         "feedback": verification.feedback,
                     },
                 )
+                if (
+                    has_blocked_evidence(execution.observations)
+                    and not step_contract_met(plan_step, execution.observations)
+                ):
+                    # The step's evidence is blocked (login/captcha/anti-bot/
+                    # OCR-off or a deterministic per-URL failure) and the
+                    # deliverable cannot be satisfied from unblocked evidence.
+                    # Re-invoking the executor would only re-burn turns on the
+                    # same blocked calls, so downgrade the retry loop to one
+                    # clean human hand-off - the human stays in the loop and
+                    # resume() remains available after they act.
+                    run_repository.append_event(
+                        db,
+                        run_id=run_id,
+                        event_type="verification_retry_downgraded",
+                        payload_json={
+                            "sequence": persisted_step.sequence,
+                            "reason": "blocked_evidence",
+                            "feedback": verification.feedback,
+                        },
+                    )
+                    return self._wait_for_user(
+                        db,
+                        run_id,
+                        persisted_step,
+                        "步骤证据被访问限制阻断（登录/验证码/反爬/OCR 未启用等），"
+                        "自动重试无法取得新证据："
+                        + verification.feedback
+                        + "。请人工确认该来源的岗位信息，或提供可公开访问的页面后重试。",
+                        output_artifact_refs=execution.artifact_refs,
+                    )
                 if retries <= task.budget.max_replans:
                     prior_observations = execution.observations
                     prior_artifact_refs = execution.artifact_refs
@@ -496,7 +570,10 @@ class AgentRuntime:
                         feedback.append(verification.feedback)
                     retry_context["verifier_feedback"] = feedback
                     execution_task = execution_task.model_copy(
-                        update={"context": retry_context}
+                        update={
+                            "context": retry_context,
+                            "execution_state": execution.execution_state,
+                        }
                     )
                     execution_task = self._with_observed_public_evidence(
                         db, execution_task, run_id
@@ -1003,6 +1080,48 @@ class AgentRuntime:
             payload_json={"question": question},
         )
         return AgentRunResult(run_id, RunStatus.waiting_user, question, error_code)
+
+    def _rescue_step_succeeded(
+        self,
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        execution: ExecutorResult,
+        *,
+        event_type: str,
+        reason: str,
+    ) -> AgentRunResult:
+        """Upgrade a step to succeeded when its deliverable is already tool-backed.
+
+        Used by the termination rescues: a verifier transport failure (invalid
+        model output) or the executor's own needs_user hand-off must not fail
+        a step whose skill deliverable is already persisted and verified by
+        the deterministic contract. The caller guarantees both gates - the
+        deliverable contract (tool-backed observation) and the blocked-
+        evidence gate (no human-gated evidence) - so this helper never
+        auto-passes a blocked step; blocked evidence keeps ending
+        human-in-the-loop. The rescue event is explicit and human-readable so
+        the trace always distinguishes a rescue from a real verification PASS.
+        """
+        run_repository.finish_step(
+            db,
+            step,
+            status=StepStatus.succeeded,
+            output_artifact_refs=execution.artifact_refs,
+        )
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type="step_succeeded",
+            payload_json={"sequence": step.sequence},
+        )
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type=event_type,
+            payload_json={"sequence": step.sequence, "reason": reason},
+        )
+        return AgentRunResult(run_id, RunStatus.running, execution.summary)
 
     def _wait_for_user(
         self,

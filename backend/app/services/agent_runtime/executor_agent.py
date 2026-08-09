@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Any
@@ -206,6 +207,12 @@ _SUCCEEDED_INPUT_SUMMARY_CHARS = 200
 # regardless of this projection, so capping only affects model awareness.
 _MAX_PROJECTED_SUCCEEDED_CALLS = 10
 
+# Cap the execution_state entries persisted across verifier RETRY
+# re-invocations. The model projection stays bounded by
+# _MAX_PROJECTED_SUCCEEDED_CALLS per invocation, but the authoritative dedup
+# set must survive a long step without unbounded growth.
+_MAX_PERSISTED_SUCCEEDED_CALLS = 40
+
 # Human-readable questions for the two waste caps. The consecutive-stall cap
 # fires on 3 identical no-progress decisions in a row; the total-waste cap
 # fires on 3 wasted turns interspersed with success (R004 pattern) or
@@ -240,6 +247,94 @@ def _summarize_succeeded_call(
     return {"tool": tool_name, "input_summary": input_repr}
 
 
+def _input_hash(tool_input: dict[str, Any]) -> str:
+    """Canonical SHA-256 of a tool input for cross-invocation dedup.
+
+    The hash is stable across dict key order and unicode escapes, so an
+    identical call issued by a later Executor invocation of the same step is
+    recognized even though its payload dict may be rebuilt differently.
+    """
+    canonical = json.dumps(
+        tool_input, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _carried_counter(value: object, *, default: int = 0) -> int:
+    """Defensive bounded read of a counter carried across invocations."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return default
+
+
+def _load_execution_state(
+    task: AgentTaskRequest,
+) -> tuple[list[dict[str, str]], int, int]:
+    """Read the persisted cross-invocation state for this step, if any.
+
+    Returns (prior_succeeded_calls, consecutive_stalls, total_wasted_turns)
+    from ``task.execution_state``, which the runtime populated on a verifier
+    RETRY. Malformed entries are dropped; counters are clamped defensively.
+    """
+    state = task.execution_state or {}
+    prior_succeeded_calls: list[dict[str, str]] = []
+    for entry in state.get("succeeded_calls", []):
+        if not isinstance(entry, dict):
+            continue
+        tool = entry.get("tool")
+        digest = entry.get("hash")
+        summary = entry.get("input_summary")
+        if not isinstance(tool, str) or not isinstance(digest, str) or not digest:
+            continue
+        prior_succeeded_calls.append(
+            {
+                "tool": tool,
+                "hash": digest,
+                "input_summary": summary if isinstance(summary, str) else "",
+            }
+        )
+    consecutive_stalls = _carried_counter(state.get("consecutive_stalls"))
+    total_wasted_turns = _carried_counter(state.get("total_wasted_turns"))
+    return prior_succeeded_calls, consecutive_stalls, total_wasted_turns
+
+
+def _snapshot_execution_state(
+    *,
+    succeeded_calls: list[tuple[str, dict[str, Any]]],
+    prior_succeeded_calls: list[dict[str, str]],
+    consecutive_stalls: int,
+    total_wasted_turns: int,
+) -> dict[str, Any]:
+    """Persistable execution state carried across verifier RETRY re-invocations.
+
+    The runtime stores this on the task for the next Executor invocation of
+    the same step, so the succeeded-call dedup set and the per-invocation
+    waste counters survive a verifier RETRY instead of restarting from zero
+    (which tripled the effective waste budget and blinded dedup across
+    retries). Entries are capped at ``_MAX_PERSISTED_SUCCEEDED_CALLS``,
+    keeping the most recent calls.
+    """
+    entries = [
+        {
+            "tool": entry["tool"],
+            "hash": entry["hash"],
+            "input_summary": entry["input_summary"],
+        }
+        for entry in prior_succeeded_calls
+    ]
+    for name, payload in succeeded_calls:
+        summary = _summarize_succeeded_call(name, payload)
+        summary["hash"] = _input_hash(payload)
+        entries.append(summary)
+    if len(entries) > _MAX_PERSISTED_SUCCEEDED_CALLS:
+        entries = entries[-_MAX_PERSISTED_SUCCEEDED_CALLS:]
+    return {
+        "succeeded_calls": entries,
+        "consecutive_stalls": consecutive_stalls,
+        "total_wasted_turns": total_wasted_turns,
+    }
+
+
 class ExecutorAgent:
     """Bounded perceive–decide–act–observe loop for a single plan step."""
 
@@ -269,15 +364,28 @@ class ExecutorAgent:
         # legitimately retried later (including after other calls).
         succeeded_calls: list[tuple[str, dict[str, Any]]] = []
         # Consecutive no-progress decisions (deduped re-calls / blocked search)
-        # reset on any real tool execution, complete, or needs_user.
-        consecutive_stalls = 0
-        # Per-step TOTAL wasted turns (NOT reset by interspersed success).
-        # Counts duplicate_tool_call + candidate_urls_already_supplied +
-        # turns whose tool call did not append a new succeeded observation.
-        # After _MAX_TOTAL_WASTED_TURNS the harness hands the step to the
-        # user: sustained no-progress even interspersed with success burns
-        # the wall clock without converging on the step's outcome.
-        total_wasted_turns = 0
+        # reset on any real tool execution, complete, or needs_user. Carried
+        # across verifier RETRY re-invocations, like the total-waste counter.
+        consecutive_stalls = _carried_counter(task.execution_state.get("consecutive_stalls"))
+        total_wasted_turns = _carried_counter(task.execution_state.get("total_wasted_turns"))
+        # Cross-invocation state carried by the runtime on a verifier RETRY:
+        # the succeeded-call dedup set and the waste counters survive the
+        # re-run instead of restarting from zero, so retries cannot re-spend
+        # the waste budget or re-issue an identical call that already
+        # succeeded in a prior invocation.
+        prior_succeeded_calls, _, _ = _load_execution_state(task)
+        prior_succeeded_hashes = {
+            (entry["tool"], entry["hash"]) for entry in prior_succeeded_calls
+        }
+
+        def current_state() -> dict[str, Any]:
+            """Snapshot this invocation's state for the runtime to carry on RETRY."""
+            return _snapshot_execution_state(
+                succeeded_calls=succeeded_calls,
+                prior_succeeded_calls=prior_succeeded_calls,
+                consecutive_stalls=consecutive_stalls,
+                total_wasted_turns=total_wasted_turns,
+            )
         # Loop-invariant projections of the (immutable) plan/step: serialize
         # once instead of re-dumping and re-building the tool catalog every
         # turn. The catalog is also memoized inside ToolRegistry.
@@ -304,6 +412,7 @@ class ExecutorAgent:
                     summary="Wall-clock budget exhausted before the next decision.",
                     observations=observations,
                     error_code="wall_clock_budget_exhausted",
+                    execution_state=current_state(),
                 )
             if turn_budget is not None and not turn_budget.try_consume():
                 return ExecutorResult(
@@ -311,6 +420,7 @@ class ExecutorAgent:
                     summary="Agent-turn budget exhausted before the next decision.",
                     observations=observations,
                     error_code="agent_turn_budget_exhausted",
+                    execution_state=current_state(),
                 )
             # Bound the observation list the model sees: keep the most-recent
             # projections full (as projected per-item by observation_for_decision)
@@ -342,10 +452,21 @@ class ExecutorAgent:
                     "prior_observations": prior_observations_for_decision,
                     "verifier_feedback": task.context.get("verifier_feedback", []),
                     "already_succeeded_calls": [
-                        _summarize_succeeded_call(name, payload)
-                        for name, payload in succeeded_calls[
-                            -_MAX_PROJECTED_SUCCEEDED_CALLS:
-                        ]
+                        *[
+                            {
+                                "tool": entry["tool"],
+                                "input_summary": entry["input_summary"],
+                            }
+                            for entry in prior_succeeded_calls[
+                                -_MAX_PROJECTED_SUCCEEDED_CALLS:
+                            ]
+                        ],
+                        *[
+                            _summarize_succeeded_call(name, payload)
+                            for name, payload in succeeded_calls[
+                                -_MAX_PROJECTED_SUCCEEDED_CALLS:
+                            ]
+                        ],
                     ],
                 },
                 response_model=ExecutorDecision,
@@ -384,12 +505,14 @@ class ExecutorAgent:
                             status="needs_user",
                             observations=observations,
                             user_question=_CANDIDATE_URLS_STALL_QUESTION,
+                            execution_state=current_state(),
                         )
                     if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
                             user_question=_TOTAL_WASTE_QUESTION,
+                            execution_state=current_state(),
                         )
                     record_observation(
                         observations,
@@ -404,7 +527,10 @@ class ExecutorAgent:
                 if any(
                     decision.tool_name == name and decision.tool_input == payload
                     for name, payload in succeeded_calls
-                ):
+                ) or (
+                    decision.tool_name,
+                    _input_hash(decision.tool_input),
+                ) in prior_succeeded_hashes:
                     consecutive_stalls += 1
                     total_wasted_turns += 1
                     if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
@@ -412,12 +538,14 @@ class ExecutorAgent:
                             status="needs_user",
                             observations=observations,
                             user_question=_DUPLICATE_STALL_QUESTION,
+                            execution_state=current_state(),
                         )
                     if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
                             user_question=_TOTAL_WASTE_QUESTION,
+                            execution_state=current_state(),
                         )
                     record_observation(
                         observations,
@@ -436,6 +564,7 @@ class ExecutorAgent:
                         summary="Tool-call budget exhausted before executing the next action.",
                         observations=observations,
                         error_code="tool_budget_exhausted",
+                        execution_state=current_state(),
                     )
                 observation = self._tools.invoke(
                     role=AgentRole.executor,
@@ -462,6 +591,7 @@ class ExecutorAgent:
                             status="needs_user",
                             observations=observations,
                             user_question=_TOTAL_WASTE_QUESTION,
+                            execution_state=current_state(),
                         )
                 continue
             if decision.action == "complete":
@@ -470,16 +600,19 @@ class ExecutorAgent:
                     summary=decision.summary,
                     artifact_refs=decision.artifact_refs,
                     observations=observations,
+                    execution_state=current_state(),
                 )
             return ExecutorResult(
                 status="needs_user",
                 observations=observations,
                 user_question=decision.user_question,
+                execution_state=current_state(),
             )
         return ExecutorResult(
             status="failed",
             observations=observations,
             summary="Executor turn budget exhausted before completing the step.",
+            execution_state=current_state(),
         )
 
 

@@ -41,6 +41,11 @@ class AgentTaskRequest(BaseModel):
     allowed_skills: list[str] = Field(min_length=1, max_length=16)
     context: dict[str, Any] = Field(default_factory=dict)
     private_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    # Cross-invocation executor state carried across verifier RETRY
+    # re-invocations of the same step (succeeded-call dedup set + waste
+    # counters). Excluded from serialization so it never enters model prompts
+    # or persisted plan JSON.
+    execution_state: dict[str, Any] = Field(default_factory=dict, exclude=True)
     budget: AgentBudget = Field(default_factory=AgentBudget)
 
     @field_validator("goal")
@@ -280,6 +285,10 @@ class ExecutorResult(BaseModel):
     observations: list[ToolObservation] = Field(default_factory=list)
     user_question: str | None = None
     error_code: str | None = None
+    # Cross-invocation execution state (succeeded-call dedup set + waste
+    # counters) for the runtime to carry into the next verifier-RETRY
+    # invocation. Excluded from serialization so the verifier never sees it.
+    execution_state: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
     @model_validator(mode="after")
     def validate_result_shape(self) -> "ExecutorResult":
