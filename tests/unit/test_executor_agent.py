@@ -7,7 +7,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
-from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.executor_agent import (
+    ExecutorAgent,
+    _carried_counter,
+    _input_hash,
+    _load_execution_state,
+    _snapshot_execution_state,
+)
 from backend.app.services.agent_runtime.observation_projection import (
     observation_for_decision,
 )
@@ -1025,4 +1031,185 @@ def test_executor_total_waste_cap_fires_in_candidate_urls_branch_after_prior_fai
     ]
     # Total-waste message, not the consecutive candidate_urls message.
     assert "累计" in result.user_question
+
+
+# ---------------------------------------------------------------------------
+# B5 - cross-invocation state carried across verifier RETRY re-invocations
+# ---------------------------------------------------------------------------
+
+
+def _discovery_task(**updates) -> AgentTaskRequest:
+    return AgentTaskRequest(
+        goal="抓取 JD", allowed_skills=["job-discovery"], **updates
+    )
+
+
+def _single_step_plan(task: AgentTaskRequest) -> ExecutionPlan:
+    return ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+
+def test_executor_dedups_an_identical_call_from_a_prior_invocation() -> None:
+    """A call that succeeded in a prior invocation is deduped on re-invocation.
+
+    The runtime carries the executor's execution_state on a verifier RETRY, so
+    the succeeded-call set (by canonical input hash) survives the re-run. The
+    re-issued identical call becomes duplicate_tool_call WITHOUT invoking the
+    handler, and the carried consecutive-stall counter trips the stall cap.
+    """
+    invocations = {"count": 0}
+
+    def handler(_context, _payload):
+        invocations["count"] += 1
+        return {"title": "AI Agent 开发工程师"}
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=handler,
+    ))
+    # State as the runtime would carry it after the first invocation: one
+    # succeeded call recorded and the consecutive-stall counter at 2.
+    prior_state = _snapshot_execution_state(
+        succeeded_calls=[("fetch-page", {"url": "https://jobs.example/1"})],
+        prior_succeeded_calls=[],
+        consecutive_stalls=2,
+        total_wasted_turns=0,
+    )
+    task = _discovery_task(execution_state=prior_state)
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+    ])
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=_single_step_plan(task), step=_single_step_plan(task).steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(4),
+    )
+
+    assert result.status == "needs_user"
+    assert invocations["count"] == 0
+    # The prior succeeded call is projected into the decision state (no hash,
+    # matching the model-facing projection) so the model can recognise it.
+    assert gateway.states[0]["already_succeeded_calls"] == [
+        {"tool": "fetch-page", "input_summary": '{"url":"https://jobs.example/1"}'}
+    ]
+    # Carried counter (2) + the deduped call = 3: the consecutive-stall cap
+    # fires before the observation is recorded, so the list is empty.
+    assert "连续重复调用" in result.user_question
+    assert result.observations == []
+    # The failure snapshot preserves the full dedup set for the next retry.
+    expected_hash = _input_hash({"url": "https://jobs.example/1"})
+    assert result.execution_state["succeeded_calls"][0]["hash"] == expected_hash
+    assert result.execution_state["consecutive_stalls"] == 3
+    assert result.execution_state["total_wasted_turns"] == 1
+
+
+def test_executor_carries_total_waste_counter_across_invocations() -> None:
+    """Wasted turns from a prior invocation are NOT reset by a RETRY (C005).
+
+    Two wasted turns were carried; the first failing call of this invocation
+    brings the total to 3 and hands the step to the user immediately.
+    """
+    invocations = {"count": 0}
+
+    def failing(_context, _payload):
+        invocations["count"] += 1
+        raise RuntimeError("provider down")
+
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="fetch-page", skill_name="job-discovery", input_model=FetchInput,
+        output_model=DetailsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=failing,
+    ))
+    prior_state = _snapshot_execution_state(
+        succeeded_calls=[], prior_succeeded_calls=[], consecutive_stalls=0,
+        total_wasted_turns=2,
+    )
+    task = _discovery_task(execution_state=prior_state)
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-page", "tool_input": {"url": "https://jobs.example/1"}},
+    ])
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=_single_step_plan(task), step=_single_step_plan(task).steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(4),
+    )
+
+    assert result.status == "needs_user"
+    assert invocations["count"] == 1
+    assert "累计" in result.user_question
+    assert [obs.error_code for obs in result.observations] == ["tool_execution_failed"]
+
+
+def test_snapshot_execution_state_caps_persisted_entries_keeping_most_recent() -> None:
+    calls = [
+        ("fetch-page", {"url": f"https://jobs.example/{i}"}) for i in range(45)
+    ]
+    snapshot = _snapshot_execution_state(
+        succeeded_calls=calls, prior_succeeded_calls=[], consecutive_stalls=1,
+        total_wasted_turns=2,
+    )
+    entries = snapshot["succeeded_calls"]
+    assert len(entries) == 40
+    assert entries[0]["tool"] == "fetch-page"
+    assert entries[-1]["tool"] == "fetch-page"
+    assert entries[0]["input_summary"] == '{"url":"https://jobs.example/5"}'
+    assert entries[-1]["input_summary"] == '{"url":"https://jobs.example/44"}'
+    assert all("hash" in entry for entry in entries)
+    assert snapshot["consecutive_stalls"] == 1
+    assert snapshot["total_wasted_turns"] == 2
+
+
+def test_snapshot_execution_state_merges_prior_entries_before_current() -> None:
+    prior = [{"tool": "fetch-old", "hash": "a" * 64, "input_summary": "old"}]
+    snapshot = _snapshot_execution_state(
+        succeeded_calls=[("fetch-page", {"url": "https://jobs.example/1"})],
+        prior_succeeded_calls=prior, consecutive_stalls=0, total_wasted_turns=0,
+    )
+    entries = snapshot["succeeded_calls"]
+    assert len(entries) == 2
+    assert entries[0]["tool"] == "fetch-old"
+    assert entries[0]["hash"] == "a" * 64
+    assert entries[1]["tool"] == "fetch-page"
+    assert entries[1]["hash"] == _input_hash({"url": "https://jobs.example/1"})
+
+
+def test_load_execution_state_drops_malformed_entries_and_counter_garbage() -> None:
+    task = _discovery_task(execution_state={
+        "succeeded_calls": [
+            "junk",
+            {"tool": "ok", "hash": "h" * 64, "input_summary": "s"},
+            {"tool": 123, "hash": "h" * 64},
+            {"tool": "no-hash"},
+            {"hash": "h" * 64},
+            {"tool": "empty-hash", "hash": ""},
+            {"tool": "no-summary", "hash": "z" * 64},
+        ],
+        "consecutive_stalls": True,
+        "total_wasted_turns": "3",
+    })
+    prior, stalls, waste = _load_execution_state(task)
+    assert prior == [
+        {"tool": "ok", "hash": "h" * 64, "input_summary": "s"},
+        {"tool": "no-summary", "hash": "z" * 64, "input_summary": ""},
+    ]
+    assert stalls == 0
+    assert waste == 0
+
+
+def test_carried_counter_rejects_non_counter_values() -> None:
+    assert _carried_counter(3) == 3
+    assert _carried_counter(2, default=7) == 2
+    assert _carried_counter(True) == 0
+    assert _carried_counter(-1) == 0
+    assert _carried_counter("3") == 0
+    assert _carried_counter(None) == 0
+    assert _carried_counter(None, default=7) == 7
 
