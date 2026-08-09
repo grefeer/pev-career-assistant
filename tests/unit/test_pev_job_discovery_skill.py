@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
@@ -1553,3 +1554,627 @@ def test_fetch_batch_value_none_without_error_is_skipped(monkeypatch) -> None:
     )
     assert result.pages == []
     assert result.failures == []
+
+
+# --- A1 certified adapters wiring (P0-2) ---------------------------------
+
+
+class _FakeAdapter:
+    """Minimal certified-adapter stand-in (execute -> records or raise)."""
+
+    def __init__(self, records: list[dict] | None, error: Exception | None = None) -> None:
+        self._records = records
+        self._error = error
+
+    def execute(self, url: str, strategy: object, trajectory: object) -> dict:
+        if self._error is not None:
+            raise self._error
+        return {"records": self._records, "company": "moka", "url": url}
+
+
+class _FakeAdaptersPackage:
+    """Minimal ``adapters`` package stand-in with injectable behaviors."""
+
+    def __init__(
+        self,
+        company: str | None = "moka",
+        adapter: _FakeAdapter | None = None,
+        company_error: Exception | None = None,
+    ) -> None:
+        self._company = company
+        self._adapter = adapter
+        self._company_error = company_error
+
+    def company_for_url(self, url: str) -> str | None:
+        if self._company_error is not None:
+            raise self._company_error
+        return self._company
+
+    def load_company_adapter(self, company: str) -> _FakeAdapter:
+        assert self._adapter is not None
+        return self._adapter
+
+
+def _requests_page_ok(monkeypatch) -> None:
+    """Route the requests fast path to a fixed public page."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text="<html><title>Fallback page</title><body>"
+            + "岗位职责：普通页面正文。" * 40
+            + "</body></html>",
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+            headers={},
+        ),
+    )
+
+
+def test_fetch_via_adapter_success_binds_json_evidence(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    records = [
+        {
+            "job_id": "MK_123",
+            "title": "后端工程师",
+            "company": "moka",
+            "location": "北京",
+            "description": "岗位职责：构建服务。任职要求：5 年经验。",
+            "apply_url": "https://app.mokahr.com/apply/moka/123",
+        }
+    ]
+    package = _FakeAdaptersPackage(company="moka", adapter=_FakeAdapter(records))
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+    )
+
+    assert result.artifact_id.startswith("observed:")
+    assert result.title == "后端工程师"
+    import json as _json
+
+    parsed = _json.loads(result.visible_text)
+    assert parsed[0]["job_id"] == "MK_123"
+    assert result.content_hash == hashlib.sha256(result.visible_text.encode("utf-8")).hexdigest()
+    assert result.artifact_id == f"observed:{result.content_hash}"
+
+
+def test_fetch_via_adapter_gate_off_and_uncovered_fall_back_to_requests(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    _requests_page_ok(monkeypatch)
+    package = _FakeAdaptersPackage(company="moka", adapter=_FakeAdapter([]))
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", False)
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+    )
+    assert "普通页面正文" in result.visible_text
+
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(package, "_company", None)
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://jobs.example/somewhere"),
+    )
+    assert "普通页面正文" in result.visible_text
+
+
+def test_fetch_via_adapter_failure_is_blocked_adapter_code(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _AdapterErrorLike(Exception):
+        def __init__(self, code: str) -> None:
+            super().__init__(code)
+            self.code = code
+
+    package = _FakeAdaptersPackage(
+        company="moka", adapter=_FakeAdapter(None, error=_AdapterErrorLike("http_error:403"))
+    )
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+
+    with pytest.raises(PublicJobFetchError, match="adapter:http_error:403"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+        )
+
+
+def test_fetch_via_adapter_empty_or_malformed_result_is_blocked(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    for bad in (None, [], {}, "not-a-list"):
+        package = _FakeAdaptersPackage(company="moka", adapter=_FakeAdapter(bad))
+        monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+        with pytest.raises(PublicJobFetchError, match="adapter:empty_result"):
+            fetch_public_job_page(
+                ToolContext(user_id="u", run_id="r"),
+                FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+            )
+
+
+def test_fetch_via_adapter_unexpected_exception_is_blocked(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    package = _FakeAdaptersPackage(
+        company="moka", adapter=_FakeAdapter(None, error=RuntimeError("boom"))
+    )
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+
+    with pytest.raises(PublicJobFetchError, match="adapter:unexpected"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+        )
+
+
+def test_wechat_route_success_binds_ocr_text_evidence(monkeypatch) -> None:
+    from backend.app.services.career_skills.wechat import FetchWechatArticleOutput
+
+    url = "https://mp.weixin.qq.com/s/starcloud-2026-campus"
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.wechat.fetch_wechat_article",
+        lambda _context, _payload: FetchWechatArticleOutput(
+            url=url,
+            status="succeeded",
+            channel="B",
+            candidates=[],
+            ocr_text="微信正文",
+            needs_deep_crawl=False,
+            reason=None,
+            artifact_id=f"observed:{'a' * 64}",
+            source_url=url,
+            content_hash="a" * 64,
+            visible_text="微信图文正文中的岗位描述与投递链接。",
+        ),
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url=url),
+    )
+
+    assert result.source_url == url
+    assert result.artifact_id == f"observed:{'a' * 64}"
+    assert result.content_hash == "a" * 64
+    assert "岗位描述" in result.visible_text
+
+
+def test_wechat_route_gate_off_raises_wechat_ocr_disabled(monkeypatch) -> None:
+    from backend.app.services.career_skills.wechat import FetchWechatArticleOutput
+
+    url = "https://mp.weixin.qq.com/s/starcloud-2026-campus"
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.wechat.fetch_wechat_article",
+        lambda _context, _payload: FetchWechatArticleOutput(
+            url=url,
+            status="needs_manual_review",
+            channel=None,
+            candidates=[],
+            ocr_text="",
+            needs_deep_crawl=False,
+            reason="ocr_disabled",
+        ),
+    )
+
+    with pytest.raises(PublicJobFetchError, match="wechat_ocr_disabled"):
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url=url),
+        )
+
+
+def test_wechat_route_slice_without_text_is_blocked(monkeypatch) -> None:
+    from backend.app.services.career_skills.wechat import FetchWechatArticleOutput
+
+    url = "https://mp.weixin.qq.com/s/starcloud-2026-campus"
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    cases = [
+        ("blocked", None, None, ""),
+        ("needs_manual_review", "article has no content", None, ""),
+        ("succeeded", None, "a" * 64, ""),
+    ]
+    for status, reason, content_hash, visible_text in cases:
+        monkeypatch.setattr(
+            "backend.app.services.career_skills.wechat.fetch_wechat_article",
+            lambda _context, _payload, status=status, reason=reason,
+            content_hash=content_hash, visible_text=visible_text:
+            FetchWechatArticleOutput(
+                url=url,
+                status=status,
+                channel="B",
+                candidates=[],
+                ocr_text=visible_text,
+                needs_deep_crawl=False,
+                reason=reason,
+                content_hash=content_hash,
+                visible_text=visible_text,
+            ),
+        )
+        with pytest.raises(PublicJobFetchError, match="wechat_ocr_failed"):
+            fetch_public_job_page(
+                ToolContext(user_id="u", run_id="r"),
+                FetchPublicJobPageInput(url=url),
+            )
+
+
+def test_wechat_route_uncovered_host_falls_back_to_requests(monkeypatch) -> None:
+    _requests_page_ok(monkeypatch)
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.wechat.fetch_wechat_article",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("wechat route must not run for non-WeChat hosts")
+        ),
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://jobs.example/ai-agent"),
+    )
+
+    assert "普通页面正文" in result.visible_text
+
+
+def test_batch_fetch_reports_wechat_ocr_disabled_per_url(monkeypatch) -> None:
+    from backend.app.services.career_skills.wechat import FetchWechatArticleOutput
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.wechat.fetch_wechat_article",
+        lambda _context, _payload: FetchWechatArticleOutput(
+            url="https://mp.weixin.qq.com/s/x",
+            status="needs_manual_review",
+            channel=None,
+            candidates=[],
+            ocr_text="",
+            needs_deep_crawl=False,
+            reason="ocr_disabled",
+        ),
+    )
+    _requests_page_ok(monkeypatch)
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(
+            urls=[
+                "https://jobs.example/a",
+                "https://mp.weixin.qq.com/s/starcloud-2026",
+            ]
+        ),
+    )
+
+    assert [page.source_url for page in result.pages] == ["https://jobs.example/a"]
+    assert result.failures[0].source_url == "https://mp.weixin.qq.com/s/starcloud-2026"
+    assert result.failures[0].error_code == "wechat_ocr_disabled"
+
+
+def test_enable_public_api_adapters_toggles_module_gate(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", False)
+    jd_module.enable_public_api_adapters(True)
+    assert jd_module._PUBLIC_API_ADAPTERS_ENABLED is True
+    jd_module.enable_public_api_adapters(False)
+    assert jd_module._PUBLIC_API_ADAPTERS_ENABLED is False
+
+
+def test_adapter_package_caches_successful_import(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    fake_pkg = _FakeAdaptersPackage(adapter=_FakeAdapter([]))
+    monkeypatch.setitem(sys.modules, "adapters", fake_pkg)
+    monkeypatch.setattr(jd_module, "_ADAPTERS_PACKAGE", None)
+    # Directory already on sys.path: the injection branch is skipped and the
+    # package is still loaded (both sys.path branches stay covered).
+    monkeypatch.syspath_prepend("C:/already-on-path")
+    monkeypatch.setattr(jd_module, "_ADAPTERS_SCRIPTS_DIR", "C:/already-on-path")
+
+    assert jd_module._adapter_package() is fake_pkg
+    assert jd_module._ADAPTERS_PACKAGE is fake_pkg
+    # Second call hits the cached branch and returns the same package.
+    assert jd_module._adapter_package() is fake_pkg
+
+
+def test_adapter_package_inserts_scripts_dir_when_missing_from_sys_path(monkeypatch) -> None:
+    """True arm of the sys.path guard: a first load with the scripts dir NOT
+    on sys.path must inject it before importing. Mirrors the caches test
+    above, which pins the already-on-path arm -- in the full suite another
+    test module imports the adapters package first, so without this test the
+    insertion branch only ever runs in isolation."""
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    fake_pkg = _FakeAdaptersPackage(adapter=_FakeAdapter([]))
+    monkeypatch.setitem(sys.modules, "adapters", fake_pkg)
+    monkeypatch.setattr(jd_module, "_ADAPTERS_PACKAGE", None)
+    scripts_dir = "C:/not-yet-on-path"
+    monkeypatch.setattr(jd_module, "_ADAPTERS_SCRIPTS_DIR", scripts_dir)
+    assert scripts_dir not in sys.path  # deterministic precondition
+
+    try:
+        assert jd_module._adapter_package() is fake_pkg
+        assert scripts_dir in sys.path  # guard's True arm ran the insertion
+        assert jd_module._ADAPTERS_PACKAGE is fake_pkg
+    finally:
+        sys.path.remove(scripts_dir)  # keep the suite's sys.path pristine
+
+
+def test_fetch_via_adapter_missing_package_or_company_error_degrades(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    _requests_page_ok(monkeypatch)
+    monkeypatch.setattr(jd_module, "_PUBLIC_API_ADAPTERS_ENABLED", True)
+    monkeypatch.setattr(jd_module, "_ADAPTERS_PACKAGE", None)
+    monkeypatch.setitem(sys.modules, "adapters", None)
+    # Import of a module cached as None raises ImportError -> package None.
+    monkeypatch.setattr(jd_module, "_adapter_package", jd_module._adapter_package)
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://jobs.example/somewhere"),
+    )
+    assert "普通页面正文" in result.visible_text
+
+    package = _FakeAdaptersPackage(adapter=_FakeAdapter([]), company_error=RuntimeError("bad"))
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://app.mokahr.com/apply/moka/123"),
+    )
+    assert "普通页面正文" in result.visible_text
+
+
+def test_adapter_company_matches_host_map_without_instantiating(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _HostMapAdapter:
+        """Class-level hosts like the real certified adapters (no __init__ call)."""
+
+        hosts = ("app.mokahr.com", "*.wild.zhiye.com")
+
+        def __init__(self) -> None:
+            raise AssertionError("host-map lookup must not instantiate adapters")
+
+    class _RegistryPackage:
+        """Package exposing only the certified-class registry."""
+
+        _ADAPTERS = {"moka": _HostMapAdapter}
+
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: _RegistryPackage())
+    assert jd_module._adapter_company_for_url("https://app.mokahr.com/x") == "moka"
+    # Suffix under a wildcard pattern matches too.
+    assert jd_module._adapter_company_for_url("https://jobs.wild.zhiye.com/x") == "moka"
+    # Bare subdomain under an exact pattern also matches.
+    assert jd_module._adapter_company_for_url("https://sub.app.mokahr.com/x") == "moka"
+
+
+def test_adapter_company_registry_is_authoritative_for_miss(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _HostMapAdapter:
+        hosts = ("app.mokahr.com",)
+
+    class _RegistryPackage:
+        _ADAPTERS = {"moka": _HostMapAdapter}
+
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: _RegistryPackage())
+    # A complete certified registry decides coverage: a miss is uncovered,
+    # never a slow company_for_url retry.
+    assert jd_module._adapter_company_for_url("https://uncovered.example/x") is None
+
+
+def test_adapter_company_host_map_error_returns_none(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _BrokenHostsAdapter:
+        @property
+        def hosts(self) -> tuple[str, ...]:
+            raise RuntimeError("boom")
+
+    class _RegistryPackage:
+        _ADAPTERS = {"broken": _BrokenHostsAdapter}
+
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: _RegistryPackage())
+    # A broken adapter's hosts table must not kill the lookup.
+    assert jd_module._adapter_company_for_url("https://app.mokahr.com/x") is None
+
+
+def test_adapter_company_empty_company_in_registry_is_none(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _HostMapAdapter:
+        hosts = ("app.mokahr.com",)
+
+    class _RegistryPackage:
+        _ADAPTERS = {"": _HostMapAdapter}
+
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: _RegistryPackage())
+    assert jd_module._adapter_company_for_url("https://app.mokahr.com/x") is None
+
+
+def test_adapter_company_unparseable_and_empty_host_are_uncovered(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    class _HostMapAdapter:
+        hosts = ("app.mokahr.com",)
+
+    class _RegistryPackage:
+        _ADAPTERS = {"moka": _HostMapAdapter}
+
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: _RegistryPackage())
+    assert jd_module._adapter_company_for_url("http://[bad") is None
+    assert jd_module._adapter_company_for_url("https://") is None
+
+
+def test_adapter_company_fallbacks_without_registry(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    # No _ADAPTERS shape -> the package's own matcher decides (fake seam).
+    package = _FakeAdaptersPackage(company="moka", adapter=_FakeAdapter([]))
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    assert jd_module._adapter_company_for_url("http://[bad") == "moka"
+    assert jd_module._adapter_company_for_url("https://") == "moka"
+
+    # A falsy company result is the same as uncovered.
+    package = _FakeAdaptersPackage(company="", adapter=_FakeAdapter([]))
+    monkeypatch.setattr(jd_module, "_adapter_package", lambda: package)
+    assert jd_module._adapter_company_for_url("https://app.mokahr.com/x") is None
+
+
+def test_extract_adapter_records_maps_structured_evidence() -> None:
+    records = [
+        {
+            "job_id": "MK_1",
+            "title": "算法工程师",
+            "company": "moka",
+            "location": "北京",
+            "description": "岗位职责：设计模型。任职要求：硕士。",
+            "apply_url": "https://app.mokahr.com/apply/a/1",
+        },
+        {
+            "job_id": "MK_2",
+            "title": "前端工程师",
+            "company": "moka",
+            "location": "上海",
+            "description": "负责前端架构。",
+            "apply_url": "https://app.mokahr.com/apply/a/2",
+            "deadline": "2026-12-31",
+        },
+    ]
+    body = json.dumps(records, ensure_ascii=False, indent=2)
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    artifact_id = f"observed:{content_hash}"
+    context = ToolContext(
+        user_id="u",
+        run_id="r",
+        metadata={
+            "observed_public_evidence": [
+                {
+                    "artifact_id": artifact_id,
+                    "source_url": "https://app.mokahr.com/apply/a/1",
+                    "content_hash": content_hash,
+                    "visible_text": body,
+                    "title": "算法工程师",
+                }
+            ]
+        },
+    )
+
+    result = extract_observed_job_details(
+        context, ExtractObservedJobDetailsInput(artifact_id=artifact_id)
+    )
+
+    assert len(result.candidates) == 2
+    first, second = result.candidates
+    assert first.title == "算法工程师"
+    assert first.company_name == "moka"
+    assert first.locations == ["北京"]
+    assert first.responsibilities == "设计模型。"
+    assert first.requirements == "硕士。"
+    assert first.apply_url == "https://app.mokahr.com/apply/a/1"
+    assert first.confidence == 1.0
+    assert first.evidence_refs == [
+        {"artifact_id": artifact_id, "source_url": "https://app.mokahr.com/apply/a/1", "content_hash": content_hash}
+    ]
+    assert second.deadline_text == "2026-12-31"
+    assert second.requirements == ""
+
+
+def test_parse_adapter_evidence_rejects_non_record_text(monkeypatch) -> None:
+    import backend.app.services.career_skills.job_discovery as jd_module
+
+    _requests_page_ok(monkeypatch)
+    body = json.dumps(
+        [{"job_id": "MK_9", "title": "X", "description": "d", "apply_url": "u"}]
+    )
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    artifact_id = f"observed:{content_hash}"
+    context = ToolContext(
+        user_id="u",
+        run_id="r",
+        metadata={
+            "observed_public_evidence": [
+                {
+                    "artifact_id": artifact_id,
+                    "source_url": "https://app.mokahr.com/apply/a/9",
+                    "content_hash": content_hash,
+                    "visible_text": body,
+                    "title": "X",
+                }
+            ]
+        },
+    )
+    result = extract_observed_job_details(
+        context, ExtractObservedJobDetailsInput(artifact_id=artifact_id)
+    )
+    assert len(result.candidates) == 1
+    assert result.candidates[0].title == "X"
+
+    # Every shape that is not a non-empty list of record dicts is never
+    # misread as adapter records: parse returns None and the extract falls
+    # back to the plain-JD-text path without raising.
+    for text in ("[服务公告] 首页", "not json", "[]", "[42]", '[{"title": 1}]'):
+        assert jd_module._parse_adapter_evidence(text) is None
+        bad_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        bad_id = f"observed:{bad_hash}"
+        bad_context = ToolContext(
+            user_id="u",
+            run_id="r",
+            metadata={
+                "observed_public_evidence": [
+                    {
+                        "artifact_id": bad_id,
+                        "source_url": "https://app.mokahr.com/apply/a/9",
+                        "content_hash": bad_hash,
+                        "visible_text": text,
+                        "title": None,
+                    }
+                ]
+            },
+        )
+        extract_observed_job_details(
+            bad_context, ExtractObservedJobDetailsInput(artifact_id=bad_id)
+        )
+

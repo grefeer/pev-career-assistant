@@ -7,9 +7,13 @@ from backend.app.services.agent_runtime.tool_registry import ToolDefinition, Too
 from backend.app.services.career_skills import (
     career_planning,
     career_sheets,
+    classify_url,
+    deduplicate_observed,
     job_discovery,
     job_matching,
     resume_tailoring,
+    validate_candidates,
+    wechat,
 )
 
 
@@ -57,7 +61,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=career_sheets.QueryCareerSheetRecordsOutput,
             allowed_roles=frozenset({AgentRole.executor}),
             handler=career_sheets.query_career_sheet_records,
-            description="查询招聘 smartsheet（内推/招聘链接台账）按企业/岗位/地点关键词与近 N 天过滤，返回候选招聘 URL；主证据源，无匹配时才用网络搜索。",
+            description="查询招聘 smartsheet（内推/招聘链接台账）按企业/岗位/地点关键词与近 N 天过滤，返回候选招聘 URL；每条记录带 prior_metadata（公司/投递链接/内推码/更新时间）补足页面缺失字段；主证据源，无匹配时才用网络搜索。",
         )
     )
     registry.register(
@@ -80,6 +84,50 @@ def build_career_tool_registry() -> ToolRegistry:
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.extract_observed_job_details,
             description="把一份已观察页面证据规范化为详细 JD。",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="validate-observed-candidates",
+            skill_name="job-discovery",
+            input_model=validate_candidates.ValidateObservedCandidatesInput,
+            output_model=validate_candidates.ValidateObservedCandidatesOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=validate_candidates.validate_observed_candidates,
+            description="对已观察页面证据做确定性质量校验（陈旧年份/正文过短/非 JD 文本），供 Verifier 判 PASS/REPLAN。",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="fetch-wechat-article",
+            skill_name="job-discovery",
+            input_model=wechat.FetchWechatArticleInput,
+            output_model=wechat.FetchWechatArticleOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=wechat.fetch_wechat_article,
+            description="OCR 抓取微信公众号图文（含 ReadGZH 镜像）为可提取文本与候选。微信图文正文是图片，普通页面抓取返回空内容——目标为 mp.weixin.qq.com 链接时使用本工具（fetch-public-job-pages 也已自动路由微信链接）；门控关闭时返回 needs_manual_review（reason ocr_disabled）。",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="deduplicate-observed-jobs",
+            skill_name="job-discovery",
+            input_model=deduplicate_observed.DeduplicateObservedJobsInput,
+            output_model=deduplicate_observed.DeduplicateObservedJobsOutput,
+            allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
+            handler=deduplicate_observed.deduplicate_observed_jobs,
+            description="对已观察页面证据按 canonical 身份（job_id/apply_url/规范化标题）做 run 内确定性去重，返回 kept/removed。",
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="classify-job-url",
+            skill_name="job-discovery",
+            input_model=classify_url.ClassifyJobUrlInput,
+            output_model=classify_url.ClassifyJobUrlOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=classify_url.classify_job_url,
+            description="对候选 URL 做低预算站点分类（wechat/adapter/static/spa/blocked，host 信号 + 4KB 探针，不启动浏览器）。",
         )
     )
     registry.register(

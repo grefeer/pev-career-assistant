@@ -141,6 +141,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     app.state.settings.job_discovery_playwright_fallback_enabled
                 )
                 stack.callback(jd_skill.enable_playwright_fallback, False)
+                jd_skill.enable_public_api_adapters(
+                    app.state.settings.use_public_api_adapters
+                )
+                stack.callback(jd_skill.enable_public_api_adapters, False)
+                from backend.app.services.career_skills import wechat as wechat_skill
+
+                wechat_skill.enable_wechat_ocr(
+                    app.state.settings.job_discovery_ocr_enabled
+                )
+                stack.callback(wechat_skill.enable_wechat_ocr, False)
             yield
     finally:
         if (

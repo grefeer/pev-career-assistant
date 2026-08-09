@@ -7,8 +7,11 @@ from collections.abc import Callable
 from html.parser import HTMLParser
 import hashlib
 import ipaddress
+import json
+from pathlib import Path
 import re
 import socket
+import sys
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
@@ -50,6 +53,53 @@ def enable_playwright_fallback(enabled: bool) -> None:
     """Toggle the rendered-fetch fallback (called from runtime assembly)."""
     global _PLAYWRIGHT_FALLBACK_ENABLED
     _PLAYWRIGHT_FALLBACK_ENABLED = enabled
+
+
+# A1 certified-adapter gate (mirror of the Playwright fallback toggle). The
+# skill's adapters package (skill/job-discovery/scripts/adapters) is loaded
+# in-process -- never via subprocess -- and only when runtime assembly opts in
+# from ``Settings.use_public_api_adapters``. A covered URL that fails is a
+# hard ``adapter:<code>`` blocked error; an unloaded package or an uncovered
+# URL degrades to the normal requests/Playwright chain.
+_PUBLIC_API_ADAPTERS_ENABLED = False
+_ADAPTERS_PACKAGE: Any | None = None
+_ADAPTERS_SCRIPTS_DIR = str(
+    Path(__file__).resolve().parents[4] / "skill" / "job-discovery" / "scripts"
+)
+
+
+def enable_public_api_adapters(enabled: bool) -> None:
+    """Toggle the A1 certified-adapter channel (called from runtime assembly)."""
+    global _PUBLIC_API_ADAPTERS_ENABLED
+    _PUBLIC_API_ADAPTERS_ENABLED = enabled
+
+
+# The WeChat OCR channel owns ``mp.weixin.qq.com`` article pages the same way
+# a certified adapter owns its hosts: their bodies are image content that the
+# plain requests/render chain reads as an empty shell, so the fetch tool
+# routes them to the OCR slice (``wechat.fetch_wechat_article``) before the
+# generic chain. The gate mirrors ``Settings.job_discovery_ocr_enabled``,
+# wired from runtime assembly like the adapter and Playwright toggles.
+_WECHAT_ARTICLE_HOST = "mp.weixin.qq.com"
+
+
+def _adapter_package() -> Any | None:
+    """Load the skill adapters package once; None when it cannot be imported.
+
+    The sys.path injection is idempotent and only adds the skill scripts
+    directory (same shape as the deepagents ``browse_fetch`` loader).
+    """
+    global _ADAPTERS_PACKAGE
+    if _ADAPTERS_PACKAGE is None:
+        scripts_dir = _ADAPTERS_SCRIPTS_DIR
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        try:
+            import adapters  # noqa: PLC0415 - lazy, guarded by callers
+        except Exception:  # noqa: BLE001 - untrusted skill boundary.
+            return None
+        _ADAPTERS_PACKAGE = adapters
+    return _ADAPTERS_PACKAGE
 
 
 _JOB_RESULT_URL_TOKENS = (
@@ -541,19 +591,151 @@ def _render_with_playwright(url: str) -> tuple[str, str | None]:
         raise PublicJobFetchError("public_fetch_failed") from None
 
 
+def _adapter_company_for_url(url: str) -> str | None:
+    """Adapter company covering ``url``, or None (uncovered / unavailable).
+
+    Packages exposing the certified ``_ADAPTERS`` registry (company ->
+    class with class-level ``hosts``) are matched from that registry with
+    no adapter instantiation -- each adapter ``__init__`` builds an httpx
+    client (~1s on Windows), so instantiating per lookup is ~5s.  The
+    registry is authoritative: a miss means the URL is uncovered.  A
+    package without the registry shape falls back to its own
+    ``company_for_url`` so the untrusted-boundary semantics stay intact.
+    """
+    package = _adapter_package()
+    if package is None:
+        return None
+    registry = getattr(package, "_ADAPTERS", None)
+    if isinstance(registry, dict):
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        if host:
+            try:
+                matched = _host_to_company(registry, host)
+            except Exception:  # noqa: BLE001 - untrusted adapter boundary.
+                matched = None
+            if matched is not None:
+                return matched
+        return None
+    try:
+        company = package.company_for_url(url)
+    except Exception:  # noqa: BLE001 - untrusted adapter boundary.
+        return None
+    return company if isinstance(company, str) and company else None
+
+
+def _host_to_company(registry: dict[str, Any], host: str) -> str | None:
+    """Host -> company from certified adapter classes, no instantiation.
+
+    Mirrors the adapters package's own matching (exact host or suffix
+    under a ``*.`` wildcard pattern); None when no class claims the host.
+    """
+    for company, adapter_cls in registry.items():
+        for pattern in getattr(adapter_cls, "hosts", ()):
+            if host == pattern or host.endswith("." + pattern.lstrip("*.")):
+                return company if isinstance(company, str) and company else None
+    return None
+
+
+def _run_company_adapter(package: Any, url: str, company: str) -> list[dict[str, Any]]:
+    """Execute one certified adapter; any failure is an ``adapter:<code>`` block."""
+    try:
+        adapter = package.load_company_adapter(company)
+        result = adapter.execute(url, None, None)
+    except Exception as exc:  # noqa: BLE001 - untrusted adapter boundary.
+        code = getattr(exc, "code", "unexpected")
+        raise PublicJobFetchError(f"adapter:{code}") from exc
+    records = result.get("records") if isinstance(result, dict) else None
+    if not isinstance(records, list) or not records:
+        raise PublicJobFetchError("adapter:empty_result")
+    return records
+
+
+def _fetch_via_adapter(url: str) -> FetchPublicJobPageOutput | None:
+    """Adapter-first fetch for a certified company URL; None when uncovered.
+
+    Adapter evidence is the same memory-bound shape as browsed evidence: a
+    JSON document of normalized records whose sha256 is the content hash, so
+    ``_with_observed_page`` and the extract side treat it like any page.
+    """
+    if not _PUBLIC_API_ADAPTERS_ENABLED:
+        return None
+    company = _adapter_company_for_url(url)
+    if company is None:
+        return None
+    package = _adapter_package()
+    records = _run_company_adapter(package, url, company)
+    body = json.dumps(records, ensure_ascii=False, indent=2)
+    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    first_title = records[0].get("title") if isinstance(records[0], dict) else None
+    return FetchPublicJobPageOutput(
+        artifact_id=f"observed:{content_hash}",
+        source_url=url,
+        title=first_title if isinstance(first_title, str) else None,
+        visible_text=body,
+        content_hash=content_hash,
+    )
+
+
+def _fetch_wechat_article_page(
+    context: ToolContext, url: str
+) -> FetchPublicJobPageOutput | None:
+    """OCR-route a WeChat article URL; None when the host is not WeChat.
+
+    Mirrors the adapter-first contract for the WeChat channel: the OCR slice
+    is authoritative for ``mp.weixin.qq.com`` pages, so a gated-off channel
+    is a hard ``wechat_ocr_disabled`` error, never a silent fallthrough to
+    the empty-page path. A slice run that produced no text is
+    ``wechat_ocr_failed``; usable text becomes the same memory-bound page
+    evidence shape as browsed pages (sha256 content hash, ``observed:`` id).
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if host != _WECHAT_ARTICLE_HOST:
+        return None
+    from backend.app.services.career_skills import wechat as wechat_skill
+
+    result = wechat_skill.fetch_wechat_article(
+        context, wechat_skill.FetchWechatArticleInput(url=url)
+    )
+    if result.status == "needs_manual_review" and result.reason == "ocr_disabled":
+        raise PublicJobFetchError("wechat_ocr_disabled")
+    if not result.content_hash or not result.visible_text:
+        raise PublicJobFetchError("wechat_ocr_failed")
+    return FetchPublicJobPageOutput(
+        artifact_id=result.artifact_id,
+        source_url=url,
+        title=None,
+        visible_text=result.visible_text,
+        content_hash=result.content_hash,
+    )
+
+
 def fetch_public_job_page(
     context: ToolContext, payload: FetchPublicJobPageInput
 ) -> FetchPublicJobPageOutput:
-    """Fetch public HTML and expose immutable visible-text evidence to Executor.
+    """Fetch public evidence and expose immutable visible-text evidence to Executor.
 
-    The plain ``requests`` fast path is tried first. When it fails, or when it
-    returns a shell with no usable text (SPA / login wall), the fetch falls back
-    to a headless-Chromium render of the same URL -- still under the original
-    public-URL validation. The fallback is gated by a runtime flag so unit
-    suites stay deterministic.
+    A WeChat article URL (``mp.weixin.qq.com``) is OCR-routed first: its body
+    is image content the generic chain reads as an empty shell. A URL covered
+    by a certified A1 adapter (moka/beisen/didi/netease/baidu) is fetched
+    adapter-first when the channel is enabled: the adapter is the
+    authoritative channel for its hosts, so a covered URL that fails is a
+    hard ``adapter:<code>`` blocked error, never a silent fallthrough.
+    Uncovered URLs take the plain ``requests`` fast path; when that fails or
+    returns a shell with no usable text (SPA / login wall), the fetch falls
+    back to a headless-Chromium render of the same URL -- still under the
+    original public-URL validation. The fallbacks are gated by runtime flags
+    so unit suites stay deterministic.
     """
-    del context
     _assert_public_url(payload.url)
+    wechat_page = _fetch_wechat_article_page(context, payload.url)
+    if wechat_page is not None:
+        return wechat_page
+    adapter_page = _fetch_via_adapter(payload.url)
+    if adapter_page is not None:
+        return adapter_page
     try:
         return _fetch_public_page_requests(payload.url)
     except PublicJobFetchError as error:
@@ -801,6 +983,11 @@ def extract_observed_job_details(
         "source_url": source_url,
         "content_hash": content_hash,
     }
+    adapter_records = _parse_adapter_evidence(visible_text)
+    if adapter_records is not None:
+        return _adapter_details_output(
+            payload.artifact_id, source_url, content_hash, adapter_records, evidence_ref
+        )
     extracted = extract_jd_candidates(visible_text, source_url)
     # A single-JD page is enriched from its own full text; a multi-candidate
     # page (e.g. a Feishu card listing) must NOT have the page's first
@@ -887,6 +1074,93 @@ def extract_observed_job_details_batch(
             )
             for artifact_id in payload.artifact_ids
         ]
+    )
+
+
+_ADAPTER_RECORD_KEYS = frozenset({"title", "description", "apply_url"})
+
+
+def _parse_adapter_evidence(text: str) -> list[dict[str, Any]] | None:
+    """Parse adapter-record JSON evidence; None when the text is not records.
+
+    Adapter evidence is a JSON list of normalized records. Everything else --
+    including a page that merely begins with "[" -- falls back to the normal
+    JD-text extraction path, so a false marker can never lose evidence.
+    """
+    if not text.lstrip().startswith("["):
+        return None
+    try:
+        records = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(records, list) or not records:
+        return None
+    if not all(
+        isinstance(record, dict) and _ADAPTER_RECORD_KEYS.issubset(record)
+        for record in records
+    ):
+        return None
+    return records
+
+
+def _record_to_job_details(
+    record: dict[str, Any], source_url: str, evidence_ref: dict[str, str]
+) -> ExtractedJobDetails:
+    """Map one normalized adapter record onto the ExtractedJobDetails shape.
+
+    The record is structured data (title / location / description /
+    apply_url), so the deterministic text heuristics are only used to split
+    its description into responsibilities vs requirements; the page-level
+    title/location inference never runs on JSON text.
+    """
+    description = record.get("description")
+    description = description if isinstance(description, str) else ""
+    location = record.get("location")
+    locations = [location] if isinstance(location, str) and location else []
+    responsibilities = (
+        _extract_jd_section(
+            description,
+            labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责", "岗位定位", "你将负责"),
+        )
+        or description
+    )
+    requirements = _extract_jd_section(
+        description,
+        labels=("任职要求", "职责要求", "岗位要求", "职位要求", "资格要求", "招聘要求"),
+    )
+    title = record.get("title")
+    company = record.get("company")
+    apply_url = record.get("apply_url")
+    deadline = record.get("deadline")
+    return ExtractedJobDetails(
+        title=title if isinstance(title, str) and title else None,
+        company_name=company if isinstance(company, str) and company else None,
+        locations=locations,
+        responsibilities=responsibilities,
+        requirements=requirements,
+        recruitment_types=_infer_recruitment_types(source_url, []),
+        apply_url=apply_url if isinstance(apply_url, str) and apply_url else None,
+        deadline_text=deadline if isinstance(deadline, str) and deadline else None,
+        confidence=1.0,
+        evidence_refs=[evidence_ref],
+        normalization_warnings=[],
+    )
+
+
+def _adapter_details_output(
+    artifact_id: str,
+    source_url: str,
+    content_hash: str,
+    records: list[dict[str, Any]],
+    evidence_ref: dict[str, str],
+) -> ExtractObservedJobDetailsOutput:
+    """Normalize adapter-record evidence into one candidate per record."""
+    candidates = [_record_to_job_details(record, source_url, evidence_ref) for record in records]
+    return ExtractObservedJobDetailsOutput(
+        source_artifact_id=artifact_id,
+        source_url=source_url,
+        content_hash=content_hash,
+        candidates=candidates,
     )
 
 

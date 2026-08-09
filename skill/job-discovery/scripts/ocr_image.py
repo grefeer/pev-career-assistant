@@ -27,6 +27,18 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+# PaddleX defaults CPU inference to oneDNN run_mode; the PIR -> oneDNN
+# attribute converter is broken in paddlepaddle >= 3.3.0 on Windows
+# (Paddle#77340: ConvertPirAttribute2RuntimeAttribute not support
+# ArrayAttribute<DoubleAttribute>), so every CPU OCR call crashes. The
+# env var is read at paddlex import time, hence it MUST be set here at
+# module scope — before any code path (including _check_paddleocr)
+# can import paddleocr.
+if "PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT" not in os.environ:
+    os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+if "FLAGS_use_onednn" not in os.environ:
+    os.environ["FLAGS_use_onednn"] = "0"
+
 
 # ---------------------------------------------------------------------------
 # Image inspection helpers (zero dependencies, pure stdlib)
@@ -139,11 +151,12 @@ def _run_paddleocr_on_bytes(image_bytes: bytes, suffix: str = ".png") -> tuple[s
 
     This is the low-level worker — it writes bytes to a temp file, runs
     PaddleOCR, and returns (full_text, avg_confidence, warnings).
+
+    NOTE: the oneDNN-disabling env vars (Paddle#77340 workaround) are set at
+    module scope above — they must be in place before this module's first
+    paddleocr import, which can happen earlier via _check_paddleocr().
     """
     import paddleocr
-
-    if "FLAGS_use_onednn" not in os.environ:
-        os.environ["FLAGS_use_onednn"] = "0"
 
     tmp_path = None
     warnings: list[str] = []

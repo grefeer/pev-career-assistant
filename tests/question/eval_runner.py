@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import sys
 import time
@@ -500,6 +501,18 @@ def main() -> None:
     from backend.app.services.career_skills import job_discovery as jd_skill
 
     jd_skill.enable_playwright_fallback(True)
+
+    # WeChat OCR gate: main.py wires this from Settings at runtime; the eval
+    # harness assembles the runtime directly, so mirror the wiring here. The
+    # .env value reaches this process via load_project_env() above, and the
+    # ocr_image subprocess needs an OCR backend the .venv may not provide
+    # (paddleocr/tesseract absent; vision is a pi-agent placeholder), so the
+    # observable outcome depends on whether the article body is text-rich.
+    from backend.app.services.career_skills import wechat as wechat_skill
+
+    wechat_skill.enable_wechat_ocr(
+        os.environ.get("JOB_DISCOVERY_OCR_ENABLED", "").lower() == "true"
+    )
 
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",

@@ -59,14 +59,25 @@ login/captcha/anti-bot result as manual review, never as a retry target.
 
 ## Certified public-JSON adapters (A1, backend-gated)
 
-Three sites that browse.py classifies as anti-bot-blocked (didi, netease,
-baidu) expose official, unauthenticated, public JSON listing endpoints.  The
-`scripts/adapters/` package (one `Adapter` module per company, contract =
-`validate(url)` + `execute(task, strategy, trajectory)` like
-`adapter_supervisor.py`) is a legal public data channel: no bypass, TLS
+Five sites that browse.py classifies as anti-bot-blocked (didi, netease,
+baidu, moka, beisen) expose official, unauthenticated, public JSON listing
+endpoints.  The `scripts/adapters/` package (one `Adapter` module per
+company, contract = `validate(url)` + `execute(task, strategy, trajectory)`
+like `adapter_supervisor.py`) is a legal public data channel: no bypass, TLS
 verification on, polite 0.2-0.5s pacing, 300 items/company hard cap.  It is a
 **fetch-only channel** - the collector stays passive; adapter output becomes
 ordinary page evidence (source_url + content_hash).
+
+- `moka` (`*.mokahr.com`): `POST /api/outer/ats-apply/website/jobs/v2` with
+  `orgId/siteId/limit/offset/needStat/site`; responses are an AES-CBC envelope
+  (`data` b64 + `necromancer` UTF-8 key, fixed IV) unwrapped internally - the
+  decryption is part of reading the site's own public response, not a bypass.
+  Tenant URL shape: `https://<host>/social-recruitment|/campus-recruitment/<slug>/<site_id>`.
+- `beisen` (`*.zhiye.com`): two phases - `GET /portal/registerSystemInfo` for
+  the tenant's `BSGlobal` config (`PortalId`, cached once per task), then
+  `POST /api/Jobad/GetJobAdPageList` (`PageIndex/PageSize=300`).  A tenant
+  page without `BSGlobal` is a legacy portal and is blocked as
+  `adapter_error` - the legacy channel is deliberately not implemented.
 
 - Every endpoint and apply/detail URL passes `is_safe_public_url` before use.
 - The whole channel is gated twice: `endpoint_allowlist.json` must carry
@@ -130,9 +141,10 @@ Read `/tmp/preview.txt` and classify:
 | Signal | Likely site type | Recommended approach |
 |--------|-----------------|---------------------|
 | `mp.weixin.qq.com` in URL | WeChat article | `browse.py --mode detail` -> check text_length -> if image-heavy, OCR -> channel triage -> recursive browse (see `wechat-image-handling.md`, 6-level pipeline) |
-| Multi-page listing (mokahr / bytedance / Mioffice / any paginated) | URL-keyed SPA | `browse.py --mode parallel-fetch` (v1.6 default; auto-falls back to `click` for load-more sites) |
+| Multi-page listing (bytedance / Mioffice / any paginated) | URL-keyed SPA | `browse.py --mode parallel-fetch` (v1.6 default; auto-falls back to `click` for load-more sites) |
 | `jobs.feishu.cn` in URL | Feishu/Lark | `parallel-fetch`, retry `search-interact` if thin |
-| `zhiye.com` in URL | zhiye.com platform | `browse.py --mode search-interact` (search box usually available) |
+| `mokahr.com` in URL | Moka SPA (adapter-first) | adapter `moka` (A1) - `browse.py` is not the first path for `*.mokahr.com`; adapter failure is `blocked`, no browse fallback |
+| `zhiye.com` in URL | Beisen SPA (adapter-first) | adapter `beisen` (A1) - `browse.py --mode search-interact` is no longer the first path for `*.zhiye.com`; legacy tenants without `BSGlobal` block as `adapter_error` |
 | `<script>` with `__NEXT_DATA__` | Next.js/Nuxt SPA | `browse.py --mode search` or `list` |
 | Login wall / 403 / captcha | Blocked | Skip, mark as `needs_manual_review` |
 | Plain HTML with listings in first 4KB | Static site | `curl` full page OR `browse.py --mode list` |
