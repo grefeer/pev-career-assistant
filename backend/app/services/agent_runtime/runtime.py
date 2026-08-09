@@ -49,6 +49,13 @@ _EVIDENCE_BUDGET_CHARS = 48_000
 #: tool context: keyword scoring needs representative text, not full JD text.
 _STRUCTURED_SECTION_CHARS = 600
 
+#: Marker appended to the replan feedback when a NEED_USER decision over a
+#: satisfied deterministic contract is converted to a bounded REPLAN. The run
+#: loop appends the outcome summary to verifier_feedback, so the marker's
+#: presence there makes the conversion once-per-run: a second identical
+#: NEED_USER after the replan keeps the human hand-off instead of looping.
+_NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
+
 
 @dataclass(frozen=True)
 class AgentRunResult:
@@ -195,6 +202,7 @@ class AgentRuntime:
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
                     deadline=deadline,
+                    replans=replans,
                 )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
@@ -317,6 +325,7 @@ class AgentRuntime:
         tool_budget: ToolCallBudget,
         turn_budget: AgentTurnBudget,
         deadline: float | None = None,
+        replans: int = 0,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
@@ -437,6 +446,14 @@ class AgentRuntime:
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
                     deadline=deadline,
+                    # Deterministic contract anchors, so the verifier never
+                    # has to infer the step contract from raw observations.
+                    step_contract_met=step_contract_met(
+                        plan_step, execution.observations
+                    ),
+                    has_blocked_evidence=has_blocked_evidence(
+                        execution.observations
+                    ),
                 )
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
@@ -559,6 +576,28 @@ class AgentRuntime:
                         + "。请人工确认该来源的岗位信息，或提供可公开访问的页面后重试。",
                         output_artifact_refs=execution.artifact_refs,
                     )
+                if any(
+                    observation.status == "failed"
+                    and observation.error_code
+                    in {"tool_skill_forbidden", "unknown_tool"}
+                    for observation in execution.observations
+                ):
+                    # R013: the verifier RETRY demands a tool-backed deliverable
+                    # that this step's skill scope permanently excludes (the
+                    # call was rejected as tool_skill_forbidden / unknown_tool).
+                    # A same-step re-invocation is provably unsatisfiable - the
+                    # executor cannot call the scoped-out tool - so it would
+                    # only re-burn turns on the same rejected call. Route to the
+                    # replan path so the planner can restructure the step
+                    # instead of looping on an impossible retry.
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=verification.feedback,
+                        summary=verification.feedback,
+                        output_artifact_refs=execution.artifact_refs,
+                    )
                 if retries <= task.budget.max_replans:
                     prior_observations = execution.observations
                     prior_artifact_refs = execution.artifact_refs
@@ -598,6 +637,41 @@ class AgentRuntime:
                     output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.NEED_USER:
+                prior_feedback = task.context.get("verifier_feedback") or []
+                if not isinstance(prior_feedback, list):
+                    prior_feedback = []
+                if (
+                    step_contract_met(plan_step, execution.observations)
+                    and not has_blocked_evidence(execution.observations)
+                    and replans < task.budget.max_replans
+                    and not any(
+                        isinstance(entry, str)
+                        and _NEEDS_USER_REPLAN_MARKER in entry
+                        for entry in prior_feedback
+                    )
+                ):
+                    # R009/R018/R033/R013: the verifier asks the human even
+                    # though the step's deliverable is already tool-backed and
+                    # unblocked. The deterministic contract (the same evidence
+                    # the verifier would inspect) is satisfied, so the hand-off
+                    # is a request the agents already finished; a bounded replan
+                    # lets the planner restructure the step instead of dying at
+                    # step 1. Guarded by the replan budget and a once-per-run
+                    # marker: the run loop appends this summary to
+                    # verifier_feedback, so a second identical NEED_USER after
+                    # the replan keeps the human hand-off. Blocked evidence
+                    # (login/captcha/anti-bot/OCR-off) always keeps the human
+                    # hand-off.
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=verification.feedback,
+                        summary=(
+                            f"{verification.feedback} {_NEEDS_USER_REPLAN_MARKER}"
+                        ),
+                        output_artifact_refs=execution.artifact_refs,
+                    )
                 return self._wait_for_user(
                     db,
                     run_id,
@@ -605,27 +679,13 @@ class AgentRuntime:
                     verification.feedback,
                     output_artifact_refs=execution.artifact_refs,
                 )
-            run_repository.finish_step(
+            return self._request_replan(
                 db,
-                persisted_step,
-                status=StepStatus.skipped,
-                output_artifact_refs=execution.artifact_refs,
-                error_code="replan_required",
-            )
-            run_repository.append_event(
-                db,
-                run_id=run_id,
-                event_type="verification_replan",
-                payload_json={
-                    "sequence": persisted_step.sequence,
-                    "feedback": verification.feedback,
-                },
-            )
-            return AgentRunResult(
                 run_id,
-                RunStatus.running,
-                verification.feedback,
-                "replan_required",
+                persisted_step,
+                feedback=verification.feedback,
+                summary=verification.feedback,
+                output_artifact_refs=execution.artifact_refs,
             )
 
     @staticmethod
@@ -1122,6 +1182,42 @@ class AgentRuntime:
             payload_json={"sequence": step.sequence, "reason": reason},
         )
         return AgentRunResult(run_id, RunStatus.running, execution.summary)
+
+    def _request_replan(
+        self,
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        *,
+        feedback: str | None,
+        summary: str,
+        output_artifact_refs: list[dict[str, str]],
+    ) -> AgentRunResult:
+        """Close a step as skipped with a replan_required outcome.
+
+        Shared by the verifier REPLAN decision and the bounded conversions
+        (NEED_USER over a satisfied contract, RETRY over a scoped-out tool):
+        the step is marked skipped with the stable ``replan_required`` code, a
+        ``verification_replan`` event records the verifier feedback, and the
+        run loop replans with ``summary`` appended to verifier_feedback.
+        """
+        run_repository.finish_step(
+            db,
+            step,
+            status=StepStatus.skipped,
+            output_artifact_refs=output_artifact_refs,
+            error_code="replan_required",
+        )
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type="verification_replan",
+            payload_json={
+                "sequence": step.sequence,
+                "feedback": feedback,
+            },
+        )
+        return AgentRunResult(run_id, RunStatus.running, summary, "replan_required")
 
     def _wait_for_user(
         self,
