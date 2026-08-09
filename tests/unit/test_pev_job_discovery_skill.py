@@ -89,15 +89,17 @@ def test_job_discovery_input_normalizers_reject_blank_values() -> None:
 
 def test_batch_fetch_preserves_successful_pages_and_explicit_per_url_failures(monkeypatch) -> None:
     monkeypatch.setattr(
-        "backend.app.services.career_skills.job_discovery.fetch_public_job_page",
-        lambda _context, payload: (
+        "backend.app.services.career_skills.job_discovery._fetch_one_with_expansion",
+        lambda _context, url: (
             (_ for _ in ()).throw(PublicJobFetchError("public_fetch_failed"))
-            if payload.url.endswith("bad")
-            else FetchPublicJobPageOutput(
-                artifact_id=f"observed:{payload.url[-1]}", source_url=payload.url,
-                title="AI Agent 开发", visible_text="岗位职责和任职要求。",
-                content_hash=payload.url[-1] * 64,
-            )
+            if url.endswith("bad")
+            else [
+                FetchPublicJobPageOutput(
+                    artifact_id=f"observed:{url[-1]}", source_url=url,
+                    title="AI Agent 开发", visible_text="岗位职责和任职要求。",
+                    content_hash=url[-1] * 64,
+                )
+            ]
         ),
     )
 
@@ -1832,11 +1834,57 @@ def test_wechat_route_slice_without_text_is_blocked(monkeypatch) -> None:
                 visible_text=visible_text,
             ),
         )
-        with pytest.raises(PublicJobFetchError, match="wechat_ocr_failed"):
+        with pytest.raises(PublicJobFetchError) as excinfo:
             fetch_public_job_page(
                 ToolContext(user_id="u", run_id="r"),
                 FetchPublicJobPageInput(url=url),
             )
+        assert excinfo.value.code == "wechat_ocr_failed"
+
+
+def test_wechat_ocr_failed_carries_anti_generalization_message(monkeypatch) -> None:
+    """The OCR-failed error must tell the executor the failure is URL-local.
+
+    Guards against the v5 regression where the executor generalized one
+    polluted WeChat URL (WHQi paywall cache) to all WeChat links and gave up
+    on 17 fetchable URLs (R003/R004/R010).
+    """
+    from backend.app.services.career_skills.wechat import FetchWechatArticleOutput
+
+    url = "https://mp.weixin.qq.com/s/whqi-polluted-cache"
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.wechat.fetch_wechat_article",
+        lambda _context, _payload: FetchWechatArticleOutput(
+            url=url,
+            status="needs_manual_review",
+            channel="B",
+            candidates=[],
+            ocr_text="",
+            needs_deep_crawl=False,
+            reason="article has no content",
+            content_hash=None,
+            visible_text="",
+        ),
+    )
+    with pytest.raises(PublicJobFetchError) as excinfo:
+        fetch_public_job_page(
+            ToolContext(user_id="u", run_id="r"),
+            FetchPublicJobPageInput(url=url),
+        )
+    assert excinfo.value.code == "wechat_ocr_failed"
+    assert "不代表同批其他微信链接也会失败" in str(excinfo.value)
+    assert "仍应继续逐一尝试" in str(excinfo.value)
+
+
+def test_public_job_fetch_error_code_only_str_falls_back_to_code() -> None:
+    """Code-only construction keeps str(exc) == code (registry observation contract)."""
+    error = PublicJobFetchError("unsafe_public_url")
+    assert error.code == "unsafe_public_url"
+    assert str(error) == "unsafe_public_url"
 
 
 def test_wechat_route_uncovered_host_falls_back_to_requests(monkeypatch) -> None:
@@ -2177,4 +2225,216 @@ def test_parse_adapter_evidence_rejects_non_record_text(monkeypatch) -> None:
         extract_observed_job_details(
             bad_context, ExtractObservedJobDetailsInput(artifact_id=bad_id)
         )
+
+
+def _noop_assert_public_url(_url: str) -> None:
+    return None
+
+
+def _jd_body(title: str) -> str:
+    return (
+        f"{title} 岗位职责：负责研发交付；岗位要求：3 年经验。" + "补充说明。" * 30
+    )
+
+
+def test_batch_fetch_expands_js_card_list_into_detail_pages(monkeypatch) -> None:
+    """P2: a rendered JS card-list yields the list page + deep-fetched details."""
+    list_url = "https://jobs.example.com/careers"
+    detail_urls = [
+        f"https://jobs.example.com/position/100{i}" for i in range(1, 4)
+    ]
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _noop_assert_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    list_text = "卡片列表：前端 后端 算法 产品" + "（加载更多）" * 40
+
+    def fake_get(url, **kwargs):  # noqa: ANN001
+        if url == list_url:
+            raise __import__("requests").ConnectionError("shell -> render")
+        return SimpleNamespace(
+            text=f"<html><body>{_jd_body(url.split('/')[-1])}</body></html>",
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (list_text, "校招职位列表", detail_urls),
+    )
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(urls=[list_url]),
+    )
+
+    assert [page.source_url for page in result.pages] == [list_url, *detail_urls]
+    assert not result.failures
+    # detail pages carry real JD body, not the empty card shell
+    assert "岗位职责" in result.pages[1].visible_text
+    assert result.pages[0].title == "校招职位列表"
+
+
+def test_batch_fetch_skips_expansion_when_page_already_has_jd_text(monkeypatch) -> None:
+    """A detail page is terminal evidence; its own links must not be expanded."""
+    list_url = "https://jobs.example.com/careers"
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _noop_assert_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("render path")
+        ),
+    )
+    jd_text = _jd_body("岗位A") + "岗位职责：" + "内容。" * 40
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (jd_text, "岗位A JD", ["https://jobs.example.com/position/1"]),
+    )
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(urls=[list_url]),
+    )
+
+    assert [page.source_url for page in result.pages] == [list_url]
+    assert not result.failures
+
+
+def test_batch_fetch_expansion_caps_and_isolates_failed_details(monkeypatch) -> None:
+    list_url = "https://jobs.example.com/careers"
+    detail_urls = [f"https://jobs.example.com/position/{i}" for i in range(1, 9)]
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _noop_assert_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    list_text = "卡片列表" + "（加载更多）" * 40
+
+    def fake_get(url, **kwargs):  # noqa: ANN001
+        if url == list_url:
+            raise __import__("requests").ConnectionError("shell -> render")
+        if int(url.rsplit("/", 1)[1]) in {3, 7}:
+            raise __import__("requests").ConnectionError("detail 3/7 down")
+        return SimpleNamespace(
+            text=f"<html><body>{_jd_body(url)}</body></html>",
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get
+    )
+
+    def fake_seam(url):  # noqa: ANN001
+        if url == list_url:
+            return (list_text, "招聘列表", detail_urls)
+        return ("", None)  # detail renders stay empty: render fallback fails too
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        fake_seam,
+    )
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(urls=[list_url]),
+    )
+
+    # cap at 5 detail pages; failing details (3) are skipped, the list page
+    # itself remains valid evidence and no batch-level failure is reported
+    assert result.pages[0].source_url == list_url
+    expanded = result.pages[1:]
+    assert len(expanded) == 4  # details 1,2,4,5 (3 failed; 6..8 never fetched)
+    assert [p.source_url for p in expanded] == [f"https://jobs.example.com/position/{i}" for i in (1, 2, 4, 5)]
+    assert not result.failures
+
+
+def test_collect_page_links_keeps_only_same_host_job_shaped_links(monkeypatch) -> None:
+    from backend.app.services.career_skills import job_discovery as jd
+
+    class FakePage:
+        def eval_on_selector_all(self, selector, expression):  # noqa: ANN001
+            return [
+                "https://jobs.example.com/position/1",
+                "https://jobs.example.com/job/2",
+                "https://jobs.example.com/about",  # not job-shaped
+                "https://other.example.com/job/3",  # cross-host
+                "http://192.168.1.5/job/4",  # private
+                "ftp://jobs.example.com/job/5",  # non-http
+                "https://jobs.example.com/position/1",  # duplicate
+                42,  # non-str junk from the DOM
+                "javascript:void(0)",
+            ]
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._is_public_url",
+        lambda url: url.startswith("https://jobs.example.com/"),
+    )
+    links = jd._collect_page_links(FakePage(), "https://jobs.example.com/careers")
+    assert links == [
+        "https://jobs.example.com/position/1",
+        "https://jobs.example.com/job/2",
+    ]
+
+
+def test_expand_from_list_links_requires_min_links_and_skips_jd_pages(monkeypatch) -> None:
+    from backend.app.services.career_skills import job_discovery as jd
+
+    # fewer than 2 job-shaped links is not a card-list
+    assert jd._expand_from_list_links("https://jobs.example.com/x", ["https://jobs.example.com/position/1"], "卡片") == []
+    # a page carrying JD-section text is itself a detail page
+    assert jd._expand_from_list_links(
+        "https://jobs.example.com/x",
+        ["https://jobs.example.com/position/1", "https://jobs.example.com/position/2"],
+        "岗位职责：负责 xxx",
+    ) == []
+
+
+def test_single_page_tool_never_expands_list_links(monkeypatch) -> None:
+    """fetch-public-job-page keeps its single-page contract even when the
+    render seam exposes detail links."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        _noop_assert_public_url,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED", True
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            __import__("requests").ConnectionError("render path")
+        ),
+    )
+    rendered = "卡片列表" + "（加载更多）" * 40
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL",
+        lambda url: (rendered, "招聘列表", ["https://jobs.example.com/position/1"]),
+    )
+
+    result = fetch_public_job_page(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPageInput(url="https://jobs.example.com/careers"),
+    )
+
+    assert result.source_url == "https://jobs.example.com/careers"
+    assert result.visible_text == rendered
 

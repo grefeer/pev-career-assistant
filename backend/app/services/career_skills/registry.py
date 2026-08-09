@@ -39,7 +39,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.FetchPublicJobPagesOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=job_discovery.fetch_public_job_pages,
-            description="批量抓取用户给出的有限官方 URL，返回每页可追溯正文或明确失败原因。",
+            description="批量抓取用户给出的有限官方 URL，返回每页可追溯正文或明确失败原因。JS 卡片列表页（渲染后无 JD 正文但有职位卡片链接）会自动展开：列表页本身 + 前 5 个详情页正文一并返回，可直接进入后续提取与匹配。failures 列表中的失败仅针对列出的 URL 本身（如 wechat_ocr_failed / public_fetch_failed / adapter:*），绝不代表同批其他 URL 或同类型的其他微信链接也会失败——同一批中其余 URL 仍应继续逐一尝试，全部尝试后才能下结论。",
         )
     )
     registry.register(
@@ -105,7 +105,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=wechat.FetchWechatArticleOutput,
             allowed_roles=frozenset({AgentRole.executor, AgentRole.verifier}),
             handler=wechat.fetch_wechat_article,
-            description="OCR 抓取微信公众号图文（含 ReadGZH 镜像）为可提取文本与候选。微信图文正文是图片，普通页面抓取返回空内容——目标为 mp.weixin.qq.com 链接时使用本工具（fetch-public-job-pages 也已自动路由微信链接）；门控关闭时返回 needs_manual_review（reason ocr_disabled）。",
+            description="OCR 抓取微信公众号图文（含 ReadGZH 镜像）为可提取文本与候选。微信图文正文是图片，普通页面抓取返回空内容——目标为 mp.weixin.qq.com 链接时使用本工具（fetch-public-job-pages 也已自动路由微信链接）；门控关闭时返回 needs_manual_review（reason ocr_disabled）。注意：单个微信链接失败（如镜像返回验证墙/付费墙、文章无正文）只代表该链接本身不可用，不代表其他微信文章链接也会失败——每篇独立尝试，其余链接仍应继续抓取。",
         )
     )
     registry.register(

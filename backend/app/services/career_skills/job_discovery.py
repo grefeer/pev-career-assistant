@@ -45,6 +45,21 @@ _MIN_USABLE_TEXT_CHARS = 160
 # the 48k per-run evidence budget kept full for recent artifacts.
 _MAX_VISIBLE_TEXT_CHARS = 32_000
 _PLAYWRIGHT_FALLBACK_ENABLED = False
+# P2 (2026-08-09): a rendered page is a JS card-list when it exposes >= this
+# many same-host job-shaped detail links while carrying no JD-section text;
+# the batch fetch then deep-fetches up to this many detail pages so
+# match-observed-jobs sees real JD body instead of an empty card shell.
+_MIN_LIST_LINKS = 2
+_MAX_LIST_EXPANSION = 5
+_JD_SECTION_MARKERS = (
+    "岗位职责",
+    "岗位要求",
+    "职位描述",
+    "工作职责",
+    "任职要求",
+    "职责描述",
+    "responsibilities",
+)
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
 
@@ -163,10 +178,15 @@ _JOB_SEARCH_SITE_OPERATORS = (
 
 
 class PublicJobFetchError(RuntimeError):
-    """Stable, non-sensitive public-web fetch failure."""
+    """Stable, non-sensitive public-web fetch failure.
 
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
+    ``message`` (optional) enriches the agent-facing error text while
+    ``code`` stays the stable, machine-testable identity.  When omitted the
+    error text falls back to the code itself.
+    """
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        super().__init__(message or code)
         self.code = code
 
 
@@ -512,17 +532,25 @@ def _fetch_validated(url: str) -> requests.Response:
     raise PublicJobFetchError("unsafe_public_url")
 
 
-def _render_with_playwright(url: str) -> tuple[str, str | None]:
-    """Render ``url`` in headless Chromium; return (body_text, title).
+def _render_with_playwright(
+    url: str, *, collect_links: bool = False
+) -> tuple[str, str | None] | tuple[str, str | None, list[str]]:
+    """Render ``url`` in headless Chromium; return (body_text, title[, links]).
 
     Uses the seam ``_PLAYWRIGHT_FETCH_IMPL`` when injected (unit tests); the
     real path lazily imports playwright and reuses one browser per process.
     A per-request route guard aborts any request whose destination is not a
     global public address, mirroring ``_assert_public_url`` inside the
     rendered page (SPA redirects and fetch() subresources included).
+    With ``collect_links=True`` the rendered DOM's same-host job-shaped
+    ``<a href>`` targets are also returned (list-page expansion, P2).
     """
     if _PLAYWRIGHT_FETCH_IMPL is not None:
-        return _PLAYWRIGHT_FETCH_IMPL(url)
+        rendered = _PLAYWRIGHT_FETCH_IMPL(url)
+        body, title = rendered[:2]
+        if collect_links:
+            return body, title, list(rendered[2]) if len(rendered) >= 3 else []
+        return body, title
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -582,7 +610,10 @@ def _render_with_playwright(url: str) -> tuple[str, str | None]:
                         break
                 else:
                     stable_samples = 0
-            return body_text, page.title() or None
+            title = page.title() or None
+            if not collect_links:
+                return body_text, title
+            return body_text, title, _collect_page_links(page, url)
         finally:
             page.close()
     except PublicJobFetchError:
@@ -702,7 +733,10 @@ def _fetch_wechat_article_page(
     if result.status == "needs_manual_review" and result.reason == "ocr_disabled":
         raise PublicJobFetchError("wechat_ocr_disabled")
     if not result.content_hash or not result.visible_text:
-        raise PublicJobFetchError("wechat_ocr_failed")
+        raise PublicJobFetchError(
+            "wechat_ocr_failed",
+            message="该微信链接抓取失败（镜像验证墙/付费墙或无正文）仅代表此 URL 本身不可用，不代表同批其他微信链接也会失败；同批其余 URL 仍应继续逐一尝试。",
+        )
     return FetchPublicJobPageOutput(
         artifact_id=result.artifact_id,
         source_url=url,
@@ -786,6 +820,125 @@ def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
     )
 
 
+def _collect_page_links(page: Any, origin_url: str) -> list[str]:
+    """Same-host job-shaped ``<a href>`` targets from a rendered DOM.
+
+    Only http(s) targets that pass the public-URL checks and share the
+    origin's hostname are kept, so list-page expansion never follows a
+    cross-host redirect ladder or a private/cloud-metadata address.  The
+    path filter reuses the search-result URL tokens (career/job/position/
+    campus/...), which match the detail-route shapes of the campus-portal
+    SPA family the expansion targets.
+    """
+    try:
+        raw = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+    except Exception:
+        return []
+    origin_host = urlsplit(origin_url).hostname
+    seen: set[str] = set()
+    links: list[str] = []
+    for href in raw:
+        if not isinstance(href, str) or not href.startswith(("http://", "https://")):
+            continue
+        if not _is_public_url(href):
+            continue
+        if urlsplit(href).hostname != origin_host:
+            continue
+        path = urlsplit(href).path.lower()
+        if not any(token in path for token in _JOB_RESULT_URL_TOKENS):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        links.append(href)
+    return links
+
+
+def _expand_from_list_links(
+    url: str, links: list[str], list_body: str
+) -> list[FetchPublicJobPageOutput]:
+    """Deep-fetch detail pages behind a JS card-list, one evidence page each.
+
+    A page is treated as a card-list only when it exposes enough same-host
+    job-shaped links while carrying no JD-section text of its own (the
+    campus-portal SPA family).  Detail fetches reuse the requests fast path
+    with the render fallback, never recurse into expansion again, and fail
+    silently per-link: the list page itself stays valid evidence.
+    """
+    if len(links) < _MIN_LIST_LINKS:
+        return []
+    if any(marker.lower() in list_body.lower() for marker in _JD_SECTION_MARKERS):
+        return []
+    pages: list[FetchPublicJobPageOutput] = []
+    for link in links[:_MAX_LIST_EXPANSION]:
+        try:
+            pages.append(_fetch_public_page_requests(link))
+            continue
+        except PublicJobFetchError as exc:
+            if exc.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
+                continue
+        try:
+            body_text, title = _render_with_playwright(link)  # no collect_links -> no recursion
+        except PublicJobFetchError:
+            continue
+        visible_text = body_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
+        if not visible_text or len(visible_text) < _MIN_USABLE_TEXT_CHARS:
+            continue
+        rendered_bytes = visible_text.encode("utf-8", errors="replace")
+        pages.append(
+            FetchPublicJobPageOutput(
+                artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
+                source_url=link,
+                title=title,
+                visible_text=visible_text,
+                content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
+            )
+        )
+    return pages
+
+
+def _fetch_one_with_expansion(
+    context: ToolContext, url: str
+) -> list[FetchPublicJobPageOutput]:
+    """Fetch one URL with P2 list-page expansion, returning 1..N evidence pages.
+
+    WeChat and adapter routes keep their single-page semantics (their bodies
+    are already the terminal evidence).  A plain ``requests`` hit is returned
+    as-is.  Only the render fallback path can expand: after a successful
+    render the page is checked for card-list shape, and when it qualifies
+    the detail pages behind its job-shaped links are deep-fetched and
+    appended after the list page itself.
+    """
+    wechat_page = _fetch_wechat_article_page(context, url)
+    if wechat_page is not None:
+        return [wechat_page]
+    adapter_page = _fetch_via_adapter(url)
+    if adapter_page is not None:
+        return [adapter_page]
+    try:
+        return [_fetch_public_page_requests(url)]
+    except PublicJobFetchError as error:
+        if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
+            raise
+    rendered_text, rendered_title, links = _render_with_playwright(
+        url, collect_links=True
+    )
+    visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
+    if not visible_text:
+        raise PublicJobFetchError("empty_public_page")
+    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
+        raise PublicJobFetchError("public_page_content_insufficient")
+    rendered_bytes = visible_text.encode("utf-8", errors="replace")
+    list_page = FetchPublicJobPageOutput(
+        artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
+        source_url=url,
+        title=rendered_title,
+        visible_text=visible_text,
+        content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
+    )
+    return [list_page, *_expand_from_list_links(url, links, visible_text)]
+
+
 def fetch_public_job_pages(
     context: ToolContext, payload: FetchPublicJobPagesInput
 ) -> FetchPublicJobPagesOutput:
@@ -793,13 +946,16 @@ def fetch_public_job_pages(
 
     Fetches run with bounded concurrency (C5): deterministic input-index
     ordering, i/n progress lines, and per-item error isolation identical to
-    the sequential loop this replaced.
+    the sequential loop this replaced.  A rendered card-list page (JS SPA,
+    no JD body, job-shaped detail links) is expanded in place (P2): the list
+    page stays first in ``pages`` and up to ``_MAX_LIST_EXPANSION`` detail
+    pages follow it, so later extract/match tools see real JD body.
     """
     pages: list[FetchPublicJobPageOutput] = []
     failures: list[PublicJobPageFetchFailure] = []
     batch = run_parallel_with_progress(
         payload.urls,
-        lambda url: fetch_public_job_page(context, FetchPublicJobPageInput(url=url)),
+        lambda url: _fetch_one_with_expansion(context, url),
         label="url",
         key=lambda url: url,
     )
@@ -809,7 +965,7 @@ def fetch_public_job_pages(
             code = error.code if isinstance(error, PublicJobFetchError) else "public_fetch_failed"
             failures.append(PublicJobPageFetchFailure(source_url=result.item, error_code=code))
         elif result.value is not None:
-            pages.append(result.value)
+            pages.extend(result.value)
     return FetchPublicJobPagesOutput(pages=pages, failures=failures)
 
 
