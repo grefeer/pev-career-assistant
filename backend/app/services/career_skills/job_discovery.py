@@ -60,6 +60,12 @@ _JD_SECTION_MARKERS = (
     "职责描述",
     "responsibilities",
 )
+# A3 (round1): the card-list gate only scans this many leading characters of
+# the list body for JD-section markers. Detail pages put their markers near
+# the top (char ~187/255); card shells carry them only in footer SEO text
+# (often past char 5k) -- so a marker anywhere in the body (RC-C) wrongly
+# blocked a shell with a job-looking footer from expanding.
+_JD_MARKER_SCAN_HEAD_CHARS = 2_000
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
 
@@ -512,24 +518,41 @@ def _fetch_validated(url: str) -> requests.Response:
     cloud metadata endpoint) would let an Agent read private network state. We
     disable auto-redirect and walk each hop ourselves, re-validating the scheme,
     absence of userinfo, and global-IP rule on every resolved target.
+
+    One transport-level retry is performed before a timeout/connection failure
+    is handed back: a single transient failure (flaky CDN edge, connection
+    reset) should not waste a whole Executor turn on a URL that succeeds a
+    moment later. Only ``requests.RequestException`` (timeout / connection /
+    HTTP transport errors) is retried; a ``PublicJobFetchError`` from the
+    redirect-walk (``unsafe_public_url``) or any blocked/4xx outcome stays
+    final -- retrying a security rejection would be both useless and risky.
     """
     current = url
-    for _ in range(_MAX_PUBLIC_REDIRECTS + 1):
-        response = requests.get(
-            current,
-            timeout=20,
-            allow_redirects=False,
-            headers=_PUBLIC_FETCH_HEADERS,
-        )
-        if not response.is_redirect:
-            return response
-        target = response.headers.get("Location")
-        if not target:
-            return response
-        target = urljoin(current, target)
-        _assert_public_url(target)
-        current = target
-    raise PublicJobFetchError("unsafe_public_url")
+    attempt = 0
+    while True:
+        try:
+            for _ in range(_MAX_PUBLIC_REDIRECTS + 1):
+                response = requests.get(
+                    current,
+                    timeout=20,
+                    allow_redirects=False,
+                    headers=_PUBLIC_FETCH_HEADERS,
+                )
+                if not response.is_redirect:
+                    return response
+                target = response.headers.get("Location")
+                if not target:
+                    return response
+                target = urljoin(current, target)
+                _assert_public_url(target)
+                current = target
+            raise PublicJobFetchError("unsafe_public_url")
+        except requests.RequestException:
+            if attempt >= 1:
+                raise
+            attempt += 1
+            # restart the whole redirect walk from the original URL
+            current = url
 
 
 def _render_with_playwright(
@@ -544,6 +567,12 @@ def _render_with_playwright(
     rendered page (SPA redirects and fetch() subresources included).
     With ``collect_links=True`` the rendered DOM's same-host job-shaped
     ``<a href>`` targets are also returned (list-page expansion, P2).
+
+    The real path relaunches the shared browser exactly once (RC-A): a
+    generic crash / OOM / CDP-disconnect mid-render tears the dead runtime
+    down and retries, so one dead browser can never fail every later render
+    in the process.  A raised ``PublicJobFetchError`` is never retried --
+    security/validation rejections stay final.
     """
     if _PLAYWRIGHT_FETCH_IMPL is not None:
         rendered = _PLAYWRIGHT_FETCH_IMPL(url)
@@ -555,21 +584,9 @@ def _render_with_playwright(
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise PublicJobFetchError("public_fetch_failed") from None
-    global _PLAYWRIGHT_RUNTIME
-    pw, browser = _PLAYWRIGHT_RUNTIME or (None, None)
-    if browser is None:
-        try:
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch(headless=True)
-            _PLAYWRIGHT_RUNTIME = (pw, browser)
-        except Exception:
-            if pw is not None:
-                try:
-                    pw.stop()
-                except Exception:
-                    pass
-            raise PublicJobFetchError("public_fetch_failed") from None
-    try:
+
+    def _render_once(browser: Any, target_url: str) -> tuple[Any, ...]:
+        """One render pass against ``browser``; the caller owns retry policy."""
         page = browser.new_page()
 
         def _abort_non_public(route: Any, request: Any) -> None:
@@ -583,7 +600,9 @@ def _render_with_playwright(
 
         page.route("**/*", _abort_non_public)
         try:
-            response = page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+            response = page.goto(
+                target_url, wait_until="domcontentloaded", timeout=20_000
+            )
             if response is None:
                 raise PublicJobFetchError("public_fetch_failed")
             # SPA career portals frequently finish rendering long after
@@ -613,13 +632,48 @@ def _render_with_playwright(
             title = page.title() or None
             if not collect_links:
                 return body_text, title
-            return body_text, title, _collect_page_links(page, url)
+            return body_text, title, _collect_page_links(page, target_url)
         finally:
             page.close()
-    except PublicJobFetchError:
-        raise
-    except Exception:
-        raise PublicJobFetchError("public_fetch_failed") from None
+
+    global _PLAYWRIGHT_RUNTIME
+    attempt = 0
+    while True:
+        pw, browser = _PLAYWRIGHT_RUNTIME or (None, None)
+        if browser is None:
+            try:
+                pw = sync_playwright().start()
+                browser = pw.chromium.launch(headless=True)
+                _PLAYWRIGHT_RUNTIME = (pw, browser)
+            except Exception:
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception:
+                        pass
+                raise PublicJobFetchError("public_fetch_failed") from None
+        try:
+            return _render_once(browser, url)
+        except PublicJobFetchError:
+            raise
+        except Exception:
+            # The shared browser died mid-render (crash / OOM / CDP disconnect).
+            # Every later attempt against the dead runtime would fail in
+            # ~0.0s, so tear it down and relaunch exactly once (RC-A). A
+            # PublicJobFetchError is never retried: security/validation
+            # rejections and the deliberate blocked-page path stay final.
+            if attempt >= 1:
+                raise PublicJobFetchError("public_fetch_failed") from None
+            attempt += 1
+            try:
+                browser.close()
+            except Exception:
+                pass
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            _PLAYWRIGHT_RUNTIME = None
 
 
 def _adapter_company_for_url(url: str) -> str | None:
@@ -791,8 +845,16 @@ def fetch_public_job_page(
     )
 
 
-def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
-    """The non-rendered evidence path: requests + visible-text normalization."""
+def _fetch_public_page_requests_with_html(
+    url: str,
+) -> tuple[FetchPublicJobPageOutput, str]:
+    """The non-rendered evidence path: requests + visible-text normalization.
+
+    Returns ``(page_evidence, raw_html)``; the raw HTML lets the requests
+    fast path run the same card-list expansion as the render path (A2, RC-B)
+    without a second fetch. Backward-compatible single-value callers keep
+    using ``_fetch_public_page_requests``.
+    """
     try:
         response = _fetch_validated(url)
         response.raise_for_status()
@@ -817,7 +879,13 @@ def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
         title=title,
         visible_text=visible_text,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
-    )
+    ), html
+
+
+def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
+    """Backward-compatible wrapper: the requests fast path, evidence only."""
+    page, _html = _fetch_public_page_requests_with_html(url)
+    return page
 
 
 def _collect_page_links(page: Any, origin_url: str) -> list[str]:
@@ -854,6 +922,57 @@ def _collect_page_links(page: Any, origin_url: str) -> list[str]:
     return links
 
 
+class _HtmlLinkCollector(HTMLParser):
+    """Same-host job-shaped ``<a href>`` targets from raw HTML.
+
+    Mirrors the filters of ``_collect_page_links`` (rendered DOM) on the
+    requests fast path: only http(s) targets that pass the public-URL checks
+    and share the origin's hostname are kept, the path filter reuses the
+    search-result URL tokens (career/job/position/campus/...), relative hrefs
+    are resolved against the page URL with ``urljoin``, and duplicates are
+    dropped. Anchors inside ``script``/``style``/``noscript`` blocks are
+    skipped (mirroring ``_VisibleTextParser``), so inline JSON never leaks
+    random URLs into the card-list candidate set.
+    """
+
+    _IGNORED = {"script", "style", "noscript"}
+
+    def __init__(self, origin_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._origin_url = origin_url
+        self._origin_host = urlsplit(origin_url).hostname
+        self._ignored_depth = 0
+        self._seen: set[str] = set()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag in self._IGNORED:
+            self._ignored_depth += 1
+        if tag != "a" or self._ignored_depth:
+            return
+        href = dict(attrs).get("href")
+        if not isinstance(href, str) or not href:
+            return
+        resolved = urljoin(self._origin_url, href)
+        if not resolved.startswith(("http://", "https://")):
+            return
+        if not _is_public_url(resolved):
+            return
+        if urlsplit(resolved).hostname != self._origin_host:
+            return
+        path = urlsplit(resolved).path.lower()
+        if not any(token in path for token in _JOB_RESULT_URL_TOKENS):
+            return
+        if resolved in self._seen:
+            return
+        self._seen.add(resolved)
+        self.links.append(resolved)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._IGNORED and self._ignored_depth:
+            self._ignored_depth -= 1
+
+
 def _expand_from_list_links(
     url: str, links: list[str], list_body: str
 ) -> list[FetchPublicJobPageOutput]:
@@ -861,13 +980,20 @@ def _expand_from_list_links(
 
     A page is treated as a card-list only when it exposes enough same-host
     job-shaped links while carrying no JD-section text of its own (the
-    campus-portal SPA family).  Detail fetches reuse the requests fast path
-    with the render fallback, never recurse into expansion again, and fail
-    silently per-link: the list page itself stays valid evidence.
+    campus-portal SPA family).  The JD-marker scan is head-positioned (A3):
+    only the first ``_JD_MARKER_SCAN_HEAD_CHARS`` characters of the body are
+    checked, because detail pages place their markers near the top while
+    card shells carry them only in footer SEO text.  Detail fetches reuse
+    the requests fast path with the render fallback, never recurse into
+    expansion again, and fail silently per-link: the list page itself stays
+    valid evidence.
     """
     if len(links) < _MIN_LIST_LINKS:
         return []
-    if any(marker.lower() in list_body.lower() for marker in _JD_SECTION_MARKERS):
+    if any(
+        marker.lower() in list_body[:_JD_MARKER_SCAN_HEAD_CHARS].lower()
+        for marker in _JD_SECTION_MARKERS
+    ):
         return []
     pages: list[FetchPublicJobPageOutput] = []
     for link in links[:_MAX_LIST_EXPANSION]:
@@ -903,11 +1029,13 @@ def _fetch_one_with_expansion(
     """Fetch one URL with P2 list-page expansion, returning 1..N evidence pages.
 
     WeChat and adapter routes keep their single-page semantics (their bodies
-    are already the terminal evidence).  A plain ``requests`` hit is returned
-    as-is.  Only the render fallback path can expand: after a successful
-    render the page is checked for card-list shape, and when it qualifies
-    the detail pages behind its job-shaped links are deep-fetched and
-    appended after the list page itself.
+    are already the terminal evidence).  Both the ``requests`` fast path and
+    the render fallback can expand: the page is checked for card-list shape,
+    and when it qualifies the detail pages behind its same-host job-shaped
+    links are deep-fetched and appended after the list page itself.  On the
+    requests path the raw HTML is scanned once for anchors (A2, RC-B), so
+    server-rendered card lists (e.g. liepin) expand deterministically without
+    a browser; the render path collects links from the rendered DOM.
     """
     wechat_page = _fetch_wechat_article_page(context, url)
     if wechat_page is not None:
@@ -916,10 +1044,14 @@ def _fetch_one_with_expansion(
     if adapter_page is not None:
         return [adapter_page]
     try:
-        return [_fetch_public_page_requests(url)]
+        page, raw_html = _fetch_public_page_requests_with_html(url)
     except PublicJobFetchError as error:
         if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
             raise
+    else:
+        collector = _HtmlLinkCollector(url)
+        collector.feed(raw_html)
+        return [page, *_expand_from_list_links(url, collector.links, page.visible_text)]
     rendered_text, rendered_title, links = _render_with_playwright(
         url, collect_links=True
     )

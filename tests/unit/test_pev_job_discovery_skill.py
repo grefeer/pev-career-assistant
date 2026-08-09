@@ -1507,17 +1507,21 @@ def test_render_with_playwright_polls_until_a_late_spa_stops_growing(monkeypatch
 
 
 def test_render_with_playwright_reuses_an_already_launched_runtime(monkeypatch) -> None:
-    # A non-None runtime means the browser already exists: no second launch, and
-    # a broken page object still degrades to a stable failure code.
+    # A non-None runtime means the browser already exists: no first launch.
+    # When that browser dies mid-render (generic error), the dead runtime is
+    # torn down and relaunched exactly once; a second generic failure still
+    # degrades to a stable failure code (RC-A).
+    dead_page = _FakePage(goto_error=RuntimeError("cdp disconnect"))
+    pw = _FakePlaywright(_FakeBrowser(dead_page))
+    _install_fake_playwright(monkeypatch, pw)
     monkeypatch.setattr(
         "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_RUNTIME",
-        (object(), object()),
-    )
-    monkeypatch.setattr(
-        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FETCH_IMPL", None
+        (pw, _FakeBrowser(dead_page)),
     )
     with pytest.raises(PublicJobFetchError, match="public_fetch_failed"):
         _render_with_playwright("https://jobs.example/x")
+    assert pw.stopped is True  # the dead runtime was torn down, not left cached
+    assert pw.launch_kwargs == {"headless": True}  # and relaunched exactly once
 
 
 def test_is_public_url_rejects_schemes_credentials_private_and_unresolvable(monkeypatch) -> None:
