@@ -20,7 +20,7 @@ import random
 import socket
 import time
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -174,6 +174,41 @@ class BaseAdapter:
         """Polite randomized pacing between requests (0.2-0.5s default)."""
         self._sleep(min_delay + self._rng.random() * (max_delay - min_delay))
 
+    def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """One endpoint call with stable error classification.
+
+        Retries transient failures up to 3 times (1s/2s/4s backoff + jitter);
+        HTTP failures become explicit blocked codes.  Callers parse the
+        response body (JSON or text) themselves.
+        """
+        if not is_safe_public_url(url):
+            raise AdapterError(ERROR_URL_NOT_ALLOWLISTED, f"unsafe endpoint URL: {url}")
+        last: BaseException | None = None
+        for attempt in range(3):
+            try:
+                response = self._client.request(method, url, params=params, json=payload, headers=headers)
+                if response.status_code >= 400:
+                    raise AdapterError(f"http_error:{response.status_code}", f"HTTP {response.status_code} from {url}")
+                return response
+            except AdapterError:
+                raise
+            except httpx.TimeoutException as exc:
+                raise AdapterError(ERROR_TIMEOUT, f"request timed out: {exc}") from exc
+            except httpx.HTTPError as exc:
+                last = exc
+                self._sleep(2**attempt + self._rng.random() * 0.5)
+            except socket.gaierror as exc:
+                raise AdapterError(ERROR_DNS, f"dns failure: {exc}") from exc
+        raise _classify_http_error(last) if last else AdapterError(ERROR_TRANSPORT, "unreachable")
+
     def _request_json(
         self,
         *,
@@ -189,31 +224,31 @@ class BaseAdapter:
         Retries transient failures up to 3 times (1s/2s/4s backoff + jitter);
         non-JSON or HTTP failures become explicit blocked codes.
         """
-        if not is_safe_public_url(url):
-            raise AdapterError(ERROR_URL_NOT_ALLOWLISTED, f"unsafe endpoint URL: {url}")
-        last: BaseException | None = None
-        for attempt in range(3):
-            try:
-                response = self._client.request(method, url, params=params, json=payload, headers=headers)
-                if response.status_code >= 400:
-                    raise AdapterError(f"http_error:{response.status_code}", f"HTTP {response.status_code} from {url}")
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    raise AdapterError(ERROR_MALFORMED_PAYLOAD, "endpoint returned non-JSON") from exc
-                if not isinstance(data, dict):
-                    raise AdapterError(ERROR_MALFORMED_PAYLOAD, "endpoint JSON is not an object")
-                return data
-            except AdapterError:
-                raise
-            except httpx.TimeoutException as exc:
-                raise AdapterError(ERROR_TIMEOUT, f"request timed out: {exc}") from exc
-            except httpx.HTTPError as exc:
-                last = exc
-                self._sleep(2**attempt + self._rng.random() * 0.5)
-            except socket.gaierror as exc:
-                raise AdapterError(ERROR_DNS, f"dns failure: {exc}") from exc
-        raise _classify_http_error(last) if last else AdapterError(ERROR_TRANSPORT, "unreachable")
+        response = self._request(method=method, url=url, params=params, payload=payload, headers=headers)
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise AdapterError(ERROR_MALFORMED_PAYLOAD, "endpoint returned non-JSON") from exc
+        if not isinstance(data, dict):
+            raise AdapterError(ERROR_MALFORMED_PAYLOAD, "endpoint JSON is not an object")
+        return data
+
+    def _request_text(
+        self,
+        *,
+        method: str,
+        url: str,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> str:
+        """One raw-text endpoint call (HTML page) with stable error classification.
+
+        Same retry/classification semantics as ``_request_json`` but returns
+        ``response.text`` for HTML endpoints (e.g. Beisen's portal
+        registration page that embeds ``BSGlobal``).
+        """
+        return self._request(method=method, url=url, params=params, payload=payload, headers=headers).text
 
     # -- execution ----------------------------------------------------------
 

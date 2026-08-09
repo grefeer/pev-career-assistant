@@ -8,6 +8,7 @@ silent empty result.  All network I/O is mocked via httpx.MockTransport.
 """
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import sys
@@ -16,6 +17,7 @@ from typing import Any
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 SKILL_SCRIPTS = (
     Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "scripts"
@@ -62,6 +64,22 @@ def _reviewed_allowlist(tmp_path: Path) -> Path:
                 "company": "baidu",
                 "host": "talent.baidu.com",
                 "path_prefixes": ["/httservice/getPostListNew"],
+                "max_items": 300,
+                "min_delay_s": 0.2,
+                "max_delay_s": 0.5,
+            },
+            {
+                "company": "moka",
+                "host": "*.mokahr.com",
+                "path_prefixes": ["/social-recruitment/", "/campus-recruitment/"],
+                "max_items": 300,
+                "min_delay_s": 0.2,
+                "max_delay_s": 0.5,
+            },
+            {
+                "company": "beisen",
+                "host": "*.zhiye.com",
+                "path_prefixes": ["/"],
                 "max_items": 300,
                 "min_delay_s": 0.2,
                 "max_delay_s": 0.5,
@@ -121,6 +139,9 @@ def test_company_for_url_maps_known_hosts_and_rejects_unknown() -> None:
     assert company_for_url("https://talent.didiglobal.com/position/1") == "didi"
     assert company_for_url("https://hr.163.com/api/hr163/position/queryPage") == "netease"
     assert company_for_url("https://talent.baidu.com/jobs/detail/9") == "baidu"
+    assert company_for_url("https://app.mokahr.com/social-recruitment/sangfor/27944") == "moka"
+    assert company_for_url("https://hire-r1.mokahr.com/campus-recruitment/trip/70415") == "moka"
+    assert company_for_url("https://chery.zhiye.com/social/jobs") == "beisen"
     assert company_for_url("https://jobs.bytedance.com/experienced") is None
     assert company_for_url("not a url") is None
 
@@ -622,6 +643,8 @@ def test_registry_load_success_and_urlparse_value_error() -> None:
 
     assert load_company_adapter("didi").company == "didi"
     assert load_company_adapter("baidu").company == "baidu"
+    assert load_company_adapter("moka").company == "moka"
+    assert load_company_adapter("beisen").company == "beisen"
     # urlparse ValueError path in company_for_url
     assert company_for_url("http://[::1") is None
 
@@ -694,3 +717,526 @@ def test_smoke_cli_entrypoint_guard_runs_main(monkeypatch, capsys) -> None:
     )
     assert exits == [1]
     assert "blocked: adapter_unknown" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# moka adapter: AES-CBC envelope, offset paging, record mapping
+# --------------------------------------------------------------------------
+
+MOKA_URL = "https://app.mokahr.com/social-recruitment/sangfor/27944"
+
+
+def _aes_encrypt(plaintext: bytes, key: bytes) -> str:
+    """PKCS7-padded AES-CBC encryption with Moka's fixed IV (test helper)."""
+    from adapters.moka import _AES_IV
+
+    pad = 16 - len(plaintext) % 16
+    encryptor = Cipher(algorithms.AES(key), modes.CBC(_AES_IV)).encryptor()
+    ciphertext = encryptor.update(plaintext + bytes([pad]) * pad) + encryptor.finalize()
+    return base64.b64encode(ciphertext).decode()
+
+
+def _moka_envelope(
+    jobs: list[dict[str, Any]],
+    total: int,
+    *,
+    plaintext: bool = False,
+    code: int | None = 0,
+    success: bool = True,
+) -> dict[str, Any]:
+    """A Moka jobs envelope: encrypted by default, plaintext for edge tests."""
+    inner = {
+        "code": code,
+        "success": success,
+        "msg": "成功",
+        "data": {"jobStats": {"total": total}, "jobs": jobs},
+    }
+    if plaintext:
+        return inner
+    return {
+        "data": _aes_encrypt(json.dumps(inner, ensure_ascii=False).encode("utf-8"), b"0123456789abcdef"),
+        "necromancer": "0123456789abcdef",
+    }
+
+
+def _moka_job(seq: int) -> dict[str, Any]:
+    return {
+        "id": f"00000000-0000-0000-0000-{seq:012d}",
+        "title": f"岗位{seq}",
+        "locations": [{"cityName": "深圳", "provinceName": "广东", "country": "中国"}],
+        "department": {"id": 1, "name": "研发部"},
+        "commitment": "全职",
+        "jobDescription": f"<p>职责{seq}</p>",
+        "publishedAt": "2026-08-01T00:00:00Z",
+        "openedAt": "2026-08-01T01:00:00Z",
+        "createdAt": "2026-08-01T02:00:00Z",
+    }
+
+
+def _moka(allowlist: Path, handler: Any, **kwargs: Any) -> Any:
+    from adapters.moka import MokaAdapter
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return MokaAdapter(allowlist_path=allowlist, client=client, sleep=lambda s: None, **kwargs)
+
+
+def test_moka_encrypted_round_trip(tmp_path) -> None:
+    requests: list[dict[str, Any]] = []
+    headers: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content or b"{}"))
+        headers.append(dict(request.headers))
+        return httpx.Response(200, json=_moka_envelope([_moka_job(1)], 1))
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(MOKA_URL, None, None)
+    assert result["company"] == "moka"
+    records = result["records"]
+    assert [r["job_id"] for r in records] == ["MK_00000000-0000-0000-0000-000000000001"]
+    assert records[0]["title"] == "岗位1"
+    assert records[0]["company"] == "sangfor"
+    assert records[0]["location"] == "深圳, 广东, 中国"
+    assert records[0]["department"] == "研发部"
+    assert records[0]["employment_type"] == "全职"
+    assert records[0]["description"] == "职责1"
+    assert records[0]["posted_at"] == "2026-08-01T00:00:00Z"
+    assert records[0]["apply_url"] == f"{MOKA_URL}/job/00000000-0000-0000-0000-000000000001"
+    body = requests[0]
+    assert body["orgId"] == "sangfor" and body["siteId"] == 27944
+    assert body["limit"] == 50 and body["offset"] == 0
+    assert body["needStat"] is True and body["site"] == "social"
+    assert headers[0]["referer"] == MOKA_URL
+
+
+def test_moka_pages_with_offset_and_total(tmp_path) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        requests.append(body)
+        jobs = [_moka_job(body["offset"] + i) for i in range(2)]
+        return httpx.Response(200, json=_moka_envelope(jobs, 3))
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(MOKA_URL, None, None)
+    # 2 records per returned page; offsets advance by the 50-item page size
+    assert len(result["records"]) == 4
+    assert [r["job_id"] for r in result["records"]] == [
+        "MK_00000000-0000-0000-0000-000000000000",
+        "MK_00000000-0000-0000-0000-000000000001",
+        "MK_00000000-0000-0000-0000-000000000050",
+        "MK_00000000-0000-0000-0000-000000000051",
+    ]
+    assert [body["offset"] for body in requests] == [0, 50]
+
+
+def test_moka_plaintext_envelope_without_encryption(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_moka_envelope([_moka_job(9)], 1, plaintext=True))
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(MOKA_URL, None, None)
+    assert result["records"][0]["job_id"] == "MK_00000000-0000-0000-0000-000000000009"
+
+
+def test_moka_campus_board_maps_site_param(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content or b"{}")
+        assert body["site"] == "campus"
+        return httpx.Response(200, json=_moka_envelope([_moka_job(5)], 1))
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(
+        "https://app.mokahr.com/campus-recruitment/sangfor/27944", None, None
+    )
+    assert result["records"][0]["job_id"] == "MK_00000000-0000-0000-0000-000000000005"
+
+
+def test_moka_api_error_code_is_adapter_error(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=_moka_envelope([], 0, plaintext=True, code=703002, success=False),
+        )
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(MOKA_URL, None, None)
+    assert exc.value.code == "adapter_error"
+    assert "703002" in str(exc.value)
+
+
+def test_moka_unwrap_missing_data_is_malformed(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 0, "success": True, "data": None})
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(MOKA_URL, None, None)
+    assert exc.value.code == "malformed_payload"
+
+
+def test_moka_jobs_not_a_list_is_clean_empty_page(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"code": 0, "success": True, "data": {"jobStats": "oops", "jobs": "nope"}},
+        )
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    adapter._parse_target(MOKA_URL)
+    assert adapter.fetch_page(1) == ([], False)
+
+
+def test_moka_empty_result_is_explicit_blocked(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_moka_envelope([], 0, plaintext=True))
+
+    adapter = _moka(_reviewed_allowlist(tmp_path), handler)
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(MOKA_URL, None, None)
+    assert exc.value.code == "empty_result"
+
+
+def test_moka_fetch_page_without_target_is_adapter_invalid(tmp_path) -> None:
+    adapter = _moka(_reviewed_allowlist(tmp_path), lambda r: httpx.Response(200, json={}))
+    with pytest.raises(AdapterError) as exc:
+        adapter.fetch_page(1)
+    assert exc.value.code == "adapter_invalid"
+
+
+def test_moka_parse_target_rejects_foreign_hosts_and_shapes(tmp_path) -> None:
+    adapter = _moka(_reviewed_allowlist(tmp_path), lambda r: httpx.Response(200, json={}))
+    for bad in (
+        "https://evil.example.com/social-recruitment/x/1",
+        "https://app.mokahr.com/social-recruitment/x",
+        "https://app.mokahr.com/social-recruitment/x/1/extra",
+        "https://app.mokahr.com/private-recruitment/x/1",
+        "https://app.mokahr.com/social-recruitment/x/abc",
+    ):
+        with pytest.raises(AdapterError) as exc:
+            adapter._parse_target(bad)
+        assert exc.value.code == "adapter_invalid"
+    adapter._parse_target("https://hire-r1.mokahr.com/campus-recruitment/sangfor/27944")
+    assert adapter._host == "hire-r1.mokahr.com"
+    assert adapter._board == "campus-recruitment"
+    assert adapter._slug == "sangfor"
+    assert adapter._site_id == 27944
+
+
+def test_moka_decrypt_failure_shapes_are_malformed_payload() -> None:
+    from adapters.moka import _decrypt
+
+    cases = [
+        ("c2l0ZQ==", "short"),  # key length 5
+        ("!!!not-b64!!!", "0123456789abcdef"),  # invalid base64
+        ("c2l0ZQ==", "0123456789abcdef"),  # ciphertext not % 16
+        (base64.b64encode(bytes(16)).decode(), "0123456789abcdef"),  # pad 0
+        (_aes_encrypt(b"not-json", b"0123456789abcdef"), "0123456789abcdef"),  # non-JSON
+        (_aes_encrypt(b"[1, 2]", b"0123456789abcdef"), "0123456789abcdef"),  # not object
+    ]
+    for data, key in cases:
+        with pytest.raises(AdapterError) as exc:
+            _decrypt(data, key)
+        assert exc.value.code == "malformed_payload"
+
+
+def test_moka_build_record_defensive_shapes(tmp_path) -> None:
+    adapter = _moka(_reviewed_allowlist(tmp_path), lambda r: httpx.Response(200, json={}))
+    adapter._parse_target(MOKA_URL)
+    raw = {
+        "id": "job-1",
+        "title": "  软件工程师  ",
+        "locations": [
+            {"cityName": "北京", "provinceName": "北京", "country": "中国"},
+            {"cityName": "北京", "provinceName": "北京", "country": "中国"},
+            "not-a-dict",
+        ],
+        "department": None,
+        "commitment": {"fullTime": True},
+        "jobDescription": None,
+        "openedAt": "2026-07-20T09:00:00Z",
+    }
+    record = adapter.build_record(raw)
+    assert record["job_id"] == "MK_job-1"
+    assert record["title"] == "  软件工程师  "
+    assert record["location"] == "北京, 北京, 中国"  # duplicate dicts deduped
+    assert record["department"] == ""
+    assert record["employment_type"] == ""  # commitment not a str
+    assert record["description"] == ""
+    assert record["posted_at"] == "2026-07-20T09:00:00Z"  # publishedAt absent -> openedAt
+    assert record["apply_url"] == f"{MOKA_URL}/job/job-1"
+    assert adapter.build_record({"id": "n"})["location"] == ""  # locations not a list
+    assert (
+        adapter.build_record({"id": "d", "department": {"id": 3, "name": None}})["department"] == ""
+    )
+    assert adapter.build_record({"id": "e", "jobDescription": ""})["description"] == ""
+
+
+def test_moka_department_str_and_strip_html(tmp_path) -> None:
+    adapter = _moka(_reviewed_allowlist(tmp_path), lambda r: httpx.Response(200, json={}))
+    record = adapter.build_record(
+        {
+            "id": "j",
+            "department": "市场部",
+            "jobDescription": "  <p>A &amp; B</p>\n  <p>C</p>  ",
+        }
+    )
+    assert record["department"] == "市场部"
+    assert record["description"] == "A & B C"
+    assert record["posted_at"] == ""
+
+
+# --------------------------------------------------------------------------
+# beisen adapter: two-phase portal, PageIndex paging, record mapping
+# --------------------------------------------------------------------------
+
+BEISEN_URL = "https://chery.zhiye.com/social/position"
+BS_GLOBAL_HTML = (
+    "<html><body><script>"
+    "var BSGlobal = {"
+    '"PortalId": "b07b2c9f-28e3-41f2-b9f3-55bb9142d8bb", '
+    '"BeiAnInfo": {"SiteName": "奇瑞校园招聘"}};'
+    "</script></body></html>"
+)
+
+
+def _bs_job(ad_id: int, name: str) -> dict[str, Any]:
+    return {
+        "JobAdId": ad_id,
+        "JobAdName": name,
+        "LocNames": ["安徽省·芜湖市"],
+        "Salary": "面议",
+        "Duty": "<div>职责<br>执行</div>",
+        "Require": "<p>要求本科</p>",
+        "Org": "研发中心",
+        "Category": "研发类",
+        "Station": "全职",
+        "ChangeDate": "2026-07-01 10:00:00",
+    }
+
+
+def _bs(allowlist: Path, handler: Any, **kwargs: Any) -> Any:
+    from adapters.beisen import BeisenAdapter
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return BeisenAdapter(allowlist_path=allowlist, client=client, sleep=lambda s: None, **kwargs)
+
+
+def _bs_handler(portal_text: str | None, search: dict[str, Any]) -> Any:
+    """Two-phase MockTransport handler: portal HTML (optional) + search JSON."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if portal_text is not None and request.url.path == "/portal/registerSystemInfo":
+            return httpx.Response(200, text=portal_text)
+        return httpx.Response(200, json=search)
+
+    return handler
+
+
+def test_beisen_two_phase_flow(tmp_path) -> None:
+    paths: list[str] = []
+    requests: list[dict[str, Any]] = []
+    referers: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/portal/registerSystemInfo":
+            return httpx.Response(200, text=BS_GLOBAL_HTML)
+        requests.append(json.loads(request.content or b"{}"))
+        referers.append(request.headers.get("referer", ""))
+        page = requests[-1]["PageIndex"]
+        if page == 1:
+            return httpx.Response(
+                200, json={"Code": 200, "Data": [_bs_job(1, "A"), _bs_job(2, "B")], "Count": 4}
+            )
+        return httpx.Response(
+            200, json={"Code": 200, "Data": [_bs_job(3, "C"), _bs_job(4, "D")], "Count": 4}
+        )
+
+    adapter = _bs(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(BEISEN_URL, None, None)
+    assert result["company"] == "beisen"
+    assert [r["job_id"] for r in result["records"]] == ["BS_1", "BS_2", "BS_3", "BS_4"]
+    first = result["records"][0]
+    assert first["title"] == "A"
+    assert first["company"] == "奇瑞"  # 校园招聘 suffix stripped from SiteName
+    assert first["location"] == "安徽省·芜湖市"
+    assert first["department"] == "研发中心"
+    assert first["salary"] == "面议"
+    assert first["description"] == "职责\n执行\n\n要求本科"
+    assert first["apply_url"] == "https://chery.zhiye.com/portal/jobs/1"
+    assert first["posted_at"] == "2026-07-01 10:00:00"
+    body = requests[0]
+    assert body["PageIndex"] == 1 and body["PageSize"] == 300
+    assert body["PortalId"] == "b07b2c9f-28e3-41f2-b9f3-55bb9142d8bb"
+    assert body["DisplayFields"] == ["Category", "Description", "LocId", "Org", "Salary"]
+    assert referers == ["https://chery.zhiye.com/social/jobs", "https://chery.zhiye.com/social/jobs"]
+    # portal resolved exactly once (cached), then 2 search pages
+    assert paths == [
+        "/portal/registerSystemInfo",
+        "/api/Jobad/GetJobAdPageList",
+        "/api/Jobad/GetJobAdPageList",
+    ]
+
+
+def test_beisen_accepts_string_200_code(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler(BS_GLOBAL_HTML, {"Code": "200", "Data": [_bs_job(2, "B")], "Count": 1}),
+    )
+    result = adapter.execute(BEISEN_URL, None, None)
+    assert result["records"][0]["job_id"] == "BS_2"
+
+
+def test_beisen_api_code_error_is_adapter_error(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler(BS_GLOBAL_HTML, {"Code": 500, "Data": [], "Count": 0}),
+    )
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(BEISEN_URL, None, None)
+    assert exc.value.code == "adapter_error"
+
+
+def test_beisen_data_not_a_list_is_clean_empty_page(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler(BS_GLOBAL_HTML, {"Code": 200, "Data": "oops", "Count": 0}),
+    )
+    adapter._parse_target(BEISEN_URL)
+    assert adapter.fetch_page(1) == ([], False)
+
+
+def test_beisen_missing_count_stops_paging(tmp_path) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/portal/registerSystemInfo":
+            return httpx.Response(200, text=BS_GLOBAL_HTML)
+        requests.append(json.loads(request.content or b"{}"))
+        return httpx.Response(200, json={"Code": 200, "Data": [_bs_job(3, "C")]})
+
+    adapter = _bs(_reviewed_allowlist(tmp_path), handler)
+    result = adapter.execute(BEISEN_URL, None, None)
+    assert [r["job_id"] for r in result["records"]] == ["BS_3"]
+    assert len(requests) == 1  # no Count -> has_more False after first page
+
+
+def test_beisen_legacy_portal_without_bsglobal_is_adapter_error(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler("<html>no portal config</html>", {"Code": 200, "Data": [], "Count": 0}),
+    )
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(BEISEN_URL, None, None)
+    assert exc.value.code == "adapter_error"
+    assert "legacy" in str(exc.value)
+
+
+def test_beisen_bsglobal_not_valid_json_is_malformed(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler("var BSGlobal = {oops};", {"Code": 200, "Data": [], "Count": 0}),
+    )
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(BEISEN_URL, None, None)
+    assert exc.value.code == "malformed_payload"
+
+
+def test_beisen_missing_portal_id_is_adapter_error(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler('var BSGlobal = {"BeiAnInfo": {"SiteName": "奇瑞招聘"}};', {"Code": 200, "Data": [], "Count": 0}),
+    )
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(BEISEN_URL, None, None)
+    assert exc.value.code == "adapter_error"
+
+
+def test_beisen_no_beian_info_falls_back_to_tenant(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler('var BSGlobal = {"PortalId": "abc-123"};', {"Code": 200, "Data": [_bs_job(1, "A")], "Count": 1}),
+    )
+    result = adapter.execute(BEISEN_URL, None, None)
+    assert result["records"][0]["company"] == "chery"
+
+
+def test_beisen_empty_result_is_explicit_blocked(tmp_path) -> None:
+    adapter = _bs(
+        _reviewed_allowlist(tmp_path),
+        _bs_handler(BS_GLOBAL_HTML, {"Code": 200, "Data": [], "Count": 0}),
+    )
+    with pytest.raises(AdapterError) as exc:
+        adapter.execute(BEISEN_URL, None, None)
+    assert exc.value.code == "empty_result"
+
+
+def test_beisen_parse_target_rejects_foreign_hosts(tmp_path) -> None:
+    adapter = _bs(_reviewed_allowlist(tmp_path), _bs_handler(None, {"Code": 200}))
+    with pytest.raises(AdapterError) as exc:
+        adapter._parse_target("https://evil.example.com/social/jobs")
+    assert exc.value.code == "adapter_invalid"
+
+
+def test_beisen_fetch_page_without_target_is_adapter_invalid(tmp_path) -> None:
+    adapter = _bs(_reviewed_allowlist(tmp_path), _bs_handler(None, {"Code": 200}))
+    with pytest.raises(AdapterError) as exc:
+        adapter.fetch_page(1)
+    assert exc.value.code == "adapter_invalid"
+
+
+def test_beisen_build_record_defensive_shapes(tmp_path) -> None:
+    adapter = _bs(_reviewed_allowlist(tmp_path), _bs_handler(None, {"Code": 200}))
+    record = adapter.build_record(
+        {
+            "JobAdId": None,
+            "JobAdName": "",
+            "LocNames": "not-a-list",
+            "DetailAddress": "  上海·浦东  ",
+            "Category": None,
+            "Station": None,
+            "Org": None,
+            "Salary": None,
+            "Duty": None,
+            "Require": "<b>通用要求</b>",
+            "PostDate": "2026-06-01 00:00:00",
+        }
+    )
+    assert record["job_id"] == "BS_"
+    assert record["title"] == ""
+    assert record["location"] == "上海·浦东"  # LocNames not a list -> DetailAddress
+    assert record["category"] == ""
+    assert record["department"] == ""  # Org and Category both absent
+    assert record["salary"] == ""
+    assert record["description"] == "通用要求"
+    assert record["posted_at"] == "2026-06-01 00:00:00"  # ChangeDate absent -> PostDate
+    assert adapter.build_record({"JobAdId": 1, "LocNames": ["  "]})["location"] == ""
+
+
+def test_beisen_coerce_int_edge_shapes() -> None:
+    from adapters.beisen import _coerce_int
+
+    assert _coerce_int("4929") == 4929
+    assert _coerce_int(None) is None
+    assert _coerce_int("abc") is None
+    assert _coerce_int({}) is None
+
+
+def test_beisen_clean_company_name_suffixes() -> None:
+    from adapters.beisen import _clean_company_name
+
+    assert _clean_company_name("奇瑞校园招聘") == "奇瑞"  # suffix at tuple head
+    assert _clean_company_name("华海清科招聘门户") == "华海清科"  # later suffix, prior False iterations
+    assert _clean_company_name("奇瑞汽车") == "奇瑞汽车"  # no suffix -> unchanged
+    assert _clean_company_name(None) is None
+    assert _clean_company_name(42) is None
+    assert _clean_company_name("   ") is None
+
+
+def test_request_text_returns_raw_html(tmp_path) -> None:
+    adapter = _didi(_reviewed_allowlist(tmp_path), lambda r: httpx.Response(200, text="<html>hi</html>"))
+    text = adapter._request_text(method="GET", url="https://talent.didiglobal.com/position/1")
+    assert text == "<html>hi</html>"

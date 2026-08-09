@@ -19,7 +19,9 @@ from urllib.parse import urlparse
 
 from .baidu import BaiduAdapter
 from .base import AdapterError
+from .beisen import BeisenAdapter
 from .didi import DidiAdapter
+from .moka import MokaAdapter
 from .netease import NeteaseAdapter
 
 __all__ = [
@@ -34,6 +36,8 @@ _ADAPTERS: dict[str, type[Any]] = {
     "didi": DidiAdapter,
     "netease": NeteaseAdapter,
     "baidu": BaiduAdapter,
+    "moka": MokaAdapter,
+    "beisen": BeisenAdapter,
 }
 
 CompanyAdapter = type[Any]

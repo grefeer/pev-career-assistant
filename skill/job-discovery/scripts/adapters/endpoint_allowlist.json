@@ -3,7 +3,7 @@
   "review_status": "reviewed",
   "reviewed_by": "Grefeer",
   "reviewed_on": "2026-08-08",
-  "notes": "A1 双门控之一。2026-08-08 人工评审通过（Claude-assisted desk review，评审证据见 commit 说明与 docs/findjobs-optimization-plan.zh-CN.md §4.1 验收标准）：(1) 三端点均为公司官方公开免鉴权 JSON 通道，无登录/签名/加密参数（安全门 #2）；(2) TLS 校验开启（httpx verify 默认），UA 为诚实 bot；(3) 分页间隔 0.2-0.5s 礼貌限速、300/公司上限；(4) 故障注入（403/timeout/DNS/empty/malformed）均返回显式 blocked code，单测覆盖；(5) 无登录/验证码/反爬绕过代码路径；(6) 证据绑定：records 经 _write_adapter_evidence 落为 content-addressed（sha256）JSON 页文件，UrlFetchResult 携带 source_url + content_hash。后端 flag use_public_api_adapters 已默认开启。2026-08-08 live smoke：didi 300 条/netease 300 条均达上限（job_id 唯一、apply_url 有效；didi 列表接口不含 JD 正文，详情页 /position/<jdId> 可作证据锚点）；baidu 端点服务端契约已变更（任何 payload 均返回 Illegal argument : recruitType，页面 JS 已不再引用），适配器如实返回 blocked: empty_result（显式 blocked，不静默为空）。",
+  "notes": "A1 双门控之一。2026-08-08 人工评审通过（Claude-assisted desk review，评审证据见 commit 说明与 docs/findjobs-optimization-plan.zh-CN.md §4.1 验收标准）：(1) 三端点均为公司官方公开免鉴权 JSON 通道，无登录/签名/加密参数（安全门 #2）；(2) TLS 校验开启（httpx verify 默认），UA 为诚实 bot；(3) 分页间隔 0.2-0.5s 礼貌限速、300/公司上限；(4) 故障注入（403/timeout/DNS/empty/malformed）均返回显式 blocked code，单测覆盖；(5) 无登录/验证码/反爬绕过代码路径；(6) 证据绑定：records 经 _write_adapter_evidence 落为 content-addressed（sha256）JSON 页文件，UrlFetchResult 携带 source_url + content_hash。后端 flag use_public_api_adapters 已默认开启。2026-08-08 live smoke：didi 300 条/netease 300 条均达上限（job_id 唯一、apply_url 有效；didi 列表接口不含 JD 正文，详情页 /position/<jdId> 可作证据锚点）；baidu 端点服务端契约已变更（任何 payload 均返回 Illegal argument : recruitType，页面 JS 已不再引用），适配器如实返回 blocked: empty_result（显式 blocked，不静默为空）。2026-08-08 第二次评审通过（Grefeer 批准，评审证据见 plan/moka-beisen-adapters/notes.md 与 tests/unit/test_adapter_supervisor_api.py 新增 moka/beisen 用例）：(7) moka（*.mokahr.com）官方免鉴权列表端点 + AES-CBC 加密信封（固定 IV 解包，非绕过）；业务错误码显式 blocked；(8) beisen（*.zhiye.com）两阶段（registerSystemInfo→BSGlobal.PortalId + 列表端点，PageSize 300 对齐上限）；legacy 租户显式 adapter_error，不实现 legacy 通道；(9) 均经 2026-08-08 live 验证（sangfor/trip、chery/hwatsing1）；(10) 注册后 *.mokahr.com / *.zhiye.com 走 adapter-first，失败即 blocked，无 browse fallback（行为变更，与既有三站一致）。",
   "endpoints": [
     {
       "company": "didi",
@@ -37,6 +37,28 @@
       "min_delay_s": 0.2,
       "max_delay_s": 0.5,
       "description": "百度官方公开职位列表 JSON 接口（无鉴权，POST recruitType/curPage，SOCIAL+CAMPUS）；详情页 talent.baidu.com/jobs/detail/<postId>"
+    },
+    {
+      "company": "moka",
+      "host": "*.mokahr.com",
+      "path_prefixes": ["/social-recruitment/", "/campus-recruitment/"],
+      "method": "POST",
+      "list_url": "https://{host}/api/outer/ats-apply/website/jobs/v2",
+      "max_items": 300,
+      "min_delay_s": 0.2,
+      "max_delay_s": 0.5,
+      "description": "Moka 官方公开职位列表 JSON 接口（无鉴权，POST orgId/siteId/limit/offset/needStat/site，50 条/页）；响应为 AES-CBC 加密信封（data b64 + necromancer key，固定 IV），解密后 {code,success,msg,data:{jobStats,jobs}}；业务错误码（如 703002 company not found）→ blocked adapter_error；详情页 https://{host}/{board}/{slug}/{site_id}/job/<id>；2026-08-08 live 验证：app.mokahr.com/social-recruitment/sangfor/27944 total=21、trip/70415 total=684"
+    },
+    {
+      "company": "beisen",
+      "host": "*.zhiye.com",
+      "path_prefixes": ["/"],
+      "method": "POST",
+      "list_url": "https://{tenant}.zhiye.com/api/Jobad/GetJobAdPageList",
+      "max_items": 300,
+      "min_delay_s": 0.2,
+      "max_delay_s": 0.5,
+      "description": "北森官方公开职位列表 JSON 接口（两阶段：GET /portal/registerSystemInfo 解析 BSGlobal.PortalId（缓存一次）→ POST /api/Jobad/GetJobAdPageList，PageIndex/PageSize 300/PortalId/DisplayFields，Code∈{200,\"200\"}，Data list，Count total）；无 BSGlobal 的 legacy 租户 → blocked adapter_error（不实现 legacy 通道）；详情页 https://{tenant}.zhiye.com/portal/jobs/<JobAdId>；2026-08-08 live 验证：chery.zhiye.com Count=4929、hwatsing1.zhiye.com Count=16"
     }
   ]
 }
