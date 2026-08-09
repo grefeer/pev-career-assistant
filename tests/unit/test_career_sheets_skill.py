@@ -21,6 +21,7 @@ from backend.app.services.career_skills.career_sheets import (
     SheetQueryError,
     _default_list_records_impl,
     _field_map,
+    _content_hash_of,
     _normalize_field_value,
     _pick_field,
     _record_matches,
@@ -146,6 +147,131 @@ def test_scan_sheet_appends_matching_records_and_normalizes_fields(monkeypatch) 
     assert record.updated_at == str(_NOW_MS)
     assert record.sheet_name == SHEET_REGISTRY[0]["name"]
     assert len(record.raw_summary) == 200  # truncated
+    assert record.prior_metadata is not None
+    assert record.prior_metadata.company_name == "字节跳动"
+    assert record.prior_metadata.apply_url == "https://job.example/1"
+    assert record.prior_metadata.update_time == str(_NOW_MS)
+
+
+def test_scan_sheet_prior_metadata_carries_referral_code(monkeypatch) -> None:
+    entry = _entry(
+        **{
+            "企业名称": "字节跳动",
+            "内推链接": "https://job.example/1",
+            "内推码(区分大小写)": "ABC123",
+            "更新时间": str(_NOW_MS),
+        }
+    )
+    monkeypatch.setattr(
+        career_sheets, "_list_records_impl", lambda *a: {"records": [entry], "has_more": False}
+    )
+    output: list[CareerSheetRecord] = []
+    _scan_sheet(SHEET_REGISTRY[0], QueryCareerSheetRecordsInput(), output)
+    prior = output[0].prior_metadata
+    assert prior is not None
+    assert prior.referral_code == "ABC123"
+    # The link column must not double-capture the referral code (or vice versa).
+    assert prior.apply_url == "https://job.example/1"
+    assert output[0].apply_url == "https://job.example/1"
+
+
+def test_scan_sheet_referral_code_never_leaks_into_apply_url(monkeypatch) -> None:
+    # A record with only a referral code column has no apply URL at all; the
+    # mapping must not fall back to the code as if it were a link.
+    entry = _entry(**{"企业名称": "腾讯", "内推码": "TX123", "更新时间": str(_NOW_MS)})
+    monkeypatch.setattr(
+        career_sheets, "_list_records_impl", lambda *a: {"records": [entry], "has_more": False}
+    )
+    output: list[CareerSheetRecord] = []
+    _scan_sheet(SHEET_REGISTRY[0], QueryCareerSheetRecordsInput(), output)
+    record = output[0]
+    assert record.apply_url is None
+    assert record.prior_metadata is not None
+    assert record.prior_metadata.referral_code == "TX123"
+    assert record.prior_metadata.apply_url is None
+
+
+def test_scan_sheet_binds_apply_url_and_content_hash(monkeypatch) -> None:
+    monkeypatch.setattr(
+        career_sheets,
+        "_list_records_impl",
+        lambda *a: {"records": [_matching_entry()], "has_more": False},
+    )
+    first: list[CareerSheetRecord] = []
+    _scan_sheet(SHEET_REGISTRY[0], QueryCareerSheetRecordsInput(), first)
+    record = first[0]
+    assert record.source_url == "https://job.example/1"  # apply_url is the source
+    assert isinstance(record.content_hash, str)
+    assert len(record.content_hash) == 64
+    # Deterministic: identical sheet content yields the identical hash.
+    second: list[CareerSheetRecord] = []
+    _scan_sheet(SHEET_REGISTRY[0], QueryCareerSheetRecordsInput(), second)
+    assert second[0].content_hash == record.content_hash
+    # The hash covers sheet-carried content, not the derived binding fields.
+    assert record.content_hash != _content_hash_of({})
+
+
+def test_scan_sheet_record_without_apply_url_stays_unbound(monkeypatch) -> None:
+    entry = _entry(**{"企业名称": "腾讯", "内推码": "TX123", "更新时间": str(_NOW_MS)})
+    monkeypatch.setattr(
+        career_sheets, "_list_records_impl", lambda *a: {"records": [entry], "has_more": False}
+    )
+    output: list[CareerSheetRecord] = []
+    _scan_sheet(SHEET_REGISTRY[0], QueryCareerSheetRecordsInput(), output)
+    record = output[0]
+    assert record.apply_url is None
+    # No apply URL -> nothing to bind -> the runtime persistence loop skips it.
+    assert record.source_url is None
+    assert record.content_hash is None
+
+
+def test_query_output_binds_records_evidence_and_is_deterministic(monkeypatch) -> None:
+    monkeypatch.setattr(
+        career_sheets,
+        "_list_records_impl",
+        lambda *a: {"records": [_matching_entry()], "has_more": False},
+    )
+    result = query_career_sheet_records(None, QueryCareerSheetRecordsInput())
+    assert result.records[0].source_url == "https://job.example/1"
+    assert result.source_url == "https://job.example/1"
+    assert isinstance(result.content_hash, str)
+    assert len(result.content_hash) == 64
+    again = query_career_sheet_records(None, QueryCareerSheetRecordsInput())
+    assert again.content_hash == result.content_hash
+    assert again.records == result.records
+
+
+def test_query_output_empty_records_falls_back_to_sheet_file_url(monkeypatch) -> None:
+    monkeypatch.setattr(
+        career_sheets,
+        "_list_records_impl",
+        lambda *a: {"records": [], "has_more": False},
+    )
+    result = query_career_sheet_records(None, QueryCareerSheetRecordsInput())
+    assert result.records == []
+    assert result.source_url == f"https://docs.qq.com/sheet/{SHEET_REGISTRY[0]['file_id']}"
+    assert isinstance(result.content_hash, str)
+    assert len(result.content_hash) == 64
+
+
+def test_prior_metadata_model_roundtrip_and_default() -> None:
+    from backend.app.services.career_skills.career_sheets import CareerSheetPriorMetadata
+
+    record = CareerSheetRecord(sheet_name="s")
+    assert record.prior_metadata is None
+    prior = CareerSheetPriorMetadata(
+        company_name="字节", apply_url="https://u", referral_code="C", update_time="t"
+    )
+    record = CareerSheetRecord(
+        sheet_name="s",
+        prior_metadata={
+            "company_name": "字节",
+            "apply_url": "https://u",
+            "referral_code": "C",
+            "update_time": "t",
+        },
+    )
+    assert record.prior_metadata == prior
 
 
 def test_scan_sheet_skips_undated_stale_and_non_matching_records(monkeypatch) -> None:
@@ -352,3 +478,16 @@ def test_executor_instruction_constructs_official_careers_url_after_empty_search
     ask_user = _EXECUTOR_INSTRUCTION.index("ask the user for an official careers URL")
     assert sheet_first < construct_url < ask_user
     assert "careers.tencent.com/search.html?keyword=" in _EXECUTOR_INSTRUCTION
+
+
+def test_verifier_instruction_accepts_sheet_evidence_without_page_text() -> None:
+    # C005: a sheet-backed step is validated by its persisted records artifact
+    # (content_hash + source_url binding), never by page text it cannot have.
+    from backend.app.services.agent_runtime.verifier_agent import _VERIFIER_INSTRUCTION
+
+    assert "query-career-sheet-records" in _VERIFIER_INSTRUCTION
+    assert "content_hash and source_url" in _VERIFIER_INSTRUCTION
+    assert (
+        "RETRY_EXECUTOR a sheet-backed step solely because no page text was captured"
+        in _VERIFIER_INSTRUCTION
+    )

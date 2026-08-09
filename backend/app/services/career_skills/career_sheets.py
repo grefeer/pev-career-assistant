@@ -5,6 +5,9 @@ The two recruitment smartsheets (Sheet A "27届提前批秋招信息汇总", She
 job-discovery: they carry 内推/招聘 links with company, industry, location and
 update-time metadata (see ``skill/job-discovery/references/smartsheet-sources.md``).
 Network search remains the fallback when the sheets hold no matching record.
+Each matched record carries a ``prior_metadata`` bundle (company / apply_url /
+referral_code / update_time) -- smartsheet-carried facts that can fill fields
+a job page itself does not display.
 
 Bridge: the smartsheet tools are exposed by the local ``mcporter`` MCP bridge
 (``tencent-docs`` server, token from the ``TENCENT_DOCS_TOKEN`` environment
@@ -14,6 +17,7 @@ variable). We call the CLI as a subprocess; any failure degrades to a stable
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -75,6 +79,20 @@ class QueryCareerSheetRecordsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class CareerSheetPriorMetadata(BaseModel):
+    """Smartsheet-carried facts that can fill fields a page lacks.
+
+    Field mapping mirrors smartsheet-sources.md: 企业名称 -> company_name,
+    内推/招聘/投递链接 -> apply_url, 内推码(区分大小写) -> referral_code,
+    更新时间/更新日期 -> update_time.
+    """
+
+    company_name: str | None = None
+    apply_url: str | None = None
+    referral_code: str | None = None
+    update_time: str | None = None
+
+
 class CareerSheetRecord(BaseModel):
     company_name: str | None = None
     apply_url: str | None = None
@@ -84,6 +102,13 @@ class CareerSheetRecord(BaseModel):
     recruitment_type: str | None = None
     updated_at: str | None = None
     raw_summary: str | None = None
+    prior_metadata: CareerSheetPriorMetadata | None = None
+    # Evidence binding (C005): the apply URL acts as source_url and the record
+    # gets a content hash, so sheet records satisfy the runtime evidence
+    # contract and can be persisted as job_search_results artifacts. Both stay
+    # None when the record carries no apply URL - nothing to bind to.
+    source_url: str | None = None
+    content_hash: str | None = None
 
 
 class QueryCareerSheetRecordsOutput(BaseModel):
@@ -93,6 +118,11 @@ class QueryCareerSheetRecordsOutput(BaseModel):
     sheets_queried: int
     truncated: bool
     query: dict[str, Any]
+    # Output-level evidence binding: source_url is the first bound record's
+    # apply URL (the smartsheet file URL when nothing matched) and content_hash
+    # covers the whole records payload, so a non-empty query is persistable.
+    source_url: str
+    content_hash: str
 
 
 # ------------------------------------------------------------------- bridge
@@ -191,6 +221,22 @@ def _pick_field(fields: dict[str, str], *needles: str) -> str | None:
     return None
 
 
+# ------------------------------------------------------------- evidence binding
+def _canonical_payload(record: CareerSheetRecord) -> dict[str, Any]:
+    """Record content minus derived evidence fields, for stable hashing."""
+    payload = record.model_dump()
+    payload.pop("source_url", None)
+    payload.pop("content_hash", None)
+    return payload
+
+
+def _content_hash_of(payload: Any) -> str:
+    """Stable sha256 over canonical JSON (mirrors runtime skill-artifact hashing)."""
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _updated_within_days(updated_raw: str | None, recent_days: int | None) -> bool:
     """True when the record's update time falls inside the requested window."""
     if recent_days is None:
@@ -265,18 +311,35 @@ def _scan_sheet(
                 fields, payload.company_keywords, payload.role_keywords, payload.location_keywords
             ):
                 continue
-            output.append(
-                CareerSheetRecord(
-                    company_name=_pick_field(fields, "企业", "公司"),
-                    apply_url=_pick_field(fields, "链接", "内推"),
-                    sheet_name=sheet["name"],
-                    industry=_pick_field(fields, "行业", "类型"),
-                    location=_pick_field(fields, "地点", "城市"),
-                    recruitment_type=_pick_field(fields, "招聘", "内推"),
-                    updated_at=updated_raw,
-                    raw_summary=(_pick_field(fields, "文案") or "")[:200] or None,
-                )
+            company_name = _pick_field(fields, "企业", "公司")
+            # Apply URL columns are 内推链接/招聘链接/投递链接 per the source
+            # doc; the bare 内推 fallback is dropped so a referral-code column
+            # (内推码) can never be captured as the apply URL.
+            apply_url = _pick_field(fields, "链接", "投递")
+            record = CareerSheetRecord(
+                company_name=company_name,
+                apply_url=apply_url,
+                sheet_name=sheet["name"],
+                industry=_pick_field(fields, "行业", "类型"),
+                location=_pick_field(fields, "地点", "城市"),
+                recruitment_type=_pick_field(fields, "招聘", "内推"),
+                updated_at=updated_raw,
+                raw_summary=(_pick_field(fields, "文案") or "")[:200] or None,
+                prior_metadata=CareerSheetPriorMetadata(
+                    company_name=company_name,
+                    apply_url=apply_url,
+                    referral_code=_pick_field(fields, "内推码"),
+                    update_time=updated_raw,
+                ),
             )
+            if apply_url is not None:
+                record = record.model_copy(
+                    update={
+                        "source_url": apply_url,
+                        "content_hash": _content_hash_of(_canonical_payload(record)),
+                    }
+                )
+            output.append(record)
         scanned += len(records)
         if not response.get("has_more"):
             return scanned, False
@@ -301,6 +364,9 @@ def query_career_sheet_records(
         scanned, stopped_at_cap = _scan_sheet(sheet, payload, records)
         scanned_total += scanned
         truncated = truncated or stopped_at_cap
+    first_source_url = next(
+        (record.source_url for record in records if record.source_url), None
+    )
     return QueryCareerSheetRecordsOutput(
         records=records,
         matched_count=len(records),
@@ -313,4 +379,6 @@ def query_career_sheet_records(
             "location_keywords": payload.location_keywords,
             "recent_days": payload.recent_days,
         },
+        source_url=first_source_url or f"https://docs.qq.com/sheet/{SHEET_REGISTRY[0]['file_id']}",
+        content_hash=_content_hash_of([_canonical_payload(record) for record in records]),
     )

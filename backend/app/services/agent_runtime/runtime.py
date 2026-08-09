@@ -758,11 +758,16 @@ class AgentRuntime:
             output = observation.output or {}
             source_url = output.get("source_url")
             content_hash = output.get("content_hash")
-            results = output.get("results")
+            # Sheet queries emit ``records``; page searches emit ``results``.
+            # Both are candidate/URL lists carrying the evidence binding, so
+            # both persist as job_search_results artifacts (C005).
+            raw = output.get("results")
+            if raw is None:
+                raw = output.get("records")
             if not (
                 isinstance(source_url, str)
                 and isinstance(content_hash, str)
-                and isinstance(results, list)
+                and isinstance(raw, list)
             ):
                 continue
             artifact = run_repository.create_artifact(
@@ -772,7 +777,7 @@ class AgentRuntime:
                 artifact_type="job_search_results",
                 source_url=source_url,
                 content_hash=content_hash,
-                content_json={"query": output.get("query"), "results": results},
+                content_json={"query": output.get("query"), "results": raw},
             )
             artifact_refs.append(
                 {

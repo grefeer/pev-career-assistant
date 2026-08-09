@@ -71,6 +71,15 @@ class SearchResultsOutput(BaseModel):
     results: list[dict[str, str]]
 
 
+class SheetRecordsOutput(BaseModel):
+    """Mirror of QueryCareerSheetRecordsOutput's evidence shape (C005)."""
+
+    records: list[dict[str, object]]
+    source_url: str
+    content_hash: str
+    query: dict[str, object]
+
+
 class ResumeTailoringOutput(BaseModel):
     target_artifact_id: str
     target_title: str | None
@@ -1794,6 +1803,71 @@ def test_runtime_persists_public_search_results_as_discovery_evidence(db_session
             "results": [{"title": "Agent 工程师", "url": "https://jobs.example/agent", "snippet": "公开 JD"}],
         }),
     ]
+
+
+def test_runtime_persists_sheet_records_as_discovery_evidence(db_session) -> None:
+    """C005: sheet-backed records satisfy the evidence contract and persist too."""
+    user = User(
+        id="user-b", account="user-b@example.test", nickname="user-b",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [{
+            "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
+            "steps": [{"step_id": "search", "objective": "查询内推表", "allowed_skills": ["job-discovery"]}],
+        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {}},
+            {"action": "complete", "summary": "已从内推表找到记录"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="query-sheet", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=SheetRecordsOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: {
+            "records": [
+                {"company_name": "字节跳动", "apply_url": "https://job.example/1", "sheet_name": "s"},
+                {"company_name": "腾讯", "apply_url": "https://job.example/2", "sheet_name": "s"},
+            ],
+            "source_url": "https://job.example/1",
+            "content_hash": "d" * 64,
+            "query": {"company_keywords": ["字节"]},
+        },
+    ))
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session, user_id=user.id,
+        task=AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"]),
+    )
+
+    artifacts = list(db_session.scalars(
+        select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+    ))
+    assert [(artifact.artifact_type, artifact.content_json) for artifact in artifacts] == [
+        ("job_search_results", {
+            "query": {"company_keywords": ["字节"]},
+            "results": [
+                {"company_name": "字节跳动", "apply_url": "https://job.example/1", "sheet_name": "s"},
+                {"company_name": "腾讯", "apply_url": "https://job.example/2", "sheet_name": "s"},
+            ],
+        }),
+    ]
+    events = run_repository.list_events(db_session, result.run_id)
+    assert any(
+        event.event_type == "executor_search_artifact"
+        and event.payload_json["source_url"] == "https://job.example/1"
+        and event.payload_json["content_hash"] == "d" * 64
+        for event in events
+    )
 
 
 def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_code(db_session) -> None:
