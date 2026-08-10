@@ -847,6 +847,11 @@ class AgentRuntime:
         candidates: list[dict[str, str]] = []
         for artifact in run_repository.list_evidence_artifacts(db, run_id):
             visible_text = artifact.content_json.get("visible_text")
+            if (
+                (not isinstance(visible_text, str) or not visible_text)
+                and artifact.artifact_type == "structured_job_details"
+            ):
+                visible_text = _structured_artifact_visible_text(artifact.content_json)
             if not isinstance(visible_text, str) or not visible_text:
                 continue
             item: dict[str, str] = {
@@ -1464,6 +1469,28 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                 }
             )
     return items
+
+
+def _structured_artifact_visible_text(content_json: dict[str, Any]) -> str:
+    """Project extracted JD candidates back into bounded model-visible text.
+
+    Structured extraction artifacts intentionally do not duplicate page
+    ``visible_text``.  They are nevertheless durable, tool-produced evidence
+    and are the only complete fallback when an older page artifact has been
+    collapsed by the run-level evidence budget.  Keep the projection bounded
+    so this fallback cannot bypass the global context ceiling.
+    """
+    raw_candidates = content_json.get("candidates")
+    if not isinstance(raw_candidates, list):
+        return ""
+    sections: list[str] = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        text = _full_candidate_text(candidate, candidate.get("title"))
+        if text:
+            sections.append(text)
+    return "\n\n".join(sections)[:_STRUCTURED_FULL_TEXT_CHARS]
 
 
 def _evidence_artifact_id(candidate: dict[str, Any]) -> str | None:
