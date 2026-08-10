@@ -11,6 +11,8 @@ JD text (plus the source evidence artifact id) for that resolution.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from backend.app.db.models import User, UserRole
@@ -463,6 +465,11 @@ def test_tool_context_resolves_collapsed_old_artifact_for_tailoring(db_session) 
         content_hash="g" * 64,
         content_json={"visible_text": "y" * 48_000},
     )
+    # Order evidence deterministically: `list_evidence_artifacts` sorts by
+    # (created_at, id), and two artifacts created in the same instant share
+    # created_at, falling back to a random UUID sort (flaky assertions).
+    old_evidence.created_at = old_evidence.created_at - timedelta(seconds=1)
+    db_session.commit()
     run_repository.create_artifact(
         db_session,
         run_id=run.id,
