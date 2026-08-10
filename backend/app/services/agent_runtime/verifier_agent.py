@@ -5,10 +5,6 @@ from __future__ import annotations
 import time
 
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
-from backend.app.services.agent_runtime.evidence_gate import (
-    has_blocked_evidence as compute_has_blocked_evidence,
-    step_contract_met as compute_step_contract_met,
-)
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.observation_projection import (
     observation_for_decision,
@@ -60,15 +56,6 @@ _VERIFIER_INSTRUCTION = (
     "source_url, not page text. Do not RETRY_EXECUTOR a sheet-backed step "
     "solely because no page text was captured, as long as the sheet records "
     "were returned with their evidence binding. "
-    "The state carries deterministic contract anchors: step_contract_met "
-    "(whether the step's skill deliverable is already tool-backed) and "
-    "has_blocked_evidence (whether any evidence is gated by "
-    "login/captcha/anti-bot/OCR-off), plus succeeded_deliverable_tool_names "
-    "listing the succeeded tool calls. If step_contract_met is true and no "
-    "blocked evidence is present, the deterministic step contract is satisfied "
-    "— return PASS rather than NEED_USER; content gaps are reported in the "
-    "final summary. NEED_USER is only for missing inputs that block the "
-    "deliverable tool from running at all."
 )
 
 
@@ -91,8 +78,6 @@ class VerifierAgent:
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
         deadline: float | None = None,
-        step_contract_met: bool | None = None,
-        has_blocked_evidence: bool | None = None,
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
         observations: list[ToolObservation] = []
@@ -115,23 +100,6 @@ class VerifierAgent:
                 for observation in execution.observations
             ]
         )
-        # Deterministic contract anchors computed by the runtime; fall back to
-        # computing them here so direct callers still get truthful anchors.
-        contract_met = (
-            step_contract_met
-            if step_contract_met is not None
-            else compute_step_contract_met(step, execution.observations)
-        )
-        blocked_evidence = (
-            has_blocked_evidence
-            if has_blocked_evidence is not None
-            else compute_has_blocked_evidence(execution.observations)
-        )
-        succeeded_deliverable_tool_names = [
-            observation.tool_name
-            for observation in execution.observations
-            if observation.status == "succeeded"
-        ]
         allowed_skills = frozenset(step.allowed_skills)
         available_tools = self._tools.tool_catalog(
             role=AgentRole.verifier, allowed_skills=allowed_skills
@@ -166,11 +134,6 @@ class VerifierAgent:
                     "execution": execution_json,
                     "execution_tool_calls": summarize_tool_call_history(
                         execution.observations
-                    ),
-                    "step_contract_met": contract_met,
-                    "has_blocked_evidence": blocked_evidence,
-                    "succeeded_deliverable_tool_names": (
-                        succeeded_deliverable_tool_names
                     ),
                     "remaining_tool_calls": (
                         tool_budget.remaining if tool_budget is not None

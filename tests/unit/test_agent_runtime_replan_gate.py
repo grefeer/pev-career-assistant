@@ -283,13 +283,13 @@ def test_needs_user_with_contract_met_converts_to_bounded_replan(db_session) -> 
     assert planner_context["verifier_feedback"] == [
         f"请人工确认匹配结果 {_NEEDS_USER_REPLAN_MARKER}"
     ]
-    # The Verifier saw the deterministic contract anchors, not raw evidence.
+    # The Verifier receives the projected observations (never the anchor
+    # contract booleans — the anchor feature was removed as a water source).
     verifier_state = gateway.states[AgentRole.verifier][0]
-    assert verifier_state["step_contract_met"] is True
-    assert verifier_state["has_blocked_evidence"] is False
-    assert verifier_state["succeeded_deliverable_tool_names"] == [
-        "match-observed-jobs"
-    ]
+    assert "step_contract_met" not in verifier_state
+    assert "has_blocked_evidence" not in verifier_state
+    assert "succeeded_deliverable_tool_names" not in verifier_state
+    assert "execution" in verifier_state
 
 
 def test_needs_user_keeps_waiting_user_when_blocked_evidence_present(db_session) -> None:
@@ -330,8 +330,8 @@ def test_needs_user_keeps_waiting_user_when_blocked_evidence_present(db_session)
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
     verifier_state = gateway.states[AgentRole.verifier][0]
-    assert verifier_state["step_contract_met"] is True
-    assert verifier_state["has_blocked_evidence"] is True
+    assert "step_contract_met" not in verifier_state
+    assert "has_blocked_evidence" not in verifier_state
 
 
 def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None:
@@ -366,8 +366,8 @@ def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
     verifier_state = gateway.states[AgentRole.verifier][0]
-    assert verifier_state["step_contract_met"] is False
-    assert verifier_state["has_blocked_evidence"] is False
+    assert "step_contract_met" not in verifier_state
+    assert "has_blocked_evidence" not in verifier_state
 
 
 def test_needs_user_conversion_is_once_per_run(db_session) -> None:
@@ -591,8 +591,8 @@ def test_retry_with_forbidden_tool_routes_to_replan(db_session) -> None:
     # the first invocation + one in the replanned step, never a third.
     assert len(gateway.states[AgentRole.executor]) == 3
     verifier_state = gateway.states[AgentRole.verifier][0]
-    assert verifier_state["step_contract_met"] is False
-    assert verifier_state["succeeded_deliverable_tool_names"] == []
+    assert "step_contract_met" not in verifier_state
+    assert "succeeded_deliverable_tool_names" not in verifier_state
     # No marker: this is the plain replan path, feedback passes through clean.
     assert gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"] == [
         "缺少匹配证据"
@@ -806,12 +806,11 @@ def test_verifier_execution_state_projection_is_bounded(db_session) -> None:
         for entry in recent[:-1]
     )
     assert len(recent[-1]["output"]["pages"]) == 10  # capped, not 20
-    # Deterministic contract anchors ride in the Verifier state.
-    assert state["step_contract_met"] is True
-    assert state["has_blocked_evidence"] is False
-    assert state["succeeded_deliverable_tool_names"] == [
-        "fetch-public-job-pages"
-    ] * len(observations)
+    # The Verifier state carries no contract anchors (feature removed); only
+    # the projected execution observations and tool history remain.
+    assert "step_contract_met" not in state
+    assert "has_blocked_evidence" not in state
+    assert "succeeded_deliverable_tool_names" not in state
     assert all(
         call["tool_name"] == "fetch-public-job-pages"
         for call in state["execution_tool_calls"]
@@ -851,4 +850,4 @@ def test_verifier_projection_excludes_verifier_own_observation_dump(db_session) 
     assert state["execution"]["observations"][0]["error_code"] == (
         "public_fetch_failed"
     )
-    assert state["step_contract_met"] is False
+    assert "step_contract_met" not in state

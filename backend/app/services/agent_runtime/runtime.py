@@ -452,14 +452,6 @@ class AgentRuntime:
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
                     deadline=deadline,
-                    # Deterministic contract anchors, so the verifier never
-                    # has to infer the step contract from raw observations.
-                    step_contract_met=step_contract_met(
-                        plan_step, execution.observations
-                    ),
-                    has_blocked_evidence=has_blocked_evidence(
-                        execution.observations
-                    ),
                 )
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
