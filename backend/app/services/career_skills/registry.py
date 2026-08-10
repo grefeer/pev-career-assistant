@@ -50,7 +50,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=job_discovery.SearchPublicJobPagesOutput,
             allowed_roles=frozenset({AgentRole.executor}),
             handler=job_discovery.search_public_job_pages,
-            description="搜索公开招聘页；仅在用户没有提供候选 URL、且 smartsheet 无匹配记录时用于发现直接招聘链接。",
+            description="搜索公开招聘页；仅在用户没有提供候选 URL（或全部候选 URL 均已抓取失败：fetch 错误或 dead_link 死链）、且 smartsheet 无匹配记录时用于发现直接招聘链接；部分候选失败绝不授权搜索。",
         )
     )
     registry.register(
