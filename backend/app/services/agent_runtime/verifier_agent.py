@@ -7,6 +7,7 @@ import time
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.observation_projection import (
+    observation_for_decision,
     record_observation,
     summarize_observations,
     summarize_tool_call_history,
@@ -54,7 +55,7 @@ _VERIFIER_INSTRUCTION = (
     "the evidence is the persisted records artifact carrying content_hash and "
     "source_url, not page text. Do not RETRY_EXECUTOR a sheet-backed step "
     "solely because no page text was captured, as long as the sheet records "
-    "were returned with their evidence binding."
+    "were returned with their evidence binding. "
 )
 
 
@@ -87,6 +88,18 @@ class VerifierAgent:
         plan_json = plan.model_dump(mode="json")
         step_json = step.model_dump(mode="json")
         execution_json = execution.model_dump(mode="json")
+        # The Executor's raw observations never reach the Verifier at full
+        # width (round-3 R013/R018/R033 verifier drift): project them exactly
+        # like the Executor's own decision state - bounded visible_text
+        # excerpts (~1,200 chars), at most 10 pages/details per observation,
+        # and the accumulated list capped at the shared 48,000-char budget
+        # with older entries collapsing to identifier-only summary lines.
+        execution_json["observations"] = summarize_observations(
+            [
+                observation_for_decision(observation)
+                for observation in execution.observations
+            ]
+        )
         allowed_skills = frozenset(step.allowed_skills)
         available_tools = self._tools.tool_catalog(
             role=AgentRole.verifier, allowed_skills=allowed_skills

@@ -21,6 +21,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -59,12 +60,50 @@ _MAX_OUTPUT_RECORDS = 20
 _MCP_TIMEOUT_SECONDS = 30
 _MILLIS_PER_DAY = 86_400_000
 
+# Bounded retry for transient bridge failures (spawn error, timeout, bad exit
+# code, unparsable JSON): the call is retried once after a short delay.
+# Rate-limit failures are NEVER retried: the daily quota will not recover
+# inside the same run, so retrying only burns time before the same stable
+# error.
+_MAX_RETRY_ATTEMPTS = 1
+_RETRY_DELAY_SECONDS = 1.5
+
+# Rate-limit markers found in the mcporter subprocess output when the Tencent
+# docs API daily quota is exhausted (MCP error 400007 "access limit"). Any hit
+# classifies the failure as ``sheet_rate_limited``: a stable condition that
+# retrying in-run cannot recover.
+_RATE_LIMIT_MARKERS: tuple[str, ...] = (
+    "400007",
+    "access limit",
+    "访问限制",
+    "quota",
+    "limit",
+    "频率",
+    "超过",
+)
+
+# Executor-facing message attached to a ``sheet_rate_limited`` failure. Kept
+# factual: it names the authorized fallback source when the smartsheet API
+# cannot serve the query, so the executor switches instead of re-issuing the
+# doomed call.
+_SHEET_RATE_LIMITED_MESSAGE = (
+    "sheet_rate_limited: Tencent smartsheet API 今日访问限制已达上限(400007 access limit)，"
+    "配额在本轮运行内不会恢复；search-public-job-pages 是授权的备用数据源，应切换到公开搜索。"
+)
+
 
 class SheetQueryError(Exception):
-    """Stable, non-sensitive smartsheet bridge failure."""
+    """Stable, non-sensitive smartsheet bridge failure.
 
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
+    ``code`` is the stable error code the harness maps into a ToolObservation
+    (``sheet_rate_limited`` / ``sheet_call_failed`` / ``sheet_bridge_unavailable``).
+    The optional ``message`` carries executor-facing guidance (for example the
+    authorized fallback when the API is rate-limited) and defaults to the bare
+    code, so a plain ``str(exc)`` stays the stable, non-sensitive code.
+    """
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        super().__init__(message or code)
         self.code = code
 
 
@@ -126,10 +165,30 @@ class QueryCareerSheetRecordsOutput(BaseModel):
 
 
 # ------------------------------------------------------------------- bridge
+def _is_rate_limited_output(stdout: str, stderr: str) -> bool:
+    """True when the mcporter output carries a Tencent rate-limit marker.
+
+    The bridge reports the exhausted daily quota as MCP error 400007
+    "access limit" on stderr; ``quota``/``limit`` and the Chinese markers
+    cover related wordings. The scan is case-insensitive for ASCII markers.
+    """
+    haystack = f"{stdout} {stderr}".lower()
+    return any(marker.lower() in haystack for marker in _RATE_LIMIT_MARKERS)
+
+
 def _default_list_records_impl(
     file_id: str, sheet_id: str, limit: int, offset: int
 ) -> dict[str, Any]:
-    """Call ``mcporter call tencent-docs smartsheet.list_records`` once."""
+    """Call ``mcporter call tencent-docs smartsheet.list_records``.
+
+    Transient transport/parse failures (spawn error, timeout, bad exit code,
+    unparsable JSON) are retried once after ``_RETRY_DELAY_SECONDS``. A
+    rate-limit marker in the subprocess output (Tencent MCP error 400007
+    "access limit", the exhausted daily quota) raises ``sheet_rate_limited``
+    immediately and is NEVER retried: the quota will not recover inside the
+    run, so the executor gets the stable failure plus the authorized
+    fallback instead of burning a retry.
+    """
     mcporter = shutil.which("mcporter")
     if not mcporter:
         raise SheetQueryError("sheet_bridge_unavailable")
@@ -147,23 +206,44 @@ def _default_list_records_impl(
     # launch directly; route it through cmd.exe.
     if mcporter.lower().endswith(".cmd"):
         cmd = ["cmd", "/c", *cmd]
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=_MCP_TIMEOUT_SECONDS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SheetQueryError("sheet_call_failed") from exc
-    if proc.returncode != 0:
-        raise SheetQueryError("sheet_call_failed")
-    try:
-        return json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise SheetQueryError("sheet_call_failed") from exc
+    for attempt in range(_MAX_RETRY_ATTEMPTS + 1):
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_MCP_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # A spawn error or timeout produces no bridge output, so no
+            # rate-limit marker can be present: transient by definition,
+            # falls through to the bounded retry below.
+            pass
+        else:
+            if proc.returncode != 0:
+                if _is_rate_limited_output(
+                    getattr(proc, "stdout", ""), getattr(proc, "stderr", "")
+                ):
+                    raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
+            else:
+                try:
+                    return json.loads(proc.stdout)
+                except json.JSONDecodeError:
+                    # The bridge reported success but produced unparsable
+                    # output; scan it for a rate-limit marker before treating
+                    # it as a transient parse failure.
+                    if _is_rate_limited_output(
+                        getattr(proc, "stdout", ""), getattr(proc, "stderr", "")
+                    ):
+                        raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
+        # Only a transient failure (spawn error, timeout, bad exit code, or
+        # unparsable output) reaches here: retry once after a short delay,
+        # then surface the stable sheet_call_failed.
+        if attempt < _MAX_RETRY_ATTEMPTS:
+            time.sleep(_RETRY_DELAY_SECONDS)
+    raise SheetQueryError("sheet_call_failed")
 
 
 _list_records_impl: Callable[[str, str, int, int], dict[str, Any]] = _default_list_records_impl

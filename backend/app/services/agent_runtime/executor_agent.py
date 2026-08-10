@@ -197,6 +197,25 @@ _MAX_CONSECUTIVE_STALLS = 3
 # success burns the wall clock without converging on the outcome.
 _MAX_TOTAL_WASTED_TURNS = 3
 
+# Stable failure codes whose identical re-issue is a doomed repeat: the sheet
+# API is rate-limited or down (sheet_rate_limited / sheet_call_failed), the
+# step's skill permanently excludes the tool (tool_skill_forbidden), or the
+# tool does not exist (unknown_tool). An identical re-issue of such a call is
+# rejected as duplicate_tool_call WITHOUT incrementing total_wasted_turns and
+# WITHOUT consuming budget, mirroring the succeeded-call dedup: an external
+# rate limit must never be mislabeled as model waste. Transient failures
+# (tool_execution_failed) and blocked codes (login_required etc.) are NOT
+# recorded, so a legitimate retry and a blocked-flow handoff keep today's
+# behavior.
+_STABLE_FAILURE_ERROR_CODES = frozenset(
+    {
+        "sheet_rate_limited",
+        "sheet_call_failed",
+        "tool_skill_forbidden",
+        "unknown_tool",
+    }
+)
+
 # Compact character budget for each already_succeeded_calls entry's
 # input_summary: enough for a URL list or query, not enough to bloat the
 # decision state with large payloads.
@@ -298,21 +317,45 @@ def _load_execution_state(
     return prior_succeeded_calls, consecutive_stalls, total_wasted_turns
 
 
+def _load_stable_failed_calls(task: AgentTaskRequest) -> list[dict[str, str]]:
+    """Read the persisted stable-failure dedup entries for this step, if any.
+
+    Mirrors ``_load_execution_state`` for the succeeded-call set: entries
+    carry ``(tool, hash)`` and malformed entries are dropped. The runtime
+    carries them on a verifier RETRY, so an identical re-issue of a doomed
+    call (rate-limited sheet API, forbidden tool, unknown tool) is deduped
+    across invocations instead of re-hitting the failure in every re-run.
+    """
+    state = task.execution_state or {}
+    prior: list[dict[str, str]] = []
+    for entry in state.get("stable_failed_calls", []):
+        if not isinstance(entry, dict):
+            continue
+        tool = entry.get("tool")
+        digest = entry.get("hash")
+        if not isinstance(tool, str) or not isinstance(digest, str) or not digest:
+            continue
+        prior.append({"tool": tool, "hash": digest})
+    return prior
+
+
 def _snapshot_execution_state(
     *,
     succeeded_calls: list[tuple[str, dict[str, Any]]],
     prior_succeeded_calls: list[dict[str, str]],
     consecutive_stalls: int,
     total_wasted_turns: int,
+    stable_failed_calls: list[tuple[str, dict[str, Any]]] | None = None,
+    prior_stable_failed_calls: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Persistable execution state carried across verifier RETRY re-invocations.
 
     The runtime stores this on the task for the next Executor invocation of
-    the same step, so the succeeded-call dedup set and the per-invocation
-    waste counters survive a verifier RETRY instead of restarting from zero
-    (which tripled the effective waste budget and blinded dedup across
-    retries). Entries are capped at ``_MAX_PERSISTED_SUCCEEDED_CALLS``,
-    keeping the most recent calls.
+    the same step, so the succeeded-call dedup set, the stable-failure dedup
+    set and the per-invocation waste counters survive a verifier RETRY
+    instead of restarting from zero (which tripled the effective waste
+    budget and blinded dedup across retries). Entries are capped at
+    ``_MAX_PERSISTED_SUCCEEDED_CALLS``, keeping the most recent calls.
     """
     entries = [
         {
@@ -328,8 +371,17 @@ def _snapshot_execution_state(
         entries.append(summary)
     if len(entries) > _MAX_PERSISTED_SUCCEEDED_CALLS:
         entries = entries[-_MAX_PERSISTED_SUCCEEDED_CALLS:]
+    stable_entries = [
+        {"tool": entry["tool"], "hash": entry["hash"]}
+        for entry in (prior_stable_failed_calls or [])
+    ]
+    for name, payload in stable_failed_calls or []:
+        stable_entries.append({"tool": name, "hash": _input_hash(payload)})
+    if len(stable_entries) > _MAX_PERSISTED_SUCCEEDED_CALLS:
+        stable_entries = stable_entries[-_MAX_PERSISTED_SUCCEEDED_CALLS:]
     return {
         "succeeded_calls": entries,
+        "stable_failed_calls": stable_entries,
         "consecutive_stalls": consecutive_stalls,
         "total_wasted_turns": total_wasted_turns,
     }
@@ -363,6 +415,14 @@ class ExecutorAgent:
         # input; only succeeded calls are recorded so a failed call may be
         # legitimately retried later (including after other calls).
         succeeded_calls: list[tuple[str, dict[str, Any]]] = []
+        # Every (tool_name, tool_input) pair whose prior attempt failed with a
+        # stable error code (rate-limited sheet API, forbidden tool, unknown
+        # tool). An identical re-issue of such a call is a doomed repeat:
+        # rejected as duplicate_tool_call WITHOUT spending the total-waste
+        # budget, mirroring the succeeded-call dedup. Transient failures and
+        # blocked codes are never recorded, so a legitimate retry or a
+        # blocked-flow handoff keeps today's behavior.
+        stable_failed_calls: list[tuple[str, dict[str, Any]]] = []
         # Consecutive no-progress decisions (deduped re-calls / blocked search)
         # reset on any real tool execution, complete, or needs_user. Carried
         # across verifier RETRY re-invocations, like the total-waste counter.
@@ -377,12 +437,18 @@ class ExecutorAgent:
         prior_succeeded_hashes = {
             (entry["tool"], entry["hash"]) for entry in prior_succeeded_calls
         }
+        prior_stable_failed_calls = _load_stable_failed_calls(task)
+        prior_stable_failed_hashes = {
+            (entry["tool"], entry["hash"]) for entry in prior_stable_failed_calls
+        }
 
         def current_state() -> dict[str, Any]:
             """Snapshot this invocation's state for the runtime to carry on RETRY."""
             return _snapshot_execution_state(
                 succeeded_calls=succeeded_calls,
                 prior_succeeded_calls=prior_succeeded_calls,
+                stable_failed_calls=stable_failed_calls,
+                prior_stable_failed_calls=prior_stable_failed_calls,
                 consecutive_stalls=consecutive_stalls,
                 total_wasted_turns=total_wasted_turns,
             )
@@ -526,6 +592,41 @@ class ExecutorAgent:
                     continue
                 if any(
                     decision.tool_name == name and decision.tool_input == payload
+                    for name, payload in stable_failed_calls
+                ) or (
+                    decision.tool_name,
+                    _input_hash(decision.tool_input),
+                ) in prior_stable_failed_hashes:
+                    # The identical call already failed with a stable error
+                    # code (rate-limited sheet API, forbidden tool, unknown
+                    # tool); repeating it cannot change the outcome. Reject
+                    # it as duplicate_tool_call WITHOUT incrementing
+                    # total_wasted_turns and WITHOUT consuming budget
+                    # (mirroring the succeeded-call dedup), so an external
+                    # rate limit is never mislabeled as model waste. The
+                    # consecutive-stall cap still applies: an agent that
+                    # keeps repeating the doomed call after the
+                    # duplicate_tool_call guidance is genuinely stalled.
+                    consecutive_stalls += 1
+                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_DUPLICATE_STALL_QUESTION,
+                            execution_state=current_state(),
+                        )
+                    record_observation(
+                        observations,
+                        observations_for_decision,
+                        ToolObservation(
+                            tool_name=decision.tool_name or "",
+                            status="failed",
+                            error_code="duplicate_tool_call",
+                        ),
+                    )
+                    continue
+                if any(
+                    decision.tool_name == name and decision.tool_input == payload
                     for name, payload in succeeded_calls
                 ) or (
                     decision.tool_name,
@@ -578,6 +679,15 @@ class ExecutorAgent:
                 if observation.status == "succeeded":
                     succeeded_calls.append((decision.tool_name, decision.tool_input))
                 else:
+                    if observation.error_code in _STABLE_FAILURE_ERROR_CODES:
+                        # A stable failure (rate-limited sheet API, forbidden
+                        # tool, unknown tool) is recorded so an identical
+                        # re-issue is deduped instead of re-hitting the doomed
+                        # call. The first failure still counts once toward the
+                        # total-waste cap: it produced no new evidence.
+                        stable_failed_calls.append(
+                            (decision.tool_name, decision.tool_input)
+                        )
                     # The tool was invoked but did not produce a new succeeded
                     # observation. Count this as a wasted turn for the total
                     # cap (sustained no-progress even when interspersed with

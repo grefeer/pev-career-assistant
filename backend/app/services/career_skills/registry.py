@@ -61,7 +61,7 @@ def build_career_tool_registry() -> ToolRegistry:
             output_model=career_sheets.QueryCareerSheetRecordsOutput,
             allowed_roles=frozenset({AgentRole.executor}),
             handler=career_sheets.query_career_sheet_records,
-            description="查询招聘 smartsheet（内推/招聘链接台账）按企业/岗位/地点关键词与近 N 天过滤，返回候选招聘 URL；每条记录带 prior_metadata（公司/投递链接/内推码/更新时间）补足页面缺失字段；主证据源，无匹配时才用网络搜索。",
+            description="查询招聘 smartsheet（内推/招聘链接台账）按企业/岗位/地点关键词与近 N 天过滤，返回候选招聘 URL；每条记录带 prior_metadata（公司/投递链接/内推码/更新时间）补足页面缺失字段；主证据源，无匹配记录时才用网络搜索；当 smartsheet 接口不可用或受限（error sheet_rate_limited / sheet_call_failed，如每日访问配额 400007 用尽）时，search-public-job-pages 是授权的备用数据源，应切换到公开搜索。",
         )
     )
     registry.register(
