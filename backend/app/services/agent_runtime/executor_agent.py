@@ -199,11 +199,15 @@ _MAX_TOTAL_WASTED_TURNS = 3
 
 # Stable failure codes whose identical re-issue is a doomed repeat: the sheet
 # API is rate-limited or down (sheet_rate_limited / sheet_call_failed), the
-# step's skill permanently excludes the tool (tool_skill_forbidden), or the
-# tool does not exist (unknown_tool). An identical re-issue of such a call is
+# step's skill permanently excludes the tool (tool_skill_forbidden), the tool
+# does not exist (unknown_tool), or the payload failed deterministic schema
+# validation (invalid_tool_input). An identical re-issue of such a call is
 # rejected as duplicate_tool_call WITHOUT incrementing total_wasted_turns and
 # WITHOUT consuming budget, mirroring the succeeded-call dedup: an external
-# rate limit must never be mislabeled as model waste. Transient failures
+# rate limit must never be mislabeled as model waste, and a deterministic
+# schema mismatch cannot be fixed by repeating the same payload (lenient input
+# coercion handles the correct shape at the tool boundary; a genuinely new bad
+# shape still counts once each toward the total-waste cap). Transient failures
 # (tool_execution_failed) and blocked codes (login_required etc.) are NOT
 # recorded, so a legitimate retry and a blocked-flow handoff keep today's
 # behavior.
@@ -213,6 +217,7 @@ _STABLE_FAILURE_ERROR_CODES = frozenset(
         "sheet_call_failed",
         "tool_skill_forbidden",
         "unknown_tool",
+        "invalid_tool_input",
     }
 )
 
