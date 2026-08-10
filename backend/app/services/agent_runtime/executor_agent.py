@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import re
 import time
 from typing import Any
 
@@ -31,6 +33,8 @@ from backend.app.services.agent_runtime.context_manifest import (
 )
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
+
+logger = logging.getLogger(__name__)
 
 _EXECUTOR_INSTRUCTION = (
     "## 角色\n"
@@ -66,8 +70,11 @@ _EXECUTOR_INSTRUCTION = (
     "your summary. Only when the observed page text itself contains no job "
     "information at all (empty, blocked, or irrelevant page) may you state the "
     "limitation and ask the user for a more specific job-page URL. "
-    "When candidate_urls is non-empty, do not call public search: the candidate "
-    "set is already user-provided evidence to process. "
+    "When candidate_urls is non-empty, do not call public search while any "
+    "candidate URL remains unfailed: the candidate set is already user-provided "
+    "evidence to process. Public search is authorized ONLY after EVERY candidate "
+    "URL has failed to produce usable evidence (fetch error, empty/shell page, "
+    "or a dead-link/offline page); a partial failure never authorizes search. "
     "When multiple observed public-page artifacts need detailed JD normalization, "
     "prefer extract-observed-job-details-batch so one evidence-bound tool result "
     "covers the finite set. "
@@ -199,11 +206,15 @@ _MAX_TOTAL_WASTED_TURNS = 3
 
 # Stable failure codes whose identical re-issue is a doomed repeat: the sheet
 # API is rate-limited or down (sheet_rate_limited / sheet_call_failed), the
-# step's skill permanently excludes the tool (tool_skill_forbidden), or the
-# tool does not exist (unknown_tool). An identical re-issue of such a call is
+# step's skill permanently excludes the tool (tool_skill_forbidden), the tool
+# does not exist (unknown_tool), or the payload failed deterministic schema
+# validation (invalid_tool_input). An identical re-issue of such a call is
 # rejected as duplicate_tool_call WITHOUT incrementing total_wasted_turns and
 # WITHOUT consuming budget, mirroring the succeeded-call dedup: an external
-# rate limit must never be mislabeled as model waste. Transient failures
+# rate limit must never be mislabeled as model waste, and a deterministic
+# schema mismatch cannot be fixed by repeating the same payload (lenient input
+# coercion handles the correct shape at the tool boundary; a genuinely new bad
+# shape still counts once each toward the total-waste cap). Transient failures
 # (tool_execution_failed) and blocked codes (login_required etc.) are NOT
 # recorded, so a legitimate retry and a blocked-flow handoff keep today's
 # behavior.
@@ -213,8 +224,41 @@ _STABLE_FAILURE_ERROR_CODES = frozenset(
         "sheet_call_failed",
         "tool_skill_forbidden",
         "unknown_tool",
+        "invalid_tool_input",
     }
 )
+
+# Per-URL failure codes that prove a user-supplied candidate URL is dead or
+# unusable as evidence: transport failure, empty/shell page, and the soft-404
+# dead-link verdict. Public search becomes authorized only when EVERY
+# candidate URL has failed this way (W2). Blocked codes (login_required,
+# captcha, anti_bot) are deliberately absent: a blocked candidate must never
+# authorize search -- the security hard gate keeps its behavior.
+_CANDIDATE_FAILURE_ERROR_CODES = frozenset(
+    {
+        "public_fetch_failed",
+        "empty_public_page",
+        "public_page_content_insufficient",
+        "dead_link",
+    }
+)
+
+# Fetch tools whose failures carry per-URL attribution for the candidate-death
+# ledger: batch fetches report each URL in output.failures (durable across
+# verifier RETRY through the merged observations), single fetches are
+# attributed in-flight from the decision payload.
+_FETCH_TOOL_NAMES = frozenset({"fetch-public-job-pages", "fetch-public-job-page"})
+
+# Verifier-feedback fragments name the missing deliverable's tool. Fragments
+# naming a tool outside this step's skill scope cannot be honored by any
+# allowed tool; injecting them only pushes the executor toward a
+# tool_skill_forbidden drift (R013 loop). The filter drops ONLY the
+# tool-naming fragments and keeps in-domain content, so the executor still
+# sees the verifier's substantive feedback. Boundaries are Chinese
+# punctuation and newlines only: a period appears inside URLs
+# (https://jobs.example/x.y), so splitting on "." would tear evidence URLs
+# apart.
+_FEEDBACK_FRAGMENT_BOUNDARIES = re.compile(r"[。！？；\n]")
 
 # Compact character budget for each already_succeeded_calls entry's
 # input_summary: enough for a URL list or query, not enough to bloat the
@@ -394,6 +438,29 @@ class ExecutorAgent:
         self._gateway = gateway
         self._tools = tools
 
+    def _scoped_out_tool_names(self, allowed_skills: frozenset[str]) -> frozenset[str]:
+        """Tool names this step's skill scope can never invoke.
+
+        The catalog advertises only in-scope tools (and ``invoke`` rejects
+        anything else as ``tool_skill_forbidden``), so the difference between
+        the executor universe and the scoped catalog is exactly the set of
+        names the executor must never act on -- including demands that arrive
+        through verifier feedback (W3).
+        """
+        catalog_names = {
+            entry["name"]
+            for entry in self._tools.tool_catalog(
+                role=AgentRole.executor, allowed_skills=allowed_skills
+            )
+        }
+        universe_names = {
+            entry["name"]
+            for entry in self._tools.tool_catalog(
+                role=AgentRole.executor, allowed_skills=None
+            )
+        }
+        return frozenset(universe_names - catalog_names)
+
     def run(
         self,
         *,
@@ -461,6 +528,20 @@ class ExecutorAgent:
         available_tools = self._tools.tool_catalog(
             role=AgentRole.executor, allowed_skills=allowed_skills
         )
+        # Tools the universe exposes but this step's skill scope can never
+        # call: verifier feedback naming one is filtered from the decision
+        # state (W3), so a scoped-out demand can never push the executor
+        # toward a tool_skill_forbidden drift.
+        scoped_out_tool_names = self._scoped_out_tool_names(allowed_skills)
+        # Candidate URLs the user supplied for this run. Public search stays
+        # forbidden while ANY of them remains unfailed; only when every
+        # candidate has failed with a fetch/dead-link error does search become
+        # authorized (W2). Single-fetch failures carry no URL in the
+        # observation, so they are attributed in-flight from the decision
+        # payload; batch failures are read from output.failures (durable
+        # across verifier RETRY through the merged observation list).
+        candidate_urls = {url for url in _candidate_urls(task)}
+        failed_candidate_urls: set[str] = set()
         prior_observations_for_decision = [
             observation_for_decision(observation)
             for observation in (prior_observations or [])
@@ -516,7 +597,10 @@ class ExecutorAgent:
                     "available_tools": available_tools,
                     "observations": summarized_observations,
                     "prior_observations": prior_observations_for_decision,
-                    "verifier_feedback": task.context.get("verifier_feedback", []),
+                    "verifier_feedback": _scope_feedback_to_step_catalog(
+                        task.context.get("verifier_feedback", []),
+                        scoped_out_tool_names=scoped_out_tool_names,
+                    ),
                     "already_succeeded_calls": [
                         *[
                             {
@@ -562,7 +646,13 @@ class ExecutorAgent:
             if decision.action == "call_tool":
                 if (
                     decision.tool_name == "search-public-job-pages"
-                    and _has_candidate_urls(task)
+                    and _has_unfailed_candidate_urls(
+                        candidate_urls,
+                        failed_candidate_urls,
+                        [*prior_observations, *observations]
+                        if prior_observations is not None
+                        else observations,
+                    )
                 ):
                     consecutive_stalls += 1
                     total_wasted_turns += 1
@@ -679,6 +769,18 @@ class ExecutorAgent:
                 if observation.status == "succeeded":
                     succeeded_calls.append((decision.tool_name, decision.tool_input))
                 else:
+                    if (
+                        decision.tool_name in _FETCH_TOOL_NAMES
+                        and observation.error_code in _CANDIDATE_FAILURE_ERROR_CODES
+                    ):
+                        # Attribute a single-fetch failure to its candidate URL
+                        # (the observation carries no tool input): the URL was
+                        # proven dead, feeding the search-authorization ledger.
+                        failed_candidate_urls.update(
+                            url
+                            for url in _payload_fetch_urls(decision.tool_input)
+                            if url in candidate_urls
+                        )
                     if observation.error_code in _STABLE_FAILURE_ERROR_CODES:
                         # A stable failure (rate-limited sheet API, forbidden
                         # tool, unknown tool) is recorded so an identical
@@ -763,10 +865,125 @@ def _with_observed_page(
     return ToolContext(user_id=context.user_id, run_id=context.run_id, metadata=metadata)
 
 
-def _has_candidate_urls(task: AgentTaskRequest) -> bool:
-    """Avoid redundant public search when the user already bounded the evidence set."""
-    candidate_urls = task.context.get("candidate_urls")
-    return isinstance(candidate_urls, list) and any(
-        isinstance(url, str) and url.strip() for url in candidate_urls
+def _candidate_urls(task: AgentTaskRequest) -> list[str]:
+    """Deduplicated, non-empty user-supplied candidate URLs (empty when none)."""
+    raw = task.context.get("candidate_urls")
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    urls: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip() and item.strip() not in seen:
+            seen.add(item.strip())
+            urls.append(item.strip())
+    return urls
+
+
+def _payload_fetch_urls(tool_input: object) -> list[str]:
+    """URLs named in a fetch-tool payload (``urls`` list or single ``url``)."""
+    if not isinstance(tool_input, dict):
+        return []
+    raw = tool_input.get("urls")
+    if isinstance(raw, list):
+        return [url for url in raw if isinstance(url, str) and url.strip()]
+    single = tool_input.get("url")
+    if isinstance(single, str) and single.strip():
+        return [single]
+    return []
+
+
+def _failed_candidate_urls(
+    observations: list[ToolObservation], *, candidate_urls: frozenset[str]
+) -> set[str]:
+    """Candidate URLs already proven dead by a batch-fetch failure entry.
+
+    Batch fetches report per-URL failures in ``output.failures``; those
+    entries survive verifier RETRY through the merged observation list, so
+    this is the durable candidate-death ledger. Single-fetch failures carry
+    no URL in the observation and are attributed in-flight instead.
+    """
+    failed: set[str] = set()
+    for observation in observations:
+        # A batch fetch reports per-URL failures inside a SUCCEEDED
+        # observation (the registry wraps handler output as succeeded; the
+        # failure detail lives in output.failures), so the ledger reads the
+        # output only -- entry-level error codes are authoritative.
+        output = observation.output
+        if not isinstance(output, dict):
+            continue
+        failures = output.get("failures")
+        if not isinstance(failures, list):
+            continue
+        for entry in failures:
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("source_url"), str)
+                and entry["source_url"] in candidate_urls
+                and entry.get("error_code") in _CANDIDATE_FAILURE_ERROR_CODES
+            ):
+                failed.add(entry["source_url"])
+    return failed
+
+
+def _has_unfailed_candidate_urls(
+    candidate_urls: frozenset[str],
+    in_flight_failed: set[str],
+    observations: list[ToolObservation],
+) -> bool:
+    """True when at least one candidate URL is not yet proven dead.
+
+    Public search stays forbidden while ANY candidate remains unfailed (the
+    candidate set is already user-provided evidence to process). Only when
+    every candidate has failed with a fetch/dead-link error -- or no
+    candidate was supplied at all -- may search run (W2). Blocked codes
+    (login_required/captcha/anti_bot) are not candidate failures, so a
+    blocked candidate keeps search forbidden.
+    """
+    if not candidate_urls:
+        return False
+    proven = in_flight_failed | _failed_candidate_urls(
+        observations, candidate_urls=candidate_urls
     )
+    return any(url not in proven for url in candidate_urls)
+
+
+def _scope_feedback_to_step_catalog(
+    feedback: object, *, scoped_out_tool_names: frozenset[str]
+) -> object:
+    """Drop verifier-feedback fragments that name a tool outside the step scope.
+
+    The stored ``verifier_feedback`` context is never modified -- this is a
+    projection for the Executor's decision state only (W3). Non-list inputs
+    and non-string entries pass through untouched; an entry whose fragments
+    all name scoped-out tools is dropped entirely, since its only content
+    was an unsatisfiable demand. Drops are logged under the
+    ``verifier_feedback_tool_filtered`` token for observability.
+    """
+    if not isinstance(feedback, list) or not scoped_out_tool_names:
+        return feedback
+    filtered: list[object] = []
+    for entry in feedback:
+        if not isinstance(entry, str):
+            filtered.append(entry)
+            continue
+        fragments = [
+            fragment.strip()
+            for fragment in _FEEDBACK_FRAGMENT_BOUNDARIES.split(entry)
+            if fragment.strip()
+        ]
+        kept = [
+            fragment
+            for fragment in fragments
+            if not any(tool_name in fragment for tool_name in scoped_out_tool_names)
+        ]
+        if len(kept) != len(fragments):
+            logger.warning(
+                "verifier_feedback_tool_filtered: dropped %d of %d fragments naming "
+                "a tool outside the step scope",
+                len(fragments) - len(kept),
+                len(fragments),
+            )
+        if kept:
+            filtered.append("。".join(kept))
+    return filtered
 

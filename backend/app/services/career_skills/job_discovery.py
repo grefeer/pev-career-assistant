@@ -39,6 +39,17 @@ _PLAYWRIGHT_FALLBACK_CODES = frozenset(
 # Visible text below this many chars is a shell (SPA boot stub, "Not Found",
 # anti-bot placeholder) rather than usable job evidence; the renderer decides.
 _MIN_USABLE_TEXT_CHARS = 160
+# Soft-404 markers (W2): a page that carries one of these strings in its title
+# or its first ``_JD_MARKER_SCAN_HEAD_CHARS`` body chars, with almost no JD
+# body, is a dead link rather than valid evidence. Classified as ``dead_link``
+# -- a neutral failure, NOT a blocked code -- so it feeds the
+# search-authorization rule (search allowed only after EVERY candidate URL
+# failed) without ever entering needs_manual_review.
+_SOFT_404_MARKERS = ("页面不存在", "职位已下线", "职位不存在", "页面已经过期")
+# At or above this many usable text chars a page is real content and the
+# soft-404 markers are ignored (e.g. a listing page that mentions one offline
+# role); below it, marker hits classify the page as a dead link.
+_MIN_REAL_JD_TEXT_CHARS = 400
 # Upper bound for the visible-text evidence captured from one page. The Feishu
 # campus portal renders a whole 100-job listing (with inline JD sections) in a
 # single DOM pass (~26k chars for the 61 NIO agent roles), so the cap must
@@ -871,6 +882,9 @@ def fetch_public_job_page(
     visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
+    dead_code = _dead_link_code(visible_text, rendered_title)
+    if dead_code is not None:
+        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
     if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
         raise PublicJobFetchError("public_page_content_insufficient")
     rendered_bytes = visible_text.encode("utf-8", errors="replace")
@@ -881,6 +895,23 @@ def fetch_public_job_page(
         visible_text=visible_text,
         content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
     )
+
+
+def _dead_link_code(text: str, title: str | None) -> str | None:
+    """Return ``dead_link`` when the page is a soft-404, else None (W2).
+
+    A page with at least ``_MIN_REAL_JD_TEXT_CHARS`` of usable text is real
+    content even if a marker string appears somewhere: markers are only
+    scanned in the title and the first ``_JD_MARKER_SCAN_HEAD_CHARS`` chars of
+    the body, and a "404" in the title also classifies the page as dead.
+    """
+    if len(text) >= _MIN_REAL_JD_TEXT_CHARS:
+        return None
+    if any(marker in text[:_JD_MARKER_SCAN_HEAD_CHARS] for marker in _SOFT_404_MARKERS):
+        return "dead_link"
+    if title and ("404" in title or any(marker in title for marker in _SOFT_404_MARKERS)):
+        return "dead_link"
+    return None
 
 
 def _fetch_public_page_requests_with_html(
@@ -909,6 +940,9 @@ def _fetch_public_page_requests_with_html(
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
+    dead_code = _dead_link_code(visible_text, title)
+    if dead_code is not None:
+        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
     if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
         raise PublicJobFetchError("public_page_content_insufficient")
     return FetchPublicJobPageOutput(
@@ -1096,6 +1130,9 @@ def _fetch_one_with_expansion(
     visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
     if not visible_text:
         raise PublicJobFetchError("empty_public_page")
+    dead_code = _dead_link_code(visible_text, rendered_title)
+    if dead_code is not None:
+        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
     if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
         raise PublicJobFetchError("public_page_content_insufficient")
     rendered_bytes = visible_text.encode("utf-8", errors="replace")

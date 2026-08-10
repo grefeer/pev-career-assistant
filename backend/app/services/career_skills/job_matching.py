@@ -5,9 +5,47 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+
+#: Data-driven mapping of model-facing ranking criteria onto the canonical
+#: Literal domain. Identity entries make case normalization a pure lookup;
+#: Chinese entries map only enum-synonymous criteria. An unknown value is left
+#: untouched so Literal validation still rejects it (no bypass, no semantic
+#: change). Every lenient conversion is recorded in ``normalization_warnings``.
+_RANKING_CRITERIA_ALIASES: dict[str, str] = {
+    "skills": "skills",
+    "location": "location",
+    "salary": "salary",
+    "recency": "recency",
+    "company_type": "company_type",
+    "技能": "skills",
+    "技能匹配": "skills",
+    "技能匹配度": "skills",
+    "匹配度": "skills",
+    "地点": "location",
+    "位置": "location",
+    "工作地点": "location",
+    "城市": "location",
+    "薪资": "salary",
+    "薪酬": "salary",
+    "工资": "salary",
+    "薪水": "salary",
+    "薪资待遇": "salary",
+    "时效": "recency",
+    "时效性": "recency",
+    "发布时间": "recency",
+    "发布日期": "recency",
+    "新近度": "recency",
+    "公司类型": "company_type",
+    "企业类型": "company_type",
+    "单位类型": "company_type",
+    "公司性质": "company_type",
+}
+
+#: Separators accepted when ``profile_keywords`` arrives as one string.
+_KEYWORD_SEPARATORS = re.compile(r"[，,;；、\n]+")
 
 
 class MatchObservedJobsInput(BaseModel):
@@ -22,6 +60,54 @@ class MatchObservedJobsInput(BaseModel):
     #: full card-list extraction can be ranked in one call without dropping
     #: captured jobs.
     limit: int = Field(default=100, ge=1, le=100)
+    #: Human-readable record of every lenient input conversion applied to this
+    #: payload (string keywords split, Chinese/case-variant criteria mapped).
+    #: Empty when the payload arrived in canonical shape.
+    normalization_warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def tolerate_model_facing_shapes(cls, values: Any) -> Any:
+        """Coerce model-generated input shapes before canonical validation.
+
+        Converts a string ``profile_keywords`` into a keyword list and maps
+        Chinese / case-variant ``ranking_criteria`` onto the canonical enum via
+        the data-driven alias table. Unknown criteria and structurally invalid
+        payloads keep today's ``ValidationError`` behavior.
+        """
+        if isinstance(values, MatchObservedJobsInput):
+            values = values.model_dump()
+        if not isinstance(values, dict):
+            return values
+        warnings: list[str] = []
+        keywords = values.get("profile_keywords")
+        if isinstance(keywords, str):
+            split_keywords = [
+                part for part in _KEYWORD_SEPARATORS.split(keywords) if part
+            ]
+            values["profile_keywords"] = split_keywords
+            warnings.append(
+                f"profile_keywords coerced from string to {len(split_keywords)} keyword(s)"
+            )
+        criteria = values.get("ranking_criteria")
+        if isinstance(criteria, list):
+            normalized_criteria: list[Any] = []
+            for raw in criteria:
+                if isinstance(raw, str):
+                    canonical = _RANKING_CRITERIA_ALIASES.get(raw.strip().lower())
+                    if canonical is not None:
+                        normalized_criteria.append(canonical)
+                        if canonical != raw:
+                            warnings.append(
+                                f"ranking_criteria {raw!r} normalized to {canonical!r}"
+                            )
+                        continue
+                # Unknown criteria keep today's Literal ValidationError.
+                normalized_criteria.append(raw)
+            values["ranking_criteria"] = normalized_criteria
+        if warnings:
+            values["normalization_warnings"] = warnings
+        return values
 
     @field_validator("profile_keywords")
     @classmethod

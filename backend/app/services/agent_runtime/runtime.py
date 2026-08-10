@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 import time
 from typing import Any
 
@@ -55,6 +56,13 @@ _STRUCTURED_SECTION_CHARS = 600
 #: presence there makes the conversion once-per-run: a second identical
 #: NEED_USER after the replan keeps the human hand-off instead of looping.
 _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
+
+#: Marker appended to the replan feedback when a RETRY-cap exhaustion over a
+#: satisfied deterministic contract is converted to a bounded REPLAN (N3).
+#: Mirrors ``_NEEDS_USER_REPLAN_MARKER``: the run loop appends the outcome
+#: summary to verifier_feedback, so a second identical exhaustion after the
+#: replan keeps the human hand-off instead of looping.
+_RETRY_REPLAN_MARKER = "<retry_replan>"
 
 #: Per-candidate cap for the full JD text preserved alongside the bounded
 #: sections (``full_text``). Extraction outputs are already bounded by the
@@ -146,6 +154,11 @@ class AgentRuntime:
             run.id,
             initial_turn_indices=run_repository.turn_indices_by_role(db, run.id),
         )
+        # N4: the plan a replan was requested from, paired with its feedback.
+        # Set in the replan branch below and consumed at the next planner
+        # output, so the isomorphic-replan guard can compare structures
+        # before a repeated plan is re-executed.
+        replan_source: tuple[ExecutionPlan, str] | None = None
         while True:
             try:
                 planner_result = self._planner.run(
@@ -164,6 +177,40 @@ class AgentRuntime:
                 return self._finish_planner_non_plan(db, run.id, run, planner_result)
 
             plan = planner_result.plan
+            if replan_source is not None:
+                source_plan, source_feedback = replan_source
+                replan_source = None
+                if (
+                    task.budget.max_replans >= 2
+                    and replans >= task.budget.max_replans
+                    and self._plans_isomorphic(source_plan, plan)
+                ):
+                    # N4 isomorphic-replan guard: the replanned plan repeats
+                    # the exact step sequence (normalized skill + objective)
+                    # that just failed to converge, and this replan exhausts
+                    # the allowed budget. Re-executing the identical structure
+                    # can only burn the remaining turn budget in a C008-style
+                    # oscillation, so the run terminates honestly as
+                    # waiting_user instead. The verifier's rejection right is
+                    # unchanged -- the guard only short-circuits a provably
+                    # repeated plan; a structurally different plan always
+                    # executes. max_replans >= 2 keeps the guard off at a
+                    # budget of 1, where the loop is already bounded to two
+                    # planner passes.
+                    question = re.sub(r"<[a-z_]+>", "", source_feedback).strip()
+                    run_repository.finish_run(
+                        db,
+                        run,
+                        status=RunStatus.waiting_user,
+                        final_summary=question,
+                    )
+                    run_repository.append_event(
+                        db,
+                        run_id=run.id,
+                        event_type="replan_isomorphic_guard",
+                        payload_json={"feedback": source_feedback},
+                    )
+                    return AgentRunResult(run.id, RunStatus.waiting_user, question, None)
             revision += 1
             run_repository.set_run_complexity(db, run, plan.complexity)
             persisted_plan = run_repository.create_plan(
@@ -245,6 +292,7 @@ class AgentRuntime:
                 feedback.append(replan_feedback)
                 feedback_context["verifier_feedback"] = feedback
                 planning_task = task.model_copy(update={"context": feedback_context})
+                replan_source = (plan, replan_feedback)
                 continue
             run_repository.finish_run(
                 db, run, status=RunStatus.succeeded, final_summary=final_summary
@@ -623,10 +671,36 @@ class AgentRuntime:
                     )
                     continue
                 # Same-step retries cannot satisfy the verifier: more retries
-                # would only burn turns on a stuck loop, so hand the step to
-                # the human. The run stays recoverable (waiting_user -> resume)
-                # instead of failing outright, and the verifier feedback tells
-                # the human what the agents could not reconcile.
+                # would only burn turns on a stuck loop. When the step's
+                # deterministic contract is already tool-backed and unblocked
+                # and the replan budget still allows a restructure, route to a
+                # bounded REPLAN (N3) so the planner can rebuild the step
+                # instead of ending the run at a human hand-off the agents had
+                # already produced. Guarded by the replan budget and a
+                # once-per-run marker exactly like the NEED_USER conversion
+                # (R009/R018/R033): a second identical exhaustion after the
+                # replan keeps the human hand-off. Blocked evidence always
+                # keeps the human hand-off.
+                prior_feedback = task.context.get("verifier_feedback") or []
+                if not isinstance(prior_feedback, list):
+                    prior_feedback = []
+                if (
+                    step_contract_met(plan_step, execution.observations)
+                    and not has_blocked_evidence(execution.observations)
+                    and replans < task.budget.max_replans
+                    and not any(
+                        isinstance(entry, str) and _RETRY_REPLAN_MARKER in entry
+                        for entry in prior_feedback
+                    )
+                ):
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=verification.feedback,
+                        summary=f"{verification.feedback} {_RETRY_REPLAN_MARKER}",
+                        output_artifact_refs=execution.artifact_refs,
+                    )
                 return self._wait_for_user(
                     db,
                     run_id,
@@ -689,6 +763,16 @@ class AgentRuntime:
     @staticmethod
     def _requires_verification(plan: ExecutionPlan, plan_step: PlanStep) -> bool:
         return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
+
+    @staticmethod
+    def _plans_isomorphic(plan_a: ExecutionPlan, plan_b: ExecutionPlan) -> bool:
+        """True when two plans carry the same normalized step sequence.
+
+        Steps are compared by their sorted allowed-skill sets and their
+        whitespace-normalized objectives, so formatting differences never
+        mask a structurally repeated plan (N4 guard).
+        """
+        return _normalize_plan_steps(plan_a) == _normalize_plan_steps(plan_b)
 
     @staticmethod
     def _build_decision_trace(
@@ -1293,6 +1377,17 @@ class AgentRuntime:
             payload_json={"error_code": error_code},
         )
         return AgentRunResult(run_id, RunStatus.failed, None, error_code)
+
+
+def _normalize_plan_steps(plan: ExecutionPlan) -> list[tuple[tuple[str, ...], str]]:
+    """Project a plan onto its comparable step sequence for the replan guard."""
+    return [
+        (
+            tuple(sorted(step.allowed_skills or [])),
+            " ".join(str(step.objective or "").split()),
+        )
+        for step in plan.steps
+    ]
 
 
 def _skill_artifact_source_url(
