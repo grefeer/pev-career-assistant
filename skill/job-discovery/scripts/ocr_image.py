@@ -122,6 +122,42 @@ _SLICE_OVERLAP = 100
 _MIN_TEXT_CONFIDENCE = 0.5
 
 
+def _ocr_cache_key(content_hash: str, engine: str) -> str:
+    """Use the full image digest and backend in the cache identity."""
+    return f"{engine}:{content_hash}"
+
+
+def _read_ocr_cache(cache_path: Path) -> dict[str, Any]:
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _write_ocr_cache(cache_path: Path, cache: dict[str, Any]) -> None:
+    """Write the cache atomically so concurrent workers never see half JSON."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_path.parent,
+            prefix=f"{cache_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(cache, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, cache_path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _check_paddleocr() -> bool:
     try:
         import paddleocr  # noqa: F401
@@ -340,19 +376,16 @@ def ocr_image(
     # Cache key
     content_hash = hashlib.sha256(image_bytes).hexdigest()
     short_hash = f"sha256_{content_hash[:16]}"
+    cache_key = _ocr_cache_key(content_hash, engine)
 
     # Check cache
     if out_dir and not no_cache:
         cache_path = out_dir / "ocr_cache.json"
-        if cache_path.exists():
-            try:
-                cache = json.loads(cache_path.read_text(encoding="utf-8"))
-                if short_hash in cache:
-                    cached = cache[short_hash]
-                    cached["cached"] = True
-                    return cached
-            except (json.JSONDecodeError, OSError):
-                pass
+        cache = _read_ocr_cache(cache_path)
+        if cache_key in cache and isinstance(cache[cache_key], dict):
+            cached = dict(cache[cache_key])
+            cached["cached"] = True
+            return cached
 
     suffix = _detect_suffix(image_bytes)
     dims = _get_dimensions(image_bytes)
@@ -445,14 +478,9 @@ def ocr_image(
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
         cache_path = out_dir / "ocr_cache.json"
-        cache = {}
-        if cache_path.exists():
-            try:
-                cache = json.loads(cache_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                pass
-        cache[short_hash] = result
-        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        cache = _read_ocr_cache(cache_path)
+        cache[cache_key] = result
+        _write_ocr_cache(cache_path, cache)
 
     return result
 

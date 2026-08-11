@@ -107,6 +107,12 @@ _SKILL_DELIVERABLE_TOOLS: dict[str, frozenset[str]] = {
 }
 
 
+def has_known_deliverable_attempt(observations: Sequence[ToolObservation]) -> bool:
+    """Return whether the runtime saw a production deliverable tool attempt."""
+    known = frozenset().union(*_SKILL_DELIVERABLE_TOOLS.values())
+    return any(observation.tool_name in known for observation in observations)
+
+
 def blocked_error_codes() -> frozenset[str]:
     """Return the stable blocked error-code set (security-gated or retry-futile).
 
@@ -159,6 +165,20 @@ def step_contract_met(
     return all(
         _skill_contract_met(skill_name, artifacts) for skill_name in step.allowed_skills
     )
+
+
+def completion_evidence_gate(
+    step: PlanStep, artifacts: Sequence[ToolObservation], *, summary: str | None = None
+) -> bool:
+    """Allow completion only when a tool-backed, unblocked deliverable exists.
+
+    A model summary is not evidence. A verified empty search result remains
+    valid because the search observation itself satisfies the discovery
+    contract; a failed/empty fetch cannot be upgraded by optimistic wording.
+    """
+    if not isinstance(summary, str) or not summary.strip():
+        return False
+    return step_contract_met(step, artifacts) and not has_blocked_evidence(artifacts)
 
 
 def has_blocked_evidence(observations: Sequence[ToolObservation]) -> bool:

@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
 import threading
 from typing import Any
@@ -88,6 +89,95 @@ _JD_SECTION_MARKERS = (
 _JD_MARKER_SCAN_HEAD_CHARS = 2_000
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
+
+
+def _playwright_worker_command(url: str, *, collect_links: bool) -> list[str]:
+    """Build the isolated render-worker command without shell interpolation."""
+    command = [
+        sys.executable,
+        "-m",
+        "backend.app.services.career_skills.playwright_worker",
+        "--url",
+        url,
+    ]
+    if collect_links:
+        command.append("--collect-links")
+    return command
+
+
+def _terminate_process_tree(pid: int) -> None:
+    """Terminate only the owned render worker and its descendants."""
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+        )
+        return
+    try:
+        import os
+        import signal
+
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            import os
+
+            os.kill(pid, 9)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _render_with_playwright_process(
+    url: str, *, collect_links: bool
+) -> tuple[str, str | None] | tuple[str, str | None, list[str]]:
+    """Render in a killable child process so Chromium cannot become an orphan."""
+    _assert_public_url(url)
+    kwargs: dict[str, Any] = {
+        "cwd": str(Path(__file__).resolve().parents[4]),
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": {**__import__("os").environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kwargs["start_new_session"] = True
+    process = subprocess.Popen(
+        _playwright_worker_command(url, collect_links=collect_links), **kwargs
+    )
+    try:
+        stdout, _stderr = process.communicate(timeout=_RENDER_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(process.pid)
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+        raise PublicJobFetchError("public_fetch_failed") from None
+    if process.returncode != 0:
+        raise PublicJobFetchError("public_fetch_failed") from None
+    try:
+        payload = json.loads((stdout or "").strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        raise PublicJobFetchError("public_fetch_failed") from None
+    if payload.get("error"):
+        raise PublicJobFetchError(str(payload["error"]))
+    body = payload.get("body")
+    title = payload.get("title")
+    if not isinstance(body, str):
+        raise PublicJobFetchError("public_fetch_failed")
+    if collect_links:
+        links = payload.get("links")
+        return body, title if isinstance(title, str) else None, (
+            links if isinstance(links, list) else []
+        )
+    return body, title if isinstance(title, str) else None
 
 
 def enable_playwright_fallback(enabled: bool) -> None:
@@ -604,6 +694,13 @@ def _render_with_playwright(
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise PublicJobFetchError("public_fetch_failed") from None
+
+    # Real Playwright runs in an isolated one-shot process. Unit tests can
+    # still inject the sync API seam; injected fakes remain in-process so the
+    # existing deterministic browser contract tests do not need a real browser.
+    if getattr(sync_playwright, "__module__", "").startswith("playwright"):
+        with _RENDER_LOCK:
+            return _render_with_playwright_process(url, collect_links=collect_links)
 
     def _render_once(browser: Any, target_url: str) -> tuple[Any, ...]:
         """One render pass against ``browser``; the caller owns retry policy."""

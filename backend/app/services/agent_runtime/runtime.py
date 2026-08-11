@@ -20,6 +20,8 @@ from backend.app.domain.agent_runtime import (
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.evidence_gate import (
+    completion_evidence_gate,
+    has_known_deliverable_attempt,
     has_blocked_evidence,
     step_contract_met,
 )
@@ -476,6 +478,17 @@ class AgentRuntime:
                     output_artifact_refs=observed_artifact_refs,
                 )
             if not self._requires_verification(plan, plan_step):
+                if has_known_deliverable_attempt(execution.observations) and not completion_evidence_gate(
+                    plan_step, execution.observations, summary=execution.summary
+                ):
+                    return self._wait_for_user(
+                        db,
+                        run_id,
+                        persisted_step,
+                        "工具未产生可核验的交付物，当前总结不能视为完成。"
+                        "请提供可公开访问的岗位页面或补充必要信息后重试。",
+                        output_artifact_refs=observed_artifact_refs,
+                    )
                 run_repository.finish_step(
                     db,
                     persisted_step,
@@ -847,11 +860,21 @@ class AgentRuntime:
         candidates: list[dict[str, str]] = []
         for artifact in run_repository.list_evidence_artifacts(db, run_id):
             visible_text = artifact.content_json.get("visible_text")
-            if (
-                (not isinstance(visible_text, str) or not visible_text)
-                and artifact.artifact_type == "structured_job_details"
-            ):
-                visible_text = _structured_artifact_visible_text(artifact.content_json)
+            if artifact.artifact_type == "structured_job_details":
+                raw_candidates = artifact.content_json.get("candidates")
+                if not isinstance(raw_candidates, list) or not any(
+                    isinstance(candidate, dict)
+                    and not isinstance(candidate.get("evidence_refs"), list)
+                    for candidate in raw_candidates
+                ):
+                    # A structured artifact explicitly linked to a source
+                    # page is already represented by that page. Standalone
+                    # structured output remains a bounded evidence item so a
+                    # target JD does not disappear behind the page budget.
+                    continue
+                visible_text = _structured_artifact_visible_text(
+                    artifact.content_json
+                )
             if not isinstance(visible_text, str) or not visible_text:
                 continue
             item: dict[str, str] = {
