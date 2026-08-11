@@ -361,6 +361,16 @@ def _load_execution_state(
     return prior_succeeded_calls, consecutive_stalls, total_wasted_turns
 
 
+def _load_failed_candidate_urls(state: object) -> set[str]:
+    """Read the durable single-fetch candidate-death ledger."""
+    if not isinstance(state, dict):
+        return set()
+    raw = state.get("failed_candidate_urls")
+    if not isinstance(raw, list):
+        return set()
+    return {url.strip() for url in raw if isinstance(url, str) and url.strip()}
+
+
 def _load_stable_failed_calls(task: AgentTaskRequest) -> list[dict[str, str]]:
     """Read the persisted stable-failure dedup entries for this step, if any.
 
@@ -391,6 +401,7 @@ def _snapshot_execution_state(
     total_wasted_turns: int,
     stable_failed_calls: list[tuple[str, dict[str, Any]]] | None = None,
     prior_stable_failed_calls: list[dict[str, str]] | None = None,
+    failed_candidate_urls: set[str] | None = None,
 ) -> dict[str, Any]:
     """Persistable execution state carried across verifier RETRY re-invocations.
 
@@ -428,7 +439,15 @@ def _snapshot_execution_state(
         "stable_failed_calls": stable_entries,
         "consecutive_stalls": consecutive_stalls,
         "total_wasted_turns": total_wasted_turns,
+        "failed_candidate_urls": sorted(failed_candidate_urls or set()),
     }
+
+
+def _candidate_search_is_authorized(
+    candidate_urls: frozenset[str], failed_candidate_urls: set[str]
+) -> bool:
+    """Allow public search only after every supplied candidate is unusable."""
+    return bool(candidate_urls) and candidate_urls.issubset(failed_candidate_urls)
 
 
 class ExecutorAgent:
@@ -516,6 +535,7 @@ class ExecutorAgent:
                 prior_succeeded_calls=prior_succeeded_calls,
                 stable_failed_calls=stable_failed_calls,
                 prior_stable_failed_calls=prior_stable_failed_calls,
+                failed_candidate_urls=failed_candidate_urls,
                 consecutive_stalls=consecutive_stalls,
                 total_wasted_turns=total_wasted_turns,
             )
@@ -541,7 +561,7 @@ class ExecutorAgent:
         # payload; batch failures are read from output.failures (durable
         # across verifier RETRY through the merged observation list).
         candidate_urls = {url for url in _candidate_urls(task)}
-        failed_candidate_urls: set[str] = set()
+        failed_candidate_urls = _load_failed_candidate_urls(task.execution_state)
         prior_observations_for_decision = [
             observation_for_decision(observation)
             for observation in (prior_observations or [])
@@ -944,7 +964,7 @@ def _has_unfailed_candidate_urls(
     proven = in_flight_failed | _failed_candidate_urls(
         observations, candidate_urls=candidate_urls
     )
-    return any(url not in proven for url in candidate_urls)
+    return not _candidate_search_is_authorized(candidate_urls, proven)
 
 
 def _scope_feedback_to_step_catalog(
