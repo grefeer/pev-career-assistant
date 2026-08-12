@@ -14,13 +14,19 @@ from typing import Any
 from backend.app.services.career_skills import job_discovery as jd
 
 
-def _render(url: str, *, collect_links: bool) -> dict[str, Any]:
+def _render(
+    url: str, *, collect_links: bool, storage_state: str | None = None
+) -> dict[str, Any]:
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         try:
-            page = browser.new_page()
+            context_kwargs: dict[str, Any] = {}
+            if storage_state:
+                context_kwargs["storage_state"] = storage_state
+            browser_context = browser.new_context(**context_kwargs)
+            page = browser_context.new_page()
 
             def abort_non_public(route: Any, request: Any) -> None:
                 try:
@@ -52,12 +58,18 @@ def _render(url: str, *, collect_links: bool) -> dict[str, Any]:
                             break
                     else:
                         stable_samples = 0
-                result: dict[str, Any] = {"body": body, "title": page.title() or None}
+                result: dict[str, Any] = {
+                    "body": body,
+                    "title": page.title() or None,
+                    "effective_url": page.url,
+                    "status_code": response.status,
+                }
                 if collect_links:
                     result["links"] = jd._collect_page_links(page, url)
                 return result
             finally:
                 page.close()
+                browser_context.close()
         finally:
             browser.close()
 
@@ -66,9 +78,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", required=True)
     parser.add_argument("--collect-links", action="store_true")
+    parser.add_argument("--storage-state")
     args = parser.parse_args()
     try:
-        payload = _render(args.url, collect_links=args.collect_links)
+        payload = _render(
+            args.url,
+            collect_links=args.collect_links,
+            storage_state=args.storage_state,
+        )
     except jd.PublicJobFetchError as exc:
         payload = {"error": exc.code}
     except Exception:

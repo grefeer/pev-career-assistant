@@ -141,6 +141,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     app.state.settings.job_discovery_playwright_fallback_enabled
                 )
                 stack.callback(jd_skill.enable_playwright_fallback, False)
+                jd_skill.configure_playwright_storage_state(
+                    app.state.settings.job_discovery_browser_storage_state_path
+                )
+                stack.callback(jd_skill.configure_playwright_storage_state, None)
                 jd_skill.enable_public_api_adapters(
                     app.state.settings.use_public_api_adapters
                 )

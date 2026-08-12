@@ -106,10 +106,22 @@ def _classify_one(url: str) -> ClassifiedJobUrl:
             url=url, site_class="adapter", evidence_signal=f"adapter={company}"
         )
     try:
-        response = _fetch_validated(url)
+        fetched = _fetch_validated(url)
+        response = getattr(fetched, "response", fetched)
+        effective_url = getattr(fetched, "effective_url", url)
     except PublicJobFetchError as exc:
         return ClassifiedJobUrl(
             url=url, site_class="blocked", evidence_signal=str(exc)
+        )
+    head = response.content[:_PROBE_BYTES].decode("utf-8", errors="replace").lower()
+    effective_host = (urlsplit(effective_url).hostname or "").lower()
+    effective_path = urlsplit(effective_url).path.lower()
+    if (
+        effective_host == "safe.liepin.com"
+        and ("captcha" in effective_path or "security" in effective_path)
+    ):
+        return ClassifiedJobUrl(
+            url=url, site_class="blocked", evidence_signal="anti_bot_challenge"
         )
     if response.status_code != 200:
         return ClassifiedJobUrl(
@@ -117,7 +129,6 @@ def _classify_one(url: str) -> ClassifiedJobUrl:
             site_class="blocked",
             evidence_signal=f"http_{response.status_code}",
         )
-    head = response.content[:_PROBE_BYTES].decode("utf-8", errors="replace").lower()
     if any(marker in head for marker in _ANTI_BOT_MARKERS):
         return ClassifiedJobUrl(
             url=url, site_class="blocked", evidence_signal="anti_bot_markers"

@@ -120,6 +120,10 @@ class Settings(BaseSettings):
     # when the plain requests path fails or returns an empty SPA/login shell.
     # Off by default so unit suites never launch a browser.
     job_discovery_playwright_fallback_enabled: bool = False
+    # Optional, explicitly provisioned Playwright storage state. The runtime
+    # only reads this file; it never saves cookies or attempts to solve a
+    # challenge. Keep it outside the repository and treat it as a credential.
+    job_discovery_browser_storage_state_path: str | None = None
     # deepagents subgraph LLM extraction gate (spec §4.3): when on, the
     # job-discovery workflow's per-page extraction consults the LLM extractor
     # (LLMJobExtractor) whenever the deterministic regex output is empty or

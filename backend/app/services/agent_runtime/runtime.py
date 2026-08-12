@@ -877,12 +877,21 @@ class AgentRuntime:
                 )
             if not isinstance(visible_text, str) or not visible_text:
                 continue
-            item: dict[str, str] = {
+            item: dict[str, Any] = {
                 "artifact_id": artifact.id,
                 "source_url": artifact.source_url,
                 "content_hash": artifact.content_hash,
                 "visible_text": visible_text,
             }
+            effective_url = artifact.content_json.get("effective_url")
+            if isinstance(effective_url, str):
+                item["effective_url"] = effective_url
+            redirect_chain = artifact.content_json.get("redirect_chain")
+            if isinstance(redirect_chain, list) and redirect_chain:
+                item["redirect_chain"] = redirect_chain
+            http_status = artifact.content_json.get("http_status")
+            if isinstance(http_status, int):
+                item["http_status"] = http_status
             title = artifact.content_json.get("title")
             if isinstance(title, str):
                 item["title"] = title
@@ -902,14 +911,14 @@ class AgentRuntime:
             remaining -= len(truncated)
         # Assemble the result in oldest-first order: summaries for older
         # artifacts, full items (with bounded visible_text) for recent ones.
-        evidence: list[dict[str, str]] = []
+        evidence: list[dict[str, Any]] = []
         for index, item in enumerate(candidates):
             if index in full_visible_text:
                 full_item = dict(item)
                 full_item["visible_text"] = full_visible_text[index]
                 evidence.append(full_item)
             else:
-                summary: dict[str, str] = {
+                summary: dict[str, Any] = {
                     "artifact_id": item["artifact_id"],
                     "source_url": item["source_url"],
                     "content_hash": item["content_hash"],
@@ -981,6 +990,9 @@ class AgentRuntime:
                     content_json={
                         "title": page.get("title"),
                         "visible_text": visible_text,
+                        "effective_url": page.get("effective_url"),
+                        "redirect_chain": page.get("redirect_chain", []),
+                        "http_status": page.get("http_status"),
                     },
                 )
                 artifact_ref = {

@@ -868,15 +868,20 @@ def _with_observed_page(
             continue
         if page["artifact_id"] in seen_artifact_ids:
             continue
-        evidence.append(
-            {
-                "artifact_id": page["artifact_id"],
-                "source_url": page["source_url"],
-                "content_hash": page["content_hash"],
-                "visible_text": page["visible_text"],
-                "title": page.get("title"),
-            }
-        )
+        evidence_item = {
+            "artifact_id": page["artifact_id"],
+            "source_url": page["source_url"],
+            "content_hash": page["content_hash"],
+            "visible_text": page["visible_text"],
+            "title": page.get("title"),
+        }
+        if isinstance(page.get("effective_url"), str) and page["effective_url"]:
+            evidence_item["effective_url"] = page["effective_url"]
+        if isinstance(page.get("redirect_chain"), list) and page["redirect_chain"]:
+            evidence_item["redirect_chain"] = page["redirect_chain"]
+        if isinstance(page.get("http_status"), int):
+            evidence_item["http_status"] = page["http_status"]
+        evidence.append(evidence_item)
         seen_artifact_ids.add(page["artifact_id"])
     if not evidence:
         return context

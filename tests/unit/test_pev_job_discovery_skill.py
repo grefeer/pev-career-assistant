@@ -76,6 +76,128 @@ def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) ->
     assert len(result.content_hash) == 64
 
 
+def test_fetch_validated_preserves_effective_url_and_redirect_chain(monkeypatch) -> None:
+    """Redirect provenance survives the transport boundary for diagnostics."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    responses = iter(
+        [
+            SimpleNamespace(
+                text="",
+                content=b"",
+                encoding="utf-8",
+                apparent_encoding="utf-8",
+                is_redirect=True,
+                status_code=302,
+                headers={"Location": "https://safe.liepin.com/captcha"},
+            ),
+            SimpleNamespace(
+                text="challenge",
+                content=b"challenge",
+                encoding="utf-8",
+                apparent_encoding="utf-8",
+                is_redirect=False,
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+
+    result = _fetch_validated("https://www.liepin.com/job/123")
+
+    assert result.effective_url == "https://safe.liepin.com/captcha"
+    assert result.redirect_chain == [
+        "https://www.liepin.com/job/123",
+        "https://safe.liepin.com/captcha",
+    ]
+    assert result.status_code == 200
+
+
+def test_liepin_captcha_is_classified_before_short_page_fallback(monkeypatch) -> None:
+    """A security page is blocked evidence, never a generic short-page retry."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._PLAYWRIGHT_FALLBACK_ENABLED",
+        True,
+    )
+    responses = iter(
+        [
+            SimpleNamespace(
+                text="",
+                encoding="utf-8",
+                apparent_encoding="utf-8",
+                is_redirect=True,
+                status_code=302,
+                headers={"Location": "https://safe.liepin.com/page/liepin/captchaPage_ip_PC"},
+            ),
+            SimpleNamespace(
+                text="<html><title>猎聘安全中心</title><body>验证码</body></html>",
+                encoding="utf-8",
+                apparent_encoding="utf-8",
+                is_redirect=False,
+                status_code=200,
+                headers={},
+                raise_for_status=lambda: None,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._render_with_playwright",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("anti-bot pages must not enter Playwright fallback")
+        ),
+    )
+
+    with pytest.raises(PublicJobFetchError, match="anti_bot_challenge") as caught:
+        fetch_public_job_page(
+            ToolContext(user_id="user-a", run_id="run-a"),
+            FetchPublicJobPageInput(url="https://www.liepin.com/job/123"),
+        )
+
+    assert caught.value.effective_url == (
+        "https://safe.liepin.com/page/liepin/captchaPage_ip_PC"
+    )
+
+
+def test_domain_circuit_breaker_skips_repeated_blocked_domain(monkeypatch) -> None:
+    """One anti-bot result prevents repeated same-domain probes in one run."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._fetch_public_page_requests",
+        lambda _url: (_ for _ in ()).throw(
+            PublicJobFetchError("anti_bot_challenge")
+        ),
+    )
+    context = ToolContext(user_id="user-a", run_id="run-a")
+
+    with pytest.raises(PublicJobFetchError, match="anti_bot_challenge"):
+        fetch_public_job_page(
+            context, FetchPublicJobPageInput(url="https://www.liepin.com/job/1")
+        )
+
+    with pytest.raises(PublicJobFetchError, match="domain_temporarily_blocked"):
+        fetch_public_job_page(
+            context, FetchPublicJobPageInput(url="https://www.liepin.com/job/2")
+        )
+
+
 def test_job_discovery_input_normalizers_reject_blank_values() -> None:
     with pytest.raises(ValueError):
         FetchPublicJobPageInput(url=" ")
@@ -111,10 +233,9 @@ def test_batch_fetch_preserves_successful_pages_and_explicit_per_url_failures(mo
     )
 
     assert [page.source_url for page in result.pages] == ["https://jobs.example/a"]
-    assert [failure.model_dump() for failure in result.failures] == [{
-        "source_url": "https://jobs.example/bad",
-        "error_code": "public_fetch_failed",
-    }]
+    assert result.failures[0].source_url == "https://jobs.example/bad"
+    assert result.failures[0].error_code == "public_fetch_failed"
+    assert result.failures[0].message == "public_fetch_failed"
 
 
 def test_search_public_job_pages_returns_only_safe_direct_result_urls(monkeypatch) -> None:
@@ -2362,13 +2483,14 @@ def test_batch_fetch_expansion_caps_and_isolates_failed_details(monkeypatch) -> 
         FetchPublicJobPagesInput(urls=[list_url]),
     )
 
-    # cap at 5 detail pages; failing details (3) are skipped, the list page
-    # itself remains valid evidence and no batch-level failure is reported
+    # cap at 5 detail pages; failing details (3) are reported explicitly, and
+    # the list page itself remains valid evidence.
     assert result.pages[0].source_url == list_url
     expanded = result.pages[1:]
     assert len(expanded) == 4  # details 1,2,4,5 (3 failed; 6..8 never fetched)
     assert [p.source_url for p in expanded] == [f"https://jobs.example.com/position/{i}" for i in (1, 2, 4, 5)]
-    assert not result.failures
+    assert [failure.source_url for failure in result.failures] == [detail_urls[2]]
+    assert result.failures[0].error_code == "empty_public_page"
 
 
 def test_collect_page_links_keeps_only_same_host_job_shaped_links(monkeypatch) -> None:

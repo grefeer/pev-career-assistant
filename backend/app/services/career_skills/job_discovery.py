@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
+from dataclasses import dataclass
 from html.parser import HTMLParser
 import hashlib
 import ipaddress
@@ -58,6 +59,7 @@ _MIN_REAL_JD_TEXT_CHARS = 400
 # the 48k per-run evidence budget kept full for recent artifacts.
 _MAX_VISIBLE_TEXT_CHARS = 32_000
 _PLAYWRIGHT_FALLBACK_ENABLED = False
+_PLAYWRIGHT_STORAGE_STATE_PATH: str | None = None
 # P2 (2026-08-09): a rendered page is a JS card-list when it exposes >= this
 # many same-host job-shaped detail links while carrying no JD-section text;
 # the batch fetch then deep-fetches up to this many detail pages so
@@ -89,6 +91,19 @@ _JD_SECTION_MARKERS = (
 _JD_MARKER_SCAN_HEAD_CHARS = 2_000
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
+_RENDER_METADATA = threading.local()
+
+
+def _render_metadata(url: str) -> tuple[str, int | None]:
+    """Read the most recent render's final URL/status without changing tuple APIs."""
+    metadata = getattr(_RENDER_METADATA, "value", None)
+    if metadata is None:
+        return url, 200
+    return metadata
+
+
+def _set_render_metadata(url: str, status_code: int | None) -> None:
+    _RENDER_METADATA.value = (url, status_code)
 
 
 def _playwright_worker_command(url: str, *, collect_links: bool) -> list[str]:
@@ -102,6 +117,8 @@ def _playwright_worker_command(url: str, *, collect_links: bool) -> list[str]:
     ]
     if collect_links:
         command.append("--collect-links")
+    if _PLAYWRIGHT_STORAGE_STATE_PATH:
+        command.extend(["--storage-state", _PLAYWRIGHT_STORAGE_STATE_PATH])
     return command
 
 
@@ -167,9 +184,23 @@ def _render_with_playwright_process(
     except (IndexError, json.JSONDecodeError):
         raise PublicJobFetchError("public_fetch_failed") from None
     if payload.get("error"):
-        raise PublicJobFetchError(str(payload["error"]))
+        raise PublicJobFetchError(
+            str(payload["error"]),
+            effective_url=payload.get("effective_url")
+            if isinstance(payload.get("effective_url"), str)
+            else url,
+            status_code=payload.get("status_code")
+            if isinstance(payload.get("status_code"), int)
+            else None,
+        )
     body = payload.get("body")
     title = payload.get("title")
+    effective_url = payload.get("effective_url")
+    status_code = payload.get("status_code")
+    _set_render_metadata(
+        effective_url if isinstance(effective_url, str) else url,
+        status_code if isinstance(status_code, int) else 200,
+    )
     if not isinstance(body, str):
         raise PublicJobFetchError("public_fetch_failed")
     if collect_links:
@@ -184,6 +215,12 @@ def enable_playwright_fallback(enabled: bool) -> None:
     """Toggle the rendered-fetch fallback (called from runtime assembly)."""
     global _PLAYWRIGHT_FALLBACK_ENABLED
     _PLAYWRIGHT_FALLBACK_ENABLED = enabled
+
+
+def configure_playwright_storage_state(path: str | None) -> None:
+    """Configure an operator-provisioned, read-only browser storage state."""
+    global _PLAYWRIGHT_STORAGE_STATE_PATH
+    _PLAYWRIGHT_STORAGE_STATE_PATH = path.strip() if isinstance(path, str) and path.strip() else None
 
 
 # A1 certified-adapter gate (mirror of the Playwright fallback toggle). The
@@ -301,9 +338,38 @@ class PublicJobFetchError(RuntimeError):
     error text falls back to the code itself.
     """
 
-    def __init__(self, code: str, message: str | None = None) -> None:
-        super().__init__(message or code)
+    def __init__(
+        self,
+        code: str,
+        message: str | None = None,
+        *,
+        effective_url: str | None = None,
+        redirect_chain: list[str] | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(code if not message else f"{code}: {message}")
         self.code = code
+        self.effective_url = effective_url
+        self.redirect_chain = list(redirect_chain or [])
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class HttpFetchResult:
+    """Validated HTTP response plus redirect provenance.
+
+    ``__getattr__`` keeps the old internal response-shaped contract working
+    for callers that only need ``status_code``, ``content`` or
+    ``raise_for_status`` while making the provenance explicit to new code.
+    """
+
+    response: Any
+    requested_url: str
+    effective_url: str
+    redirect_chain: list[str]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.response, name)
 
 
 class FetchPublicJobPageInput(BaseModel):
@@ -326,6 +392,9 @@ class FetchPublicJobPageOutput(BaseModel):
     title: str | None
     visible_text: str
     content_hash: str
+    effective_url: str | None = None
+    redirect_chain: list[str] = Field(default_factory=list)
+    http_status: int | None = None
 
 
 class FetchPublicJobPagesInput(BaseModel):
@@ -347,6 +416,10 @@ class PublicJobPageFetchFailure(BaseModel):
 
     source_url: str
     error_code: str
+    effective_url: str | None = None
+    redirect_chain: list[str] = Field(default_factory=list)
+    http_status: int | None = None
+    message: str | None = None
 
 
 class FetchPublicJobPagesOutput(BaseModel):
@@ -619,7 +692,84 @@ def _assert_public_url(url: str) -> None:
             raise PublicJobFetchError("unsafe_public_url")
 
 
-def _fetch_validated(url: str) -> requests.Response:
+_ACCESS_BLOCK_TEXT_MARKERS = (
+    "安全验证",
+    "验证码",
+    "访问验证",
+    "captcha",
+    "verify you are human",
+    "security center",
+    "安全中心",
+    "人机验证",
+)
+
+
+def _detect_access_block(
+    *,
+    effective_url: str,
+    title: str | None,
+    visible_text: str,
+    status_code: int | None,
+) -> str | None:
+    """Classify access gates before generic empty/short-page heuristics."""
+    parsed = urlsplit(effective_url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    if host == "safe.liepin.com" and (
+        "captcha" in path or "security" in path or "verify" in path
+    ):
+        return "anti_bot_challenge"
+    if host == "wow.liepin.com" and "transit" in path:
+        return "anti_bot_challenge"
+    text = f"{title or ''}\n{visible_text[:2_000]}".lower()
+    if any(marker.lower() in text for marker in _ACCESS_BLOCK_TEXT_MARKERS):
+        return "anti_bot_challenge"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code in {401, 403}:
+        return "access_denied"
+    return None
+
+
+def _domain_scope(url: str) -> str:
+    """Return the run-level circuit key without merging unrelated registries."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "liepin.com" or host.endswith(".liepin.com"):
+        return "liepin.com"
+    return host
+
+
+def _blocked_domains(context: ToolContext) -> set[str]:
+    raw = context.metadata.get("blocked_public_domains", [])
+    if not isinstance(raw, list):
+        return set()
+    return {item for item in raw if isinstance(item, str) and item}
+
+
+def _ensure_domain_available(context: ToolContext, url: str) -> None:
+    domain = _domain_scope(url)
+    if domain in _blocked_domains(context):
+        raise PublicJobFetchError(
+            "domain_temporarily_blocked",
+            message=f"当前运行已暂停访问 {domain}：该域名此前返回了反爬或访问阻断。",
+            effective_url=url,
+        )
+
+
+def _remember_blocked_domain(
+    context: ToolContext, url: str, error: PublicJobFetchError
+) -> None:
+    if error.code not in {"anti_bot_challenge", "access_denied"}:
+        return
+    domains = _blocked_domains(context)
+    domains.add(_domain_scope(url))
+    context.metadata["blocked_public_domains"] = sorted(domains)
+    context.metadata.setdefault("blocked_public_domain_reasons", {})[
+        _domain_scope(url)
+    ] = error.code
+
+
+def _fetch_validated(url: str) -> HttpFetchResult:
     """GET ``url`` following redirects manually, re-checking every hop is public.
 
     ``requests`` follows 3xx redirects automatically, but it never re-runs
@@ -638,6 +788,8 @@ def _fetch_validated(url: str) -> requests.Response:
     final -- retrying a security rejection would be both useless and risky.
     """
     current = url
+    redirect_chain = [url]
+    last_status: int | None = None
     attempt = 0
     while True:
         try:
@@ -648,15 +800,51 @@ def _fetch_validated(url: str) -> requests.Response:
                     allow_redirects=False,
                     headers=_PUBLIC_FETCH_HEADERS,
                 )
+                last_status = getattr(response, "status_code", None)
                 if not response.is_redirect:
-                    return response
+                    return HttpFetchResult(
+                        response=response,
+                        requested_url=url,
+                        effective_url=current,
+                        redirect_chain=list(redirect_chain),
+                    )
                 target = response.headers.get("Location")
                 if not target:
-                    return response
+                    return HttpFetchResult(
+                        response=response,
+                        requested_url=url,
+                        effective_url=current,
+                        redirect_chain=list(redirect_chain),
+                    )
                 target = urljoin(current, target)
-                _assert_public_url(target)
+                try:
+                    _assert_public_url(target)
+                except PublicJobFetchError as exc:
+                    raise PublicJobFetchError(
+                        exc.code,
+                        str(exc),
+                        effective_url=target,
+                        redirect_chain=[*redirect_chain, target],
+                        status_code=last_status,
+                    ) from exc
                 current = target
-            raise PublicJobFetchError("unsafe_public_url")
+                redirect_chain.append(current)
+            raise PublicJobFetchError(
+                "unsafe_public_url",
+                effective_url=current,
+                redirect_chain=redirect_chain,
+                status_code=last_status,
+            )
+        except PublicJobFetchError as exc:
+            if not exc.effective_url:
+                raise PublicJobFetchError(
+                    exc.code,
+                    str(exc),
+                    effective_url=current,
+                    redirect_chain=redirect_chain,
+                    status_code=last_status,
+                ) from exc
+            raise
         except requests.RequestException:
             if attempt >= 1:
                 raise
@@ -686,6 +874,7 @@ def _render_with_playwright(
     """
     if _PLAYWRIGHT_FETCH_IMPL is not None:
         rendered = _PLAYWRIGHT_FETCH_IMPL(url)
+        _set_render_metadata(url, 200)
         body, title = rendered[:2]
         if collect_links:
             return body, title, list(rendered[2]) if len(rendered) >= 3 else []
@@ -964,6 +1153,7 @@ def fetch_public_job_page(
     so unit suites stay deterministic.
     """
     _assert_public_url(payload.url)
+    _ensure_domain_available(context, payload.url)
     wechat_page = _fetch_wechat_article_page(context, payload.url)
     if wechat_page is not None:
         return wechat_page
@@ -973,25 +1163,22 @@ def fetch_public_job_page(
     try:
         return _fetch_public_page_requests(payload.url)
     except PublicJobFetchError as error:
+        _remember_blocked_domain(context, payload.url, error)
         if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
             raise
     rendered_text, rendered_title = _render_with_playwright(payload.url)
-    visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
-    if not visible_text:
-        raise PublicJobFetchError("empty_public_page")
-    dead_code = _dead_link_code(visible_text, rendered_title)
-    if dead_code is not None:
-        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
-    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
-        raise PublicJobFetchError("public_page_content_insufficient")
-    rendered_bytes = visible_text.encode("utf-8", errors="replace")
-    return FetchPublicJobPageOutput(
-        artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
-        source_url=payload.url,
-        title=rendered_title,
-        visible_text=visible_text,
-        content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
-    )
+    rendered_effective_url, rendered_status = _render_metadata(payload.url)
+    try:
+        return _build_evidence_page(
+            requested_url=payload.url,
+            effective_url=rendered_effective_url,
+            title=rendered_title,
+            visible_text=rendered_text,
+            status_code=rendered_status,
+        )
+    except PublicJobFetchError as error:
+        _remember_blocked_domain(context, payload.url, error)
+        raise
 
 
 def _dead_link_code(text: str, title: str | None) -> str | None:
@@ -1011,6 +1198,67 @@ def _dead_link_code(text: str, title: str | None) -> str | None:
     return None
 
 
+def _normalize_visible_text(text: str) -> str:
+    """Normalize evidence text so requests and rendered paths hash alike."""
+    lines = (" ".join(line.split()) for line in text.splitlines())
+    return "\n".join(line for line in lines if line)
+
+
+def _build_evidence_page(
+    *,
+    requested_url: str,
+    effective_url: str,
+    title: str | None,
+    visible_text: str,
+    status_code: int | None,
+    redirect_chain: list[str] | None = None,
+) -> FetchPublicJobPageOutput:
+    """Apply one classification/normalization contract to every fetch path."""
+    normalized_text = _normalize_visible_text(visible_text)[:_MAX_VISIBLE_TEXT_CHARS]
+    blocked_code = _detect_access_block(
+        effective_url=effective_url,
+        title=title,
+        visible_text=normalized_text,
+        status_code=status_code,
+    )
+    diagnostics = {
+        "effective_url": effective_url,
+        "redirect_chain": list(redirect_chain or [requested_url]),
+        "status_code": status_code,
+    }
+    if blocked_code is not None:
+        raise PublicJobFetchError(
+            blocked_code,
+            message=(
+                f"公开页面被站点访问控制阻断（effective_url={effective_url}, "
+                f"status={status_code}）。不会继续无状态重试。"
+            ),
+            **diagnostics,
+        )
+    if not normalized_text:
+        raise PublicJobFetchError("empty_public_page", **diagnostics)
+    dead_code = _dead_link_code(normalized_text, title)
+    if dead_code is not None:
+        raise PublicJobFetchError(
+            dead_code,
+            message="页面已下线或不存在（死链），非有效岗位证据。",
+            **diagnostics,
+        )
+    if len(normalized_text) < _MIN_USABLE_TEXT_CHARS:
+        raise PublicJobFetchError("public_page_content_insufficient", **diagnostics)
+    content_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+    return FetchPublicJobPageOutput(
+        artifact_id=f"observed:{content_hash}",
+        source_url=requested_url,
+        effective_url=effective_url,
+        redirect_chain=list(redirect_chain or [requested_url]),
+        http_status=status_code,
+        title=title,
+        visible_text=normalized_text,
+        content_hash=content_hash,
+    )
+
+
 def _fetch_public_page_requests_with_html(
     url: str,
 ) -> tuple[FetchPublicJobPageOutput, str]:
@@ -1022,8 +1270,13 @@ def _fetch_public_page_requests_with_html(
     using ``_fetch_public_page_requests``.
     """
     try:
-        response = _fetch_validated(url)
-        response.raise_for_status()
+        fetched = _fetch_validated(url)
+        response = fetched.response
+        effective_url = fetched.effective_url
+        redirect_chain = fetched.redirect_chain
+        status_code = getattr(response, "status_code", None)
+        if status_code not in {401, 403, 429}:
+            response.raise_for_status()
     except PublicJobFetchError:
         raise
     except requests.RequestException as exc:
@@ -1033,22 +1286,16 @@ def _fetch_public_page_requests_with_html(
     html = response.text
     parser = _VisibleTextParser()
     parser.feed(html)
-    visible_text = "\n".join(parser.text_parts)[:_MAX_VISIBLE_TEXT_CHARS]
-    if not visible_text:
-        raise PublicJobFetchError("empty_public_page")
     title = " ".join(parser.title_parts) or None
-    dead_code = _dead_link_code(visible_text, title)
-    if dead_code is not None:
-        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
-    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
-        raise PublicJobFetchError("public_page_content_insufficient")
-    return FetchPublicJobPageOutput(
-        artifact_id=f"observed:{hashlib.sha256(html.encode('utf-8', errors='replace')).hexdigest()}",
-        source_url=url,
+    page = _build_evidence_page(
+        requested_url=url,
+        effective_url=effective_url,
         title=title,
-        visible_text=visible_text,
-        content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
-    ), html
+        visible_text="\n".join(parser.text_parts),
+        status_code=status_code,
+        redirect_chain=redirect_chain,
+    )
+    return page, html
 
 
 def _fetch_public_page_requests(url: str) -> FetchPublicJobPageOutput:
@@ -1143,7 +1390,13 @@ class _HtmlLinkCollector(HTMLParser):
 
 
 def _expand_from_list_links(
-    url: str, links: list[str], list_body: str
+    url: str,
+    links: list[str],
+    list_body: str,
+    *,
+    context: ToolContext | None = None,
+    failure_sink: list[PublicJobPageFetchFailure] | None = None,
+    failure_lock: threading.Lock | None = None,
 ) -> list[FetchPublicJobPageOutput]:
     """Deep-fetch detail pages behind a JS card-list, one evidence page each.
 
@@ -1155,7 +1408,8 @@ def _expand_from_list_links(
     card shells carry them only in footer SEO text.  Detail fetches reuse
     the requests fast path with the render fallback, never recurse into
     expansion again, and fail silently per-link: the list page itself stays
-    valid evidence.
+    valid evidence. When a failure sink is provided, detail failures are
+    returned to the caller instead of being silently discarded.
     """
     if len(links) < _MIN_LIST_LINKS:
         return []
@@ -1165,35 +1419,77 @@ def _expand_from_list_links(
     ):
         return []
     pages: list[FetchPublicJobPageOutput] = []
+
+    def record_failure(link: str, error: PublicJobFetchError) -> None:
+        if failure_sink is None:
+            return
+        failure = PublicJobPageFetchFailure(
+            source_url=link,
+            error_code=error.code,
+            effective_url=error.effective_url,
+            redirect_chain=error.redirect_chain,
+            http_status=error.status_code,
+            message=str(error),
+        )
+        if failure_lock is None:
+            failure_sink.append(failure)
+        else:
+            with failure_lock:
+                failure_sink.append(failure)
+
     for link in links[:_MAX_LIST_EXPANSION]:
+        if context is not None:
+            try:
+                _ensure_domain_available(context, link)
+            except PublicJobFetchError as exc:
+                record_failure(link, exc)
+                break
         try:
             pages.append(_fetch_public_page_requests(link))
             continue
         except PublicJobFetchError as exc:
+            if context is not None:
+                _remember_blocked_domain(context, link, exc)
             if exc.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
+                record_failure(link, exc)
+                if exc.code in {"anti_bot_challenge", "access_denied"}:
+                    break
                 continue
         try:
             body_text, title = _render_with_playwright(link)  # no collect_links -> no recursion
-        except PublicJobFetchError:
+        except PublicJobFetchError as exc:
+            if context is not None:
+                _remember_blocked_domain(context, link, exc)
+            record_failure(link, exc)
+            if exc.code in {"anti_bot_challenge", "access_denied"}:
+                break
             continue
-        visible_text = body_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
-        if not visible_text or len(visible_text) < _MIN_USABLE_TEXT_CHARS:
-            continue
-        rendered_bytes = visible_text.encode("utf-8", errors="replace")
-        pages.append(
-            FetchPublicJobPageOutput(
-                artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
-                source_url=link,
-                title=title,
-                visible_text=visible_text,
-                content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
+        try:
+            pages.append(
+                _build_evidence_page(
+                    requested_url=link,
+                    effective_url=link,
+                    title=title,
+                    visible_text=body_text,
+                    status_code=200,
+                )
             )
-        )
+        except PublicJobFetchError as exc:
+            if context is not None:
+                _remember_blocked_domain(context, link, exc)
+            record_failure(link, exc)
+            if exc.code in {"anti_bot_challenge", "access_denied"}:
+                break
+            continue
     return pages
 
 
 def _fetch_one_with_expansion(
-    context: ToolContext, url: str
+    context: ToolContext,
+    url: str,
+    *,
+    failure_sink: list[PublicJobPageFetchFailure] | None = None,
+    failure_lock: threading.Lock | None = None,
 ) -> list[FetchPublicJobPageOutput]:
     """Fetch one URL with P2 list-page expansion, returning 1..N evidence pages.
 
@@ -1206,6 +1502,8 @@ def _fetch_one_with_expansion(
     server-rendered card lists (e.g. liepin) expand deterministically without
     a browser; the render path collects links from the rendered DOM.
     """
+    _assert_public_url(url)
+    _ensure_domain_available(context, url)
     wechat_page = _fetch_wechat_article_page(context, url)
     if wechat_page is not None:
         return [wechat_page]
@@ -1215,32 +1513,49 @@ def _fetch_one_with_expansion(
     try:
         page, raw_html = _fetch_public_page_requests_with_html(url)
     except PublicJobFetchError as error:
+        _remember_blocked_domain(context, url, error)
         if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
             raise
     else:
         collector = _HtmlLinkCollector(url)
         collector.feed(raw_html)
-        return [page, *_expand_from_list_links(url, collector.links, page.visible_text)]
+        return [
+            page,
+            *_expand_from_list_links(
+                url,
+                collector.links,
+                page.visible_text,
+                context=context,
+                failure_sink=failure_sink,
+                failure_lock=failure_lock,
+            ),
+        ]
     rendered_text, rendered_title, links = _render_with_playwright(
         url, collect_links=True
     )
-    visible_text = rendered_text.strip()[:_MAX_VISIBLE_TEXT_CHARS]
-    if not visible_text:
-        raise PublicJobFetchError("empty_public_page")
-    dead_code = _dead_link_code(visible_text, rendered_title)
-    if dead_code is not None:
-        raise PublicJobFetchError(dead_code, message="页面已下线或不存在（死链），非有效岗位证据。")
-    if len(visible_text) < _MIN_USABLE_TEXT_CHARS:
-        raise PublicJobFetchError("public_page_content_insufficient")
-    rendered_bytes = visible_text.encode("utf-8", errors="replace")
-    list_page = FetchPublicJobPageOutput(
-        artifact_id=f"observed:{hashlib.sha256(rendered_bytes).hexdigest()}",
-        source_url=url,
-        title=rendered_title,
-        visible_text=visible_text,
-        content_hash=hashlib.sha256(rendered_bytes).hexdigest(),
-    )
-    return [list_page, *_expand_from_list_links(url, links, visible_text)]
+    rendered_effective_url, rendered_status = _render_metadata(url)
+    try:
+        list_page = _build_evidence_page(
+            requested_url=url,
+            effective_url=rendered_effective_url,
+            title=rendered_title,
+            visible_text=rendered_text,
+            status_code=rendered_status,
+        )
+    except PublicJobFetchError as error:
+        _remember_blocked_domain(context, url, error)
+        raise
+    return [
+        list_page,
+        *_expand_from_list_links(
+            url,
+            links,
+            list_page.visible_text,
+            context=context,
+            failure_sink=failure_sink,
+            failure_lock=failure_lock,
+        ),
+    ]
 
 
 def fetch_public_job_pages(
@@ -1257,9 +1572,25 @@ def fetch_public_job_pages(
     """
     pages: list[FetchPublicJobPageOutput] = []
     failures: list[PublicJobPageFetchFailure] = []
+    failure_lock = threading.Lock()
+    def work(url: str) -> list[FetchPublicJobPageOutput]:
+        try:
+            return _fetch_one_with_expansion(
+                context,
+                url,
+                failure_sink=failures,
+                failure_lock=failure_lock,
+            )
+        except TypeError as exc:
+            # Keep older test seams and third-party wrappers that still expose
+            # the original two-argument helper contract working.
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return _fetch_one_with_expansion(context, url)
+
     batch = run_parallel_with_progress(
         payload.urls,
-        lambda url: _fetch_one_with_expansion(context, url),
+        work,
         label="url",
         key=lambda url: url,
     )
@@ -1267,7 +1598,22 @@ def fetch_public_job_pages(
         if result.error is not None:
             error = result.error
             code = error.code if isinstance(error, PublicJobFetchError) else "public_fetch_failed"
-            failures.append(PublicJobPageFetchFailure(source_url=result.item, error_code=code))
+            failures.append(
+                PublicJobPageFetchFailure(
+                    source_url=result.item,
+                    error_code=code,
+                    effective_url=(
+                        error.effective_url if isinstance(error, PublicJobFetchError) else None
+                    ),
+                    redirect_chain=(
+                        error.redirect_chain if isinstance(error, PublicJobFetchError) else []
+                    ),
+                    http_status=(
+                        error.status_code if isinstance(error, PublicJobFetchError) else None
+                    ),
+                    message=str(error),
+                )
+            )
         elif result.value is not None:
             pages.extend(result.value)
     return FetchPublicJobPagesOutput(pages=pages, failures=failures)
