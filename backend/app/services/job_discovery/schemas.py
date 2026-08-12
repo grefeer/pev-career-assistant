@@ -49,7 +49,7 @@ class StrategyRecord:
 
     @classmethod
     def from_orm(cls, orm_obj: Any) -> "StrategyRecord":
-        """Build from a JobDiscoveryStrategy ORM instance."""
+        """Build from an ORM-like object exposing the same attributes."""
         return cls(
             id=orm_obj.id,
             url_pattern=orm_obj.url_pattern,
