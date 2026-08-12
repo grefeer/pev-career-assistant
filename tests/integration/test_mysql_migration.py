@@ -33,6 +33,22 @@ PROFILE_TABLES = {
     "confirmed_profile_versions",
 }
 ALEMBIC_TABLES = {"alembic_version"}
+LEGACY_TABLES = {
+    "analysis_sessions",
+    "job_discovery_tasks",
+    "job_discovery_evidence",
+    "discovered_job_candidates",
+    "job_discovery_strategies",
+    "job_discovery_trajectories",
+    "site_adapters",
+    "observed_sites",
+    "user_preferences",
+    "user_job_interactions",
+    "job_relevance_scores",
+    "personalized_discovery_runs",
+    "personalized_discovery_recommendations",
+    "user_discovery_source_statuses",
+}
 HEAD_REVISION = "20260718_0011"
 BUSINESS_TABLES |= PROFILE_TABLES
 MANUAL_SUBMISSION_TABLES = {
@@ -349,6 +365,12 @@ def test_mysql_migration_upgrade_and_downgrade(
             _run_alembic("downgrade", "20260717_0005", env=env)
             assert "user_job_submissions" not in inspect(engine).get_table_names()
             _run_alembic("upgrade", "head", env=env)
+            head_inspector = sa.inspect(engine)
+            assert LEGACY_TABLES.isdisjoint(set(head_inspector.get_table_names()))
+            match_columns_at_head = {
+                col["name"] for col in head_inspector.get_columns("match_reports")
+            }
+            assert "analysis_session_id" not in match_columns_at_head
             assert FEEDBACK_TABLES <= set(sa.inspect(engine).get_table_names())
             feedback_columns = {col["name"] for col in sa.inspect(engine).get_columns("job_feedback")}
             assert {
