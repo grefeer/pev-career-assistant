@@ -97,6 +97,38 @@ def test_preparation_plan_accepts_the_observed_page_artifact_identifier() -> Non
     assert result.schedule_assumption.startswith("未提供目标日期")
 
 
+def test_preparation_plan_resolves_candidate_id_from_structured_evidence() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "observed_public_evidence": [{
+                "artifact_id": "page-artifact",
+                "source_url": "https://jobs.example/list",
+            }],
+            "structured_job_candidates": [{
+                "candidate_id": "candidate-1",
+                "source_artifact_id": "page-artifact",
+                "source_url": "https://jobs.example/list",
+                "title": "Agent 工程师",
+                "full_text": "要求 Python 与 RAG。",
+            }],
+        },
+    )
+
+    result = build_preparation_plan(
+        context,
+        BuildPreparationPlanInput(
+            target_artifact_id="candidate-1",
+            focus_keywords=["Python", "RAG"],
+            target_date=date(2026, 8, 9),
+        ),
+    )
+
+    assert result.source_url == "https://jobs.example/list"
+    assert result.jd_topics == ["python", "rag"]
+
+
 def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence() -> None:
     with pytest.raises(ValidationError):
         BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=[" "])

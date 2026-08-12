@@ -362,7 +362,7 @@ def test_evidence_assembly_keeps_single_oversized_artifact_truncated(db_session)
     evidence = projected.context["observed_public_evidence"]
 
     assert len(evidence) == 1
-    assert evidence[0]["visible_text"] == "x" * 48_000
+    assert "visible_text" not in evidence[0]
 
 
 def test_evidence_assembly_keeps_all_artifacts_when_under_budget(db_session) -> None:
@@ -388,7 +388,7 @@ def test_evidence_assembly_keeps_all_artifacts_when_under_budget(db_session) -> 
 
     assert len(evidence) == 3
     for item in evidence:
-        assert "visible_text" in item
+        assert "visible_text" not in item
         assert "title" in item
 
 
@@ -433,13 +433,8 @@ def test_evidence_assembly_summarizes_older_artifacts_when_over_budget(db_sessio
         assert "title" in item
         assert "visible_text" not in item
 
-    # At least one full item (most-recent with visible_text).
-    full_items = [item for item in evidence if "visible_text" in item]
-    assert len(full_items) >= 1, "Expected at least one full item for recent artifacts"
-
-    # Total visible_text chars within budget.
-    total_chars = sum(len(item["visible_text"]) for item in full_items)
-    assert total_chars <= 48_000
+    # Full text is hydrated only at the deterministic tool boundary.
+    assert all("visible_text" not in item for item in evidence)
 
 
 def test_evidence_assembly_preserves_most_recent_full_when_over_budget(db_session) -> None:
@@ -485,7 +480,7 @@ def test_evidence_assembly_preserves_most_recent_full_when_over_budget(db_sessio
 
     # The last artifact (index 3, most-recent) should be kept full.
     last_item = evidence[-1]
-    assert "visible_text" in last_item
+    assert "visible_text" not in last_item
     assert last_item["source_url"] == "https://jobs.example/3"
     assert last_item["title"] == "岗位 3"
 
@@ -520,7 +515,7 @@ def test_evidence_assembly_skips_artifacts_without_visible_text(db_session) -> N
 
     assert len(evidence) == 1
     assert evidence[0]["source_url"] == "https://jobs.example/valid"
-    assert evidence[0]["visible_text"] == "valid JD body"
+    assert "visible_text" not in evidence[0]
 
 
 def test_evidence_assembly_no_artifacts_returns_empty_evidence_list(db_session) -> None:

@@ -54,7 +54,10 @@ def _find_raw_target(raw_evidence: object, target_id: str) -> dict[str, Any] | N
     if not isinstance(raw_evidence, list):
         return None
     for item in raw_evidence:
-        if isinstance(item, dict) and item.get("artifact_id") == target_id:
+        if isinstance(item, dict) and (
+            item.get("artifact_id") == target_id
+            or item.get("source_url") == target_id
+        ):
             return item
     return None
 
@@ -74,6 +77,7 @@ def _find_structured_candidate(
             target_id == candidate.get("candidate_id")
             or target_id == candidate.get("artifact_id")
             or target_id == candidate.get("source_artifact_id")
+            or target_id == candidate.get("source_url")
             or (
                 isinstance(target_source_url, str)
                 and target_source_url == candidate.get("source_url")

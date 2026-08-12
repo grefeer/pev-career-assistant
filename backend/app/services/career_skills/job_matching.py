@@ -47,6 +47,14 @@ _RANKING_CRITERIA_ALIASES: dict[str, str] = {
 #: Separators accepted when ``profile_keywords`` arrives as one string.
 _KEYWORD_SEPARATORS = re.compile(r"[，,;；、\n]+")
 
+# Historical model outputs used both English aliases and the old camelCase
+# names. Normalize them before canonical Pydantic validation.
+_INPUT_ALIASES: dict[str, tuple[str, ...]] = {
+    "profile_keywords": ("keywords", "profileKeywords", "skills"),
+    "preferred_locations": ("locations", "preferredLocations", "cities"),
+    "ranking_criteria": ("criteria", "rankingCriteria", "sort_by"),
+}
+
 
 class MatchObservedJobsInput(BaseModel):
     """Confirmed user capabilities or preferences selected by the Executor."""
@@ -79,7 +87,15 @@ class MatchObservedJobsInput(BaseModel):
             values = values.model_dump()
         if not isinstance(values, dict):
             return values
+        values = dict(values)
         warnings: list[str] = []
+        for canonical, aliases in _INPUT_ALIASES.items():
+            if canonical not in values:
+                for alias in aliases:
+                    if alias in values:
+                        values[canonical] = values[alias]
+                        warnings.append(f"{alias} normalized to {canonical}")
+                        break
         keywords = values.get("profile_keywords")
         if isinstance(keywords, str):
             split_keywords = [
@@ -89,7 +105,29 @@ class MatchObservedJobsInput(BaseModel):
             warnings.append(
                 f"profile_keywords coerced from string to {len(split_keywords)} keyword(s)"
             )
+        locations = values.get("preferred_locations")
+        if isinstance(locations, str):
+            split_locations = [
+                part.strip()
+                for part in _KEYWORD_SEPARATORS.split(locations)
+                if part.strip()
+            ]
+            values["preferred_locations"] = split_locations
+            warnings.append(
+                f"preferred_locations coerced from string to {len(split_locations)} location(s)"
+            )
         criteria = values.get("ranking_criteria")
+        if isinstance(criteria, str):
+            split_criteria = [
+                part.strip()
+                for part in _KEYWORD_SEPARATORS.split(criteria)
+                if part.strip()
+            ]
+            values["ranking_criteria"] = split_criteria
+            criteria = split_criteria
+            warnings.append(
+                f"ranking_criteria coerced from string to {len(split_criteria)} criterion/criteria"
+            )
         if isinstance(criteria, list):
             normalized_criteria: list[Any] = []
             for raw in criteria:
@@ -105,8 +143,18 @@ class MatchObservedJobsInput(BaseModel):
                 # Unknown criteria keep today's Literal ValidationError.
                 normalized_criteria.append(raw)
             values["ranking_criteria"] = normalized_criteria
+        # The business contract is fixed at 100. Model-provided caps are
+        # compatibility noise, not a reason to reject an otherwise valid call.
+        raw_limit = values.get("limit")
+        if raw_limit is not None and raw_limit != 100:
+            warnings.append("limit normalized to fixed business limit 100")
+        values["limit"] = 100
         if warnings:
-            values["normalization_warnings"] = warnings
+            existing = values.get("normalization_warnings")
+            values["normalization_warnings"] = [
+                *(existing if isinstance(existing, list) else []),
+                *warnings,
+            ]
         return values
 
     @field_validator("profile_keywords")
@@ -131,6 +179,8 @@ class ObservedJobMatch(BaseModel):
     """A transparent score over one immutable public JD artifact."""
 
     artifact_id: str
+    candidate_id: str | None = None
+    source_artifact_id: str | None = None
     source_url: str
     title: str | None
     score: int = Field(ge=0, le=100)
@@ -262,6 +312,16 @@ def _match_candidate(
     excerpt = section_text or normalized_title or ""
     return _score_job(
         artifact_id=artifact_id,
+        candidate_id=(
+            item.get("candidate_id")
+            if isinstance(item.get("candidate_id"), str)
+            else None
+        ),
+        source_artifact_id=(
+            item.get("source_artifact_id")
+            if isinstance(item.get("source_artifact_id"), str)
+            else None
+        ),
         source_url=source_url,
         title=normalized_title,
         searchable=searchable,
@@ -273,6 +333,8 @@ def _match_candidate(
 def _score_job(
     *,
     artifact_id: str,
+    candidate_id: str | None = None,
+    source_artifact_id: str | None = None,
     source_url: str,
     title: str | None,
     searchable: str,
@@ -296,6 +358,8 @@ def _score_job(
     score = min(100, len(matched) * 34)
     return ObservedJobMatch(
         artifact_id=artifact_id,
+        candidate_id=candidate_id,
+        source_artifact_id=source_artifact_id,
         source_url=source_url,
         title=title,
         score=score,

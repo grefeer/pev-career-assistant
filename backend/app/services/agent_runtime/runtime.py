@@ -41,13 +41,6 @@ from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 
-#: Character budget for the ``observed_public_evidence`` context supplied to
-#: later Agent turns. The most-recent artifacts are kept full (with bounded
-#: ``visible_text``); older artifacts that exceed this budget collapse to
-#: identifier-only summary lines so early-link evidence is preserved as a
-#: pointer rather than silently dropped.
-_EVIDENCE_BUDGET_CHARS = 48_000
-
 #: Per-candidate section truncation when projecting extract outputs into the
 #: tool context: keyword scoring needs representative text, not full JD text.
 _STRUCTURED_SECTION_CHARS = 600
@@ -428,6 +421,22 @@ class AgentRuntime:
                     "artifact_refs": [*prior_artifact_refs, *observed_artifact_refs],
                 }
             )
+            if any(
+                observation.status == "failed"
+                and observation.error_code == "tool_skill_forbidden"
+                for observation in execution.observations
+            ):
+                return self._request_replan(
+                    db,
+                    run_id,
+                    persisted_step,
+                    feedback=(
+                        "当前步骤的 Skill 范围无法执行模型选择的工具；"
+                        "请将计划拆分为每步一个 Skill 后重试。"
+                    ),
+                    summary="步骤 Skill 范围冲突，已停止重复工具调用并请求重规划。",
+                    output_artifact_refs=execution.artifact_refs,
+                )
             if execution.status == "needs_user":
                 if (
                     step_contract_met(plan_step, execution.observations)
@@ -839,25 +848,14 @@ class AgentRuntime:
     def _with_observed_public_evidence(
         db: Session, task: AgentTaskRequest, run_id: str
     ) -> AgentTaskRequest:
-        """Expose bounded, tool-produced public evidence to later Agent turns.
+        """Expose only traceable JD pointers to later Agent turns.
 
-        Most-recent artifacts are kept full (with bounded ``visible_text``);
-        older artifacts that do not fit the character budget collapse to
-        identifier-only summary lines (``artifact_id``/``source_url``/
-        ``content_hash``/``title`` - never ``visible_text``), so early-link
-        evidence is preserved as a traceable pointer rather than silently
-        dropped. Total ``visible_text`` characters stay within ``_EVIDENCE_BUDGET_CHARS``.
-
-        ``list_evidence_artifacts`` returns oldest-first (production order); we
-        walk newest-to-oldest when assigning the character budget so the
-        freshest evidence - most relevant to the current decision - is kept
-        full, and the oldest evidence is the first to be summarized.
+        Full page bodies remain in the database and are hydrated by
+        :meth:`_tool_context` immediately before a deterministic tool runs.
+        Planner/Executor therefore carry stable identifiers and URLs across
+        steps instead of copying the same JD text into every model request.
         """
-        budget_chars = _EVIDENCE_BUDGET_CHARS
-        # Build candidate items in oldest-first order (production order) with
-        # full visible_text. Artifacts without a non-empty visible_text are
-        # skipped - they carry no page evidence the model can act on.
-        candidates: list[dict[str, str]] = []
+        candidates: list[dict[str, Any]] = []
         for artifact in run_repository.list_evidence_artifacts(db, run_id):
             visible_text = artifact.content_json.get("visible_text")
             if artifact.artifact_type == "structured_job_details":
@@ -881,7 +879,6 @@ class AgentRuntime:
                 "artifact_id": artifact.id,
                 "source_url": artifact.source_url,
                 "content_hash": artifact.content_hash,
-                "visible_text": visible_text,
             }
             effective_url = artifact.content_json.get("effective_url")
             if isinstance(effective_url, str):
@@ -896,38 +893,8 @@ class AgentRuntime:
             if isinstance(title, str):
                 item["title"] = title
             candidates.append(item)
-        # Walk newest-to-oldest, assigning truncated visible_text to items
-        # that fit within the remaining budget. Items that don't fit (budget
-        # exhausted) become identifier-only summary lines. This preserves the
-        # most-recent evidence full while keeping older evidence as pointers.
-        full_visible_text: dict[int, str] = {}
-        remaining = budget_chars
-        for index in range(len(candidates) - 1, -1, -1):
-            text = candidates[index]["visible_text"]
-            truncated = text[:remaining]
-            if not truncated:
-                break  # Budget exhausted; this and all older items get summarized.
-            full_visible_text[index] = truncated
-            remaining -= len(truncated)
-        # Assemble the result in oldest-first order: summaries for older
-        # artifacts, full items (with bounded visible_text) for recent ones.
-        evidence: list[dict[str, Any]] = []
-        for index, item in enumerate(candidates):
-            if index in full_visible_text:
-                full_item = dict(item)
-                full_item["visible_text"] = full_visible_text[index]
-                evidence.append(full_item)
-            else:
-                summary: dict[str, Any] = {
-                    "artifact_id": item["artifact_id"],
-                    "source_url": item["source_url"],
-                    "content_hash": item["content_hash"],
-                }
-                if "title" in item:
-                    summary["title"] = item["title"]
-                evidence.append(summary)
         context = dict(task.context)
-        context["observed_public_evidence"] = evidence
+        context["observed_public_evidence"] = candidates
         return task.model_copy(update={"context": context})
 
     @staticmethod
@@ -943,7 +910,11 @@ class AgentRuntime:
         aggregated page. Candidates are tool-side authority only: they never
         enter ``task.context``, so model prompts stay unchanged.
         """
-        evidence = task.context.get("observed_public_evidence", [])
+        evidence = _full_observed_public_evidence(db, run_id)
+        if not evidence:
+            # Compatibility for an initial in-memory tool call before its
+            # first evidence artifact has been persisted.
+            evidence = task.context.get("observed_public_evidence", [])
         profile_facts = task.private_context.get("confirmed_profile_facts", {})
         return ToolContext(
             user_id=user_id,
@@ -1468,7 +1439,7 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
         raw_candidates = artifact.content_json.get("candidates")
         if not isinstance(raw_candidates, list):
             continue
-        for candidate in raw_candidates:
+        for candidate_index, candidate in enumerate(raw_candidates):
             if not isinstance(candidate, dict):
                 continue
             source_url = candidate.get("apply_url")
@@ -1478,6 +1449,7 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
             items.append(
                 {
                     "artifact_id": artifact.id,
+                    "candidate_id": f"{artifact.id}:candidate:{candidate_index}",
                     #: The evidence artifact this candidate was extracted from
                     #: (``ExtractedJobDetails.evidence_refs``), so a collapsed
                     #: page pointer can also resolve by artifact identity.
@@ -1503,6 +1475,29 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     "full_text": _full_candidate_text(candidate, title),
                 }
             )
+    return items
+
+
+def _full_observed_public_evidence(
+    db: Session, run_id: str
+) -> list[dict[str, Any]]:
+    """Hydrate persisted page pointers only at the deterministic tool boundary."""
+    items: list[dict[str, Any]] = []
+    for artifact in run_repository.list_evidence_artifacts(db, run_id):
+        visible_text = artifact.content_json.get("visible_text")
+        if not isinstance(visible_text, str) or not visible_text:
+            continue
+        item: dict[str, Any] = {
+            "artifact_id": artifact.id,
+            "source_url": artifact.source_url,
+            "content_hash": artifact.content_hash,
+            "visible_text": visible_text,
+        }
+        for key in ("title", "effective_url", "redirect_chain", "http_status"):
+            value = artifact.content_json.get(key)
+            if value not in (None, "", [], {}):
+                item[key] = value
+        items.append(item)
     return items
 
 

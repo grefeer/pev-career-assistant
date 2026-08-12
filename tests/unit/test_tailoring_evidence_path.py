@@ -259,6 +259,52 @@ def test_tailoring_brief_whitespace_visible_text_falls_back_to_structured_candid
     assert result.supported_keywords == ["python"]
 
 
+def test_tailoring_brief_resolves_candidate_id_and_source_artifact_id() -> None:
+    context = _brief_context(
+        evidence=[{
+            "artifact_id": "page-artifact",
+            "source_url": "https://jobs.example/list",
+        }],
+        candidates=[{
+            "candidate_id": "candidate-1",
+            "artifact_id": "structured-artifact",
+            "source_artifact_id": "page-artifact",
+            "source_url": "https://jobs.example/list",
+            "title": "Agent 工程师",
+            "full_text": "要求 Python 与 RAG。",
+        }],
+    )
+
+    by_candidate = _brief(context, target_artifact_id="candidate-1")
+    by_source = _brief(context, target_artifact_id="page-artifact")
+
+    assert by_candidate.source_url == by_source.source_url == "https://jobs.example/list"
+    assert by_candidate.supported_keywords == ["python", "rag"]
+    assert "python" in by_source.supported_keywords
+
+
+def test_tailoring_brief_resolves_target_when_model_returns_source_url() -> None:
+    context = _brief_context(
+        evidence=[_collapsed_pointer(source_url="https://jobs.example/url-target")],
+        candidates=[{
+            "candidate_id": "candidate-url",
+            "source_artifact_id": "art-old",
+            "source_url": "https://jobs.example/url-target",
+            "title": "平台工程师",
+            "full_text": "要求 Python。",
+        }],
+    )
+
+    result = _brief(
+        context,
+        target_artifact_id="https://jobs.example/url-target",
+        target_keywords=["Python"],
+    )
+
+    assert result.source_url == "https://jobs.example/url-target"
+    assert result.supported_keywords == ["python"]
+
+
 def test_tailoring_brief_rejects_non_str_source_url_with_visible_text() -> None:
     """A full artifact with a non-string source_url keeps failing immediately."""
     context = _brief_context(

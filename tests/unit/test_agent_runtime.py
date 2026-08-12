@@ -1405,7 +1405,6 @@ def test_runtime_supplies_observed_public_evidence_to_the_next_planned_step(db_s
         "source_url": "https://jobs.example/1",
         "content_hash": "c" * 64,
         "title": "AI Agent 开发工程师",
-        "visible_text": "负责 Agent 平台、RAG 与工具调用。",
     }]
 
 
@@ -1431,7 +1430,7 @@ def test_runtime_bounds_public_evidence_context_to_the_configured_character_limi
     projected = AgentRuntime._with_observed_public_evidence(db_session, task, run.id)
 
     evidence = projected.context["observed_public_evidence"]
-    assert evidence[0]["visible_text"] == "x" * 48_000
+    assert "visible_text" not in evidence[0]
 
 
 def test_tool_context_projects_structured_job_candidates_from_extract_artifacts(db_session) -> None:

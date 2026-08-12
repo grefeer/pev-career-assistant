@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.target_evidence import resolve_target_evidence
 from backend.app.services.job_discovery.tools.skill_validator import (
     normalize_skill,
     skills_from_text,
@@ -93,7 +94,11 @@ def build_preparation_plan(
     context: ToolContext, payload: BuildPreparationPlanInput
 ) -> PreparationPlanOutput:
     """Produce actions only for topics that the selected observed JD contains."""
-    target = _find_target(context.metadata.get("observed_public_evidence"), payload.target_artifact_id)
+    target = resolve_target_evidence(
+        context.metadata.get("observed_public_evidence"),
+        context.metadata.get("structured_job_candidates"),
+        payload.target_artifact_id,
+    )
     if target is None:
         raise CareerPlanningError("target_evidence_not_found")
     source_url = target.get("source_url")
@@ -135,6 +140,7 @@ def build_preparation_plan(
     if payload.additional_target_artifact_ids:
         skill_gaps = _aggregate_skill_gaps(
             context.metadata.get("observed_public_evidence"),
+            context.metadata.get("structured_job_candidates"),
             (payload.target_artifact_id, *payload.additional_target_artifact_ids),
             payload.resume_skills,
             payload.gap_limit,
@@ -152,6 +158,7 @@ def build_preparation_plan(
 
 def _aggregate_skill_gaps(
     raw_evidence: object,
+    structured_candidates: object,
     artifact_ids: tuple[str, ...],
     resume_skills: list[str],
     gap_limit: int,
@@ -168,7 +175,7 @@ def _aggregate_skill_gaps(
     """
     texts: list[str] = []
     for artifact_id in artifact_ids:
-        item = _find_target(raw_evidence, artifact_id)
+        item = resolve_target_evidence(raw_evidence, structured_candidates, artifact_id)
         if item is None:
             continue
         visible_text = item.get("visible_text")

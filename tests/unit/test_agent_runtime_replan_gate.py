@@ -593,9 +593,11 @@ def test_retry_with_forbidden_tool_routes_to_replan(db_session) -> None:
     verifier_state = gateway.states[AgentRole.verifier][0]
     assert "step_contract_met" not in verifier_state
     assert "succeeded_deliverable_tool_names" not in verifier_state
-    # No marker: this is the plain replan path, feedback passes through clean.
+    # The scope violation is detected before verifier invocation, so the
+    # runtime supplies a deterministic replan reason rather than repeating
+    # the verifier feedback after an impossible call.
     assert gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"] == [
-        "缺少匹配证据"
+        "步骤 Skill 范围冲突，已停止重复工具调用并请求重规划。"
     ]
 
 

@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.target_evidence import resolve_target_evidence
 
 
 class ResumeTailoringError(RuntimeError):
@@ -65,7 +66,11 @@ def build_resume_tailoring_brief(
     context: ToolContext, payload: BuildResumeTailoringBriefInput
 ) -> ResumeTailoringBriefOutput:
     """Compare only one observed JD with facts already confirmed by the user."""
-    target = _find_target(context.metadata.get("observed_public_evidence"), payload.target_artifact_id)
+    target = resolve_target_evidence(
+        context.metadata.get("observed_public_evidence"),
+        context.metadata.get("structured_job_candidates"),
+        payload.target_artifact_id,
+    )
     if target is None:
         raise ResumeTailoringError("target_evidence_not_found")
     visible_text = target.get("visible_text")
@@ -76,18 +81,7 @@ def build_resume_tailoring_brief(
         target_title = target.get("title") if isinstance(target.get("title"), str) else None
         job_text = f"{target_title or ''}\n{visible_text}".lower()
     else:
-        # The artifact may have been collapsed to an identifier-only pointer
-        # when the decision projection hit its evidence budget. The run's
-        # structured extraction candidates retain the full JD text, so resolve
-        # the pointer against them instead of failing the step.
-        target_title, job_text, source_url = _structured_target_evidence(
-            context.metadata.get("structured_job_candidates"),
-            target,
-            payload.target_artifact_id,
-        )
-        if job_text is None:
-            raise ResumeTailoringError("target_evidence_incomplete")
-        job_text = f"{target_title or ''}\n{job_text}".lower()
+        raise ResumeTailoringError("target_evidence_incomplete")
     required_keywords = [
         (keyword, keyword.lower())
         for keyword in payload.target_keywords

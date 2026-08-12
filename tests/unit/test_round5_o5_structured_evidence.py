@@ -58,10 +58,8 @@ def test_structured_job_details_are_projected_as_bounded_evidence(db_session) ->
     evidence = projected.context["observed_public_evidence"]
     target = next(item for item in evidence if item["artifact_id"] == structured.id)
 
-    assert "visible_text" in target
-    assert "大模型应用开发工程师" in target["visible_text"]
-    assert "RAG" in target["visible_text"]
-    assert sum(len(item.get("visible_text", "")) for item in evidence) <= 48_000
+    assert "visible_text" not in target
+    assert target["source_url"] == "https://jobs.example/structured"
 
 
 def test_malformed_structured_artifact_is_not_projected(db_session) -> None:

@@ -89,6 +89,21 @@ def test_profile_keywords_list_shape_is_unchanged() -> None:
     assert payload.normalization_warnings == []
 
 
+def test_legacy_aliases_and_limit_are_normalized_before_tool_validation() -> None:
+    payload = MatchObservedJobsInput.model_validate({
+        "keywords": "Python、RAG",
+        "locations": "上海, 北京",
+        "rankingCriteria": "技能, 地点",
+        "limit": 500,
+    })
+
+    assert payload.profile_keywords == ["python", "rag"]
+    assert payload.preferred_locations == ["上海", "北京"]
+    assert payload.ranking_criteria == ["skills", "location"]
+    assert payload.limit == 100
+    assert "limit normalized to fixed business limit 100" in payload.normalization_warnings
+
+
 # --- input tolerance: ranking_criteria --------------------------------------
 
 
@@ -282,7 +297,7 @@ def test_executor_distinct_invalid_payloads_each_count_one_wasted_turn() -> None
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"ranking_criteria": ["综合评分"]}},
         {"action": "call_tool", "tool_name": "match-jobs",
-         "tool_input": {"limit": 500}},
+         "tool_input": {"ranking_criteria": ["不存在的标准"]}},
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"profile_keywords": [123]}},
     ])

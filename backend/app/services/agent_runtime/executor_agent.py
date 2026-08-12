@@ -786,6 +786,20 @@ class ExecutorAgent:
                 )
                 record_observation(observations, observations_for_decision, observation)
                 tool_context = _with_observed_page(tool_context, observation)
+                if observation.error_code == "tool_skill_forbidden":
+                    # This is a plan-scope defect, not a recoverable tool
+                    # failure. Stop after the first rejected call so the
+                    # runtime can replan instead of spending turns repeating
+                    # an action this step can never execute.
+                    return ExecutorResult(
+                        status="needs_user",
+                        observations=observations,
+                        user_question=(
+                            "当前步骤调用了不在其 Skill 范围内的工具，"
+                            "需要重新规划为单一 Skill 步骤。"
+                        ),
+                        execution_state=current_state(),
+                    )
                 if observation.status == "succeeded":
                     succeeded_calls.append((decision.tool_name, decision.tool_input))
                 else:
