@@ -282,7 +282,7 @@ queued -> running -> succeeded / partial_success / needs_manual_review / failed 
 
 ## Database Migrations
 
-Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0023`. Sequence:
+Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `0024`. Sequence:
 
 - `0001`: Platform foundation (users, sessions, devices, tasks, audit)
 - `0002`: Device credentials
@@ -298,6 +298,7 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `002
 - `0021`: Profile active version
 - `0022`: DeepAgents runtime runs + artifacts (deepagents_runs / deepagents_artifacts)
 - `0023`: SeenJob cross-run dedup ledger (job-discovery dedup, TTL-pruned)
+- `0024`: Retire 14 legacy tables (job-discovery / site-adapter / personalized-discovery / analysis-session schemas)
 - Hotfixes: `7b757ef17d3f` (MatchReport CHECK constraint), `7e8f22313271` (job-discovery tables), `ffc4f5917966` (strategy/trajectory tables)
 
 ## Coverage Policy
