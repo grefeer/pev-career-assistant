@@ -46,6 +46,8 @@ checkpoints/
 data/app_users.json
 data/minio/
 data/
+# Legacy-table retirement backups (sub-project 4)
+backups/
 minio-data/
 executor-data/checkpoints/
 executor-data/chrome-profile/
