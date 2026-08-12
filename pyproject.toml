@@ -17,24 +17,23 @@ norecursedirs = [".worktrees", "manual"]
 #
 # The ``domain/*`` modules omitted below are pre-PEV paths retained solely
 # for ``StrEnum`` imports consumed by ``db/models.py``; their transition/
-# helper functions are vestigial and slated for retirement in sub-project 4
-# ("Legacy Retirement and Portfolio"). Retained production packages (api,
-# config, db.session/base, domain.agent_runtime, domain.profiles,
-# middleware, main, repositories, services.agent_runtime,
-# services.career_skills, services.{auth,profiles,rate_limit,storage,
-# profile_parser}, services.job_discovery.{schemas,tools.jd_extraction})
-# remain measured and must stay at 100%.
+# helper functions are vestigial.  The personalized-discovery/preferences
+# pair was retired in sub-project 4 (legacy table retirement, migration 0024).
+# Retained production packages (api, config, db.session/base,
+# domain.agent_runtime, domain.profiles, middleware, main, repositories,
+# services.agent_runtime, services.career_skills, services.{auth,profiles,
+# rate_limit,storage,profile_parser},
+# services.job_discovery.{schemas,tools.jd_extraction}) remain measured and
+# must stay at 100%.
 # ---------------------------------------------------------------------------
 [tool.coverage.run]
 branch = true
 omit = [
   "backend/app/domain/job_submissions.py",
-  "backend/app/domain/personalized_discovery.py",
   "backend/app/domain/application_tracking.py",
   "backend/app/domain/company_research.py",
   "backend/app/domain/interview_prep.py",
   "backend/app/domain/job_feedback.py",
-  "backend/app/domain/preferences.py",
 ]
 
 [tool.coverage.report]

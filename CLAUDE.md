@@ -249,14 +249,6 @@ pending_completion / pending_review -> rejected -> pending_review (after correct
 
 Students ONLY see `verified`. Admin review uses `review_version` optimistic locking.
 
-### JobDiscoveryTask States
-
-```
-queued -> running -> succeeded / partial_success / needs_manual_review / failed / cancelled
-```
-
-> The `JobDiscoveryTask` model and table persist, but the worker that processed them has been retired. This state machine documents the retained schema, not an active processing flow.
-
 ## Key Conventions
 
 ### Naming & Code Style
