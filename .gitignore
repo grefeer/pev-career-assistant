@@ -88,5 +88,9 @@ skill/tmp/
 nul
 var/
 settings.json
+.codex/
 tests/question/eval_results/
 docs/study/
+plan/
+temp/
+Program/
