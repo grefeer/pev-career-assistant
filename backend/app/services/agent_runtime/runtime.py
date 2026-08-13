@@ -1275,7 +1275,7 @@ class AgentRuntime:
 
         def trace(
             role: AgentRole,
-            decision_json: dict[str, str],
+            decision_json: dict[str, object],
             turn_metadata: dict[str, object] | None = None,
         ) -> None:
             turn_indices[role] += 1
@@ -1288,6 +1288,15 @@ class AgentRuntime:
                 input_tokens = turn_metadata.get("input_tokens")
                 output_tokens = turn_metadata.get("output_tokens")
                 context_manifest = turn_metadata.get("context_manifest")
+                # Preserve bounded, non-sensitive DeepExecutor diagnostics in
+                # the durable turn JSON. Provider prompts and raw tool output
+                # remain excluded from the trace.
+                for key in ("deep_executor", "internal_model_calls"):
+                    if key in turn_metadata:
+                        decision_json = {
+                            **decision_json,
+                            key: turn_metadata[key],
+                        }
             run_repository.create_turn(
                 db,
                 run_id=run_id,

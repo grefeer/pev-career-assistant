@@ -8,7 +8,7 @@ from typing import Any
 from backend.app.domain.agent_runtime import AgentRole
 
 
-DecisionTrace = Callable[[AgentRole, dict[str, str], dict[str, Any] | None], None]
+DecisionTrace = Callable[[AgentRole, dict[str, Any], dict[str, Any] | None], None]
 
 
 def decision_summary(

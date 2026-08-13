@@ -81,6 +81,20 @@ class ModelCallBudget:
         self.output_tokens_used += output_tokens
         return self.within_limits
 
+    def cancel(self) -> None:
+        """Release the active reservation after a provider call fails.
+
+        ``try_reserve`` runs before the provider boundary. If the provider
+        raises, ``record`` cannot safely infer usage and must not be called;
+        leaving the reservation committed would make a recoverable retry look
+        permanently over budget.
+        """
+        estimate = self._active_reservation
+        self._reserved_input_tokens = max(0, self._reserved_input_tokens - estimate)
+        self._active_reservation = 0
+        if estimate:
+            self.requests_used = max(0, self.requests_used - 1)
+
     @property
     def within_limits(self) -> bool:
         return (

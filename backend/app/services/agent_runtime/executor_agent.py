@@ -516,6 +516,38 @@ class ExecutorAgent:
         prior_observations: list[ToolObservation] | None = None,
     ) -> ExecutorResult:
         """Execute a step without precomputing its tool sequence in the harness."""
+        # Production uses the LangChain chat model held by
+        # LangChainModelGateway, so it receives the DeepAgents executor with
+        # native progressive Skill disclosure. Deterministic gateway doubles
+        # used by the existing unit suite do not expose a chat model and keep
+        # the old seam for focused loop/budget tests.
+        if (
+            getattr(self._gateway, "chat_model", None) is not None
+            or getattr(self._gateway, "_model", None) is not None
+        ):
+            from pathlib import Path
+
+            from backend.app.services.agent_runtime.deep_executor import (
+                DeepExecutorAgent,
+            )
+
+            return DeepExecutorAgent(
+                gateway=self._gateway,
+                tools=self._tools,
+                skills=self._skills,
+                skill_root=Path(__file__).resolve().parents[4] / "skill",
+            ).run(
+                task=task,
+                plan=plan,
+                step=step,
+                context=context,
+                trace=trace,
+                tool_budget=tool_budget,
+                turn_budget=turn_budget,
+                model_budget=model_budget,
+                deadline=deadline,
+                prior_observations=prior_observations,
+            )
         observations: list[ToolObservation] = []
         tool_context = context
         # Every (tool_name, tool_input) pair that already succeeded in this

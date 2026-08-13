@@ -356,6 +356,8 @@ def run_question(
                 "status": decision.get("status"),
                 "error_code": decision.get("error_code"),
                 "summary": (decision.get("summary") or decision.get("feedback") or "")[:400],
+                "deep_executor": decision.get("deep_executor", False),
+                "internal_model_calls": decision.get("internal_model_calls"),
             }
         )
         if decision.get("verification_decision"):

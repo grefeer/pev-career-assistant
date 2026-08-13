@@ -147,6 +147,17 @@ def test_model_budget_is_a_hard_physical_ceiling() -> None:
     assert not budget.try_reserve(1)
 
 
+def test_model_budget_cancel_releases_failed_provider_reservation() -> None:
+    budget = ModelCallBudget(1, 100, 40)
+    assert budget.try_reserve(60)
+
+    budget.cancel()
+
+    assert budget.requests_used == 0
+    assert budget.remaining_input_tokens == 100
+    assert budget.try_reserve(60)
+
+
 def test_typed_context_input_can_reference_task_goal() -> None:
     task = AgentTaskRequest(goal="find a role", allowed_skills=["job-discovery"])
 

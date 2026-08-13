@@ -96,6 +96,16 @@ class LangChainModelGateway:
         """Return token usage for the most recent decide() call, if available."""
         return self._last_usage
 
+    @property
+    def chat_model(self) -> Any:
+        """Expose the unstructured chat model for tool-calling runtimes.
+
+        The ordinary PEV roles call ``decide`` with a schema. DeepAgents needs
+        the same underlying chat model unwrapped so it can bind tools; it must
+        never receive the gateway's JSON-only structured-output wrapper.
+        """
+        return self._model
+
     def decide(
         self,
         *,
@@ -121,7 +131,11 @@ class LangChainModelGateway:
             # requires the word "json" in the prompt; this minimal hint
             # satisfies that protocol requirement without changing the
             # action contract.
-            system_content += " Return one JSON object matching the requested schema."
+            system_content += (
+                " Return one JSON object matching the requested schema."
+                f" The complete JSON Schema is: "
+                f"{json.dumps(response_model.model_json_schema(), ensure_ascii=False, separators=(',', ':'))}"
+            )
 
         if self._catalog_in_system_prompt:
             state_copy = dict(state)
@@ -261,14 +275,20 @@ class LangChainModelGateway:
         response_model: type[ResponseT],
     ) -> ResponseT:
         """Use ordinary JSON output only when a provider rejects response_format."""
+        schema_hint = (
+            "The schema is: "
+            f"{json.dumps(response_model.model_json_schema(), ensure_ascii=False)} "
+            if self._structured_method != "json_mode"
+            else ""
+        )
         fallback_messages = [
             *messages,
             SystemMessage(
                 content=(
-                    "Return only one JSON object matching this schema exactly: "
-                    f"{json.dumps(response_model.model_json_schema(), ensure_ascii=False)} "
-                    f"{_role_action_contract(role)} "
-                    f"{json_repair_rules(role.value)}"
+                    "Return only one JSON object matching the requested schema exactly. "
+                    + schema_hint
+                    + f"{_role_action_contract(role)} "
+                    + f"{json_repair_rules(role.value)}"
                 )
             ),
         ]
@@ -349,12 +369,45 @@ def _strip_json_fence(content: str) -> str:
         return cleaned[7:-3].strip()
     if cleaned.startswith("```") and cleaned.endswith("```"):
         return cleaned[3:-3].strip()
-    brace = cleaned.find("{")
-    if brace > 0:
-        cleaned = cleaned[brace:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].strip()
+    balanced = _extract_first_balanced_json_object(cleaned)
+    if balanced is not None:
+        return balanced
     return cleaned
+
+
+def _extract_first_balanced_json_object(content: str) -> str | None:
+    """Extract the first balanced JSON object from prose or a fenced reply.
+
+    DeepSeek may add a short sentence before or after an otherwise valid
+    terminal object when no provider-side response format is active. Scanning
+    braces while respecting JSON strings handles both prose wrappers and
+    braces embedded in summary text without accepting a partial object.
+    """
+    start = content.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(content)):
+        char = content[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return content[start : index + 1]
+    return None
 
 
 # Known provider-emitted wrong field names that should map to a schema field
@@ -544,7 +597,12 @@ def build_agent_chat_model(
 def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
     """Build the live OpenAI-compatible decision provider for all three roles."""
     model, structured_method = build_agent_chat_model(
-        settings, max_tokens=settings.agent_harness_model_max_output_tokens
+        # Planner stage-1 plans can contain several fully specified steps. The
+        # old 4096 cap truncated valid JSON before schema validation. Keep the
+        # configurable value as the floor, but give the role gateway enough
+        # room for the largest normal plan.
+        settings,
+        max_tokens=max(settings.agent_harness_model_max_output_tokens, 8_192),
     )
     return LangChainModelGateway(
         model,
