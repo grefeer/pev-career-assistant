@@ -17,6 +17,7 @@ from backend.app.services.agent_runtime.model_gateway import (
     _role_action_contract,
     _strip_json_fence,
 )
+from backend.app.services.agent_runtime.model_budget import ModelCallBudget
 from tests.conftest import settings_override
 from backend.app.services.agent_runtime.schemas import (
     ExecutorDecision,
@@ -368,6 +369,29 @@ def test_gateway_retries_one_malformed_preferred_local_json_completion() -> None
 
     assert result.action == "need_user"
     assert model.responses == []
+
+
+def test_gateway_counts_each_physical_json_recovery_request() -> None:
+    model = SequencedLocalJsonModel(
+        [
+            '{"action":"bad"}',
+            '{"action":"bad"}',
+            '{"action":"need_user","user_question":"请确认城市。"}',
+        ]
+    )
+    budget = ModelCallBudget(max_requests=2, max_input_tokens=10_000, max_output_tokens=1_000)
+
+    with pytest.raises(AgentModelGatewayError, match="model_budget_exhausted"):
+        LangChainModelGateway(model, prefer_local_json_validation=True).decide(
+            role=AgentRole.planner,
+            instruction="形成计划",
+            state={"goal": "找岗位"},
+            response_model=PlannerDecision,
+            model_budget=budget,
+        )
+
+    assert budget.requests_used == 2
+    assert budget.failed_requests == 0
 
 
 def test_gateway_retries_two_malformed_preferred_local_json_completions() -> None:

@@ -27,6 +27,20 @@
 - [x] 完成本轮定向与相关全量单测验证
 - [x] 修复散文包裹终态 JSON，并覆盖异常失败路径 trace 与评测 JSON 序列化
 - [x] 完成 `tests/unit` 全量验证：1557 passed、7 skipped；ruff 通过
+- [x] 修复 Executor Skill prompt：注入有界 policy/完成契约/单步流程，并过滤无关文件工具
+- [x] 修复历史窗口裁剪：tool-call 与 ToolMessage 成组保留，相关回归 293 passed
+
+## Audit disposition: 2026-08-13 findings_report.md
+
+- [x] P1-1 state.json：容错加载、备份回退、临时文件 + fsync + replace
+- [x] P1-3 gateway：每个真实 provider 请求独立计费，重试不绕过物理预算
+- [x] P1-4 resume/recover：owner 查询支持 `FOR UPDATE`，状态检查与变更同一锁内
+- [x] P1-5 POSIX helper：新建进程组并在 killpg 失败时回退杀单进程
+- [x] P1-6 profile facts：从 DeepExecutor 模型 metadata 投影中移除，工具侧仍可用
+- [x] P1-7 Planner：非法 ExecutionPlan 降级为 `waiting_user/invalid_execution_plan`
+- [x] P1-8 skill script：显式脚本白名单、最小环境、stdout/stderr 标签脱敏
+- [x] 选定 P2：cache hash 校验、非 Web scheme 拦截、deduplicate output 边界、OCR 联系方式提示、持久化正文上限、敏感目录 ignore
+- [ ] 保留为风险/后续：DNS TOCTOU（报告标为 unverified）、大范围性能重构、未证实的 output 误贴、Verifier 停滞镜像、模块拆分
 
 ## Invariants
 
@@ -39,3 +53,5 @@
 - Skill 包默认只读；证据和运行产物必须走 ToolRegistry/持久化边界。
 - DeepExecutor 共享 turn 只按 step 消耗一次；内部 model call 必须有独立上限且不污染 PEV turn 统计。
 - DeepExecutor 失败终态也必须留下安全 trace，包含错误码和内部调用次数。
+- Executor prompt 必须包含当前 Skill 的可执行摘要和 completion contract，不能只依赖空 execution_policy。
+- 历史窗口不得产生未配对的 AI tool call；无法安全裁剪时交给 SDK 的 canonical repair。

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import time
 
+from pydantic import ValidationError
+
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.model_budget import (
@@ -70,6 +72,8 @@ _PLANNER_INSTRUCTION = (
     + PLANNER_RUNTIME_RULES
 )
 
+_MAX_INVALID_PLAN_RETRIES = 3
+
 
 class PlannerAgent:
     """Goal-oriented Planning loop; it is not a one-shot prompt template."""
@@ -115,7 +119,11 @@ class PlannerAgent:
             role=AgentRole.executor, allowed_skills=allowed_skills
         )
         premature_need_user_retries = 0
+        invalid_plan_retries = 0
         runtime_feedback: str | None = None
+        gateway_manages_model_budget = bool(
+            getattr(self._gateway, "manages_model_budget", False)
+        )
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return PlannerResult(
@@ -160,21 +168,38 @@ class PlannerAgent:
             }
             if runtime_feedback:
                 decision_state["runtime_feedback"] = runtime_feedback
-            if model_budget is not None and not model_budget.try_reserve(
-                estimate_input_tokens(_PLANNER_INSTRUCTION, decision_state)
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.try_reserve(
+                    estimate_input_tokens(_PLANNER_INSTRUCTION, decision_state)
+                )
             ):
                 return PlannerResult(
                     status="failed",
                     observations=observations,
                     error_code="model_budget_exhausted",
                 )
-            decision = self._gateway.decide(
-                role=AgentRole.planner,
-                instruction=_PLANNER_INSTRUCTION,
-                state=decision_state,
-                response_model=PlannerDecision,
-            )
-            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+            if gateway_manages_model_budget:
+                decision = self._gateway.decide(
+                    role=AgentRole.planner,
+                    instruction=_PLANNER_INSTRUCTION,
+                    state=decision_state,
+                    response_model=PlannerDecision,
+                    model_budget=model_budget,
+                )
+            else:
+                decision = self._gateway.decide(
+                    role=AgentRole.planner,
+                    instruction=_PLANNER_INSTRUCTION,
+                    state=decision_state,
+                    response_model=PlannerDecision,
+                )
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.record(self._gateway.last_usage)
+            ):
                 return PlannerResult(
                     status="failed",
                     observations=observations,
@@ -218,13 +243,74 @@ class PlannerAgent:
                 )
                 continue
             if decision.action == "plan":
-                plan = ExecutionPlan(
-                    task=task,
-                    created_by=AgentRole.planner,
-                    complexity=decision.complexity,
-                    success_criteria=decision.success_criteria,
-                    steps=decision.steps,
-                )
+                try:
+                    plan = ExecutionPlan(
+                        task=task,
+                        created_by=AgentRole.planner,
+                        complexity=decision.complexity,
+                        success_criteria=decision.success_criteria,
+                        steps=decision.steps,
+                    )
+                except ValidationError as error:
+                    if (
+                        invalid_plan_retries < _MAX_INVALID_PLAN_RETRIES
+                        and _turn < task.budget.max_agent_turns - 1
+                    ):
+                        invalid_plan_retries += 1
+                        details = []
+                        for item in error.errors()[:4]:
+                            location = ".".join(str(part) for part in item.get("loc", ()))
+                            message = str(item.get("msg") or "invalid value")
+                            details.append(f"{location or 'plan'}: {message}")
+                        runtime_feedback = (
+                            "ExecutionPlan 校验失败，请只修正以下结构问题后重新输出计划："
+                            + "; ".join(details)[:500]
+                        )
+                        continue
+                    return PlannerResult(
+                        status="needs_user",
+                        observations=observations,
+                        user_question=(
+                            "模型生成的执行计划不符合运行约束，请重试或补充必要信息。"
+                        ),
+                        error_code="invalid_execution_plan",
+                    )
+                if self._skills is not None:
+                    plan = plan.model_copy(
+                        update={
+                            "steps": [
+                                self._skills.normalize_step_ports(step)
+                                for step in plan.steps
+                            ]
+                        }
+                    )
+                    port_error = next(
+                        (
+                            error
+                            for step in plan.steps
+                            if (error := self._skills.validate_step_ports(step))
+                        ),
+                        None,
+                    )
+                    if port_error:
+                        if (
+                            invalid_plan_retries < _MAX_INVALID_PLAN_RETRIES
+                            and _turn < task.budget.max_agent_turns - 1
+                        ):
+                            invalid_plan_retries += 1
+                            runtime_feedback = (
+                                "ExecutionPlan 端口校验失败，请使用 Skill policy 中的规范 artifact 类型："
+                                + port_error[:500]
+                            )
+                            continue
+                        return PlannerResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=(
+                                "模型生成的执行计划包含不兼容的 artifact 类型，请重试。"
+                            ),
+                            error_code="invalid_execution_plan",
+                        )
                 return PlannerResult(
                     status="planned", plan=plan, observations=observations
                 )

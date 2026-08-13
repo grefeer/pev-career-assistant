@@ -112,6 +112,9 @@ class VerifierAgent:
         )
         premature_need_user_retries = 0
         runtime_feedback: str | None = None
+        gateway_manages_model_budget = bool(
+            getattr(self._gateway, "manages_model_budget", False)
+        )
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return VerifierResult(
@@ -160,8 +163,12 @@ class VerifierAgent:
             }
             if runtime_feedback:
                 decision_state["runtime_feedback"] = runtime_feedback
-            if model_budget is not None and not model_budget.try_reserve(
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.try_reserve(
                 estimate_input_tokens(_VERIFIER_INSTRUCTION, decision_state)
+                )
             ):
                 return VerifierResult(
                     decision=VerificationDecision.NEED_USER,
@@ -169,13 +176,26 @@ class VerifierAgent:
                     observations=observations,
                     error_code="model_budget_exhausted",
                 )
-            decision = self._gateway.decide(
-                role=AgentRole.verifier,
-                instruction=_VERIFIER_INSTRUCTION,
-                state=decision_state,
-                response_model=VerifierDecision,
-            )
-            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+            if gateway_manages_model_budget:
+                decision = self._gateway.decide(
+                    role=AgentRole.verifier,
+                    instruction=_VERIFIER_INSTRUCTION,
+                    state=decision_state,
+                    response_model=VerifierDecision,
+                    model_budget=model_budget,
+                )
+            else:
+                decision = self._gateway.decide(
+                    role=AgentRole.verifier,
+                    instruction=_VERIFIER_INSTRUCTION,
+                    state=decision_state,
+                    response_model=VerifierDecision,
+                )
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.record(self._gateway.last_usage)
+            ):
                 return VerifierResult(
                     decision=VerificationDecision.NEED_USER,
                     feedback="Model budget exhausted after independent verification.",

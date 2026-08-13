@@ -93,6 +93,7 @@ def _discovery_observation_is_valid(observation: ToolObservation) -> bool:
             and bool(output["content_hash"])
             and isinstance(candidates, list)
             and any(isinstance(candidate, dict) for candidate in candidates)
+            and output.get("source_quality") in {None, "jd_complete"}
         )
     if observation.tool_name not in _DISCOVERY_EVIDENCE_TOOLS:
         return False

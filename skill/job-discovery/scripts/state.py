@@ -28,12 +28,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 STATE_PATH = Path("output/state.json")
+STATE_BACKUP_PATH = STATE_PATH.with_suffix(".json.bak")
 DEFAULT_SOURCE_SHEETS: dict[str, Any] = {
     "fGOTkFoVohnQ": {
         "title": "27届提前批秋招信息汇总（持续更新）",
@@ -46,15 +50,58 @@ DEFAULT_SOURCE_SHEETS: dict[str, Any] = {
 }
 
 
-def _load_state() -> dict[str, Any]:
-    if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+def _default_state() -> dict[str, Any]:
     return {"source_sheets": {}, "processed": {}}
+
+
+def _read_state_file(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if not isinstance(value.get("source_sheets", {}), dict):
+        return None
+    if not isinstance(value.get("processed", {}), dict):
+        return None
+    return value
+
+
+def _load_state() -> dict[str, Any]:
+    state = _read_state_file(STATE_PATH)
+    if state is not None:
+        return state
+    backup = _read_state_file(STATE_BACKUP_PATH)
+    if backup is not None:
+        return backup
+    return _default_state()
 
 
 def _save_state(state: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Preserve the last valid snapshot before replacing the live file. A
+    # partially written state file must never be the only recovery point.
+    if _read_state_file(STATE_PATH) is not None:
+        shutil.copy2(STATE_PATH, STATE_BACKUP_PATH)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=STATE_PATH.parent,
+            prefix=f"{STATE_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, STATE_PATH)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def cmd_init() -> None:

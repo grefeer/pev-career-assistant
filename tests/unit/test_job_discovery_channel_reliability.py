@@ -18,6 +18,7 @@ import pytest
 
 from backend.app.services.career_skills import job_discovery as jd
 from backend.app.services.career_skills.job_discovery import (
+    FetchPublicJobPageOutput,
     PublicJobFetchError,
     _fetch_one_with_expansion,
     _fetch_public_page_requests,
@@ -398,6 +399,122 @@ def test_fetch_one_with_expansion_requests_path_skips_jd_pages(monkeypatch) -> N
     )
 
     assert [page.source_url for page in pages] == [list_url]
+
+
+def test_list_expansion_prioritizes_detail_routes_over_navigation(monkeypatch) -> None:
+    """Navigation links must not consume the bounded detail-fetch budget."""
+    list_url = "https://career.hebut.edu.cn/correcruit/index.html?p=1"
+    navigation_urls = [
+        "https://career.hebut.edu.cn/correcruit/index.html",
+        "https://career.hebut.edu.cn/recruitment/index.html",
+        "https://career.hebut.edu.cn/basicrecruit/index.html",
+    ]
+    detail_urls = [
+        "https://career.hebut.edu.cn/correcruit/content/id/79131.html",
+        "https://career.hebut.edu.cn/correcruit/content/id/79130.html",
+        "https://career.hebut.edu.cn/correcruit/content/id/79121.html",
+    ]
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda url, *args, **kwargs: SimpleNamespace(
+            text=_jd_page_html(url.rsplit("/", 1)[-1]),
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        ),
+    )
+
+    pages = _expand_from_list_links(
+        list_url,
+        [*navigation_urls, *detail_urls],
+        "卡片列表 " * 60,
+    )
+
+    assert [page.source_url for page in pages[: len(detail_urls)]] == detail_urls
+
+
+def test_iguopin_list_detail_probe_reports_anonymous_access_denial(monkeypatch) -> None:
+    page = FetchPublicJobPageOutput(
+        artifact_id="list-1",
+        source_url="https://www.iguopin.com/job/list?keyword=Java",
+        title="招聘信息-国聘",
+        visible_text="职位卡片 " * 80,
+        content_hash="a" * 64,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.post",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            json=lambda: {"data": [{"job_id": "job-1"}]},
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            json=lambda: {"code": 403},
+        ),
+    )
+
+    error = jd._probe_iguopin_detail_access(page.source_url, page)
+
+    assert error is not None
+    assert error.code == "access_denied"
+
+
+def test_hebut_detail_fetch_expands_recent_public_campus_indexes(monkeypatch) -> None:
+    """A supplied campus JD can expose sibling recent postings safely."""
+    detail_url = "https://career.hebut.edu.cn/correcruit/content/id/78016.html"
+    index_urls = {
+        "https://career.hebut.edu.cn/correcruit/index.html?p=1",
+        "https://career.hebut.edu.cn/correcruit/index.html?p=2",
+    }
+    sibling_urls = [
+        "https://career.hebut.edu.cn/correcruit/content/id/79111.html",
+        "https://career.hebut.edu.cn/correcruit/content/id/79113.html",
+    ]
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._is_public_url",
+        lambda url: url.startswith("https://career.hebut.edu.cn/"),
+    )
+
+    def fake_get(url, *args, **kwargs):  # noqa: ANN001
+        if url == detail_url:
+            html = _jd_page_html("中粮集团校园招聘")
+        elif url in index_urls:
+            links = "".join(f'<a href="{item}">岗位</a>' for item in sibling_urls)
+            html = "<html><body>校园职位列表 " + ("卡片 " * 60) + links + "</body></html>"
+        else:
+            html = _jd_page_html(url.rsplit("/", 1)[-1])
+        return SimpleNamespace(
+            text=html,
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+            is_redirect=False,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get", fake_get
+    )
+    result = jd.fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        jd.FetchPublicJobPagesInput(urls=[detail_url]),
+    )
+
+    sources = [page.source_url for page in result.pages]
+    assert sources[0] == detail_url
+    assert sibling_urls[0] in sources
+    assert sibling_urls[1] in sources
 
 
 def test_fetch_public_page_requests_with_html_keeps_backward_compat(monkeypatch) -> None:

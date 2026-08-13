@@ -33,6 +33,7 @@ class ModelCallBudget:
     max_input_tokens: int
     max_output_tokens: int
     requests_used: int = 0
+    failed_requests: int = 0
     input_tokens_used: int = 0
     output_tokens_used: int = 0
     _reserved_input_tokens: int = 0
@@ -85,15 +86,15 @@ class ModelCallBudget:
         """Release the active reservation after a provider call fails.
 
         ``try_reserve`` runs before the provider boundary. If the provider
-        raises, ``record`` cannot safely infer usage and must not be called;
-        leaving the reservation committed would make a recoverable retry look
-        permanently over budget.
+        raises, input reservation is released, but the physical request is
+        retained in ``requests_used`` so a failed provider call cannot bypass
+        the hard request ceiling. ``failed_requests`` is an audit counter.
         """
         estimate = self._active_reservation
         self._reserved_input_tokens = max(0, self._reserved_input_tokens - estimate)
         self._active_reservation = 0
         if estimate:
-            self.requests_used = max(0, self.requests_used - 1)
+            self.failed_requests += 1
 
     @property
     def within_limits(self) -> bool:

@@ -1,5 +1,27 @@
 # Task Plan: 本轮83案例全量在线评测与自适应优化
 
+## 2026-08-13 P0/P1 收敛优化
+
+### Goal
+在不绕过公网反爬和不放宽评测契约的前提下，消除 DeepExecutor 证据已满足后的空转/终态硬失败，并修复 planner 非法计划与 list-only 详情页流程。
+
+### Phases
+- [x] P0-A：锁定 `jd_complete` 评测契约与运行时完成门禁测试
+- [x] P0-B：工具调用后确定性收敛，补齐终态解析失败降级与 trace
+- [x] P1-A：补强 completion contract 提示词与结构化 JD 完成规则
+- [x] P1-B：planner 非法计划有界重试
+- [x] P1-C：list-only 详情页展开与来源一致性校验
+- [x] Verification：定向单测、ruff、10 题公网回归（代码门禁完成；公网回归待单独启动）
+
+### Invariants
+- 不自动绕过 Liepin 验证码、登录、反爬或安全页。
+- `list_only`、无正文、无 hash、无 source_url 的页面不得作为成功 JD。
+- 替代来源必须通过职位/公司/来源一致性校验，不能用无关职位百科冒充目标 JD。
+- 现有未提交修改全部保留，测试结果写入新目录。
+
+### Status
+**Currently complete for code phase** - P0/P1 代码、定向测试、全量单元测试与代码质量检查完成；公网 10 题未启动。
+
 # Task Plan: 10轮提示词快速迭代（前10个非链式案例）
 
 ## 本轮目标
@@ -203,3 +225,45 @@
 
 ## Status
 **Complete** - 提示词与 harness 补强完成；完整单元集、Ruff、compileall 均通过，下一步是重新进行 live A/B 评测。
+
+# Task Plan: Executor Skill/Tool P0-P2 capability remediation
+
+## Goal
+基于 run6 证据，修复确定性完成闸门的误拒与不可诊断问题，增强公开职位来源降级和列表页详情展开，并保留反爬安全边界与现有成功契约。
+
+## Phases
+- [ ] P0：复现 Q057 gate mismatch，补充门禁诊断、证据与 artifact 一致性校验及回归测试
+- [ ] P1-A：评测开启 public API adapters，补充低反爬来源路由和有限搜索降级
+- [ ] P1-B：增强 list-only SPA 的公开详情路由发现，不绕过登录/验证码/反爬
+- [ ] P2：补充 partial-evidence 可观测字段，不引入未经验证的 partial_success 评分状态
+- [ ] Verification：定向测试、tests/unit、Ruff/compileall、串行 10 题公网回归
+
+## Invariants
+- 不绕过 Liepin 或任何站点的验证码、登录、反爬、安全页。
+- `jd_complete` 仍是 job-discovery 成功证据门槛；`list_only` 不能冒充 JD。
+- 仅使用工具产出和已持久化的证据；模型提出的 URL 不具备证据权威。
+- P2 只增加诊断，不改变当前 RunStatus 和 eval 成功评分口径。
+
+## Status
+**Currently in P0 investigation** - 已确认 Q057 有 2 个 `jd_complete` artifact，但尚未完成 observation/gate 的运行时级复现。
+
+# 2026-08-13 run8 收敛修复
+
+## Goal
+复测固定 10 题，达到至少 8/10 `succeeded`；若剩余非成功样例均为公开站点反爬、登录或验证码阻断，则按外部阻断交付证据。
+
+## Current evidence
+- run8 目录：`tests/question/eval_results/deep_executor_nonchain_20260813_run8_live/`
+- 当前结果：10/10 `waiting_user`；7/10 `external_blocked`，Q017/Q028 为 `model_or_verifier_decision`，Q034 为 `no_progress_duplicate`。
+- Q017/Q028 已有 `jd_complete` 页面和结构化详情 artifact，但终态在步骤完成门禁前被暂停。
+- Q034 只有 `list_only` 页面；不能把列表页直接判为 JD 成功，需先验证公开详情路由是否可发现。
+
+## Phases
+- [ ] 修复 runtime completion gate 合并 trusted artifact refs
+- [ ] 为证据门禁和 needs_user rescue 补回归测试
+- [ ] 验证国聘列表页详情展开，不绕过反爬/登录
+- [ ] 运行定向测试、ruff、compileall
+- [ ] 串行重跑 10 题并审计 success/root cause
+
+## Status
+当前在第一阶段：修改 runtime 的 completion evidence 路径。

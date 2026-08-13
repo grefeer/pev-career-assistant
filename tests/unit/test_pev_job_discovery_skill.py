@@ -2597,6 +2597,23 @@ def test_collect_page_links_keeps_only_same_host_job_shaped_links(monkeypatch) -
     ]
 
 
+def test_collect_page_links_accepts_public_spa_data_detail_routes(monkeypatch) -> None:
+    from backend.app.services.career_skills import job_discovery as jd
+
+    class FakePage:
+        def eval_on_selector_all(self, selector, expression):  # noqa: ANN001
+            return ["/job/detail?id=1", "/position/2", "https://other.example/job/3"]
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._is_public_url",
+        lambda url: url.startswith("https://www.iguopin.com/"),
+    )
+    assert jd._collect_page_links(FakePage(), "https://www.iguopin.com/job/list") == [
+        "https://www.iguopin.com/job/detail?id=1",
+        "https://www.iguopin.com/position/2",
+    ]
+
+
 def test_expand_from_list_links_requires_min_links_and_skips_jd_pages(monkeypatch) -> None:
     from backend.app.services.career_skills import job_discovery as jd
 

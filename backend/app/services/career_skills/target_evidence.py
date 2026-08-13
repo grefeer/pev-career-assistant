@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+
+def _normalized_url(value: object) -> str | None:
+    """Normalize only harmless URL presentation differences for lookup."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return value.strip()
+    path = parsed.path.rstrip("/") or "/"
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
 
 
 def resolve_target_evidence(
@@ -82,14 +94,18 @@ def _find_structured_candidate(
         if not isinstance(candidate, dict):
             continue
         if (
-            target_id == candidate.get("candidate_id")
+            target_id.strip() == candidate.get("candidate_id")
             or target_id == candidate.get("artifact_id")
             or target_id == candidate.get("source_artifact_id")
-            or target_id == candidate.get("source_url")
+            or _normalized_url(target_id) == _normalized_url(candidate.get("source_url"))
             or (
                 isinstance(target_source_url, str)
                 and target_source_url
-                in {candidate.get("source_url"), candidate.get("page_source_url")}
+                and _normalized_url(target_source_url)
+                in {
+                    _normalized_url(candidate.get("source_url")),
+                    _normalized_url(candidate.get("page_source_url")),
+                }
             )
         ):
             return candidate

@@ -17,6 +17,8 @@ from backend.app.services.agent_runtime.evidence_gate import (
     step_contract_met,
 )
 from backend.app.services.agent_runtime.schemas import PlanStep, ToolObservation
+from backend.app.services.career_skills.manifest import build_career_skill_registry
+from backend.app.services.career_skills.registry import build_career_tool_registry
 
 
 def _step(*allowed_skills: str) -> PlanStep:
@@ -178,6 +180,25 @@ def test_step_contract_does_not_close_on_search_or_sheet_index_only() -> None:
     assert step_contract_met(_step("job-discovery"), [sheet]) is False
 
 
+def test_job_discovery_detail_contract_rejects_list_only_source() -> None:
+    detail = {
+        "source_url": "https://jobs.example/list",
+        "content_hash": "d" * 64,
+        "source_quality": "list_only",
+        "candidates": [{"title": "岗位"}],
+    }
+    assert step_contract_met(
+        _step("job-discovery"),
+        [_observed("extract-observed-job-details", output=detail)],
+    ) is False
+
+    detail["source_quality"] = "jd_complete"
+    assert step_contract_met(
+        _step("job-discovery"),
+        [_observed("extract-observed-job-details", output=detail)],
+    ) is True
+
+
 def test_step_contract_met_for_the_three_report_skills() -> None:
     match = _observed("match-observed-jobs", output={"matches": []})
     assert step_contract_met(_step("job-matching"), [match]) is True
@@ -315,3 +336,49 @@ def test_batch_fetch_with_evidence_and_blocked_failure_meets_contract_and_is_blo
     )
     assert step_contract_met(_step("job-discovery"), [mixed]) is True
     assert has_blocked_evidence([mixed]) is True
+
+
+def test_completion_diagnostics_accepts_trusted_jd_artifact_when_quality_is_missing() -> None:
+    registry = build_career_skill_registry(build_career_tool_registry())
+    step = _step("job-discovery")
+    observation = _observed(
+        "fetch-public-job-pages",
+        output={"pages": [{"source_url": "https://jobs.example/1", "content_hash": "a" * 64, "visible_text": "JD"}]},
+    )
+    refs = [{
+        "artifact_id": "artifact-1",
+        "artifact_type": "public_job_page",
+        "tool": "fetch-public-job-pages",
+        "source_url": "https://jobs.example/1",
+        "content_hash": "a" * 64,
+        "quality": "jd_complete",
+    }]
+    diagnostics = registry.completion_evidence_diagnostics(
+        step, [observation], summary="已完成", artifact_refs=refs
+    )
+    assert diagnostics["observation_contract_met"] is True
+    assert diagnostics["trusted_artifact_contract_met"] is True
+    assert diagnostics["gate_passed"] is True
+
+
+def test_completion_diagnostics_never_rescues_list_only_or_blocked_artifacts() -> None:
+    registry = build_career_skill_registry(build_career_tool_registry())
+    step = _step("job-discovery")
+    refs = [{
+        "artifact_id": "artifact-1",
+        "artifact_type": "public_job_page",
+        "tool": "fetch-public-job-pages",
+        "source_url": "https://jobs.example/list",
+        "content_hash": "a" * 64,
+        "quality": "list_only",
+    }]
+    blocked = _observed(
+        "fetch-public-job-pages",
+        output={"pages": [], "failures": [{"error_code": "captcha"}]},
+    )
+    diagnostics = registry.completion_evidence_diagnostics(
+        step, [blocked], summary="已完成", artifact_refs=refs
+    )
+    assert diagnostics["trusted_artifact_contract_met"] is False
+    assert diagnostics["blocked"] is True
+    assert diagnostics["gate_passed"] is False

@@ -52,13 +52,139 @@ logger = logging.getLogger(__name__)
 class DeepExecutorResponse(BaseModel):
     """Structured terminal state emitted by the DeepAgents Executor."""
 
-    model_config = {"extra": "forbid"}
+    # Unknown fields are ignored rather than rejected: the runtime discards
+    # model-supplied artifact_refs and rewrites them from DB-derived evidence,
+    # so extra keys carry no authority and must not abort an otherwise valid
+    # terminal decision.
+    model_config = {"extra": "ignore"}
 
     status: str = Field(pattern="^(succeeded|needs_user|failed)$")
     summary: str = ""
     user_question: str | None = None
     error_code: str | None = None
     artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+# Common LLM spellings for terminal states. Coerced before validation so a
+# cosmetic status variant cannot turn a valid terminal decision into an
+# invalid response (which previously hard-failed the run).
+_TERMINAL_STATUS_ALIASES: dict[str, str] = {
+    "success": "succeeded",
+    "successful": "succeeded",
+    "completed": "succeeded",
+    "complete": "succeeded",
+    "done": "succeeded",
+    "finished": "succeeded",
+    "need_user": "needs_user",
+    "waiting_user": "needs_user",
+    "fail": "failed",
+    "failure": "failed",
+}
+
+# Observation tool -> artifact type persisted by the runtime's
+# ``_persist_observed_evidence``. Used to prevent an early deterministic stop
+# when the step's declared outputs are not actually covered by the produced
+# observations.
+_OBSERVATION_ARTIFACT_TYPES: dict[str, str] = {
+    "fetch-public-job-pages": "public_job_page",
+    "fetch-public-job-page": "public_job_page",
+    "fetch-wechat-article": "public_job_page",
+    "search-public-job-pages": "job_search_results",
+    "query-career-sheet-records": "job_search_results",
+    "extract-observed-job-details": "structured_job_details",
+    "extract-observed-job-details-batch": "structured_job_details",
+    "match-observed-jobs": "job_matching_report",
+    "build-resume-tailoring-brief": "resume_tailoring_brief",
+    "build-preparation-plan": "career_preparation_plan",
+}
+
+
+def _produces_persisted_artifact(observation: ToolObservation) -> bool:
+    """True when a succeeded observation carries the shape the runtime persists.
+
+    Mirrors ``AgentRuntime._persist_observed_evidence``: a mapped tool name
+    alone does not guarantee an artifact (e.g. ``match-observed-jobs`` with an
+    empty ``matches`` list persists nothing).
+    """
+    if observation.status != "succeeded":
+        return False
+    artifact_type = _OBSERVATION_ARTIFACT_TYPES.get(observation.tool_name)
+    if artifact_type is None:
+        return False
+    output = observation.output or {}
+    if artifact_type == "public_job_page":
+        raw_pages = output.get("pages")
+        pages = raw_pages if isinstance(raw_pages, list) else [output]
+        return any(
+            isinstance(page, dict)
+            and all(
+                isinstance(page.get(key), str) and page[key]
+                for key in ("source_url", "content_hash", "visible_text")
+            )
+            for page in pages
+        )
+    if artifact_type == "structured_job_details":
+        raw_details = output.get("details")
+        details = raw_details if isinstance(raw_details, list) else [output]
+        return any(
+            isinstance(detail, dict)
+            and isinstance(detail.get("source_url"), str)
+            and isinstance(detail.get("content_hash"), str)
+            and isinstance(detail.get("candidates"), list)
+            for detail in details
+        )
+    if artifact_type == "job_search_results":
+        raw = output.get("results")
+        if raw is None:
+            raw = output.get("records")
+        return (
+            isinstance(output.get("source_url"), str)
+            and isinstance(output.get("content_hash"), str)
+            and isinstance(raw, list)
+        )
+    # Skill deliverables (match/tailoring/plan) persist only with a usable
+    # source URL; the match report additionally accepts per-row sources.
+    direct_source = output.get("source_url")
+    if isinstance(direct_source, str) and direct_source:
+        return True
+    if artifact_type != "job_matching_report":
+        return False
+    matches = output.get("matches")
+    return isinstance(matches, list) and any(
+        isinstance(match, dict)
+        and isinstance(match.get("source_url"), str)
+        and bool(match["source_url"])
+        for match in matches
+    )
+
+
+_EXECUTOR_OPERATING_PROCEDURE = (
+    "Operating procedure:\n"
+    "1. Inspect the supplied evidence and current observations before "
+    "each call.\n"
+    "2. At each decision, either call exactly one listed business "
+    "tool or emit the final JSON; never mix a tool call with a final "
+    "status.\n"
+    "3. Prefer the next tool that can satisfy the step contract. "
+    "After a successful deliverable tool, stop calling tools and "
+    "emit succeeded. Never repeat an identical successful call.\n"
+    "4. Only page-backed job evidence closes the step: a "
+    "list/search index page (quality=list_only) is not evidence. "
+    "Open the individual job detail pages it links to and capture "
+    "them before extraction.\n"
+    "5. If public evidence is blocked, private, missing, or a safe "
+    "next tool is unavailable, stop and emit needs_user instead of "
+    "guessing or trying unrelated routes.\n"
+    "6. The filesystem is read-only and only read_file may be used "
+    "for an exceptional, known procedure lookup. Do not browse the "
+    "Skill tree, invent helper paths, or use scripts as a substitute "
+    "for a registered business tool.\n\n"
+    "When work is complete, output ONLY one final JSON object with "
+    "status=succeeded, needs_user, or failed. succeeded requires a "
+    "non-empty summary; needs_user requires a non-empty user_question; "
+    "failed may include error_code. Do not output a tool result as a "
+    "terminal status."
+)
 
 
 class _DeepExecutorBudgetError(RuntimeError):
@@ -73,6 +199,14 @@ class _DeepExecutorStallError(RuntimeError):
         self.question = question
 
 
+class _DeepExecutorCompletionError(RuntimeError):
+    """Internal control flow used to stop after a deterministic deliverable."""
+
+    def __init__(self, summary: str) -> None:
+        super().__init__(summary)
+        self.summary = summary
+
+
 @dataclass
 class _DeepExecutionLedger:
     """Bounded, retry-stable call state shared by all DeepAgents tools."""
@@ -83,6 +217,7 @@ class _DeepExecutionLedger:
     succeeded_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     stable_failed_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     failed_candidate_urls: set[str] = field(default_factory=set)
+    processed_candidate_urls: set[str] = field(default_factory=set)
     unavailable_tools: set[str] = field(default_factory=set)
     invalid_input_signatures: list[str] = field(default_factory=list)
     blocked_public_domains: set[str] = field(default_factory=set)
@@ -129,6 +264,20 @@ class _DeepExecutionLedger:
     def record(self, name: str, payload: dict[str, Any], observation: ToolObservation) -> None:
         if observation.status == "succeeded":
             self.succeeded_calls.append((name, payload))
+            self.processed_candidate_urls.update(
+                _payload_fetch_urls(payload) & self.candidate_urls
+            )
+            output = observation.output
+            if isinstance(output, dict):
+                raw_pages = output.get("pages")
+                pages = raw_pages if isinstance(raw_pages, list) else [output]
+                for page in pages:
+                    if not isinstance(page, dict):
+                        continue
+                    for key in ("source_url", "effective_url"):
+                        value = page.get(key)
+                        if isinstance(value, str) and value in self.candidate_urls:
+                            self.processed_candidate_urls.add(value)
             self.consecutive_stalls = 0
             return
         if observation.error_code in {
@@ -206,12 +355,17 @@ class _DeepExecutionLedger:
             stable_failed_calls=self.stable_failed_calls,
             prior_stable_failed_calls=self.prior_stable_failed_calls,
             failed_candidate_urls=self.failed_candidate_urls,
+            processed_candidate_urls=self.processed_candidate_urls,
             phase="deep_executor",
             candidate_status=(
                 "all_unusable"
                 if self.candidate_urls and self.candidate_urls.issubset(self.failed_candidate_urls)
+                else "all_processed"
+                if self.candidate_urls and self.candidate_urls.issubset(
+                    self.failed_candidate_urls | self.processed_candidate_urls
+                )
                 else "partially_processed"
-                if self.failed_candidate_urls
+                if self.failed_candidate_urls or self.processed_candidate_urls
                 else "supplied"
                 if self.candidate_urls
                 else "unknown"
@@ -296,7 +450,22 @@ class _DeepExecutorBudgetMiddleware(AgentMiddleware[Any, Any, Any]):
 class _DeepExecutorToolFilterMiddleware(AgentMiddleware[Any, Any, Any]):
     """Hide generic execution and subagent tools from the step agent."""
 
-    _EXCLUDED = frozenset({"execute", "task", "write_todos"})
+    # The Executor already has a bounded, explicit business-tool catalog.
+    # Generic filesystem navigation and mutation tools create distraction and
+    # are not part of the PEV evidence contract. Keep read_file available for
+    # an exceptional procedure lookup; permissions still deny all writes.
+    _EXCLUDED = frozenset(
+        {
+            "execute",
+            "task",
+            "write_todos",
+            "ls",
+            "glob",
+            "grep",
+            "write_file",
+            "edit_file",
+        }
+    )
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
         tools = getattr(request, "tools", None)
@@ -386,6 +555,7 @@ class DeepExecutorAgent:
         from backend.app.services.agent_runtime.executor_agent import (
             _load_execution_state,
             _load_failed_candidate_urls,
+            _load_processed_candidate_urls,
             _load_invalid_input_signatures,
             _load_stable_failed_calls,
             _load_unavailable_tools,
@@ -398,6 +568,7 @@ class DeepExecutorAgent:
             prior_succeeded_calls=prior_succeeded_calls,
             prior_stable_failed_calls=_load_stable_failed_calls(task),
             failed_candidate_urls=_load_failed_candidate_urls(task.execution_state),
+            processed_candidate_urls=_load_processed_candidate_urls(task.execution_state),
             invalid_input_signatures=_load_invalid_input_signatures(task),
             unavailable_tools=_load_unavailable_tools(task),
             consecutive_stalls=consecutive_stalls,
@@ -408,6 +579,7 @@ class DeepExecutorAgent:
         context_holder = {"value": context}
         script_runner = SkillScriptRunner(skill_dir)
         wrapped_tools = self._build_tools(
+            step=step,
             context_holder=context_holder,
             allowed_skills=frozenset(allowed_skills),
             observations=observations,
@@ -470,6 +642,21 @@ class DeepExecutorAgent:
                     "configurable": {
                         "thread_id": f"{context.run_id}:{step.step_id}"
                     },
+                },
+            )
+        except _DeepExecutorCompletionError as completion:
+            return self._result(
+                status="succeeded",
+                observations=observations,
+                summary=completion.summary,
+                user_question=None,
+                error_code=None,
+                artifact_refs=[],
+                ledger=ledger,
+                trace=trace,
+                trace_metadata={
+                    "internal_model_calls": model_call_counter["count"],
+                    "completion_source": "deterministic_tool_contract",
                 },
             )
         except _DeepExecutorStallError as error:
@@ -554,11 +741,30 @@ class DeepExecutorAgent:
             )
         terminal = _terminal_from_messages(result)
         if terminal is None:
+            completion_summary = self._completion_summary(step, observations)
+            if completion_summary is not None:
+                return self._result(
+                    status="succeeded",
+                    observations=observations,
+                    summary=completion_summary,
+                    user_question=None,
+                    error_code=None,
+                    artifact_refs=[],
+                    ledger=ledger,
+                    trace=trace,
+                    trace_metadata={
+                        "internal_model_calls": model_call_counter["count"],
+                        "completion_source": "post_loop_contract_fallback",
+                    },
+                )
             return self._result(
-                status="failed",
+                status="needs_user",
                 observations=observations,
                 summary=None,
-                user_question=None,
+                user_question=(
+                    "模型未返回可解析的终态，但当前步骤的交付证据尚未满足完成契约。"
+                    "请补充岗位正文或重试。"
+                ),
                 error_code="deep_executor_invalid_response",
                 artifact_refs=[],
                 ledger=ledger,
@@ -646,6 +852,7 @@ class DeepExecutorAgent:
     def _build_tools(
         self,
         *,
+        step: PlanStep,
         context_holder: dict[str, ToolContext],
         allowed_skills: frozenset[str],
         observations: list[ToolObservation],
@@ -683,7 +890,9 @@ class DeepExecutorAgent:
             if (
                 name in {"search-public-job-pages", "query-career-sheet-records"}
                 and ledger.candidate_urls
-                and not ledger.candidate_urls.issubset(ledger.failed_candidate_urls)
+                and not ledger.candidate_urls.issubset(
+                    ledger.failed_candidate_urls | ledger.processed_candidate_urls
+                )
             ):
                 blocked = ToolObservation(
                     tool_name=name,
@@ -731,6 +940,9 @@ class DeepExecutorAgent:
                     context_holder["value"].metadata.get("public_search_query_hashes", [])
                 )
                 ledger.record(_definition.name, payload, observation)
+                completion_summary = self._completion_summary(step, observations)
+                if completion_summary is not None:
+                    raise _DeepExecutorCompletionError(completion_summary)
                 return _observation_text(observation, projected=True)
 
             wrapped.append(
@@ -827,18 +1039,12 @@ class DeepExecutorAgent:
                 + "\n\n"
                 "You are the Executor for exactly one PEV plan step. The active "
                 f"Skill is '{skill_name}'. Use the listed business tools first; "
-                "read SKILL.md or references only when the task genuinely needs "
-                "their procedure, and never write files. Do not repeatedly call "
-                "filesystem tools, write_todos, or the same business tool. "
+                "follow the Skill policy summary and the step contract below. "
                 "Never invent evidence, bypass login/captcha/anti-bot, or submit "
                 "an irreversible application.\n\n"
                 "Scoped business tools:\n"
                 f"{tool_catalog}\n\n"
-                "When work is complete, output ONLY one final JSON object with "
-                "status=succeeded, needs_user, or failed. succeeded requires a "
-                "non-empty summary; needs_user requires a non-empty user_question; "
-                "failed may include error_code. Do not output a tool result as a "
-                "terminal status."
+                f"{_EXECUTOR_OPERATING_PROCEDURE}"
             ),
             # Directly inject the scoped policy above. Progressive skill
             # disclosure caused extra filesystem calls and consumed the old
@@ -864,7 +1070,70 @@ class DeepExecutorAgent:
         if self._skills is None:
             return f"Active Skill: {skill_name}"
         definition = self._skills.get(skill_name)
-        return definition.execution_policy if definition is not None else f"Active Skill: {skill_name}"
+        if definition is None:
+            return f"Active Skill: {skill_name}"
+
+        # ``execution_policy`` is intentionally optional in the reviewed
+        # manifest. The canonical SKILL.md is much larger than a decision
+        # prompt, so inject only the bounded registry projection instead of
+        # enabling progressive filesystem disclosure again.
+        policy = self._skills.prompt_policy([skill_name], max_chars=2_400)
+        contract = definition.completion_contract
+        deliverables = (
+            ", ".join(sorted(contract.deliverable_tools))
+            if contract is not None
+            else "none"
+        )
+        inputs = ", ".join(port.name for port in definition.input_ports) or "none"
+        outputs = ", ".join(port.name for port in definition.output_ports) or "none"
+        return (
+            f"Active Skill: {skill_name}\n"
+            f"Skill policy summary:\n{policy}\n\n"
+            "Step contract:\n"
+            f"- deliverable tools: {deliverables}\n"
+            f"- required input ports: {inputs}\n"
+            f"- output ports: {outputs}\n"
+            f"- description: {definition.description}\n"
+            "- completion rule: a successful deliverable observation that passes "
+            "the evidence gate ends this step; do not repeat it or continue searching."
+        )
+
+    def _completion_summary(
+        self, step: PlanStep, observations: list[ToolObservation]
+    ) -> str | None:
+        """Return a stable summary only for a clean, skill-owned deliverable."""
+        if self._skills is None:
+            return None
+        if not self._skills.step_contract_met(step, observations):
+            return None
+        if self._skills.has_blocked_evidence(observations):
+            return None
+        if not self._declared_outputs_covered(step, observations):
+            return None
+        return "已通过 Skill 完成契约并生成可核验的工具交付物。"
+
+    @staticmethod
+    def _declared_outputs_covered(
+        step: PlanStep, observations: list[ToolObservation]
+    ) -> bool:
+        """Require the produced observations to cover the step's declared outputs.
+
+        A tool observation counts as produced only when its output carries the
+        shape the runtime actually persists. Declared artifact types with no
+        known producing tool are skipped: the promise cannot be falsified from
+        observations, and blocking would only burn model turns on a plan the
+        Planner already validated.
+        """
+        declared = {
+            ref.artifact_type for ref in step.outputs if ref.artifact_type is not None
+        }
+        produced = {
+            _OBSERVATION_ARTIFACT_TYPES[observation.tool_name]
+            for observation in observations
+            if _produces_persisted_artifact(observation)
+        }
+        checkable = declared & frozenset(_OBSERVATION_ARTIFACT_TYPES.values())
+        return checkable.issubset(produced)
 
     @staticmethod
     def _input_message(
@@ -944,7 +1213,11 @@ def _terminal_from_messages(result: Any) -> DeepExecutorResponse | None:
             candidate = _extract_first_balanced_json_object(content)
             if candidate is None:
                 candidate = _strip_json_fence(content)
-            return DeepExecutorResponse.model_validate(json.loads(candidate))
+            payload = json.loads(candidate)
+            if isinstance(payload, dict) and isinstance(payload.get("status"), str):
+                status = payload["status"].strip().lower()
+                payload["status"] = _TERMINAL_STATUS_ALIASES.get(status, status)
+            return DeepExecutorResponse.model_validate(payload)
         except Exception:
             continue
     return None
@@ -1014,7 +1287,6 @@ def _bounded_context_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     for key in (
         "blocked_public_domains",
         "public_search_query_hashes",
-        "confirmed_profile_facts",
         "resolved_step_inputs",
     ):
         if key in metadata:
@@ -1103,8 +1375,54 @@ def _bounded_deep_agent_messages(messages: Any) -> list[Any] | None:
     """
     if not isinstance(messages, list) or len(messages) <= 18:
         return None
-    prefix = messages[:2]
-    start = max(2, len(messages) - 16)
-    while start > 2 and getattr(messages[start], "type", None) == "tool":
+    prefix_end = min(2, len(messages))
+    while prefix_end < len(messages) and not _tool_history_is_complete(
+        messages[:prefix_end]
+    ):
+        prefix_end += 1
+
+    start = max(prefix_end, len(messages) - 16)
+    while start > prefix_end and (
+        _is_tool_message(messages[start]) or _message_tool_call_ids(messages[start])
+    ):
         start -= 1
-    return [*prefix, *messages[start:]]
+
+    selected = [*messages[:prefix_end], *messages[start:]]
+    while start > prefix_end and not _tool_history_is_complete(selected):
+        start -= 1
+        selected = [*messages[:prefix_end], *messages[start:]]
+    if not _tool_history_is_complete(selected):
+        # The incoming history itself is malformed. Leave it untouched so the
+        # SDK's PatchToolCallsMiddleware can apply its canonical repair.
+        return None
+    return selected
+
+
+def _is_tool_message(message: Any) -> bool:
+    return getattr(message, "type", None) == "tool"
+
+
+def _message_tool_call_ids(message: Any) -> set[str]:
+    ids: set[str] = set()
+    for key in ("tool_calls", "invalid_tool_calls"):
+        calls = getattr(message, key, None)
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if isinstance(call, dict) and isinstance(call.get("id"), str):
+                ids.add(call["id"])
+    return ids
+
+
+def _tool_history_is_complete(messages: list[Any]) -> bool:
+    answered = {
+        tool_call_id
+        for message in messages
+        if _is_tool_message(message)
+        and isinstance((tool_call_id := getattr(message, "tool_call_id", None)), str)
+    }
+    return all(
+        call_id in answered
+        for message in messages
+        for call_id in _message_tool_call_ids(message)
+    )

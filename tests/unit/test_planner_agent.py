@@ -13,6 +13,11 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
+from backend.app.services.agent_runtime.skill_definition import (
+    ArtifactPort,
+    SkillDefinition,
+    SkillRegistry,
+)
 
 
 class PreferenceInput(BaseModel):
@@ -134,3 +139,131 @@ def test_planner_can_sense_confirmed_profile_field_availability_without_fact_val
 
     assert gateway.states[0]["confirmed_profile_fact_fields"] == ["projects", "skills"]
     assert "秘密项目" not in str(gateway.states[0])
+
+
+def test_planner_downgrades_invalid_execution_plan_to_recoverable_wait() -> None:
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "plan",
+                "complexity": "L1",
+                "success_criteria": ["完成"],
+                "steps": [
+                    {
+                        "step_id": "duplicate",
+                        "objective": "第一步",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                    {
+                        "step_id": "duplicate",
+                        "objective": "第二步",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                ],
+            },
+            {
+                "action": "plan",
+                "complexity": "L1",
+                "success_criteria": ["完成"],
+                "steps": [
+                    {
+                        "step_id": "duplicate",
+                        "objective": "仍然非法的计划",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                    {
+                        "step_id": "duplicate",
+                        "objective": "重复步骤",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                ],
+            },
+            {
+                "action": "plan",
+                "complexity": "L1",
+                "success_criteria": ["完成"],
+                "steps": [
+                    {
+                        "step_id": "duplicate",
+                        "objective": "第三次仍然非法",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                    {
+                        "step_id": "duplicate",
+                        "objective": "重复步骤",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                ],
+            },
+            {
+                "action": "plan",
+                "complexity": "L1",
+                "success_criteria": ["完成"],
+                "steps": [
+                    {
+                        "step_id": "duplicate",
+                        "objective": "第四次仍然非法",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                    {
+                        "step_id": "duplicate",
+                        "objective": "重复步骤",
+                        "allowed_skills": ["job-discovery"],
+                    },
+                ],
+            },
+        ]
+    )
+
+    result = PlannerAgent(gateway=gateway, tools=ToolRegistry()).run(
+        task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"]),
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "needs_user"
+    assert result.error_code == "invalid_execution_plan"
+    assert result.user_question
+    assert len(gateway.states) == 4
+    assert "ExecutionPlan 校验失败" in gateway.states[3]["runtime_feedback"]
+
+
+def test_planner_normalizes_known_model_artifact_port_alias() -> None:
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "plan",
+                "complexity": "L1",
+                "success_criteria": ["完成匹配"],
+                "steps": [
+                    {
+                        "step_id": "match",
+                        "objective": "匹配岗位",
+                        "allowed_skills": ["job-matching"],
+                        "outputs": [
+                            {"name": "best_match", "artifact_type": "match_result"}
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    skills = SkillRegistry(
+        [
+            SkillDefinition(
+                name="job-matching",
+                output_ports=(ArtifactPort("report", frozenset({"job_matching_report"})),),
+            )
+        ]
+    )
+
+    result = PlannerAgent(
+        gateway=gateway, tools=ToolRegistry(), skills=skills
+    ).run(
+        task=AgentTaskRequest(goal="匹配岗位", allowed_skills=["job-matching"]),
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "planned"
+    assert result.plan is not None
+    assert result.plan.steps[0].outputs[0].artifact_type == "job_matching_report"
+    assert len(gateway.states) == 1

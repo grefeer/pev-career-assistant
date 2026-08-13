@@ -79,11 +79,12 @@ def completion_evidence_gate(
     artifacts: Sequence[ToolObservation],
     *,
     summary: str | None = None,
+    artifact_refs=(),
     skill_registry: SkillRegistry | None = None,
 ) -> bool:
     """Apply the skill contract without making the runtime know its domain."""
     return (skill_registry or _legacy_registry()).completion_evidence_gate(
-        step, artifacts, summary=summary
+        step, artifacts, summary=summary, artifact_refs=artifact_refs
     )
 
 

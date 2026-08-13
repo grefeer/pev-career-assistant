@@ -527,7 +527,9 @@ class AgentRuntime:
         task: AgentTaskRequest,
     ) -> AgentRunResult:
         """Continue a paused Run without resetting its durable operational budget."""
-        run = run_repository.get_run_for_owner(db, run_id, user_id)
+        run = run_repository.get_run_for_owner(
+            db, run_id, user_id, for_update=True
+        )
         if run is None:
             raise ValueError("agent_run_not_found")
         if run.status is not RunStatus.waiting_user:
@@ -550,7 +552,9 @@ class AgentRuntime:
         task: AgentTaskRequest,
     ) -> AgentRunResult:
         """Replan a process-interrupted running Run from committed evidence only."""
-        run = run_repository.get_run_for_owner(db, run_id, user_id)
+        run = run_repository.get_run_for_owner(
+            db, run_id, user_id, for_update=True
+        )
         if run is None:
             raise ValueError("agent_run_not_found")
         if run.status is not RunStatus.running:
@@ -653,7 +657,9 @@ class AgentRuntime:
                 )
             if execution.status == "needs_user":
                 if (
-                    self._step_contract_met(plan_step, execution.observations)
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and not self._has_blocked_evidence(execution.observations)
                 ):
                     # The executor asked the human even though the step's
@@ -698,6 +704,23 @@ class AgentRuntime:
                     output_artifact_refs=observed_artifact_refs,
                     error_code="wall_clock_budget_exhausted",
                 )
+            if (
+                execution.status == "failed"
+                and execution.error_code == "deep_executor_invalid_response"
+                and self._step_contract_met(
+                    plan_step, execution.observations, execution.artifact_refs
+                )
+                and not self._has_blocked_evidence(execution.observations)
+            ):
+                return self._rescue_step_succeeded(
+                    db,
+                    run_id,
+                    persisted_step,
+                    execution,
+                    event_type="executor_rescue_succeeded",
+                    reason="invalid_terminal_deliverable_persisted",
+                    output_artifact_refs=observed_artifact_refs,
+                )
             if execution.status != "succeeded":
                 return self._fail_step(
                     db,
@@ -708,7 +731,10 @@ class AgentRuntime:
                 )
             if not self._requires_verification(plan, plan_step):
                 if self._completion_gate_rejected(
-                    plan_step, execution.observations, summary=execution.summary
+                    plan_step,
+                    execution.observations,
+                    summary=execution.summary,
+                    artifact_refs=execution.artifact_refs,
                 ):
                     return self._wait_for_user(
                         db,
@@ -746,7 +772,9 @@ class AgentRuntime:
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
                     if (
-                        self._step_contract_met(plan_step, execution.observations)
+                        self._step_contract_met(
+                            plan_step, execution.observations, execution.artifact_refs
+                        )
                         and not self._has_blocked_evidence(execution.observations)
                     ):
                         # The verifier transport degraded after the step's
@@ -803,9 +831,17 @@ class AgentRuntime:
                     output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.PASS:
-                if self._skills is not None and not self._skills.completion_evidence_gate(
-                    plan_step, execution.observations, summary=execution.summary
-                ):
+                diagnostics = (
+                    self._skills.completion_evidence_diagnostics(
+                        plan_step,
+                        execution.observations,
+                        summary=execution.summary,
+                        artifact_refs=execution.artifact_refs,
+                    )
+                    if self._skills is not None
+                    else None
+                )
+                if diagnostics is not None and not diagnostics["gate_passed"]:
                     run_repository.append_event(
                         db,
                         run_id=run_id,
@@ -813,6 +849,7 @@ class AgentRuntime:
                         payload_json={
                             "sequence": persisted_step.sequence,
                             "reason": "deterministic_contract_not_satisfied",
+                            "evidence_diagnostics": diagnostics,
                         },
                     )
                     return self._wait_for_user(
@@ -822,6 +859,14 @@ class AgentRuntime:
                         "Verifier 的 PASS 未通过 Skill 的确定性交付契约，不能将该步骤标记为完成。"
                         "请补充工具产出或人工确认后重试。",
                         output_artifact_refs=execution.artifact_refs,
+                        terminal_contract=build_terminal_contract(
+                            observations=execution.observations,
+                            source_role="runtime",
+                            phase="verification",
+                            contract_met=bool(diagnostics["contract_met"]),
+                            artifact_count=len(execution.artifact_refs),
+                            evidence_diagnostics=diagnostics,
+                        ),
                     )
                 run_repository.finish_step(
                     db,
@@ -878,7 +923,9 @@ class AgentRuntime:
                 )
                 if (
                     self._has_blocked_evidence(execution.observations)
-                    and not self._step_contract_met(plan_step, execution.observations)
+                    and not self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                 ):
                     # The step's evidence is blocked (login/captcha/anti-bot/
                     # OCR-off or a deterministic per-URL failure) and the
@@ -974,7 +1021,9 @@ class AgentRuntime:
                 # replan keeps the human hand-off. Blocked evidence always
                 # keeps the human hand-off.
                 if (
-                    self._step_contract_met(plan_step, execution.observations)
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and not self._has_blocked_evidence(execution.observations)
                     and replans < task.budget.max_replans
                     and not task.replan_state.conversion_used(
@@ -999,7 +1048,9 @@ class AgentRuntime:
                 )
             if verification.decision is VerificationDecision.NEED_USER:
                 if (
-                    self._step_contract_met(plan_step, execution.observations)
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and not self._has_blocked_evidence(execution.observations)
                     and replans < task.budget.max_replans
                     and not task.replan_state.conversion_used(
@@ -1175,10 +1226,22 @@ class AgentRuntime:
         return tagged
 
     def _step_contract_met(
-        self, step: PlanStep, observations: list
+        self,
+        step: PlanStep,
+        observations: list,
+        artifact_refs: list[dict[str, Any]] | None = None,
     ) -> bool:
         if self._skills is None:
             return legacy_step_contract_met(step, observations)
+        if artifact_refs:
+            return bool(
+                self._skills.completion_evidence_diagnostics(
+                    step,
+                    observations,
+                    summary="contract-check",
+                    artifact_refs=artifact_refs,
+                )["contract_met"]
+            )
         return self._skills.step_contract_met(step, observations)
 
     def _has_blocked_evidence(self, observations: list) -> bool:
@@ -1192,13 +1255,17 @@ class AgentRuntime:
         observations: list,
         *,
         summary: str | None,
+        artifact_refs: list[dict[str, Any]] | None = None,
     ) -> bool:
         if self._skills is None:
             return has_known_deliverable_attempt(observations) and not legacy_completion_evidence_gate(
                 step, observations, summary=summary
             )
         return self._skills.has_completion_contract(step) and not self._skills.completion_evidence_gate(
-            step, observations, summary=summary
+            step,
+            observations,
+            summary=summary,
+            artifact_refs=artifact_refs or (),
         )
 
     @staticmethod
@@ -1463,7 +1530,7 @@ class AgentRuntime:
                     content_hash=content_hash,
                     content_json={
                         "title": page.get("title"),
-                        "visible_text": visible_text,
+                        "visible_text": visible_text[:_STRUCTURED_FULL_TEXT_CHARS],
                         "effective_url": page.get("effective_url"),
                         "redirect_chain": page.get("redirect_chain", []),
                         "http_status": page.get("http_status"),
@@ -1478,6 +1545,8 @@ class AgentRuntime:
                     "source_url": source_url,
                     "content_hash": content_hash,
                 }
+                if page.get("quality") is not None:
+                    artifact_ref["quality"] = page["quality"]
                 artifact_refs.append(artifact_ref)
                 run_repository.append_event(
                     db,
@@ -1562,15 +1631,16 @@ class AgentRuntime:
                     content_hash=content_hash,
                     content_json={"candidates": candidates},
                 )
-                artifact_refs.append(
-                    {
+                detail_ref = {
                         "artifact_id": artifact.id,
                         "artifact_type": "structured_job_details",
                         "tool": observation.tool_name,
                         "source_url": source_url,
                         "content_hash": content_hash,
-                    }
-                )
+                }
+                if detail.get("source_quality") is not None:
+                    detail_ref["source_quality"] = detail["source_quality"]
+                artifact_refs.append(detail_ref)
                 run_repository.append_event(
                     db,
                     run_id=run_id,
@@ -1665,14 +1735,18 @@ class AgentRuntime:
         planner_result: PlannerResult,
     ) -> AgentRunResult:
         if planner_result.status == "needs_user":
+            planner_error_code = planner_result.error_code or "need_user"
             return self._finish_planner_waiting(
                 db,
                 run_id,
                 run,
                 planner_result.user_question,
                 event_type="planner_needs_user",
+                error_code=planner_result.error_code,
                 terminal_contract=build_terminal_contract(
-                    error_code="need_user", source_role="planner", phase="planning"
+                    error_code=planner_error_code,
+                    source_role="planner",
+                    phase="planning",
                 ),
             )
         if planner_result.error_code == "wall_clock_budget_exhausted":
@@ -1778,6 +1852,7 @@ class AgentRuntime:
         *,
         event_type: str,
         reason: str,
+        output_artifact_refs: list[dict[str, str]] | None = None,
     ) -> AgentRunResult:
         """Upgrade a step to succeeded when its deliverable is already tool-backed.
 
@@ -1795,7 +1870,11 @@ class AgentRuntime:
             db,
             step,
             status=StepStatus.succeeded,
-            output_artifact_refs=execution.artifact_refs,
+            output_artifact_refs=(
+                output_artifact_refs
+                if output_artifact_refs is not None
+                else execution.artifact_refs
+            ),
         )
         run_repository.append_event(
             db,

@@ -102,6 +102,9 @@ def install_public_network_guard(context: Any) -> None:
     """
     def guard(route: Any) -> None:
         scheme = urlparse(route.request.url).scheme.lower()
+        if scheme not in {"http", "https", "data", "blob", "about"}:
+            route.abort()
+            return
         if scheme in {"http", "https"} and not is_safe_public_url(route.request.url):
             route.abort()
             return
@@ -231,7 +234,9 @@ def _check_cache(out_dir: Path, url: str, cache_mode: str) -> dict[str, Any] | N
         return None  # Always re-browse, cache check happens post-browse
     cache = _load_cache(out_dir)
     content_hash = cache.get(url)
-    if not content_hash:
+    if not isinstance(content_hash, str) or not re.fullmatch(
+        r"sha256_[0-9a-f]{16}", content_hash
+    ):
         return None
     text_path = out_dir / f"{content_hash}.txt"
     screenshot_path = out_dir / f"{content_hash}.png"

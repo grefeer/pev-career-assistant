@@ -67,6 +67,9 @@ _PLAYWRIGHT_STORAGE_STATE_PATH: str | None = None
 # match-observed-jobs sees real JD body instead of an empty card shell.
 _MIN_LIST_LINKS = 2
 _MAX_LIST_EXPANSION = 5
+_CAMPUS_PORTAL_HOST = "career.hebut.edu.cn"
+_MAX_CAMPUS_INDEX_PAGES = 2
+_MAX_CAMPUS_DETAIL_PAGES = 20
 # Render calls are serialized behind this lock and bounded by a hard
 # watchdog: the C5 batch fetch runs up to 4 worker threads, and playwright's
 # sync API is thread-affine (its event loop binds to the thread that started
@@ -93,6 +96,48 @@ _JD_MARKER_SCAN_HEAD_CHARS = 2_000
 _PLAYWRIGHT_FETCH_IMPL: Callable[[str], tuple[str, str | None]] | None = None
 _PLAYWRIGHT_RUNTIME: tuple[Any, Any] | None = None
 _RENDER_METADATA = threading.local()
+
+
+def _prioritize_detail_links(links: list[str]) -> list[str]:
+    """Put likely detail routes before navigation links from the same page.
+
+    Campus portals commonly expose navigation links (``/index.html``,
+    ``/recruitment/index.html``) before the actual job links in their HTML.
+    Expansion is intentionally bounded, so consuming the cap on navigation
+    pages silently loses the public JD evidence that follows them.  The
+    existing URL safety and same-host filters remain authoritative; this only
+    changes the order of already-accepted links and preserves stable order for
+    links with the same score.
+    """
+    detail_route = re.compile(
+        r"/(?:content|detail|position|job|jobs|post)(?:/|$)", re.IGNORECASE
+    )
+    detail_query = re.compile(
+        r"(?:^|_)(?:id|job[_-]?id|position[_-]?id|post[_-]?id)=",
+        re.IGNORECASE,
+    )
+
+    def score(url: str) -> int:
+        parsed = urlsplit(url)
+        path = parsed.path.rstrip("/").lower()
+        basename = path.rsplit("/", 1)[-1]
+        value = 0
+        if detail_route.search(path):
+            value += 4
+        if detail_query.search(parsed.query):
+            value += 2
+        if re.search(r"/(?:id|position|post)/[^/]+$", path):
+            value += 1
+        if basename in {"index", "index.html", "list", "search", "careers"}:
+            value -= 3
+        return value
+
+    return [
+        url
+        for _, url in sorted(
+            enumerate(links), key=lambda item: (-score(item[1]), item[0])
+        )
+    ]
 
 
 def _render_metadata(url: str) -> tuple[str, int | None]:
@@ -295,6 +340,7 @@ _JOB_RESULT_TEXT_RE = re.compile(
 # Patterns ending in "." match the first label (careers.example,
 # career.hebut.edu.cn, jobs.bytedance.com); plain domains match by suffix.
 _JOB_SEARCH_ALLOWED_HOST_PATTERNS = (
+    "career.",
     "careers.",
     "jobs.",
     "campus.",
@@ -317,18 +363,21 @@ _JOB_SEARCH_ALLOWED_HOST_PATTERNS = (
 # steers with "site:") so the provider itself biases toward recruiting domains
 # instead of returning 教程/百科/官网首页 noise.
 _JOB_SEARCH_SITE_OPERATORS = (
+    "site:talent.baidu.com",
+    "site:jobs.bytedance.com",
+    "site:careers.tencent.com",
+    "site:campus.tencent.com",
+    "site:career.hebut.edu.cn",
+    "site:fenbi.com",
+    "site:juejin.cn",
     "site:liepin.com",
     "site:iguopin.com",
     "site:zhaopin.com",
     "site:shixiseng.com",
     "site:lagou.com",
     "site:job.ncss.cn",
-    "site:talent.baidu.com",
-    "site:jobs.bytedance.com",
-    "site:careers.tencent.com",
-    "site:campus.tencent.com",
-    "site:juejin.cn",
 )
+_MAX_PUBLIC_SEARCH_ROUTES = 3
 
 
 class PublicJobFetchError(RuntimeError):
@@ -443,6 +492,132 @@ class FetchPublicJobPagesOutput(BaseModel):
     failures: list[PublicJobPageFetchFailure] = Field(default_factory=list)
 
 
+_IGUOPIN_LIST_HOSTS = frozenset({"iguopin.com", "www.iguopin.com"})
+_IGUOPIN_API_ORIGIN = "https://gp-api.iguopin.com"
+_IGUOPIN_RECOMMEND_PATH = "/api/jobs/v1/recom-job"
+_IGUOPIN_DETAIL_PATH = "/api/jobs/v3/info"
+
+
+def _probe_iguopin_detail_access(url: str, page: FetchPublicJobPageOutput) -> PublicJobFetchError | None:
+    """Probe only the anonymous public detail boundary for an IGUOPIN list.
+
+    IGUOPIN renders public job cards but its documented browser requests can
+    return an authorization response for the detail endpoint.  We do not use
+    the API payload as job evidence and never add credentials or retry a 401/
+    403.  The probe exists solely to turn a card-only page plus a confirmed
+    detail denial into an auditable external block instead of a duplicate-call
+    stall.
+    """
+    if page.quality != "list_only":
+        return None
+    parsed = urlsplit(url)
+    if (parsed.hostname or "").lower() not in _IGUOPIN_LIST_HOSTS:
+        return None
+    if not parsed.path.lower().startswith("/job"):
+        return None
+    keyword = parse_qs(parsed.query).get("keyword", [""])[0].strip()
+    if not keyword:
+        return None
+
+    recommend_url = _IGUOPIN_API_ORIGIN + _IGUOPIN_RECOMMEND_PATH
+    detail_url = _IGUOPIN_API_ORIGIN + _IGUOPIN_DETAIL_PATH
+    _assert_public_url(recommend_url)
+    _assert_public_url(detail_url)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.iguopin.com",
+        "Referer": "https://www.iguopin.com/",
+        "User-Agent": _PUBLIC_FETCH_HEADERS["User-Agent"],
+    }
+    try:
+        response = requests.post(
+            recommend_url,
+            json={
+                "search": {"page": 1, "page_size": 20, "keyword": keyword},
+                "recom": {
+                    "update_time": True,
+                    "company_nature": True,
+                    "hot_job": True,
+                },
+            },
+            timeout=20,
+            allow_redirects=False,
+            headers=headers,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code in {401, 403}:
+        return PublicJobFetchError("access_denied", status_code=response.status_code)
+    try:
+        envelope = response.json()
+    except ValueError:
+        return None
+    if isinstance(envelope, dict) and str(envelope.get("code")) in {"401", "403"}:
+        return PublicJobFetchError("access_denied", status_code=int(envelope["code"]))
+    records = envelope.get("data") if isinstance(envelope, dict) else None
+    if isinstance(records, dict):
+        records = records.get("list") or records.get("records") or records.get("rows")
+    if not isinstance(records, list):
+        return None
+    job_id = next(
+        (
+            record.get("job_id") or record.get("id")
+            for record in records
+            if isinstance(record, dict)
+            and (record.get("job_id") or record.get("id"))
+        ),
+        None,
+    )
+    if job_id is None:
+        return None
+    try:
+        detail_response = requests.get(
+            detail_url,
+            params={"job_id": str(job_id)},
+            timeout=20,
+            allow_redirects=False,
+            headers=headers,
+        )
+    except requests.RequestException:
+        return None
+    if detail_response.status_code in {401, 403}:
+        return PublicJobFetchError(
+            "access_denied", status_code=detail_response.status_code
+        )
+    try:
+        detail_envelope = detail_response.json()
+    except ValueError:
+        return None
+    if isinstance(detail_envelope, dict) and str(detail_envelope.get("code")) in {"401", "403"}:
+        return PublicJobFetchError(
+            "access_denied", status_code=int(detail_envelope["code"])
+        )
+    return None
+
+
+def _persist_fetch_failure(
+    failure_sink: list[PublicJobPageFetchFailure],
+    failure_lock: threading.Lock | None,
+    *,
+    source_url: str,
+    error: PublicJobFetchError,
+) -> None:
+    failure = PublicJobPageFetchFailure(
+        source_url=source_url,
+        error_code=error.code,
+        effective_url=error.effective_url,
+        redirect_chain=error.redirect_chain,
+        http_status=error.status_code,
+        message=str(error),
+    )
+    if failure_lock is None:
+        failure_sink.append(failure)
+    else:
+        with failure_lock:
+            failure_sink.append(failure)
+
+
 class SearchPublicJobPagesInput(BaseModel):
     """A bounded public-web query selected by the Executor from the user's goal."""
 
@@ -513,6 +688,7 @@ class ExtractObservedJobDetailsOutput(BaseModel):
     source_artifact_id: str
     source_url: str
     content_hash: str
+    source_quality: Literal["jd_complete", "list_only", "js_shell", "empty"] | None = None
     candidates: list[ExtractedJobDetails]
 
 
@@ -1207,7 +1383,12 @@ def fetch_public_job_page(
     if adapter_page is not None:
         return adapter_page
     try:
-        return _fetch_public_page_requests(payload.url)
+        page = _fetch_public_page_requests(payload.url)
+        probe_error = _probe_iguopin_detail_access(payload.url, page)
+        if probe_error is not None:
+            _remember_blocked_domain(context, payload.url, probe_error)
+            raise probe_error
+        return page
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, payload.url, error)
         if error.code not in _PLAYWRIGHT_FALLBACK_CODES or not _PLAYWRIGHT_FALLBACK_ENABLED:
@@ -1215,13 +1396,18 @@ def fetch_public_job_page(
     rendered_text, rendered_title = _render_with_playwright(payload.url)
     rendered_effective_url, rendered_status = _render_metadata(payload.url)
     try:
-        return _build_evidence_page(
+        page = _build_evidence_page(
             requested_url=payload.url,
             effective_url=rendered_effective_url,
             title=rendered_title,
             visible_text=rendered_text,
             status_code=rendered_status,
         )
+        probe_error = _probe_iguopin_detail_access(payload.url, page)
+        if probe_error is not None:
+            _remember_blocked_domain(context, payload.url, probe_error)
+            raise probe_error
+        return page
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, payload.url, error)
         raise
@@ -1361,14 +1547,26 @@ def _collect_page_links(page: Any, origin_url: str) -> list[str]:
     SPA family the expansion targets.
     """
     try:
-        raw = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+        raw = page.eval_on_selector_all(
+            "a[href], [data-href], [data-url], [data-link], [data-detail-url]",
+            """els => els.flatMap(e => [
+                e.href,
+                e.getAttribute('data-href'),
+                e.getAttribute('data-url'),
+                e.getAttribute('data-link'),
+                e.getAttribute('data-detail-url')
+            ]).filter(Boolean)""",
+        )
     except Exception:
         return []
     origin_host = urlsplit(origin_url).hostname
     seen: set[str] = set()
     links: list[str] = []
     for href in raw:
-        if not isinstance(href, str) or not href.startswith(("http://", "https://")):
+        if not isinstance(href, str):
+            continue
+        href = urljoin(origin_url, href)
+        if not href.startswith(("http://", "https://")):
             continue
         if not _is_public_url(href):
             continue
@@ -1412,9 +1610,24 @@ class _HtmlLinkCollector(HTMLParser):
             self._ignored_depth += 1
         if tag != "a" or self._ignored_depth:
             return
-        href = dict(attrs).get("href")
+        attrs_map = dict(attrs)
+        href = attrs_map.get("href")
+        data_candidates = [
+            attrs_map.get(key)
+            for key in ("data-href", "data-url", "data-link", "data-detail-url")
+        ]
+        if not isinstance(href, str) or not href:
+            href = next((value for value in data_candidates if isinstance(value, str) and value), None)
         if not isinstance(href, str) or not href:
             return
+        candidates = [href]
+        for value in data_candidates:
+            if isinstance(value, str) and value:
+                candidates.append(value)
+        for candidate in candidates:
+            self._add_candidate(candidate)
+
+    def _add_candidate(self, href: str) -> None:
         resolved = urljoin(self._origin_url, href)
         if not resolved.startswith(("http://", "https://")):
             return
@@ -1443,6 +1656,7 @@ def _expand_from_list_links(
     context: ToolContext | None = None,
     failure_sink: list[PublicJobPageFetchFailure] | None = None,
     failure_lock: threading.Lock | None = None,
+    max_links: int | None = None,
 ) -> list[FetchPublicJobPageOutput]:
     """Deep-fetch detail pages behind a JS card-list, one evidence page each.
 
@@ -1469,21 +1683,15 @@ def _expand_from_list_links(
     def record_failure(link: str, error: PublicJobFetchError) -> None:
         if failure_sink is None:
             return
-        failure = PublicJobPageFetchFailure(
+        _persist_fetch_failure(
+            failure_sink,
+            failure_lock,
             source_url=link,
-            error_code=error.code,
-            effective_url=error.effective_url,
-            redirect_chain=error.redirect_chain,
-            http_status=error.status_code,
-            message=str(error),
+            error=error,
         )
-        if failure_lock is None:
-            failure_sink.append(failure)
-        else:
-            with failure_lock:
-                failure_sink.append(failure)
 
-    for link in links[:_MAX_LIST_EXPANSION]:
+    expansion_limit = max_links if max_links is not None else _MAX_LIST_EXPANSION
+    for link in _prioritize_detail_links(links)[:expansion_limit]:
         if context is not None:
             try:
                 _ensure_domain_available(context, link)
@@ -1530,6 +1738,70 @@ def _expand_from_list_links(
     return pages
 
 
+def _expand_official_campus_detail(
+    url: str,
+    page: FetchPublicJobPageOutput,
+    *,
+    context: ToolContext,
+    failure_sink: list[PublicJobPageFetchFailure] | None = None,
+    failure_lock: threading.Lock | None = None,
+) -> list[FetchPublicJobPageOutput]:
+    """Boundedly inspect the official campus portal indexes behind one JD.
+
+    Some university portals expose a complete JD at the supplied URL but do
+    not link sibling postings from that page.  For the reviewed Hebut portal,
+    two public, paginated index pages are the smallest deterministic route to
+    recent postings; their same-host detail links are then expanded by the
+    normal bounded list handler.  This is public-page fetching only: every
+    derived URL is still validated, and failures remain explicit.
+    """
+    parsed = urlsplit(url)
+    if (
+        page.quality != "jd_complete"
+        or (parsed.hostname or "").lower() != _CAMPUS_PORTAL_HOST
+        or not parsed.path.lower().startswith("/correcruit/content/")
+    ):
+        return []
+    expanded: list[FetchPublicJobPageOutput] = []
+    seen: set[str] = {url}
+    for page_number in range(1, _MAX_CAMPUS_INDEX_PAGES + 1):
+        index_url = (
+            f"https://{_CAMPUS_PORTAL_HOST}/correcruit/index.html?p={page_number}"
+        )
+        try:
+            index_page, raw_html = _fetch_public_page_requests_with_html(index_url)
+        except PublicJobFetchError as error:
+            if context is not None:
+                _remember_blocked_domain(context, index_url, error)
+            if failure_sink is not None:
+                _persist_fetch_failure(
+                    failure_sink,
+                    failure_lock,
+                    source_url=index_url,
+                    error=error,
+                )
+            continue
+        if index_page.source_url not in seen:
+            expanded.append(index_page)
+            seen.add(index_page.source_url)
+        collector = _HtmlLinkCollector(index_url)
+        collector.feed(raw_html)
+        details = _expand_from_list_links(
+            index_url,
+            collector.links,
+            index_page.visible_text,
+            context=context,
+            failure_sink=failure_sink,
+            failure_lock=failure_lock,
+            max_links=_MAX_CAMPUS_DETAIL_PAGES,
+        )
+        for detail in details:
+            if detail.source_url not in seen:
+                expanded.append(detail)
+                seen.add(detail.source_url)
+    return expanded
+
+
 def _fetch_one_with_expansion(
     context: ToolContext,
     url: str,
@@ -1565,6 +1837,27 @@ def _fetch_one_with_expansion(
     else:
         collector = _HtmlLinkCollector(url)
         collector.feed(raw_html)
+        probe_error = _probe_iguopin_detail_access(url, page)
+        if probe_error is not None:
+            _remember_blocked_domain(context, url, probe_error)
+            if failure_sink is None:
+                raise probe_error
+            _persist_fetch_failure(
+                failure_sink,
+                failure_lock,
+                source_url=url,
+                error=probe_error,
+            )
+            return [page]
+        campus_pages = _expand_official_campus_detail(
+            url,
+            page,
+            context=context,
+            failure_sink=failure_sink,
+            failure_lock=failure_lock,
+        )
+        if campus_pages:
+            return [page, *campus_pages]
         return [
             page,
             *_expand_from_list_links(
@@ -1591,6 +1884,27 @@ def _fetch_one_with_expansion(
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, url, error)
         raise
+    probe_error = _probe_iguopin_detail_access(url, list_page)
+    if probe_error is not None:
+        _remember_blocked_domain(context, url, probe_error)
+        if failure_sink is None:
+            raise probe_error
+        _persist_fetch_failure(
+            failure_sink,
+            failure_lock,
+            source_url=url,
+            error=probe_error,
+        )
+        return [list_page]
+    campus_pages = _expand_official_campus_detail(
+        url,
+        list_page,
+        context=context,
+        failure_sink=failure_sink,
+        failure_lock=failure_lock,
+    )
+    if campus_pages:
+        return [list_page, *campus_pages]
     return [
         list_page,
         *_expand_from_list_links(
@@ -1683,7 +1997,7 @@ def search_public_job_pages(
     if not isinstance(attempted, list):
         attempted = []
         context.metadata["public_search_query_hashes"] = attempted
-    if query_hash in attempted or len(attempted) >= 2:
+    if query_hash in attempted or len(attempted) >= _MAX_PUBLIC_SEARCH_ROUTES:
         raise PublicJobFetchError(
             "route_already_consumed",
             message="本次运行的公开搜索路由已使用完毕，请转入人工确认或使用已有候选页面。",
@@ -1854,10 +2168,18 @@ def extract_observed_job_details(
         "source_url": source_url,
         "content_hash": content_hash,
     }
+    source_quality = evidence.get("quality")
+    if source_quality not in {"jd_complete", "list_only", "js_shell", "empty"}:
+        source_quality = None
     adapter_records = _parse_adapter_evidence(visible_text)
     if adapter_records is not None:
         return _adapter_details_output(
-            payload.artifact_id, source_url, content_hash, adapter_records, evidence_ref
+            payload.artifact_id,
+            source_url,
+            content_hash,
+            adapter_records,
+            evidence_ref,
+            source_quality=source_quality,
         )
     extracted = extract_jd_candidates(visible_text, source_url)
     # A single-JD page is enriched from its own full text; a multi-candidate
@@ -1930,6 +2252,7 @@ def extract_observed_job_details(
         source_artifact_id=payload.artifact_id,
         source_url=source_url,
         content_hash=content_hash,
+        source_quality=source_quality,
         candidates=candidates,
     )
 
@@ -2024,6 +2347,8 @@ def _adapter_details_output(
     content_hash: str,
     records: list[dict[str, Any]],
     evidence_ref: dict[str, str],
+    *,
+    source_quality: str | None = None,
 ) -> ExtractObservedJobDetailsOutput:
     """Normalize adapter-record evidence into one candidate per record."""
     candidates = [_record_to_job_details(record, source_url, evidence_ref) for record in records]
@@ -2031,6 +2356,7 @@ def _adapter_details_output(
         source_artifact_id=artifact_id,
         source_url=source_url,
         content_hash=content_hash,
+        source_quality=source_quality,
         candidates=candidates,
     )
 

@@ -174,3 +174,18 @@ def test_skill_registry_compiles_artifact_port_contracts() -> None:
 
     assert registry.validate_step_ports(valid) is None
     assert "produce only" in (registry.validate_step_ports(invalid) or "")
+
+
+def test_skill_registry_normalizes_only_the_known_matching_alias() -> None:
+    registry = SkillRegistry()
+    step = PlanStep(
+        step_id="match",
+        objective="match",
+        allowed_skills=["job-matching"],
+        outputs=[StepOutputRef(name="best", artifact_type="match_result")],
+    )
+
+    normalized = registry.normalize_step_ports(step)
+
+    assert normalized.outputs[0].artifact_type == "job_matching_report"
+    assert step.outputs[0].artifact_type == "match_result"

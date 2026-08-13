@@ -80,11 +80,25 @@ def create_run(
     return run
 
 
-def get_run_for_owner(db: Session, run_id: str, user_id: str) -> AgentRun | None:
-    """Fetch exactly one run only if it belongs to the requesting user."""
-    return db.scalar(
-        select(AgentRun).where(AgentRun.id == run_id, AgentRun.user_id == user_id)
+def get_run_for_owner(
+    db: Session,
+    run_id: str,
+    user_id: str,
+    *,
+    for_update: bool = False,
+) -> AgentRun | None:
+    """Fetch one owner-scoped run, optionally locking its lifecycle row.
+
+    Resume/recover transitions must read and validate the status while holding
+    the same row lock that protects the subsequent state mutation. SQLite
+    ignores ``FOR UPDATE``; MySQL serializes concurrent callers here.
+    """
+    statement = select(AgentRun).where(
+        AgentRun.id == run_id, AgentRun.user_id == user_id
     )
+    if for_update:
+        statement = statement.with_for_update()
+    return db.scalar(statement)
 
 
 def list_runs_for_owner(db: Session, user_id: str, *, limit: int) -> list[AgentRun]:

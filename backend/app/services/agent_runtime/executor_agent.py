@@ -279,6 +279,16 @@ def _load_failed_candidate_urls(state: object) -> set[str]:
     return {url.strip() for url in raw if isinstance(url, str) and url.strip()}
 
 
+def _load_processed_candidate_urls(state: object) -> set[str]:
+    """Read candidate URLs already examined successfully by a prior turn."""
+    if not isinstance(state, dict):
+        return set()
+    raw = state.get("processed_candidate_urls")
+    if not isinstance(raw, list):
+        return set()
+    return {url.strip() for url in raw if isinstance(url, str) and url.strip()}
+
+
 def _load_stable_failed_calls(task: AgentTaskRequest) -> list[dict[str, str]]:
     """Read the persisted stable-failure dedup entries for this step, if any.
 
@@ -334,6 +344,7 @@ def _snapshot_execution_state(
     stable_failed_calls: list[tuple[str, dict[str, Any]]] | None = None,
     prior_stable_failed_calls: list[dict[str, str]] | None = None,
     failed_candidate_urls: set[str] | None = None,
+    processed_candidate_urls: set[str] | None = None,
     phase: str = "discover",
     candidate_status: str = "unknown",
     last_error_fingerprint: str | None = None,
@@ -380,6 +391,7 @@ def _snapshot_execution_state(
         "consecutive_stalls": consecutive_stalls,
         "total_wasted_turns": total_wasted_turns,
         "failed_candidate_urls": sorted(failed_candidate_urls or set()),
+        "processed_candidate_urls": sorted(processed_candidate_urls or set()),
         "progress_ledger": {
             "phase": phase,
             "candidate_status": candidate_status,
@@ -625,6 +637,9 @@ class ExecutorAgent:
         )
         premature_need_user_retries = 0
         runtime_feedback: str | None = None
+        gateway_manages_model_budget = bool(
+            getattr(self._gateway, "manages_model_budget", False)
+        )
         # Tools the universe exposes but this step's skill scope can never
         # call: verifier feedback naming one is filtered from the decision
         # state (W3), so a scoped-out demand can never push the executor
@@ -732,8 +747,12 @@ class ExecutorAgent:
             }
             if runtime_feedback:
                 decision_state["runtime_feedback"] = runtime_feedback
-            if model_budget is not None and not model_budget.try_reserve(
-                estimate_input_tokens(_EXECUTOR_INSTRUCTION, decision_state)
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.try_reserve(
+                    estimate_input_tokens(_EXECUTOR_INSTRUCTION, decision_state)
+                )
             ):
                 return ExecutorResult(
                     status="failed",
@@ -742,13 +761,26 @@ class ExecutorAgent:
                     error_code="model_budget_exhausted",
                     execution_state=current_state(),
                 )
-            decision = self._gateway.decide(
-                role=AgentRole.executor,
-                instruction=_EXECUTOR_INSTRUCTION,
-                state=decision_state,
-                response_model=ExecutorDecision,
-            )
-            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+            if gateway_manages_model_budget:
+                decision = self._gateway.decide(
+                    role=AgentRole.executor,
+                    instruction=_EXECUTOR_INSTRUCTION,
+                    state=decision_state,
+                    response_model=ExecutorDecision,
+                    model_budget=model_budget,
+                )
+            else:
+                decision = self._gateway.decide(
+                    role=AgentRole.executor,
+                    instruction=_EXECUTOR_INSTRUCTION,
+                    state=decision_state,
+                    response_model=ExecutorDecision,
+                )
+            if (
+                model_budget is not None
+                and not gateway_manages_model_budget
+                and not model_budget.record(self._gateway.last_usage)
+            ):
                 return ExecutorResult(
                     status="failed",
                     summary="Model budget exhausted after the latest decision.",

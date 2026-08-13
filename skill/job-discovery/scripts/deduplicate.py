@@ -656,17 +656,31 @@ def _expand_files(file_args: list[str]) -> list[str]:
     """
     import glob
 
+    output_root = Path("output").resolve()
+
+    def is_output_json(value: str) -> bool:
+        candidate = Path(value)
+        if candidate.suffix.lower() != ".json":
+            return False
+        try:
+            candidate.resolve().relative_to(output_root)
+        except ValueError:
+            return False
+        return True
+
     expanded: list[str] = []
     seen: set[str] = set()
     for a in file_args:
         if any(ch in a for ch in "*?["):
             matches = sorted(glob.glob(a, recursive=True))
             for m in matches:
+                if not is_output_json(m):
+                    continue
                 if m not in seen:
                     seen.add(m)
                     expanded.append(m)
         else:
-            if a not in seen:
+            if is_output_json(a) and a not in seen:
                 seen.add(a)
                 expanded.append(a)
     return expanded
@@ -685,13 +699,20 @@ def main() -> None:
                         help="Do NOT drop placeholder/test titles (default: drop them)")
     args = parser.parse_args()
 
+    output_path = Path(args.out) if args.out else None
+    if output_path is not None:
+        try:
+            output_path.resolve().relative_to(Path("output").resolve())
+        except ValueError:
+            parser.error("--out must stay under the skill output directory")
+
     files = _expand_files(args.files)
     if not files:
         # Nothing to merge - emit an empty-but-valid result so the caller (and the
         # harness reading candidates_merged.json) gets a clean empty array, not a
         # missing file.
-        if args.out:
-            out_path = Path(args.out)
+        if output_path is not None:
+            out_path = output_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text("[]", encoding="utf-8")
         print(json.dumps({
@@ -699,14 +720,14 @@ def main() -> None:
             "stats": {"input_count": 0, "output_count": 0, "duplicates_removed": 0},
             "load_errors": [],
             "verify_warnings_count": 0,
-            "output_file": str(Path(args.out).resolve()) if args.out else None,
+            "output_file": str(output_path.resolve()) if output_path else None,
         }, ensure_ascii=False))
         return
 
     result = process(files, verify=not args.no_verify, keep_garbage=args.keep_garbage)
 
-    if args.out:
-        out_path = Path(args.out)
+    if output_path is not None:
+        out_path = output_path
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
             json.dumps(result["candidates"], ensure_ascii=False, indent=2),
@@ -719,7 +740,7 @@ def main() -> None:
         "stats": result["stats"],
         "load_errors": result["load_errors"],
         "verify_warnings_count": len(result.get("verify_warnings", {})),
-        "output_file": str(Path(args.out).resolve()) if args.out else None,
+        "output_file": str(output_path.resolve()) if output_path else None,
     }, ensure_ascii=False))
 
 

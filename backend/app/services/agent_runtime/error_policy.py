@@ -39,6 +39,7 @@ class TerminalContract:
     contract_met: bool = False
     blocked: bool = False
     artifact_count: int = 0
+    evidence_diagnostics: dict[str, Any] | None = None
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,11 @@ class TerminalContract:
                 "blocked": self.blocked,
                 "artifact_count": self.artifact_count,
             },
+            **(
+                {"evidence_diagnostics": self.evidence_diagnostics}
+                if self.evidence_diagnostics is not None
+                else {}
+            ),
         }
 
 
@@ -86,29 +92,64 @@ def build_terminal_contract(
     phase: str = "tool",
     contract_met: bool = False,
     artifact_count: int = 0,
+    evidence_diagnostics: dict[str, Any] | None = None,
 ) -> TerminalContract:
     """Classify structured error signals without inspecting model prose."""
     codes = _nested_error_codes(observations)
     if error_code:
         codes.insert(0, error_code)
     code = next((value for value in codes if value), "need_user")
-    if code in {"anti_bot", "anti_bot_challenge", "captcha", "login_required", "access_denied", "domain_temporarily_blocked", "needs_manual_review", "ocr_disabled"}:
-        return TerminalContract(FailureClass.EXTERNAL_BLOCKED, code, source_role, phase, user_action="provide_public_job_url_or_jd_text", blocked=True, artifact_count=artifact_count)
+    external_code = next(
+        (value for value in codes if _is_external_terminal_code(value)), None
+    )
+    if external_code is not None:
+        code = external_code
+    if _is_external_terminal_code(code):
+        return TerminalContract(FailureClass.EXTERNAL_BLOCKED, code, source_role, phase, user_action="provide_public_job_url_or_jd_text", blocked=True, artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
     if code in {
         "invalid_tool_input", "tool_skill_forbidden", "unknown_tool", "tool_role_forbidden",
         "verification_failed", "success_contract_not_satisfied", "observed_evidence_not_found",
         "public_page_content_insufficient",
     }:
-        return TerminalContract(FailureClass.CONTRACT_VIOLATION, code, source_role, phase, user_action="provide_missing_tool_input", artifact_count=artifact_count)
+        return TerminalContract(FailureClass.CONTRACT_VIOLATION, code, source_role, phase, user_action="provide_missing_tool_input", artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
     if code in {"duplicate_tool_call", "candidate_urls_already_supplied", "route_already_consumed", "repeated_plan_fingerprint", "no_progress_duplicate"}:
-        return TerminalContract(FailureClass.NO_PROGRESS, code, source_role, phase, user_action="provide_alternate_public_source", artifact_count=artifact_count)
+        return TerminalContract(FailureClass.NO_PROGRESS, code, source_role, phase, user_action="provide_alternate_public_source", artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
     if code == "invalid_model_response":
-        return TerminalContract(FailureClass.MODEL_OUTPUT_INVALID, code, source_role, phase, user_action="retry_model_or_provide_information", artifact_count=artifact_count)
+        return TerminalContract(FailureClass.MODEL_OUTPUT_INVALID, code, source_role, phase, user_action="retry_model_or_provide_information", artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
     if code in {"sheet_rate_limited", "sheet_call_failed", "sheet_bridge_unavailable", "source_unavailable", "public_search_failed", "public_fetch_failed", "search_empty"}:
-        return TerminalContract(FailureClass.UPSTREAM_TOOL_FAILURE, code, source_role, phase, user_action="provide_alternate_public_source", artifact_count=artifact_count)
+        return TerminalContract(FailureClass.UPSTREAM_TOOL_FAILURE, code, source_role, phase, user_action="provide_alternate_public_source", artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
     if code.endswith("budget_exhausted") or code == "wall_clock_budget_exhausted":
-        return TerminalContract(FailureClass.BUDGET_EXHAUSTED, code, source_role, phase, user_action="retry_within_a_new_budget_window", artifact_count=artifact_count)
-    return TerminalContract(FailureClass.MODEL_DECISION, code, source_role, phase, artifact_count=artifact_count)
+        return TerminalContract(FailureClass.BUDGET_EXHAUSTED, code, source_role, phase, user_action="retry_within_a_new_budget_window", artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
+    return TerminalContract(FailureClass.MODEL_DECISION, code, source_role, phase, artifact_count=artifact_count, evidence_diagnostics=evidence_diagnostics)
+
+
+def _is_external_terminal_code(code: str) -> bool:
+    """Recognize stable source-access blocks before model-level symptoms."""
+    if code in {
+        "anti_bot",
+        "anti_bot_challenge",
+        "captcha",
+        "login_required",
+        "access_denied",
+        "domain_temporarily_blocked",
+        "needs_manual_review",
+        "ocr_disabled",
+    }:
+        return True
+    if code in {
+        "adapter:url_not_allowlisted",
+        "adapter:empty_result",
+        "adapter:malformed_payload",
+        "adapter:adapter_error",
+        "adapter:adapter_unknown",
+        "adapter:adapter_invalid",
+        "adapter:allowlist_missing",
+    }:
+        return True
+    if code.startswith("adapter:http_error:"):
+        status = code.removeprefix("adapter:http_error:")
+        return status.isdigit() and 400 <= int(status) < 500 and status not in {"408", "429"}
+    return False
 
 
 class ErrorDisposition(StrEnum):

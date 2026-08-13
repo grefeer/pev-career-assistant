@@ -11,7 +11,10 @@ from backend.app.services.agent_runtime.error_policy import (
     ErrorPolicy,
     default_error_policy,
 )
-from backend.app.services.agent_runtime.schemas import PlanStep, ToolObservation
+from backend.app.services.agent_runtime.schemas import (
+    PlanStep,
+    ToolObservation,
+)
 
 if TYPE_CHECKING:
     from backend.app.services.agent_runtime.tool_registry import ToolRegistry
@@ -72,6 +75,10 @@ class SkillDefinition:
 
 class SkillRegistry:
     """Immutable-after-startup registry of skill definitions."""
+
+    _ARTIFACT_TYPE_ALIASES = {
+        "match_result": "job_matching_report",
+    }
 
     def __init__(
         self,
@@ -151,6 +158,8 @@ class SkillRegistry:
                 f"Skill: {definition.name}\n"
                 f"Description: {definition.description}\n"
                 f"Deliverables: {deliverables}\n"
+                f"Accepted artifact inputs: {self._port_types(definition.input_ports)}\n"
+                f"Produced artifact outputs: {self._port_types(definition.output_ports)}\n"
                 f"Verification: {definition.verification_policy.value}"
                 + (f"\nPolicy: {definition.execution_policy}" if definition.execution_policy else "")
                 + (
@@ -169,6 +178,12 @@ class SkillRegistry:
         # Keep section boundaries intact when the metadata headers consume the
         # available budget. This is a final safety cap, not the normal path.
         return rendered[:max_chars]
+
+    @staticmethod
+    def _port_types(ports: Iterable[ArtifactPort]) -> str:
+        """Render canonical artifact types so planners do not invent aliases."""
+        values = sorted({artifact_type for port in ports for artifact_type in port.artifact_types})
+        return ", ".join(values) if values else "none"
 
     def has_completion_contract(self, step: PlanStep) -> bool:
         """Return true only when every skill in a step declares a contract."""
@@ -215,6 +230,28 @@ class SkillRegistry:
                 )
         return None
 
+    def normalize_step_ports(self, step: PlanStep) -> PlanStep:
+        """Canonicalize one known model alias before runtime port validation.
+
+        The alias map is deliberately tiny and one-way. It repairs a naming
+        synonym emitted by the model; it never invents an artifact or widens
+        a Skill's accepted port contract.
+        """
+        def canonical(value: str | None) -> str | None:
+            return self._ARTIFACT_TYPE_ALIASES.get(value, value)
+
+        outputs = [
+            output.model_copy(update={"artifact_type": canonical(output.artifact_type)})
+            for output in step.outputs
+        ]
+        inputs = [
+            input_ref.model_copy(
+                update={"artifact_type": canonical(input_ref.artifact_type)}
+            )
+            for input_ref in step.inputs
+        ]
+        return step.model_copy(update={"inputs": inputs, "outputs": outputs})
+
     def step_contract_met(
         self, step: PlanStep, observations: Sequence[ToolObservation]
     ) -> bool:
@@ -237,15 +274,91 @@ class SkillRegistry:
         observations: Sequence[ToolObservation],
         *,
         summary: str | None,
+        artifact_refs: Sequence[Mapping[str, Any]] = (),
     ) -> bool:
-        """Apply a contract only when the skill explicitly declares one."""
-        if not isinstance(summary, str) or not summary.strip():
-            return False
-        if not self.has_completion_contract(step):
-            return True
-        return self.step_contract_met(step, observations) and not self.has_blocked_evidence(
-            observations
+        """Apply a contract using observations and trusted runtime artifacts."""
+        return self.completion_evidence_diagnostics(
+            step, observations, summary=summary, artifact_refs=artifact_refs
+        )["gate_passed"]
+
+    def completion_evidence_diagnostics(
+        self,
+        step: PlanStep,
+        observations: Sequence[ToolObservation],
+        *,
+        summary: str | None,
+        artifact_refs: Sequence[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
+        """Explain the gate without exposing raw evidence or model prose."""
+        summary_present = isinstance(summary, str) and bool(summary.strip())
+        contract_declared = self.has_completion_contract(step)
+        observation_contract_met = self.step_contract_met(step, observations)
+        trusted_artifact_contract_met = self._trusted_artifact_contract_met(
+            step, artifact_refs
         )
+        blocked = self.has_blocked_evidence(observations)
+        contract_met = observation_contract_met or trusted_artifact_contract_met
+        reason_codes: list[str] = []
+        if not summary_present:
+            reason_codes.append("missing_summary")
+        if contract_declared and not contract_met:
+            reason_codes.append("missing_deliverable")
+        if blocked:
+            reason_codes.append("blocked_evidence")
+        if not contract_declared:
+            reason_codes.append("no_explicit_contract")
+        return {
+            "summary_present": summary_present,
+            "contract_declared": contract_declared,
+            "observation_contract_met": observation_contract_met,
+            "trusted_artifact_contract_met": trusted_artifact_contract_met,
+            "contract_met": contract_met,
+            "blocked": blocked,
+            "gate_passed": summary_present and (not contract_declared or contract_met) and not blocked,
+            "reason_codes": reason_codes,
+            "observation_count": len(observations),
+            "trusted_artifact_count": len(artifact_refs),
+            "observation_tools": sorted({item.tool_name for item in observations}),
+        }
+
+    def _trusted_artifact_contract_met(
+        self, step: PlanStep, artifact_refs: Sequence[Mapping[str, Any]]
+    ) -> bool:
+        """Use only runtime-produced refs; model-proposed URLs never qualify."""
+        refs = [item for item in artifact_refs if isinstance(item, Mapping)]
+        if not self.has_completion_contract(step):
+            return False
+        for skill_name in step.allowed_skills:
+            definition = self.get(skill_name)
+            contract = definition.completion_contract if definition else None
+            if contract is not None and not any(
+                ref.get("tool") in contract.deliverable_tools
+                and self._trusted_artifact_ref_is_usable(ref)
+                for ref in refs
+            ):
+                return False
+        declared = {item.artifact_type for item in step.outputs if item.artifact_type}
+        produced = {
+            str(ref.get("artifact_type"))
+            for ref in refs
+            if self._trusted_artifact_ref_is_usable(ref)
+        }
+        checkable = declared & {"public_job_page", "structured_job_details"}
+        return not checkable or checkable.issubset(produced)
+
+    @staticmethod
+    def _trusted_artifact_ref_is_usable(ref: Mapping[str, Any]) -> bool:
+        if not all(
+            isinstance(ref.get(key), str) and bool(ref.get(key))
+            for key in ("artifact_id", "artifact_type", "tool", "source_url", "content_hash")
+        ):
+            return False
+        artifact_type = ref.get("artifact_type")
+        if artifact_type == "public_job_page":
+            return ref.get("quality") == "jd_complete"
+        if artifact_type == "structured_job_details":
+            return ref.get("source_quality") in {None, "jd_complete"}
+        return True
 
     def has_blocked_evidence(self, observations: Sequence[ToolObservation]) -> bool:
         """Inspect error codes and structured output markers deterministically."""

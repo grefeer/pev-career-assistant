@@ -10,6 +10,11 @@ from backend.app.services.agent_runtime.runtime import (
     StepDependencyError,
     _task_input_value,
 )
+from backend.app.services.agent_runtime.skill_definition import (
+    CompletionContract,
+    SkillDefinition,
+    SkillRegistry,
+)
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutorDecision,
@@ -21,6 +26,65 @@ from backend.app.services.agent_runtime.schemas import (
     VerifierDecision,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.target_evidence import resolve_target_evidence
+
+
+def test_runtime_contract_checks_can_use_persisted_trusted_artifacts() -> None:
+    """A valid persisted page still closes a step when model observations are sparse."""
+    runtime = AgentRuntime(
+        planner=object(),
+        executor=object(),
+        verifier=object(),
+        agent_version="pev-test",
+        skills=SkillRegistry(
+            [
+                SkillDefinition(
+                    name="job-discovery",
+                    completion_contract=CompletionContract(
+                        deliverable_tools=frozenset({"fetch-public-job-pages"})
+                    ),
+                )
+            ]
+        ),
+    )
+    step = PlanStep(
+        step_id="discover",
+        objective="抓取 JD",
+        allowed_skills=["job-discovery"],
+        outputs=[StepOutputRef(name="job_page", artifact_type="public_job_page")],
+    )
+    refs = [
+        {
+            "artifact_id": "artifact-1",
+            "artifact_type": "public_job_page",
+            "tool": "fetch-public-job-pages",
+            "source_url": "https://jobs.example/1",
+            "content_hash": "a" * 64,
+            "quality": "jd_complete",
+        }
+    ]
+
+    assert runtime._step_contract_met(step, [], refs) is True
+    assert runtime._completion_gate_rejected(
+        step, [], summary="已完成", artifact_refs=refs
+    ) is False
+
+
+def test_target_evidence_resolves_equivalent_public_jd_urls() -> None:
+    candidate = {
+        "artifact_id": "artifact-1",
+        "source_url": "https://jobs.example/1",
+        "page_source_url": "https://jobs.example/1",
+        "full_text": "岗位职责：建设 AI 产品",
+        "title": "AI 产品经理",
+    }
+
+    resolved = resolve_target_evidence(
+        [], [candidate], " HTTPS://JOBS.EXAMPLE/1/#ignored "
+    )
+
+    assert resolved is not None
+    assert resolved["artifact_id"] == "artifact-1"
 
 
 def test_role_decisions_publish_real_discriminators() -> None:
@@ -153,9 +217,10 @@ def test_model_budget_cancel_releases_failed_provider_reservation() -> None:
 
     budget.cancel()
 
-    assert budget.requests_used == 0
+    assert budget.requests_used == 1
+    assert budget.failed_requests == 1
     assert budget.remaining_input_tokens == 100
-    assert budget.try_reserve(60)
+    assert not budget.try_reserve(60)
 
 
 def test_typed_context_input_can_reference_task_goal() -> None:

@@ -173,7 +173,11 @@ class AgentRunService:
             raise AgentRuntimeDisabledError("agent_harness_disabled")
         if self._runtime is None:
             raise AgentRuntimeUnavailableError("agent_harness_unavailable")
-        run = self.get_run(db, user_id=user_id, run_id=run_id)
+        run = run_repository.get_run_for_owner(
+            db, run_id, user_id, for_update=True
+        )
+        if run is None:
+            raise AgentRunNotFoundError(run_id)
         if run.status is not RunStatus.waiting_user:
             raise AgentRunNotResumableError("agent_run_not_waiting_user")
         cleaned_response = user_response.strip()
@@ -201,7 +205,11 @@ class AgentRunService:
             raise AgentRuntimeDisabledError("agent_harness_disabled")
         if self._runtime is None:
             raise AgentRuntimeUnavailableError("agent_harness_unavailable")
-        run = self.get_run(db, user_id=user_id, run_id=run_id)
+        run = run_repository.get_run_for_owner(
+            db, run_id, user_id, for_update=True
+        )
+        if run is None:
+            raise AgentRunNotFoundError(run_id)
         if run.status is not RunStatus.running:
             raise AgentRunNotResumableError("agent_run_not_running")
         task = AgentTaskRequest(

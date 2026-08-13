@@ -10,17 +10,28 @@ from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
 from backend.app.services.agent_runtime.deep_executor import (
     DeepExecutorAgent,
     _DeepExecutionLedger,
+    _EXECUTOR_OPERATING_PROCEDURE,
+    _bounded_context_metadata,
     _bounded_deep_agent_messages,
+    _produces_persisted_artifact,
     _terminal_from_messages,
 )
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
     PlanStep,
+    StepOutputRef,
+    ToolObservation,
+)
+from backend.app.services.agent_runtime.skill_definition import (
+    CompletionContract,
+    SkillDefinition,
+    SkillRegistry,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
+from backend.app.services.career_skills.manifest import build_career_skill_registry
 from tests.unit.deepagents_testkit import ScriptedModel
 
 
@@ -114,6 +125,53 @@ def test_deep_executor_bridges_business_tool_and_structured_terminal_state() -> 
     assert result.observations[0].output == {"value": "ok"}
 
 
+def test_deep_executor_stops_at_clean_deliverable_without_an_extra_model_turn() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "echo-tool",
+                        "args": {"value": "ok"},
+                        "id": "call-complete",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    task, plan, step = _inputs()
+    skills = SkillRegistry(
+        [
+            SkillDefinition(
+                name="job-discovery",
+                completion_contract=CompletionContract(
+                    frozenset({"echo-tool"}),
+                    observation_check=lambda observation: observation.output == {"value": "ok"},
+                ),
+            )
+        ]
+    )
+
+    result = DeepExecutorAgent(
+        gateway=Gateway(model),
+        tools=_registry(),
+        skills=skills,
+        skill_root=Path("skill"),
+    ).run(
+        task=task,
+        plan=plan,
+        step=step,
+        context=ToolContext(user_id="user", run_id="run-deterministic-completion"),
+    )
+
+    assert result.status == "succeeded"
+    assert result.error_code is None
+    assert result.summary == "已通过 Skill 完成契约并生成可核验的工具交付物。"
+    assert result.execution_state["succeeded_calls"][0]["tool"] == "echo-tool"
+
+
 def test_deep_executor_consumes_one_pev_turn_for_multiple_internal_calls() -> None:
     model = ScriptedModel(
         [
@@ -172,7 +230,38 @@ def test_deep_executor_hides_generic_execute_and_subagent_tools() -> None:
     assert RecordingModel.bound_tool_names
     assert "execute" not in RecordingModel.bound_tool_names[0]
     assert "task" not in RecordingModel.bound_tool_names[0]
+    assert "ls" not in RecordingModel.bound_tool_names[0]
+    assert "write_file" not in RecordingModel.bound_tool_names[0]
     assert "run_skill_script" in RecordingModel.bound_tool_names[0]
+
+
+def test_executor_prompt_includes_bounded_skill_contract() -> None:
+    skills = build_career_skill_registry(_registry(), package_root=Path("skill"))
+    agent = DeepExecutorAgent(
+        gateway=Gateway(RecordingModel(['{"status":"succeeded","summary":"完成"}'])),
+        tools=_registry(),
+        skills=skills,
+        skill_root=Path("skill"),
+    )
+
+    prompt = agent._system_prompt("job-discovery")
+
+    assert "Skill policy summary:" in prompt
+    assert "Canonical Skill instructions:" in prompt
+    assert "deliverable tools:" in prompt
+    assert len(prompt) < 4_000
+
+
+def test_deep_executor_does_not_project_profile_facts_into_model_metadata() -> None:
+    metadata = {
+        "confirmed_profile_facts": {"projects": ["private project"]},
+        "resolved_step_inputs": {"target": "AI"},
+    }
+
+    bounded = _bounded_context_metadata(metadata)
+
+    assert "confirmed_profile_facts" not in bounded
+    assert bounded["resolved_step_inputs"] == {"target": "AI"}
 
 
 def test_deep_executor_requires_one_skill_per_pev_step() -> None:
@@ -227,6 +316,175 @@ def test_invalid_structured_terminal_is_a_recoverable_executor_failure() -> None
 
     assert result.status == "failed"
     assert result.error_code == "deep_executor_invalid_terminal"
+
+
+def test_terminal_parse_accepts_status_alias_and_extra_fields() -> None:
+    result = {
+        "messages": [
+            AIMessage(content='{"status":"success","summary":"完成","noise":true}')
+        ]
+    }
+
+    response = _terminal_from_messages(result)
+
+    assert response is not None
+    assert response.status == "succeeded"
+    assert response.summary == "完成"
+    assert response.artifact_refs == []
+
+
+def test_terminal_parse_normalizes_case_and_need_user_alias() -> None:
+    result = {
+        "messages": [
+            AIMessage(content='{"status":"Waiting_user","user_question":"缺少输入"}')
+        ]
+    }
+
+    response = _terminal_from_messages(result)
+
+    assert response is not None
+    assert response.status == "needs_user"
+    assert response.user_question == "缺少输入"
+
+
+def test_terminal_parse_discards_non_string_status_and_non_object_payload() -> None:
+    non_string_status = {"messages": [AIMessage(content='{"status":1,"summary":"x"}')]}
+    non_object_payload = {"messages": [AIMessage(content='"plain text"')]}
+
+    assert _terminal_from_messages(non_string_status) is None
+    assert _terminal_from_messages(non_object_payload) is None
+
+
+def _declared_output_step() -> PlanStep:
+    return PlanStep(
+        step_id="discover",
+        objective="采集并结构化岗位",
+        allowed_skills=["job-discovery"],
+        outputs=[StepOutputRef(name="jd", artifact_type="structured_job_details")],
+    )
+
+
+def _fetch_page_observation() -> ToolObservation:
+    return ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": "https://example.com/job",
+                    "content_hash": "abc",
+                    "visible_text": "岗位描述",
+                }
+            ]
+        },
+    )
+
+
+def _extract_details_observation() -> ToolObservation:
+    return ToolObservation(
+        tool_name="extract-observed-job-details",
+        status="succeeded",
+        output={
+            "source_url": "https://example.com/job",
+            "content_hash": "abc",
+            "candidates": [{"title": "示例岗位"}],
+        },
+    )
+
+
+def test_declared_outputs_covered_requires_produced_artifact_type() -> None:
+    step = _declared_output_step()
+
+    assert (
+        DeepExecutorAgent._declared_outputs_covered(step, [_fetch_page_observation()])
+        is False
+    )
+    assert (
+        DeepExecutorAgent._declared_outputs_covered(
+            step, [_fetch_page_observation(), _extract_details_observation()]
+        )
+        is True
+    )
+
+
+def test_declared_outputs_covered_skips_types_without_a_known_producer() -> None:
+    step = PlanStep(
+        step_id="discover",
+        objective="未知产出类型",
+        allowed_skills=["job-discovery"],
+        outputs=[StepOutputRef(name="raw", artifact_type="artifact_id")],
+    )
+
+    assert DeepExecutorAgent._declared_outputs_covered(step, []) is True
+
+
+def test_declared_outputs_covered_ignores_failed_deliverable() -> None:
+    step = _declared_output_step()
+    failed_extract = ToolObservation(
+        tool_name="extract-observed-job-details",
+        status="failed",
+        error_code="adapter:empty_result",
+    )
+
+    assert (
+        DeepExecutorAgent._declared_outputs_covered(
+            step, [_fetch_page_observation(), failed_extract]
+        )
+        is False
+    )
+
+
+def test_empty_match_report_and_placeholder_source_are_not_persisted() -> None:
+    step = PlanStep(
+        step_id="match",
+        objective="匹配岗位",
+        allowed_skills=["job-matching"],
+        outputs=[StepOutputRef(name="report", artifact_type="job_matching_report")],
+    )
+    empty_matches = ToolObservation(
+        tool_name="match-observed-jobs",
+        status="succeeded",
+        output={"matches": []},
+    )
+    missing_source = ToolObservation(
+        tool_name="match-observed-jobs",
+        status="succeeded",
+        output={"matches": [{"title": "无来源行"}]},
+    )
+    row_source = ToolObservation(
+        tool_name="match-observed-jobs",
+        status="succeeded",
+        output={
+            "matches": [{"title": "有来源行", "source_url": "https://example.com/job"}]
+        },
+    )
+
+    assert _produces_persisted_artifact(empty_matches) is False
+    assert _produces_persisted_artifact(missing_source) is False
+    assert _produces_persisted_artifact(row_source) is True
+    assert DeepExecutorAgent._declared_outputs_covered(step, [empty_matches]) is False
+    assert DeepExecutorAgent._declared_outputs_covered(step, [row_source]) is True
+
+
+def test_completion_summary_blocks_when_declared_output_not_produced() -> None:
+    skills = build_career_skill_registry(_registry(), package_root=Path("skill"))
+    agent = DeepExecutorAgent(
+        gateway=Gateway(RecordingModel(['{"status":"succeeded","summary":"完成"}'])),
+        tools=_registry(),
+        skills=skills,
+        skill_root=Path("skill"),
+    )
+    step = _declared_output_step()
+
+    assert agent._completion_summary(step, [_fetch_page_observation()]) is None
+    assert agent._completion_summary(
+        step, [_fetch_page_observation(), _extract_details_observation()]
+    ) == "已通过 Skill 完成契约并生成可核验的工具交付物。"
+
+
+def test_executor_operating_procedure_requires_detail_page_expansion() -> None:
+    assert "quality=list_only" in _EXECUTOR_OPERATING_PROCEDURE
+    assert "detail pages" in _EXECUTOR_OPERATING_PROCEDURE
 
 
 def test_filesystem_tools_cannot_modify_the_skill_package(tmp_path: Path) -> None:
@@ -331,7 +589,9 @@ def test_deep_agent_history_window_moves_left_from_orphan_tool_message() -> None
     bounded = _bounded_deep_agent_messages(messages)
 
     assert bounded is not None
-    assert bounded[2] is messages[3]
+    assert bounded[2] is messages[2]
+    assert bounded[3] is messages[3]
+    assert bounded[4] is messages[4]
 
 
 def test_ledger_snapshot_preserves_retry_state_and_deduplicates() -> None:

@@ -576,6 +576,9 @@ def main() -> None:
     from backend.app.services.career_skills import job_discovery as jd_skill
 
     jd_skill.enable_playwright_fallback(True)
+    # Mirror production main.py: certified public API adapters are part of
+    # the real evidence path and must be enabled for live evaluation too.
+    jd_skill.enable_public_api_adapters(True)
 
     # WeChat OCR gate: main.py wires this from Settings at runtime; the eval
     # harness assembles the runtime directly, so mirror the wiring here. The
@@ -636,6 +639,8 @@ def main() -> None:
                 flush=True,
             )
     finally:
+        jd_skill.enable_public_api_adapters(False)
+        jd_skill.enable_playwright_fallback(False)
         db.close()
 
 

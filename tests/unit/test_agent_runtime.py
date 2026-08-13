@@ -1603,6 +1603,35 @@ def test_runtime_persists_every_page_from_one_batch_fetch_observation(db_session
     )] == ["岗位 A", "岗位 B"]
 
 
+def test_runtime_caps_persisted_page_text(db_session) -> None:
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    execution = ExecutorResult(
+        status="succeeded",
+        summary="已抓取超长页面",
+        observations=[ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={"visible_text": "x" * 40_000, "source_url": "https://jobs.example/a", "content_hash": "a" * 64},
+        )],
+    )
+
+    AgentRuntime._persist_observed_evidence(db_session, run.id, step, execution)
+
+    artifact = db_session.scalar(
+        select(AgentArtifact).where(AgentArtifact.run_id == run.id)
+    )
+    assert artifact is not None
+    assert len(artifact.content_json["visible_text"]) == 32_000
+
+
 def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session) -> None:
     """A provider outage cannot escape the harness as an untracked API failure."""
     user = User(

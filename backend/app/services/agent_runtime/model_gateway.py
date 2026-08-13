@@ -13,6 +13,10 @@ from pydantic import BaseModel
 
 from backend.app.config import Settings
 from backend.app.domain.agent_runtime import AgentRole
+from backend.app.services.agent_runtime.model_budget import (
+    ModelCallBudget,
+    estimate_input_tokens,
+)
 from backend.app.services.agent_runtime.prompt_rules import json_repair_rules
 
 logger = logging.getLogger(__name__)
@@ -97,6 +101,11 @@ class LangChainModelGateway:
         return self._last_usage
 
     @property
+    def manages_model_budget(self) -> bool:
+        """Whether this gateway accounts every physical provider request."""
+        return True
+
+    @property
     def chat_model(self) -> Any:
         """Expose the unstructured chat model for tool-calling runtimes.
 
@@ -113,6 +122,7 @@ class LangChainModelGateway:
         instruction: str,
         state: dict[str, object],
         response_model: type[ResponseT],
+        model_budget: ModelCallBudget | None = None,
     ) -> ResponseT:
         """Ask a provider for exactly one validated role decision.
 
@@ -159,27 +169,42 @@ class LangChainModelGateway:
                 messages=messages,
                 role=role,
                 response_model=response_model,
+                model_budget=model_budget,
             )
         raw_content: str | None = None
         try:
             structured_model = self._model.with_structured_output(
                 response_model, include_raw=True, method=self._structured_method
             )
-            raw_result = structured_model.invoke(messages)
+            def invoke_structured() -> Any:
+                raw_result = structured_model.invoke(messages)
+                if isinstance(raw_result, dict):
+                    raw_message = raw_result.get("raw")
+                    if raw_message is not None:
+                        self._extract_usage(raw_message)
+                        candidate = getattr(raw_message, "content", None)
+                        if isinstance(candidate, str):
+                            nonlocal_raw_content[0] = candidate
+                return raw_result
+
+            nonlocal_raw_content = [None]
+            raw_result = self._invoke_physical(
+                role=role,
+                messages=messages,
+                model_budget=model_budget,
+                invoke=invoke_structured,
+            )
+            raw_content = nonlocal_raw_content[0]
             parsed = raw_result.get("parsed") if isinstance(raw_result, dict) else None
-            if isinstance(raw_result, dict):
-                raw_message = raw_result.get("raw")
-                if raw_message is not None:
-                    self._extract_usage(raw_message)
-                    candidate = getattr(raw_message, "content", None)
-                    if isinstance(candidate, str):
-                        raw_content = candidate
+        except AgentModelGatewayError:
+            raise
         except Exception as exc:  # noqa: BLE001 - provider exceptions are untrusted.
             if _response_format_unavailable(exc):
                 return self._decide_with_local_json_validation(
                     messages=messages,
                     role=role,
                     response_model=response_model,
+                    model_budget=model_budget,
                 )
             raise AgentModelGatewayError("model_request_failed") from exc
         try:
@@ -212,6 +237,7 @@ class LangChainModelGateway:
                     messages=messages,
                     role=role,
                     response_model=response_model,
+                    model_budget=model_budget,
                 )
             except AgentModelGatewayError as retry_error:
                 if retry_error.code == "model_request_failed":
@@ -224,6 +250,7 @@ class LangChainModelGateway:
         messages: list[SystemMessage | HumanMessage],
         role: AgentRole,
         response_model: type[ResponseT],
+        model_budget: ModelCallBudget | None = None,
     ) -> ResponseT:
         """Allow two malformed-completion retries for a JSON-only provider.
 
@@ -241,9 +268,10 @@ class LangChainModelGateway:
                     messages=messages,
                     role=role,
                     response_model=response_model,
+                    model_budget=model_budget,
                 )
             except AgentModelGatewayError as error:
-                if error.code == "model_request_failed":
+                if error.code in {"model_request_failed", "model_budget_exhausted"}:
                     raise
                 last_error = error
                 if attempt < 2:
@@ -273,6 +301,7 @@ class LangChainModelGateway:
         messages: list[SystemMessage | HumanMessage],
         role: AgentRole,
         response_model: type[ResponseT],
+        model_budget: ModelCallBudget | None = None,
     ) -> ResponseT:
         """Use ordinary JSON output only when a provider rejects response_format."""
         schema_hint = (
@@ -292,11 +321,22 @@ class LangChainModelGateway:
                 )
             ),
         ]
-        try:
+        def invoke_local() -> Any:
             raw_result = self._model.invoke(fallback_messages)
+            self._extract_usage(raw_result)
+            return raw_result
+
+        try:
+            raw_result = self._invoke_physical(
+                role=role,
+                messages=fallback_messages,
+                model_budget=model_budget,
+                invoke=invoke_local,
+            )
+        except AgentModelGatewayError:
+            raise
         except Exception as exc:  # noqa: BLE001 - provider boundary.
             raise AgentModelGatewayError("model_request_failed") from exc
-        self._extract_usage(raw_result)
         content = getattr(raw_result, "content", raw_result)
         if not isinstance(content, str):
             raise AgentModelGatewayError("invalid_model_response")
@@ -312,6 +352,41 @@ class LangChainModelGateway:
                 len(content),
             )
             raise AgentModelGatewayError("invalid_model_response") from exc
+
+    def _invoke_physical(
+        self,
+        *,
+        role: AgentRole,
+        messages: list[SystemMessage | HumanMessage],
+        model_budget: ModelCallBudget | None,
+        invoke: Any,
+    ) -> Any:
+        """Reserve and commit one physical provider request.
+
+        A single logical ``decide`` may perform a structured request followed
+        by local JSON recovery requests. Counting here, at the actual model
+        boundary, keeps the hard request/token ceilings honest.
+        """
+        self._last_usage = None
+        if model_budget is None:
+            return invoke()
+        state = {
+            "messages": [
+                getattr(message, "content", "") for message in messages
+            ],
+            "role": role.value,
+        }
+        estimate = estimate_input_tokens("agent_gateway", state)
+        if not model_budget.try_reserve(estimate):
+            raise AgentModelGatewayError("model_budget_exhausted")
+        try:
+            response = invoke()
+        except BaseException:
+            model_budget.cancel()
+            raise
+        if not model_budget.record(self._last_usage):
+            raise AgentModelGatewayError("model_budget_exhausted")
+        return response
 
     def _extract_usage(self, raw_message: Any) -> None:
         """Extract token usage from a raw AIMessage and store in _last_usage.

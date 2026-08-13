@@ -347,7 +347,7 @@ def _run_vision_placeholder(image_path: str) -> tuple[str, float, list[str]]:
     return (
         f"[VISION_REQUIRED] Image at {image_path} — use vision capability to read text from this image. "
         f"Read the image with the read tool and extract all visible job descriptions, "
-        f"company names, requirements, and contact information.",
+        f"company names, requirements, and application channels.",
         0.0,
         ["Vision-based OCR — invoke read tool on image, then extract text"],
     )

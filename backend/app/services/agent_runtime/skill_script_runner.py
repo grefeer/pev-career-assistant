@@ -14,8 +14,35 @@ from pydantic import BaseModel, Field, field_validator
 
 _MAX_OUTPUT_CHARS = 12_000
 _MAX_ARGUMENTS = 32
+_ALLOWED_SCRIPT_PATHS = frozenset(
+    {
+        "scripts/adapter_supervisor.py",
+        "scripts/browse.py",
+        "scripts/coverage_gate.py",
+        "scripts/deduplicate.py",
+        "scripts/normalize.py",
+        "scripts/ocr_image.py",
+        "scripts/read_evidence.py",
+        "scripts/state.py",
+        "scripts/validate.py",
+        "scripts/write_candidates.py",
+    }
+)
+_SAFE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "WINDIR",
+    }
+)
 _SECRET_RE = re.compile(
-    r"(?i)(bearer\s+|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|authorization)"
+    r"(?i)(bearer\s+|api[_-]?key|access[_-]?token|refresh[_-]?token|"
+    r"password|secret|authorization|cookie|session|encryption[_-]?key)"
     r"\s*[:=]?\s*([^\s,;]+)"
 )
 
@@ -73,6 +100,11 @@ class SkillScriptRunner:
             return self._failure(payload.script_path, "script_path_outside_skill")
         if relative_path.suffix.lower() != ".py":
             return self._failure(payload.script_path, "script_must_be_python")
+        normalized_path = relative_path.as_posix().lower()
+        if normalized_path not in {
+            path.lower() for path in _ALLOWED_SCRIPT_PATHS
+        }:
+            return self._failure(payload.script_path, "script_not_allowlisted")
 
         script = (self._skill_dir / relative_path).resolve()
         if not _is_within(script, self._skill_dir):
@@ -80,7 +112,11 @@ class SkillScriptRunner:
         if not script.is_file():
             return self._failure(payload.script_path, "script_not_found")
 
-        environment = os.environ.copy()
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.upper() in _SAFE_ENVIRONMENT_KEYS
+        }
         environment["PYTHONUTF8"] = "1"
         # Make package-local imports work for helpers under scripts/ while
         # keeping the process rooted at the active Skill directory. Existing
@@ -98,6 +134,7 @@ class SkillScriptRunner:
                 encoding="utf-8",
                 errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                start_new_session=os.name != "nt",
             )
             stdout, stderr = process.communicate(timeout=payload.timeout_seconds)
         except subprocess.TimeoutExpired as exc:
@@ -156,7 +193,7 @@ def _redact(value: str) -> str:
 
 
 def _terminate_process_tree(pid: int) -> None:
-    """Terminate a helper and browser descendants on Windows."""
+    """Terminate a helper and its descendants on both supported platforms."""
     if sys.platform == "win32":
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -167,4 +204,7 @@ def _terminate_process_tree(pid: int) -> None:
         try:
             os.killpg(pid, 9)
         except (OSError, ProcessLookupError):
-            pass
+            try:
+                os.kill(pid, 9)
+            except (OSError, ProcessLookupError):
+                pass

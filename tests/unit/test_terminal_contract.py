@@ -31,3 +31,21 @@ def test_duplicate_and_model_errors_have_stable_classes() -> None:
 
     assert duplicate.failure_class is FailureClass.NO_PROGRESS
     assert invalid.failure_class is FailureClass.MODEL_OUTPUT_INVALID
+
+
+def test_adapter_blocker_takes_precedence_over_verifier_symptom() -> None:
+    observation = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="failed",
+        error_code="adapter:empty_result",
+    )
+
+    contract = build_terminal_contract(
+        error_code="verification_failed",
+        observations=[observation],
+        source_role="verifier",
+        phase="verification",
+    )
+
+    assert contract.failure_class is FailureClass.EXTERNAL_BLOCKED
+    assert contract.reason_code == "adapter:empty_result"
