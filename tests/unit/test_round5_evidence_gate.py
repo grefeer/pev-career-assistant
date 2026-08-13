@@ -24,14 +24,14 @@ def test_completion_gate_rejects_a_job_discovery_summary_without_evidence() -> N
     )
 
 
-def test_completion_gate_accepts_a_verified_empty_search_result() -> None:
+def test_completion_gate_rejects_a_search_index_without_a_job_page() -> None:
     step = PlanStep(
         step_id="discover",
         objective="查询公开岗位",
         allowed_skills=["job-discovery"],
     )
 
-    assert completion_evidence_gate(
+    assert not completion_evidence_gate(
         step,
         [
             ToolObservation(

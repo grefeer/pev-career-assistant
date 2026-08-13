@@ -253,6 +253,10 @@ def _match_raw_evidence(
     for item in raw_evidence:
         if not isinstance(item, dict):
             continue
+        if item.get("quality") in {"list_only", "js_shell", "empty"}:
+            # Index pages and shell pages are routing evidence, not a JD that
+            # can support a matching score.
+            continue
         artifact_id = item.get("artifact_id")
         source_url = item.get("source_url")
         visible_text = item.get("visible_text")
@@ -281,6 +285,8 @@ def _match_candidate(
     item: dict[str, Any], payload: MatchObservedJobsInput
 ) -> ObservedJobMatch | None:
     """Score one structured job candidate against the confirmed profile."""
+    if item.get("source_quality") in {"list_only", "js_shell", "empty"}:
+        return None
     artifact_id = item.get("artifact_id")
     source_url = item.get("source_url")
     if not (

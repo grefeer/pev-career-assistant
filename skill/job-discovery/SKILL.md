@@ -59,25 +59,14 @@ login/captcha/anti-bot result as manual review, never as a retry target.
 
 ## Certified public-JSON adapters (A1, backend-gated)
 
-Five sites that browse.py classifies as anti-bot-blocked (didi, netease,
-baidu, moka, beisen) expose official, unauthenticated, public JSON listing
-endpoints.  The `scripts/adapters/` package (one `Adapter` module per
-company, contract = `validate(url)` + `execute(task, strategy, trajectory)`
-like `adapter_supervisor.py`) is a legal public data channel: no bypass, TLS
+Three sites that browse.py classifies as anti-bot-blocked (didi, netease,
+baidu) expose official, unauthenticated, public JSON listing endpoints.  The
+`scripts/adapters/` package (one `Adapter` module per company, contract =
+`validate(url)` + `execute(task, strategy, trajectory)` like
+`adapter_supervisor.py`) is a legal public data channel: no bypass, TLS
 verification on, polite 0.2-0.5s pacing, 300 items/company hard cap.  It is a
 **fetch-only channel** - the collector stays passive; adapter output becomes
 ordinary page evidence (source_url + content_hash).
-
-- `moka` (`*.mokahr.com`): `POST /api/outer/ats-apply/website/jobs/v2` with
-  `orgId/siteId/limit/offset/needStat/site`; responses are an AES-CBC envelope
-  (`data` b64 + `necromancer` UTF-8 key, fixed IV) unwrapped internally - the
-  decryption is part of reading the site's own public response, not a bypass.
-  Tenant URL shape: `https://<host>/social-recruitment|/campus-recruitment/<slug>/<site_id>`.
-- `beisen` (`*.zhiye.com`): two phases - `GET /portal/registerSystemInfo` for
-  the tenant's `BSGlobal` config (`PortalId`, cached once per task), then
-  `POST /api/Jobad/GetJobAdPageList` (`PageIndex/PageSize=300`).  A tenant
-  page without `BSGlobal` is a legacy portal and is blocked as
-  `adapter_error` - the legacy channel is deliberately not implemented.
 
 - Every endpoint and apply/detail URL passes `is_safe_public_url` before use.
 - The whole channel is gated twice: `endpoint_allowlist.json` must carry
@@ -141,10 +130,9 @@ Read `/tmp/preview.txt` and classify:
 | Signal | Likely site type | Recommended approach |
 |--------|-----------------|---------------------|
 | `mp.weixin.qq.com` in URL | WeChat article | `browse.py --mode detail` -> check text_length -> if image-heavy, OCR -> channel triage -> recursive browse (see `wechat-image-handling.md`, 6-level pipeline) |
-| Multi-page listing (bytedance / Mioffice / any paginated) | URL-keyed SPA | `browse.py --mode parallel-fetch` (v1.6 default; auto-falls back to `click` for load-more sites) |
+| Multi-page listing (mokahr / bytedance / Mioffice / any paginated) | URL-keyed SPA | `browse.py --mode parallel-fetch` (v1.6 default; auto-falls back to `click` for load-more sites) |
 | `jobs.feishu.cn` in URL | Feishu/Lark | `parallel-fetch`, retry `search-interact` if thin |
-| `mokahr.com` in URL | Moka SPA (adapter-first) | adapter `moka` (A1) - `browse.py` is not the first path for `*.mokahr.com`; adapter failure is `blocked`, no browse fallback |
-| `zhiye.com` in URL | Beisen SPA (adapter-first) | adapter `beisen` (A1) - `browse.py --mode search-interact` is no longer the first path for `*.zhiye.com`; legacy tenants without `BSGlobal` block as `adapter_error` |
+| `zhiye.com` in URL | zhiye.com platform | `browse.py --mode search-interact` (search box usually available) |
 | `<script>` with `__NEXT_DATA__` | Next.js/Nuxt SPA | `browse.py --mode search` or `list` |
 | Login wall / 403 / captcha | Blocked | Skip, mark as `needs_manual_review` |
 | Plain HTML with listings in first 4KB | Static site | `curl` full page OR `browse.py --mode list` |
@@ -213,7 +201,29 @@ Review `merged_final.json` and update `state.json`. Full details in
 | Search mode: no search box found | Auto-fallback to `list` mode (with `--fallback full`) |
 | Search mode: keyword returns 0 results | Try next keyword (first_match) or fallback to full list |
 | Search mode: post-search count == pre-count | Warning logged - possible client-side fake filter; results may be incomplete |
+| Login wall on a registered site (L2ac) | Check with `scripts/check_login.py`; run `scripts/login.py` for the human login; then re-crawl with `scripts/crawl.py` |
+| 403 / 429 / slider / captcha (L2ac) | Anti-crawl layer: exponential backoff (30/60/120s x3) or human-assisted challenge; surface as `blocked:<code>` |
+| Rate-limited after 3 backoffs (L2ac) | Report `blocked:rate_limited`, stop crawling that site for the day |
 
+## Login & anti-crawl (L2ac)
+
+For target sites that hit the anti-crawl registry (`anti_crawl/site_registry.py`) or show a
+login wall / 403 / slider / captcha: use this layer instead of plain `browse.py`. Only
+registered sites, personal accounts, personal job-seeking use.
+
+```bash
+python scripts/check_login.py [--site liepin]   # health check: login + anti-crawl status
+python scripts/login.py --site liepin           # interactive one-time login (QR/SMS/slider), persistent per-site profile
+python scripts/crawl.py --site liepin --keyword "AI" --max-pages 3   # logged-in crawl
+```
+
+- `crawl.py` output is isomorphic with `browse.py` (same `output/evidence/` dir, same sha256
+  evidence naming) - Phase 4-6 unchanged.
+- Discipline: polite pacing by default (random 2-5s/page, single-page concurrency, daily cap 500
+  pages); 403/429 exponential backoff; sliders/captchas are **human-assisted only** (headed
+  window, 5s poll, 5min timeout) - never automated bypass.
+- Signature-parameter sites are out of scope here (Firefox-Reverse toolchain territory); label
+  them honestly. See `references/anti-crawl-guide.md` + `references/site-adapters.md`.
 ## References
 
 Load these as needed during processing:
@@ -226,6 +236,8 @@ Load these as needed during processing:
 - `references/wechat-image-handling.md` - WeChat article full pipeline: OCR strategy (5 levels) + channel triage & recursive browsing (Level 6)
 - `references/smartsheet-sources.md` - **L3**: Sheet A/B IDs, field mappings, Phase 1 INGEST
 - `references/incremental-persistence.md` - **L3**: state.json, three-tier change detection, Phase 5/6 dedup/persist, resumability
+- `references/anti-crawl-guide.md` - **L2ac**: login + anti-crawl decision tree (check_login -> login -> crawl); status semantics; compliance red lines
+- `references/site-adapters.md` - **L2ac**: anti-crawl site profiles (moka/nowcoder/baidu/58/liepin): defense types, login signals, search URL templates
 
 ## Progressive disclosure: how deep to go
 
@@ -237,6 +249,7 @@ This skill is designed with usage levels. Start shallow; go deeper only when nee
 | **L2: Single URL** | `SKILL.md` + `references/single-url-extraction.md` (+ `browse-modes.md`, `schema.md`, `extraction-guide.md` as needed) | Processing one career page end-to-end |
 | **L2w: WeChat article** | L2 + `references/wechat-image-handling.md` (6-level pipeline) | Processing a WeChat article with channel triage + recursive browsing |
 | **L3: Batch pipeline** | L2 + `references/smartsheet-sources.md` + `references/incremental-persistence.md` + `state.py` + `deduplicate.py` | Processing dozens of URLs from Smartsheet |
+| **L2ac: Login + anti-crawl** | L2 + `references/anti-crawl-guide.md` + `references/site-adapters.md` + `scripts/check_login.py` + `scripts/login.py` + `scripts/crawl.py` | Target site requires login or is anti-crawled (liepin/58/nowcoder/baidu/moka) |
 
 Each script works standalone at its level. `deduplicate.py` contains its own embedded
 normalizer so L3 doesn't require running L1 first - but L1 is available as a lighter
@@ -250,3 +263,25 @@ tool when you just need to normalize one title for comparison.
 - `scripts/deduplicate.py` - **L3**: Normalize, semantic-dedup, and merge candidates across batches
 - `scripts/state.py` - **L3**: Incremental state manager: init, check (skip/extract), mark, diff
 - `scripts/ocr_image.py` - Multi-backend OCR (vision -> PaddleOCR -> Tesseract) for image extraction
+- `scripts/check_login.py` - **L2ac**: per-site login status + anti-crawl status health check (writes `store/state/health.json`)
+- `scripts/login.py` - **L2ac**: interactive one-time login (QR/SMS/slider), persistent per-site browser profile
+- `scripts/crawl.py` - **L2ac**: logged-in crawling (search/detail modes), browse.py-compatible output
+- `scripts/anti_crawl_selftest.py` - **L2ac**: offline self-test of the anti-crawl layer (no network needed)
+
+## PEV adapter boundary
+
+When this package is activated by the backend PEV runtime, the deterministic
+adapter tools are selected by the runtime but their business order is defined
+here. For a named recruitment data source, query it with
+`query-career-sheet-records` using the stated recency/location/company filters,
+then fetch each returned `apply_url`; do not pass role keywords to a company
+ledger. If the query returns no records, a bounded `search-public-job-pages`
+fallback is allowed. Never retry an identical query or fetch, and treat login,
+captcha, anti-bot, and empty/shell pages as honest evidence limits requiring
+manual review rather than bypass attempts.
+
+If a downstream activated Skill needs a target JD and the user supplied a role,
+company, or public source constraint but no exact JD, this Skill may be planned
+as the evidence-producing preceding step. It should capture one or more usable
+public artifacts for the downstream step; it must not fabricate a JD or ask for
+server-held candidate facts.

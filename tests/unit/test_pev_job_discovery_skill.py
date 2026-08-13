@@ -41,6 +41,56 @@ from backend.app.services.career_skills.job_discovery import (
 from backend.app.services.agent_runtime.tool_context import ToolContext
 
 
+def test_page_quality_separates_jd_list_shell_and_empty_evidence() -> None:
+    complete = FetchPublicJobPageOutput(
+        artifact_id="a",
+        source_url="https://jobs.example/a",
+        title="岗位",
+        visible_text="岗位职责：" + "开发 Agent。" * 80,
+        content_hash="a" * 64,
+    )
+    list_only = FetchPublicJobPageOutput(
+        artifact_id="b",
+        source_url="https://jobs.example/b",
+        title="岗位列表",
+        visible_text="岗位列表：" + "职位卡片 " * 80,
+        content_hash="b" * 64,
+    )
+    shell = FetchPublicJobPageOutput(
+        artifact_id="c",
+        source_url="https://jobs.example/c",
+        title="招聘",
+        visible_text="Loading...",
+        content_hash="c" * 64,
+    )
+    empty = FetchPublicJobPageOutput(
+        artifact_id="d",
+        source_url="https://jobs.example/d",
+        title=None,
+        visible_text="",
+        content_hash="d" * 64,
+    )
+
+    assert (complete.quality, list_only.quality, shell.quality, empty.quality) == (
+        "jd_complete",
+        "list_only",
+        "js_shell",
+        "empty",
+    )
+    assert complete.quality_signal == "jd_section_marker"
+    assert list_only.quality_signal == "list_marker_without_jd_section"
+
+    homepage = FetchPublicJobPageOutput(
+        artifact_id="e",
+        source_url="https://careers.example/",
+        title="招聘首页",
+        visible_text="招聘首页 浏览岗位 公司介绍 联系我们 " * 80,
+        content_hash="e" * 64,
+    )
+    assert homepage.quality == "list_only"
+    assert homepage.quality_signal == "usable_text_without_jd_section"
+
+
 def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) -> None:
     """Executor receives source-backed text, not a model-generated JD claim."""
     monkeypatch.setattr(
@@ -302,6 +352,32 @@ def test_search_public_job_pages_filters_safe_links_that_are_not_job_results(mon
     result = search_public_job_pages(
         ToolContext(user_id="user-a", run_id="run-a"),
         SearchPublicJobPagesInput(query="AI Agent 应用开发 官方招聘", max_results=5),
+    )
+
+    assert result.results == []
+
+
+def test_search_public_job_pages_rejects_a_recruiting_homepage(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text=(
+                '<li class="b_algo"><h2><a href="https://careers.example/">'
+                "Careers - Frontend Engineer</a></h2><p>招聘职位</p></li>"
+            ),
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        SearchPublicJobPagesInput(query="Frontend Engineer careers", max_results=5),
     )
 
     assert result.results == []

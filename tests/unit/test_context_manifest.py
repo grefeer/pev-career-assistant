@@ -266,13 +266,11 @@ def test_executor_instruction_preserved_after_header_strip() -> None:
 
     # Verify key rule phrases still exist (sanity check that content is preserved)
     key_phrases = [
-        "Never re-fetch a URL",
-        "duplicate_tool_call",
-        "Hard stop: after 3 consecutive fetch attempts",
-        "tool_skill_forbidden",
-        "The 'complete' decision",
+        "generic Planner-Executor-Verifier runtime",
+        "advertised tools",
+        "typed step inputs",
+        "tool-backed observations",
         "needs_user",
-        "校招内推汇总表",
     ]
     for phrase in key_phrases:
         assert phrase in stripped, f"Missing phrase: {phrase}"
@@ -292,14 +290,10 @@ def test_planner_instruction_preserved_after_header_strip() -> None:
     stripped = _strip_headers(sectioned)
 
     key_phrases = [
-        "one separate step per requested deliverable",
-        "allowed_skills",
-        "job-discovery",
-        "job-matching",
-        "resume-tailoring",
-        "career-planning",
-        "confirmed profile fact fields",
-        "校招内推汇总表",
+        "generic Planner-Executor-Verifier runtime",
+        "outcome-based plan",
+        "typed inputs, outputs, and dependencies",
+        "activated Skill instructions",
     ]
     for phrase in key_phrases:
         assert phrase in stripped, f"Missing phrase: {phrase}"
@@ -316,11 +310,10 @@ def test_verifier_instruction_preserved_after_header_strip() -> None:
     stripped = _strip_headers(sectioned)
 
     key_phrases = [
-        "Independently inspect the planned success criteria",
-        "Do not treat an Executor claim as evidence",
-        "match-observed-jobs",
-        "build-resume-tailoring-brief",
-        "build-preparation-plan",
+        "generic Planner-Executor-Verifier runtime",
+        "step contract",
+        "tool observations",
+        "persisted artifact references",
         "RETRY_EXECUTOR",
     ]
     for phrase in key_phrases:

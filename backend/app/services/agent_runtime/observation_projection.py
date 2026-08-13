@@ -94,11 +94,34 @@ def detail_for_decision(detail: dict[str, Any]) -> dict[str, Any]:
         for candidate in candidates
         if isinstance(candidate, dict) and isinstance(candidate.get("title"), str)
     ] if isinstance(candidates, list) else []
-    return {
+    projected = {
         key: detail[key]
-        for key in ("source_artifact_id", "source_url", "content_hash")
+        for key in (
+            "artifact_id", "candidate_id", "source_artifact_id",
+            "source_url", "content_hash",
+        )
         if key in detail
     } | {"candidate_titles": titles}
+    # Keep bounded candidate references so later turns can select the same
+    # evidence without replaying the page body.
+    if isinstance(candidates, list):
+        refs = []
+        for candidate in candidates[:_MAX_PROJECTED_ITEMS]:
+            if not isinstance(candidate, dict):
+                continue
+            ref = {
+                key: candidate[key]
+                for key in (
+                    "artifact_id", "candidate_id", "source_artifact_id",
+                    "source_url", "content_hash",
+                )
+                if isinstance(candidate.get(key), str)
+            }
+            if ref:
+                refs.append(ref)
+        if refs:
+            projected["candidate_refs"] = refs
+    return projected
 
 
 def summarize_observations(
@@ -152,7 +175,10 @@ def _summarize_observation(observation: dict[str, Any]) -> dict[str, Any]:
             summary[key] = value
     output = observation.get("output")
     if isinstance(output, dict):
-        for key in ("source_url", "content_hash"):
+        for key in (
+            "artifact_id", "candidate_id", "source_artifact_id",
+            "source_url", "content_hash",
+        ):
             value = output.get(key)
             if isinstance(value, str):
                 summary[key] = value

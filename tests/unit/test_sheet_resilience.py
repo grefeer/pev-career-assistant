@@ -317,6 +317,38 @@ def test_executor_dedups_identical_reissue_after_stable_failure_without_waste() 
     ]
 
 
+def test_executor_circuit_breaks_different_payloads_after_sheet_outage() -> None:
+    """Changing sheet keywords cannot bypass a run-wide quota outage."""
+    invocations = {"count": 0}
+
+    def rate_limited_handler(_context, _payload):
+        invocations["count"] += 1
+        raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
+
+    gateway = ScriptedGateway(
+        [
+            {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
+            {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "腾讯"}},
+        ]
+    )
+    task = _discovery_task()
+    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler)).run(
+        task=task,
+        plan=_single_step_plan(task),
+        step=_single_step_plan(task).steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(2),
+    )
+
+    assert result.status == "needs_user"
+    assert invocations["count"] == 1
+    assert [obs.error_code for obs in result.observations] == [
+        "sheet_rate_limited",
+        "source_unavailable",
+    ]
+    assert result.execution_state["unavailable_tools"] == ["query-sheet"]
+
+
 def test_executor_dedups_identical_reissue_after_unknown_tool_failure() -> None:
     """unknown_tool is a stable failure: its identical re-issue is deduped."""
     gateway = ScriptedGateway(

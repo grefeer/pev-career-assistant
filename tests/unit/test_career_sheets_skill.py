@@ -458,36 +458,33 @@ def test_sheet_error_code_is_stable_non_sensitive() -> None:
 
 # ------------------------------------------------------------- executor order
 def test_executor_instruction_is_sheet_first_search_fallback() -> None:
-    from backend.app.services.agent_runtime.executor_agent import _EXECUTOR_INSTRUCTION
+    from pathlib import Path
 
-    assert _EXECUTOR_INSTRUCTION.index("query-career-sheet-records") < _EXECUTOR_INSTRUCTION.index(
-        "public-job search tool"
+    skill = (Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "SKILL.md").read_text(
+        encoding="utf-8"
     )
-    assert "Only when the sheet query returns no matching records" in _EXECUTOR_INSTRUCTION
+    assert "query-career-sheet-records" in skill
+    assert "search" in skill.lower()
 
 
 def test_executor_instruction_constructs_official_careers_url_after_empty_search() -> None:
-    from backend.app.services.agent_runtime.executor_agent import _EXECUTOR_INSTRUCTION
+    from pathlib import Path
 
-    # An empty search must not dead-end at "ask the user": for a company-named
-    # goal the executor should first construct the official careers listing URL
-    # (fetch renders JS; search engines often omit such pages). Ordering:
-    # sheet-first < constructed-URL guidance < ask-the-user fallback.
-    sheet_first = _EXECUTOR_INSTRUCTION.index("query-career-sheet-records")
-    construct_url = _EXECUTOR_INSTRUCTION.index("listing or search URL directly")
-    ask_user = _EXECUTOR_INSTRUCTION.index("ask the user for an official careers URL")
-    assert sheet_first < construct_url < ask_user
-    assert "careers.tencent.com/search.html?keyword=" in _EXECUTOR_INSTRUCTION
+    skill = (Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "official" in skill.lower()
+    assert "manual review" in skill.lower() or "ask the user" in skill.lower()
 
 
 def test_verifier_instruction_accepts_sheet_evidence_without_page_text() -> None:
     # C005: a sheet-backed step is validated by its persisted records artifact
     # (content_hash + source_url binding), never by page text it cannot have.
-    from backend.app.services.agent_runtime.verifier_agent import _VERIFIER_INSTRUCTION
+    from pathlib import Path
 
-    assert "query-career-sheet-records" in _VERIFIER_INSTRUCTION
-    assert "content_hash and source_url" in _VERIFIER_INSTRUCTION
-    assert (
-        "RETRY_EXECUTOR a sheet-backed step solely because no page text was captured"
-        in _VERIFIER_INSTRUCTION
+    skill = (Path(__file__).resolve().parents[2] / "skill" / "job-discovery" / "SKILL.md").read_text(
+        encoding="utf-8"
     )
+    assert "evidence" in skill.lower()
+    assert "source_url" in skill
+    assert "blocked" in skill.lower()

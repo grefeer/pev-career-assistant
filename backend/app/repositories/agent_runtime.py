@@ -391,6 +391,16 @@ def count_turns(db: Session, run_id: str) -> int:
     return int(db.scalar(select(func.count()).where(AgentTurn.run_id == run_id)) or 0)
 
 
+def model_usage_totals(db: Session, run_id: str) -> tuple[int, int, int]:
+    """Return durable model request count and measured input/output tokens."""
+    rows = db.scalars(select(AgentTurn).where(AgentTurn.run_id == run_id)).all()
+    return (
+        len(rows),
+        sum(turn.input_tokens or 0 for turn in rows),
+        sum(turn.output_tokens or 0 for turn in rows),
+    )
+
+
 def count_tool_decisions(db: Session, run_id: str) -> int:
     """Count persisted Agent-selected tool calls without database-specific JSON SQL."""
     return sum(

@@ -52,6 +52,9 @@ def build_adaptive_agent_budget(settings: Settings, allowed_skills: list[str]) -
         max_tool_calls=settings.agent_harness_max_tool_calls,
         max_replans=settings.agent_harness_max_replans,
         max_wall_clock_seconds=settings.agent_harness_max_wall_clock_seconds,
+        max_model_requests=settings.agent_harness_max_model_requests,
+        max_input_tokens=settings.agent_harness_max_input_tokens,
+        max_output_tokens=settings.agent_harness_max_output_tokens,
     )
 
 

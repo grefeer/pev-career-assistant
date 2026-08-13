@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 from typing import Any, Protocol, TypeVar
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -12,6 +13,7 @@ from pydantic import BaseModel
 
 from backend.app.config import Settings
 from backend.app.domain.agent_runtime import AgentRole
+from backend.app.services.agent_runtime.prompt_rules import json_repair_rules
 
 logger = logging.getLogger(__name__)
 
@@ -185,10 +187,11 @@ class LangChainModelGateway:
                 except Exception:  # noqa: BLE001 - fall through to model retry.
                     logger.warning(
                         "gateway stage1 raw unrecoverable; role=%s model=%s "
-                        "content=%r",
+                        "content_sha256=%s chars=%d",
                         role.value,
                         response_model.__name__,
-                        raw_content[:2000],
+                        _content_fingerprint(raw_content),
+                        len(raw_content),
                     )
             try:
                 return self._decide_with_local_json_retry(
@@ -238,7 +241,8 @@ class LangChainModelGateway:
                                 "object matching the requested schema. Return "
                                 "ONLY a single JSON object: no prose before or "
                                 "after it, no extra fields, no trailing "
-                                "punctuation."
+                                "punctuation. "
+                                + json_repair_rules(role.value)
                             )
                         ),
                     ]
@@ -263,7 +267,8 @@ class LangChainModelGateway:
                 content=(
                     "Return only one JSON object matching this schema exactly: "
                     f"{json.dumps(response_model.model_json_schema(), ensure_ascii=False)} "
-                    f"{_role_action_contract(role)}"
+                    f"{_role_action_contract(role)} "
+                    f"{json_repair_rules(role.value)}"
                 )
             ),
         ]
@@ -279,10 +284,12 @@ class LangChainModelGateway:
             return _parse_and_validate(content, response_model)
         except Exception as exc:  # noqa: BLE001 - untrusted model content.
             logger.warning(
-                "gateway local-json parse failed; role=%s model=%s content=%r",
+                "gateway local-json parse failed; role=%s model=%s "
+                "content_sha256=%s chars=%d",
                 role.value,
                 response_model.__name__,
-                content[:2000],
+                _content_fingerprint(content),
+                len(content),
             )
             raise AgentModelGatewayError("invalid_model_response") from exc
 
@@ -322,6 +329,11 @@ def _response_format_unavailable(error: Exception) -> bool:
     return "response_format" in message and (
         "unavailable" in message or "not supported" in message
     )
+
+
+def _content_fingerprint(content: str) -> str:
+    """Return an audit-safe fingerprint without retaining model/user text."""
+    return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def _strip_json_fence(content: str) -> str:
@@ -382,7 +394,7 @@ def _coerce_response_fields(
     """
     if not isinstance(data, dict):
         return data
-    schema_fields = response_model.model_json_schema().get("properties", {})
+    schema_fields = _response_schema_fields(response_model)
     if len(data) == 1:
         only_key, only_value = next(iter(data.items()))
         if only_key not in schema_fields and isinstance(only_value, dict):
@@ -406,7 +418,56 @@ def _coerce_response_fields(
             for index, step in enumerate(steps):
                 if isinstance(step, dict) and not step.get("step_id"):
                     step["step_id"] = f"step-{index + 1}"
+                if not isinstance(step, dict):
+                    continue
+                # A model often declares an artifact input's source step but
+                # omits the duplicated DAG edge. This is a deterministic,
+                # lossless normalization: only an explicit ``from_step`` can
+                # be promoted into ``depends_on``; unknown sources still fail
+                # the PlanStep/ExecutionPlan validators.
+                dependencies = step.setdefault("depends_on", [])
+                if not isinstance(dependencies, list):
+                    continue
+                inputs = step.get("inputs", [])
+                if isinstance(inputs, list):
+                    for input_ref in inputs:
+                        if not isinstance(input_ref, dict):
+                            continue
+                        source = input_ref.get("from_step")
+                        if (
+                            input_ref.get("kind") == "artifact"
+                            and isinstance(source, str)
+                            and source.strip()
+                            and source not in dependencies
+                        ):
+                            dependencies.append(source)
     return data
+
+
+def _response_schema_fields(response_model: type[BaseModel]) -> dict[str, object]:
+    """Return the union of top-level fields for flat and discriminated models.
+
+    The gateway's tolerant provider repair predates the discriminated RootModel
+    decisions.  A RootModel intentionally exposes ``oneOf`` instead of a
+    top-level ``properties`` object, so repair must inspect each branch without
+    weakening the actual Pydantic validation that follows.
+    """
+    schema = response_model.model_json_schema()
+    properties = dict(schema.get("properties", {}))
+    definitions = schema.get("$defs", {})
+    for branch in schema.get("oneOf", []):
+        if not isinstance(branch, dict):
+            continue
+        resolved = branch
+        reference = branch.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            candidate = definitions.get(reference.rsplit("/", 1)[-1])
+            if isinstance(candidate, dict):
+                resolved = candidate
+        branch_properties = resolved.get("properties", {})
+        if isinstance(branch_properties, dict):
+            properties.update(branch_properties)
+    return properties
 
 
 def _parse_and_validate(
@@ -482,7 +543,9 @@ def build_agent_chat_model(
 
 def build_agent_model_gateway(settings: Settings) -> LangChainModelGateway:
     """Build the live OpenAI-compatible decision provider for all three roles."""
-    model, structured_method = build_agent_chat_model(settings)
+    model, structured_method = build_agent_chat_model(
+        settings, max_tokens=settings.agent_harness_model_max_output_tokens
+    )
     return LangChainModelGateway(
         model,
         prefer_local_json_validation=False,

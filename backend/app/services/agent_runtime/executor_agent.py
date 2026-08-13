@@ -8,9 +8,18 @@ import logging
 import re
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.model_budget import (
+    ModelCallBudget,
+    estimate_input_tokens,
+)
+from backend.app.services.agent_runtime.prompt_rules import (
+    COMMON_RUNTIME_RULES,
+    EXECUTOR_RUNTIME_RULES,
+)
 from backend.app.services.agent_runtime.observation_projection import (
     observation_for_decision,
     record_observation,
@@ -24,6 +33,7 @@ from backend.app.services.agent_runtime.schemas import (
     PlanStep,
     ToolObservation,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
@@ -36,158 +46,29 @@ from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 logger = logging.getLogger(__name__)
 
+# Generic runtime prompt. Career-specific capture, matching, tailoring, and
+# planning rules live in canonical ``skill/*/SKILL.md`` packages.
 _EXECUTOR_INSTRUCTION = (
     "## 角色\n"
-    "You are the Executor Agent. Work toward the current planned outcome using "
-    "only its permitted Skills. Observe every tool result, including failures, "
-    "and independently select the next allowed action. Do not claim an artifact "
-    "that is absent from observations; ask the user if the goal cannot proceed. "
-    "Do not complete a planned outcome until its stated success criteria and all "
-    "user-requested deliverables assigned to this step have tool-backed results; "
-    "if evidence cannot support one, state the limitation rather than silently "
-    "omitting it. "
-    "\n## 行为规则\n"
-    "Already-succeeded calls are listed in `already_succeeded_calls` in the "
-    "decision state. Do NOT re-invoke a (tool, input) you already succeeded "
-    "with - reuse its prior observation. Re-calling a succeeded tool wastes a "
-    "turn and counts toward the waste limit: after 3 total wasted turns "
-    "(duplicates, blocked searches, or failed calls) the step is handed to "
-    "the user. "
-    "When context supplies candidate_urls, treat them as a finite candidate set: "
-    "prefer fetch-public-job-pages to capture the set in one bounded observation; "
-    "otherwise fetch each unique URL at most once, then use the observed artifact IDs to "
-    "extract structured details and move to the next requested Skill. Never "
-    "re-fetch a URL that is already represented by a successful observation. "
-    "Once all supplied candidates have been observed, choose extraction, matching, "
-    "tailoring, planning, verification, or a truthful limitation; do not keep "
-    "fetching pages. Structured extraction is an enhancement for human-readable "
-    "JD normalization, not a prerequisite: match-observed-jobs, "
-    "build-resume-tailoring-brief, and build-preparation-plan operate on the "
-    "observed page text itself and accept any observed artifact as target. When "
-    "extraction returns no structured candidates (for example a card-list page "
-    "whose entries are not normalized), still proceed with matching, tailoring, "
-    "or planning on the raw observed text and note the extraction limitation in "
-    "your summary. Only when the observed page text itself contains no job "
-    "information at all (empty, blocked, or irrelevant page) may you state the "
-    "limitation and ask the user for a more specific job-page URL. "
-    "When candidate_urls is non-empty, do not call public search while any "
-    "candidate URL remains unfailed: the candidate set is already user-provided "
-    "evidence to process. Public search is authorized ONLY after EVERY candidate "
-    "URL has failed to produce usable evidence (fetch error, empty/shell page, "
-    "or a dead-link/offline page); a partial failure never authorizes search. "
-    "When multiple observed public-page artifacts need detailed JD normalization, "
-    "prefer extract-observed-job-details-batch so one evidence-bound tool result "
-    "covers the finite set. "
-    "\n## 流程\n"
-    "When a job-discovery task has no supplied URL, or the goal refers to the "
-    "recruitment data source by name (校招内推汇总表/内推台账/招聘数据源/就业信息网), "
-    "first call query-career-sheet-records with the recency window stated in "
-    "the goal and at most location or company keywords. Do NOT pass role or "
-    "position keywords: the sheet stores companies, not roles, so role terms "
-    "would filter out every company. When it returns records, fetch each "
-    "company's apply_url with fetch-public-job-pages (each unique URL at most "
-    "once) and look for matching roles inside the fetched pages; if a page "
-    "yields no usable job text, note it and move on - never re-fetch a URL "
-    "and never issue a fetch with an empty URL list. "
-    "Only when the sheet query returns no matching records may you use the "
-    "public-job search tool; then independently select a returned direct URL "
-    "for evidence capture. Use the user's language and role terms when forming "
-    "a search query (Chinese goals need Chinese recruitment terms). After one "
-    "search observation, prefer fetching a plausible returned result; retry a "
-    "search at most once only when no plausible public career URL was returned. "
-    "Do not loop through search-provider or job-board domain variations without "
-    "capturing evidence. A search observation with an empty results list is a "
-    "verified provider limitation: do not search again; when the goal names a "
-    "company with a known official careers site, construct and fetch that site's "
-    "listing or search URL directly (for example careers.tencent.com/search.html?keyword=<role terms>), "
-    "because fetch renders JavaScript while search engines often omit such "
-    "listing pages; only when no official careers URL can be formed, or it yields "
-    "no usable JD, ask the user for an official careers URL or relax the source "
-    "constraint. If a fetched "
-    "page does not contain a usable JD, state that evidence limitation and choose "
-    "a different returned direct URL at most once before asking the user. "
-    "When verifier_feedback is present, the Verifier found a tool-backed "
-    "deliverable missing from the prior attempt for this same step. The "
-    "missing deliverable is named in feedback. Call that named tool next, "
-    "reusing the observed public evidence that prior_observations already "
-    "captured; do not repeat a discovery tool (fetch/extract/search) whose "
-    "result already appears in prior_observations, and do not re-fetch a URL "
-    "that prior_observations already observed. "
-    "A duplicate_tool_call observation means you just re-issued an identical "
-    "tool call that already succeeded: that result is already in observations. "
-    "Move to the next distinct action (extract, match, tailor, plan, verify, or "
-    "complete) instead of repeating the same call. A repeated fetch or extract "
-    "cannot improve the evidence: if the observed page text itself contains no "
-    "usable job information, ask the user instead of re-running capture tools; "
-    "when the page text is usable but structured extraction produced nothing, "
-    "proceed with matching, tailoring, or planning on the raw observed text "
-    "instead of extracting again. If verifier_feedback "
-    "names a deliverable that this step's permitted Skills cannot produce, "
-    "state that limitation and ask the user for the specific missing input "
-    "rather than re-running capture tools. "
-    "\n## 输出契约\n"
-    "The 'complete' decision ends the step as succeeded. Use it only when "
-    "(1) the step's success criteria are met with tool-backed results, or "
-    "(2) you exhausted every allowed path and deliver an honest, "
-    "evidence-grounded negative finding as the final result (for example, "
-    "every permitted source was searched and none matches the goal). When the "
-    "path is blocked (login/captcha/anti-bot, which must never be "
-    "circumvented) or you need something from the user (a specific URL, a JD, "
-    "permission to relax a constraint) to proceed, decide 'needs_user' with a "
-    "clear question. Never decide 'complete' while your own summary asks the "
-    "user a question. If your final summary asks the user to provide "
-    "anything, to paste a link, or to relax a constraint, the decision must be "
-    "'needs_user', never 'complete'. 'complete' is reserved for delivering the "
-    "step's final result, not for reporting a handoff. A summary that reports "
-    "tool failure, a blocked page (login/captcha/anti-bot), or that the "
-    "evidence could not be captured is not a completed negative finding: when "
-    "evidence acquisition failed or was blocked, decide 'needs_user' and "
-    "state what input would unblock it. 'complete' with a negative finding is "
-    "allowed only when the searches and queries themselves executed "
-    "successfully and returned no matching results (an empty-result finding), "
-    "never when the tools failed or the pages were blocked. "
-    "A deliverable produced by its tool is tool-backed even when the "
-    "underlying evidence is imperfect (for example a card-list page without "
-    "full JD 职责/要求 bodies). After the requested deliverable(s) have been "
-    "produced by their tools, do not ask the user for a fuller JD, a "
-    "detail-page URL, or any other extra input: deliver the result, note the "
-    "evidence limitation inside the summary, and decide 'complete'. needs_user "
-    "is for missing inputs that block a deliverable from being produced at "
-    "all, not for improving already-produced evidence. "
-    "\n## 禁止项\n"
-    "A discovery step must not issue more than 3 search observations in "
-    "total, no matter how the query differs. The fourth search call is "
-    "forbidden: after the third search observation, either fetch one returned "
-    "URL or decide 'needs_user'/'complete'; never search again. "
-    "A fetch counts as no-progress when its page text contains no job "
-    "information (only navigation, footer, or a shell), even though the tool "
-    "returned success: treat it exactly like a failed fetch for the hard-stop "
-    "rule, and after 3 consecutive no-progress fetches stop fetching "
-    "entirely. Many real career pages (SPA login walls, JS-loaded lists) "
-    "return 'success' with no usable content; re-fetching or searching "
-    "further cannot change that. "
-    "Never loop over pages one fetch at a time: when several URLs need "
-    "capture, use fetch-public-job-pages or extract-observed-job-details-batch "
-    "so one bounded observation covers the set. A page that yields no usable "
-    "JD (insufficient content, blocked, or irrelevant) is a dead end: do not "
-    "re-fetch it, and do not keep fetching further speculative URLs after the "
-    "plausible candidates have been observed. If all plausible candidates were "
-    "observed without capturing valid evidence, decide 'needs_user' with an "
-    "honest summary instead of continuing to fetch. "
-    "Hard stop: after 3 consecutive fetch attempts that fail or yield no "
-    "usable job text, stop fetching entirely - no further speculative fetches "
-    "and no retrying a failed URL, regardless of how many candidates remain. "
-    "Complete the step with an honest negative finding (if the searches and "
-    "queries themselves succeeded but returned nothing) or decide 'needs_user' "
-    "with the evidence limitation stated. A query-career-sheet-records call "
-    "that returned 0 records will not change when re-issued with the same "
-    "parameters: never retry a sheet query identically; switch to the "
-    "public search tool instead. "
-    "A tool_skill_forbidden observation means the current step's Skill scope "
-    "permanently excludes that tool; retrying it cannot succeed. Do not retry "
-    "the forbidden tool. Produce the deliverable with a tool allowed in this "
-    "step, or decide 'needs_user' and explain what input would unblock the "
-    "step."
+    "You are the Executor role in a generic Planner-Executor-Verifier runtime.\n"
+    "## 行为规则\n"
+    "Work only toward the current step, use only advertised tools and Skill "
+    "authority, inspect every observation, reuse successful calls, do not repeat a "
+    "doomed call, honor typed step inputs and prior artifacts, and use confirmed "
+    "private context when the activated Skill exposes it instead of asking the user "
+    "to repeat server-held facts.\n"
+    "## 流程\n"
+    "Never claim an artifact absent from tool-backed observations. If evidence is "
+    "blocked or a required input is unavailable, return a precise needs_user handoff.\n"
+    "## 输出契约\n"
+    "Choose complete only when the activated Skill contract and the step success "
+    "criteria are satisfied.\n"
+    "## 禁止项\n"
+    "Do not invent evidence, bypass access controls, or perform an irreversible "
+    "external action."
+    "\n\n"
+    + COMMON_RUNTIME_RULES
+    + EXECUTOR_RUNTIME_RULES
 )
 
 # The executor is allowed a few identical re-issues before the harness
@@ -225,21 +106,38 @@ _STABLE_FAILURE_ERROR_CODES = frozenset(
         "tool_skill_forbidden",
         "unknown_tool",
         "invalid_tool_input",
+        "route_already_consumed",
     }
 )
 
-# Per-URL failure codes that prove a user-supplied candidate URL is dead or
-# unusable as evidence: transport failure, empty/shell page, and the soft-404
-# dead-link verdict. Public search becomes authorized only when EVERY
-# candidate URL has failed this way (W2). Blocked codes (login_required,
-# captcha, anti_bot) are deliberately absent: a blocked candidate must never
-# authorize search -- the security hard gate keeps its behavior.
+# Once a source route has declared a run-wide outage (for example the daily
+# smartsheet quota), changing query parameters cannot make that same route
+# healthy.  Persist these names across verifier retries so the model can only
+# choose an actual fallback route, never burn calls on a different payload.
+_RUN_WIDE_UNAVAILABLE_CODES = frozenset(
+    {
+        "sheet_rate_limited",
+        "sheet_call_failed",
+        "sheet_bridge_unavailable",
+        "route_already_consumed",
+    }
+)
+
+# Per-URL failure codes that make a user-supplied candidate unusable for this
+# run.  Access-blocked candidates are included deliberately: search fallback
+# is safe only after the blocked domain is added to the run circuit breaker,
+# which prevents the fallback from selecting the same blocked host again.
 _CANDIDATE_FAILURE_ERROR_CODES = frozenset(
     {
         "public_fetch_failed",
         "empty_public_page",
         "public_page_content_insufficient",
         "dead_link",
+        "anti_bot_challenge",
+        "access_denied",
+        "login_required",
+        "captcha",
+        "domain_temporarily_blocked",
     }
 )
 
@@ -248,6 +146,12 @@ _CANDIDATE_FAILURE_ERROR_CODES = frozenset(
 # verifier RETRY through the merged observations), single fetches are
 # attributed in-flight from the decision payload.
 _FETCH_TOOL_NAMES = frozenset({"fetch-public-job-pages", "fetch-public-job-page"})
+
+# Dynamic listing pages may return a fresh content hash on every request even
+# when no new job evidence was produced.  Bound repeated successful attempts
+# to the same route so changing query parameters cannot consume the whole
+# wall-clock budget.  A batch containing a genuinely new route remains legal.
+_MAX_SUCCESSFUL_FETCH_ATTEMPTS_PER_ROUTE = 4
 
 # Verifier-feedback fragments name the missing deliverable's tool. Fragments
 # naming a tool outside this step's skill scope cannot be honored by any
@@ -291,6 +195,10 @@ _DUPLICATE_STALL_QUESTION = (
 _TOTAL_WASTE_QUESTION = (
     "累计多次无效或重复的工具调用未取得进展，无法继续自动完成该步骤。"
     "请人工确认当前产出，或补充缺失的岗位页面/信息后重试。"
+)
+_SOURCE_UNAVAILABLE_QUESTION = (
+    "一个招聘来源在本次运行中已确认不可用，继续更换参数也不会恢复。"
+    "请使用其他公开来源，或提供可访问的岗位页面/文本后重试。"
 )
 
 
@@ -393,6 +301,30 @@ def _load_stable_failed_calls(task: AgentTaskRequest) -> list[dict[str, str]]:
     return prior
 
 
+def _validation_signature(error_message: str | None) -> str | None:
+    """Return a stable field/type signature without retaining submitted data."""
+    if not isinstance(error_message, str):
+        return None
+    matches = re.findall(r"([A-Za-z_][A-Za-z0-9_.]*):\s*([a-z][a-z0-9_]*)", error_message)
+    if not matches:
+        return None
+    return ";".join(f"{field}:{error_type}" for field, error_type in matches[:4])
+
+
+def _load_invalid_input_signatures(task: AgentTaskRequest) -> list[str]:
+    raw = (task.execution_state or {}).get("invalid_input_signatures", [])
+    if not isinstance(raw, list):
+        return []
+    return [value for value in raw if isinstance(value, str) and value][:20]
+
+
+def _load_unavailable_tools(task: AgentTaskRequest) -> set[str]:
+    raw = (task.execution_state or {}).get("unavailable_tools", [])
+    if not isinstance(raw, list):
+        return set()
+    return {value for value in raw if isinstance(value, str) and value}
+
+
 def _snapshot_execution_state(
     *,
     succeeded_calls: list[tuple[str, dict[str, Any]]],
@@ -402,6 +334,14 @@ def _snapshot_execution_state(
     stable_failed_calls: list[tuple[str, dict[str, Any]]] | None = None,
     prior_stable_failed_calls: list[dict[str, str]] | None = None,
     failed_candidate_urls: set[str] | None = None,
+    phase: str = "discover",
+    candidate_status: str = "unknown",
+    last_error_fingerprint: str | None = None,
+    terminal_reason: str | None = None,
+    blocked_public_domains: list[str] | None = None,
+    public_search_query_hashes: list[str] | None = None,
+    invalid_input_signatures: list[str] | None = None,
+    unavailable_tools: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     """Persistable execution state carried across verifier RETRY re-invocations.
 
@@ -440,6 +380,80 @@ def _snapshot_execution_state(
         "consecutive_stalls": consecutive_stalls,
         "total_wasted_turns": total_wasted_turns,
         "failed_candidate_urls": sorted(failed_candidate_urls or set()),
+        "progress_ledger": {
+            "phase": phase,
+            "candidate_status": candidate_status,
+            "last_error_fingerprint": last_error_fingerprint,
+            "terminal_reason": terminal_reason,
+        },
+        "blocked_public_domains": sorted(
+            domain for domain in (blocked_public_domains or [])
+            if isinstance(domain, str) and domain
+        ),
+        "public_search_query_hashes": sorted(
+            value for value in (public_search_query_hashes or [])
+            if isinstance(value, str) and value
+        ),
+        "invalid_input_signatures": list(dict.fromkeys(
+            value for value in (invalid_input_signatures or [])
+            if isinstance(value, str) and value
+        ))[-20:],
+        "unavailable_tools": sorted(
+            value for value in (unavailable_tools or [])
+            if isinstance(value, str) and value
+        ),
+    }
+
+
+def _progress_ledger(
+    observations: list[ToolObservation],
+    *,
+    total_wasted_turns: int,
+    candidate_urls: set[str],
+    failed_candidate_urls: set[str],
+) -> dict[str, object]:
+    """Expose a small typed progress summary instead of raw counters alone."""
+    last_failure = next(
+        (
+            f"{observation.tool_name}:{observation.error_code}"
+            for observation in reversed(observations)
+            if observation.status == "failed" and observation.error_code
+        ),
+        None,
+    )
+    if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+        terminal_reason = "no_progress"
+    elif last_failure in {
+        "fetch-public-job-pages:anti_bot_challenge",
+        "fetch-public-job-page:anti_bot_challenge",
+        "query-career-sheet-records:sheet_rate_limited",
+        "query-career-sheet-records:sheet_call_failed",
+        "query-career-sheet-records:sheet_bridge_unavailable",
+        "query-career-sheet-records:source_unavailable",
+    }:
+        terminal_reason = "external_blocked"
+    else:
+        terminal_reason = None
+    if candidate_urls and candidate_urls.issubset(failed_candidate_urls):
+        candidate_status = "all_unusable"
+    elif candidate_urls & failed_candidate_urls:
+        candidate_status = "partially_processed"
+    elif candidate_urls:
+        candidate_status = "supplied"
+    else:
+        candidate_status = "unknown"
+    tool_names = {observation.tool_name for observation in observations}
+    phase = (
+        "deliver" if "match-observed-jobs" in tool_names
+        else "extract" if any("extract" in name for name in tool_names)
+        else "capture" if any("fetch" in name for name in tool_names)
+        else "discover"
+    )
+    return {
+        "phase": phase,
+        "candidate_status": candidate_status,
+        "last_error_fingerprint": last_failure,
+        "terminal_reason": terminal_reason,
     }
 
 
@@ -453,9 +467,16 @@ def _candidate_search_is_authorized(
 class ExecutorAgent:
     """Bounded perceive–decide–act–observe loop for a single plan step."""
 
-    def __init__(self, *, gateway: AgentModelGateway, tools: ToolRegistry) -> None:
+    def __init__(
+        self,
+        *,
+        gateway: AgentModelGateway,
+        tools: ToolRegistry,
+        skills: SkillRegistry | None = None,
+    ) -> None:
         self._gateway = gateway
         self._tools = tools
+        self._skills = skills
 
     def _scoped_out_tool_names(self, allowed_skills: frozenset[str]) -> frozenset[str]:
         """Tool names this step's skill scope can never invoke.
@@ -490,6 +511,7 @@ class ExecutorAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        model_budget: ModelCallBudget | None = None,
         deadline: float | None = None,
         prior_observations: list[ToolObservation] | None = None,
     ) -> ExecutorResult:
@@ -527,9 +549,17 @@ class ExecutorAgent:
         prior_stable_failed_hashes = {
             (entry["tool"], entry["hash"]) for entry in prior_stable_failed_calls
         }
+        invalid_input_signatures = _load_invalid_input_signatures(task)
+        unavailable_tools = _load_unavailable_tools(task)
 
         def current_state() -> dict[str, Any]:
             """Snapshot this invocation's state for the runtime to carry on RETRY."""
+            ledger = _progress_ledger(
+                [*(prior_observations or []), *observations],
+                total_wasted_turns=total_wasted_turns,
+                candidate_urls=candidate_urls,
+                failed_candidate_urls=failed_candidate_urls,
+            )
             return _snapshot_execution_state(
                 succeeded_calls=succeeded_calls,
                 prior_succeeded_calls=prior_succeeded_calls,
@@ -538,6 +568,19 @@ class ExecutorAgent:
                 failed_candidate_urls=failed_candidate_urls,
                 consecutive_stalls=consecutive_stalls,
                 total_wasted_turns=total_wasted_turns,
+                **ledger,
+                blocked_public_domains=(
+                    context.metadata.get("blocked_public_domains", [])
+                    if isinstance(context.metadata.get("blocked_public_domains", []), list)
+                    else []
+                ),
+                public_search_query_hashes=(
+                    context.metadata.get("public_search_query_hashes", [])
+                    if isinstance(context.metadata.get("public_search_query_hashes", []), list)
+                    else []
+                ),
+                invalid_input_signatures=invalid_input_signatures,
+                unavailable_tools=unavailable_tools,
             )
         # Loop-invariant projections of the (immutable) plan/step: serialize
         # once instead of re-dumping and re-building the tool catalog every
@@ -548,6 +591,8 @@ class ExecutorAgent:
         available_tools = self._tools.tool_catalog(
             role=AgentRole.executor, allowed_skills=allowed_skills
         )
+        premature_need_user_retries = 0
+        runtime_feedback: str | None = None
         # Tools the universe exposes but this step's skill scope can never
         # call: verifier feedback naming one is filtered from the decision
         # state (W3), so a scoped-out demand can never push the executor
@@ -596,51 +641,89 @@ class ExecutorAgent:
             # every observation's identity, but the oldest ones lose their
             # visible_text/pages/details so the list stays bounded in long chains.
             summarized_observations = summarize_observations(observations_for_decision)
+            decision_state = {
+                "goal": task.goal,
+                "context": task.context,
+                "private_context": (
+                    self._skills.project_private_context(
+                        step.allowed_skills, task.private_context
+                    )
+                    if self._skills is not None
+                    else task.private_context
+                ),
+                "skill_policy": (
+                    self._skills.prompt_policy(step.allowed_skills)
+                    if self._skills is not None
+                    else ""
+                ),
+                "remaining_tool_calls": (
+                    tool_budget.remaining
+                    if tool_budget is not None
+                    else task.budget.max_tool_calls - len(observations)
+                ),
+                "remaining_agent_turns": (
+                    turn_budget.remaining
+                    if turn_budget is not None
+                    else task.budget.max_agent_turns - _turn - 1
+                ),
+                "plan": plan_json,
+                "step": step_json,
+                "available_tools": available_tools,
+                "observations": summarized_observations,
+                "prior_observations": prior_observations_for_decision,
+                "verifier_feedback": _scope_feedback_to_step_catalog(
+                    task.context.get("verifier_feedback", []),
+                    scoped_out_tool_names=scoped_out_tool_names,
+                ),
+                "already_succeeded_calls": [
+                    *[
+                        {
+                            "tool": entry["tool"],
+                            "input_summary": entry["input_summary"],
+                        }
+                        for entry in prior_succeeded_calls[-_MAX_PROJECTED_SUCCEEDED_CALLS:]
+                    ],
+                    *[
+                        _summarize_succeeded_call(name, payload)
+                        for name, payload in succeeded_calls[-_MAX_PROJECTED_SUCCEEDED_CALLS:]
+                    ],
+                ],
+                "replan_state": task.replan_state.model_dump(mode="json"),
+                "progress_ledger": _progress_ledger(
+                    [*(prior_observations or []), *observations],
+                    total_wasted_turns=total_wasted_turns,
+                    candidate_urls=candidate_urls,
+                    failed_candidate_urls=failed_candidate_urls,
+                ),
+                "invalid_input_signatures": invalid_input_signatures[-8:],
+                "unavailable_tools": sorted(unavailable_tools),
+            }
+            if runtime_feedback:
+                decision_state["runtime_feedback"] = runtime_feedback
+            if model_budget is not None and not model_budget.try_reserve(
+                estimate_input_tokens(_EXECUTOR_INSTRUCTION, decision_state)
+            ):
+                return ExecutorResult(
+                    status="failed",
+                    summary="Model budget exhausted before the next decision.",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                    execution_state=current_state(),
+                )
             decision = self._gateway.decide(
                 role=AgentRole.executor,
                 instruction=_EXECUTOR_INSTRUCTION,
-                state={
-                    "goal": task.goal,
-                    "context": task.context,
-                    "private_context": task.private_context,
-                    "remaining_tool_calls": (
-                        tool_budget.remaining if tool_budget is not None
-                        else task.budget.max_tool_calls - len(observations)
-                    ),
-                    "remaining_agent_turns": (
-                        turn_budget.remaining
-                        if turn_budget is not None
-                        else task.budget.max_agent_turns - _turn - 1
-                    ),
-                    "plan": plan_json,
-                    "step": step_json,
-                    "available_tools": available_tools,
-                    "observations": summarized_observations,
-                    "prior_observations": prior_observations_for_decision,
-                    "verifier_feedback": _scope_feedback_to_step_catalog(
-                        task.context.get("verifier_feedback", []),
-                        scoped_out_tool_names=scoped_out_tool_names,
-                    ),
-                    "already_succeeded_calls": [
-                        *[
-                            {
-                                "tool": entry["tool"],
-                                "input_summary": entry["input_summary"],
-                            }
-                            for entry in prior_succeeded_calls[
-                                -_MAX_PROJECTED_SUCCEEDED_CALLS:
-                            ]
-                        ],
-                        *[
-                            _summarize_succeeded_call(name, payload)
-                            for name, payload in succeeded_calls[
-                                -_MAX_PROJECTED_SUCCEEDED_CALLS:
-                            ]
-                        ],
-                    ],
-                },
+                state=decision_state,
                 response_model=ExecutorDecision,
             )
+            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+                return ExecutorResult(
+                    status="failed",
+                    summary="Model budget exhausted after the latest decision.",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                    execution_state=current_state(),
+                )
             if trace is not None:
                 usage = self._gateway.last_usage
                 if isinstance(usage, dict):
@@ -735,6 +818,77 @@ class ExecutorAgent:
                         ),
                     )
                     continue
+                requested_fetch_urls = set(_payload_fetch_urls(decision.tool_input))
+                fetch_observations = [*(prior_observations or []), *observations]
+                observed_fetch_urls = _observed_fetch_urls(fetch_observations)
+                observed_route_counts = _observed_fetch_route_counts(fetch_observations)
+                if (
+                    decision.tool_name in _FETCH_TOOL_NAMES
+                    and requested_fetch_urls
+                    and (
+                        requested_fetch_urls.issubset(observed_fetch_urls)
+                        or all(
+                            observed_route_counts.get(_fetch_route_key(url), 0)
+                            >= _MAX_SUCCESSFUL_FETCH_ATTEMPTS_PER_ROUTE
+                            for url in requested_fetch_urls
+                        )
+                    )
+                ):
+                    # Semantic duplicate: the payload may have different
+                    # filters, or even fresh dynamic hashes, but every
+                    # requested URL already produced sufficient evidence or
+                    # exhausted the route repetition allowance. A batch with
+                    # one genuinely new route remains executable.
+                    consecutive_stalls += 1
+                    total_wasted_turns += 1
+                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_DUPLICATE_STALL_QUESTION,
+                            execution_state=current_state(),
+                        )
+                    if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+                        return ExecutorResult(
+                            status="needs_user",
+                            observations=observations,
+                            user_question=_TOTAL_WASTE_QUESTION,
+                            execution_state=current_state(),
+                        )
+                    record_observation(
+                        observations,
+                        observations_for_decision,
+                        ToolObservation(
+                            tool_name=decision.tool_name or "",
+                            status="failed",
+                            error_code="duplicate_tool_call",
+                            error_message=(
+                                "请求中的 URL 均已成功抓取；请改用尚未处理的 URL "
+                                "或继续使用现有证据。"
+                            ),
+                        ),
+                    )
+                    continue
+                if decision.tool_name in unavailable_tools:
+                    record_observation(
+                        observations,
+                        observations_for_decision,
+                        ToolObservation(
+                            tool_name=decision.tool_name or "",
+                            status="failed",
+                            error_code="source_unavailable",
+                            error_message=(
+                                "该工具所属来源已在本次运行中熔断，"
+                                "请改用其他已授权来源。"
+                            ),
+                        ),
+                    )
+                    return ExecutorResult(
+                        status="needs_user",
+                        observations=observations,
+                        user_question=_SOURCE_UNAVAILABLE_QUESTION,
+                        execution_state=current_state(),
+                    )
                 if any(
                     decision.tool_name == name and decision.tool_input == payload
                     for name, payload in succeeded_calls
@@ -802,7 +956,44 @@ class ExecutorAgent:
                     )
                 if observation.status == "succeeded":
                     succeeded_calls.append((decision.tool_name, decision.tool_input))
+                    if (
+                        decision.tool_name == "search-public-job-pages"
+                        and isinstance(observation.output, dict)
+                        and observation.output.get("terminal_reason") == "search_empty"
+                    ):
+                        # A network-successful empty search is not progress:
+                        # expose it as bounded no-progress so the model cannot
+                        # keep inventing queries until the wall-clock budget
+                        # is exhausted.
+                        total_wasted_turns += 1
+                        if total_wasted_turns >= _MAX_TOTAL_WASTED_TURNS:
+                            return ExecutorResult(
+                                status="needs_user",
+                                observations=observations,
+                                user_question=(
+                                    "公开搜索已完成但没有找到可核验岗位页面。"
+                                    "请提供具体岗位链接或岗位文本后继续。"
+                                ),
+                                execution_state=current_state(),
+                            )
                 else:
+                    if observation.error_code in _RUN_WIDE_UNAVAILABLE_CODES:
+                        unavailable_tools.add(decision.tool_name or "")
+                    if observation.error_code == "invalid_tool_input":
+                        signature = _validation_signature(observation.error_message)
+                        if signature:
+                            invalid_input_signatures.append(signature)
+                            same_signature_count = invalid_input_signatures.count(signature)
+                            if same_signature_count >= 2:
+                                return ExecutorResult(
+                                    status="needs_user",
+                                    observations=observations,
+                                    user_question=(
+                                        "工具输入连续违反同一字段契约，自动修正未取得进展。"
+                                        "请补充该字段的合法值后重试。"
+                                    ),
+                                    execution_state=current_state(),
+                                )
                     if (
                         decision.tool_name in _FETCH_TOOL_NAMES
                         and observation.error_code in _CANDIDATE_FAILURE_ERROR_CODES
@@ -848,6 +1039,37 @@ class ExecutorAgent:
                     observations=observations,
                     execution_state=current_state(),
                 )
+            terminal_handoff_codes = {
+                "anti_bot_challenge",
+                "captcha",
+                "login_required",
+                "access_denied",
+                "domain_temporarily_blocked",
+                "source_unavailable",
+            }
+            has_terminal_handoff = any(
+                observation.error_code in terminal_handoff_codes
+                for observation in [*(prior_observations or []), *observations]
+            )
+            has_successful_observation = any(
+                observation.status == "succeeded"
+                for observation in [*(prior_observations or []), *observations]
+            )
+            if (
+                available_tools
+                and not has_terminal_handoff
+                and not has_successful_observation
+                and premature_need_user_retries < 1
+                and _turn < task.budget.max_agent_turns - 1
+            ):
+                premature_need_user_retries += 1
+                runtime_feedback = (
+                    "Policy correction: this handoff is premature because no "
+                    "terminal access block is recorded and permitted tools remain. "
+                    "Re-check observations and call one tool that can produce "
+                    "new evidence before asking the user."
+                )
+                continue
             return ExecutorResult(
                 status="needs_user",
                 observations=observations,
@@ -931,6 +1153,75 @@ def _payload_fetch_urls(tool_input: object) -> list[str]:
     return []
 
 
+def _observed_fetch_urls(observations: list[ToolObservation]) -> set[str]:
+    """Return URLs already fetched successfully in the current step.
+
+    Exact payload deduplication cannot catch a model that keeps changing
+    filters while sending the same URL batch back to a fetch tool.  The fetch
+    observation is the authoritative source for this semantic check; failed
+    or merely proposed URLs are deliberately excluded.
+    """
+    observed: set[str] = set()
+    for observation in observations:
+        if observation.status != "succeeded" or observation.tool_name not in _FETCH_TOOL_NAMES:
+            continue
+        output = observation.output
+        if not isinstance(output, dict):
+            continue
+        raw_pages = output.get("pages")
+        pages = raw_pages if isinstance(raw_pages, list) else [output]
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            for field in ("source_url", "effective_url"):
+                url = page.get(field)
+                if isinstance(url, str) and url.strip():
+                    observed.add(url.strip())
+    return observed
+
+
+def _fetch_route_key(url: str) -> str:
+    """Return a stable fetch route identity while ignoring query churn."""
+    value = url.strip()
+    parsed = urlsplit(value)
+    if parsed.netloc and parsed.path:
+        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path}"
+    return value
+
+
+def _observed_fetch_route_counts(
+    observations: list[ToolObservation],
+) -> dict[str, int]:
+    """Count successful fetch attempts by route, not volatile query string."""
+    counts: dict[str, int] = {}
+    for observation in observations:
+        if observation.status != "succeeded" or observation.tool_name not in _FETCH_TOOL_NAMES:
+            continue
+        for url in _observed_fetch_urls_from_observation(observation):
+            route = _fetch_route_key(url)
+            counts[route] = counts.get(route, 0) + 1
+    return counts
+
+
+def _observed_fetch_urls_from_observation(
+    observation: ToolObservation,
+) -> set[str]:
+    output = observation.output
+    if not isinstance(output, dict):
+        return set()
+    raw_pages = output.get("pages")
+    pages = raw_pages if isinstance(raw_pages, list) else [output]
+    urls: set[str] = set()
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        for field in ("source_url", "effective_url"):
+            value = page.get(field)
+            if isinstance(value, str) and value.strip():
+                urls.add(value.strip())
+    return urls
+
+
 def _failed_candidate_urls(
     observations: list[ToolObservation], *, candidate_urls: frozenset[str]
 ) -> set[str]:
@@ -971,12 +1262,9 @@ def _has_unfailed_candidate_urls(
 ) -> bool:
     """True when at least one candidate URL is not yet proven dead.
 
-    Public search stays forbidden while ANY candidate remains unfailed (the
-    candidate set is already user-provided evidence to process). Only when
-    every candidate has failed with a fetch/dead-link error -- or no
-    candidate was supplied at all -- may search run (W2). Blocked codes
-    (login_required/captcha/anti_bot) are not candidate failures, so a
-    blocked candidate keeps search forbidden.
+    Public search stays forbidden while ANY candidate remains usable. Once
+    every supplied candidate is dead or blocked, search may use another public
+    host; the blocked-domain circuit breaker filters the original host.
     """
     if not candidate_urls:
         return False

@@ -8,9 +8,10 @@ Agents choose a plan, a permitted Skill, and a verifier outcome.
 from __future__ import annotations
 
 import re
-from typing import Any
+from enum import StrEnum
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, RootModel, field_validator, model_validator
 
 from backend.app.domain.agent_runtime import (
     AgentRole,
@@ -19,6 +20,62 @@ from backend.app.domain.agent_runtime import (
 )
 
 _SKILL_NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
+
+
+class ReplanReason(StrEnum):
+    """Machine-readable reason for a bounded planner re-entry."""
+
+    VERIFIER_REPLAN = "verifier_replan"
+    TOOL_SCOPE_CONFLICT = "tool_scope_conflict"
+    RETRY_CONTRACT_EXHAUSTED = "retry_contract_exhausted"
+    NEED_USER_CONTRACT = "need_user_contract"
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+
+
+class ReplanState(BaseModel):
+    """Validated control state for one run's planner re-entry decisions.
+
+    Human-readable feedback remains in ``context.verifier_feedback``.  This
+    object owns only the machine state that used to be encoded by sentinel
+    strings, so prompt wording can never accidentally change control flow.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    count: int = Field(default=0, ge=0, le=10)
+    source_revision: int | None = Field(default=None, ge=1)
+    last_reason: ReplanReason | None = None
+    last_feedback: str | None = Field(default=None, max_length=2_000)
+    conversion_reasons: list[ReplanReason] = Field(default_factory=list, max_length=10)
+
+    def conversion_used(self, reason: ReplanReason) -> bool:
+        """Return whether a contract-driven conversion was already attempted."""
+        return reason in self.conversion_reasons
+
+    def requested(
+        self,
+        *,
+        reason: ReplanReason,
+        feedback: str | None,
+        source_revision: int | None,
+        count: int | None = None,
+    ) -> "ReplanState":
+        """Return the next immutable state after a replan request."""
+        conversions = list(self.conversion_reasons)
+        if reason in {
+            ReplanReason.RETRY_CONTRACT_EXHAUSTED,
+            ReplanReason.NEED_USER_CONTRACT,
+        } and reason not in conversions:
+            conversions.append(reason)
+        return self.model_copy(
+            update={
+                "count": self.count + 1 if count is None else count,
+                "source_revision": source_revision,
+                "last_reason": reason,
+                "last_feedback": feedback,
+                "conversion_reasons": conversions,
+            }
+        )
 
 
 class AgentBudget(BaseModel):
@@ -30,6 +87,11 @@ class AgentBudget(BaseModel):
     max_tool_calls: int = Field(default=24, ge=1, le=200)
     max_replans: int = Field(default=2, ge=0, le=10)
     max_wall_clock_seconds: int = Field(default=300, ge=10, le=3_600)
+    # Physical model ceilings.  Turn count limits lifecycle decisions; these
+    # limits bound provider requests and measured token consumption separately.
+    max_model_requests: int = Field(default=128, ge=1, le=500)
+    max_input_tokens: int = Field(default=1_000_000, ge=1_000, le=2_000_000)
+    max_output_tokens: int = Field(default=200_000, ge=1_000, le=500_000)
 
 
 class AgentTaskRequest(BaseModel):
@@ -46,7 +108,16 @@ class AgentTaskRequest(BaseModel):
     # counters). Excluded from serialization so it never enters model prompts
     # or persisted plan JSON.
     execution_state: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    replan_state: ReplanState = Field(default_factory=ReplanState, exclude=True)
     budget: AgentBudget = Field(default_factory=AgentBudget)
+
+    @model_validator(mode="after")
+    def load_typed_replan_state(self) -> "AgentTaskRequest":
+        """Hydrate typed control state when a run is resumed from JSON context."""
+        raw_state = self.context.get("replan_state")
+        if raw_state is not None:
+            object.__setattr__(self, "replan_state", ReplanState.model_validate(raw_state))
+        return self
 
     @field_validator("goal")
     @classmethod
@@ -69,6 +140,36 @@ class AgentTaskRequest(BaseModel):
         return cleaned
 
 
+class StepInputRef(BaseModel):
+    """Structured input reference; values are never copied through prose."""
+
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["context", "artifact"]
+    name: str = Field(min_length=1, max_length=100)
+    from_step: str | None = Field(default=None, max_length=80)
+    artifact_type: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "StepInputRef":
+        if self.kind == "artifact" and not self.from_step:
+            raise ValueError("artifact inputs require from_step")
+        if self.kind == "context" and self.from_step is not None:
+            raise ValueError("context inputs must not specify from_step")
+        if self.kind == "context" and self.artifact_type is not None:
+            raise ValueError("context inputs must not specify artifact_type")
+        return self
+
+
+class StepOutputRef(BaseModel):
+    """Named artifact output declared by a Planner-created step."""
+
+    model_config = {"extra": "forbid"}
+
+    name: str = Field(min_length=1, max_length=100)
+    artifact_type: str | None = Field(default=None, max_length=100)
+
+
 class PlanStep(BaseModel):
     """One Planner-created outcome, not a harness-selected tool invocation."""
 
@@ -79,6 +180,9 @@ class PlanStep(BaseModel):
     allowed_skills: list[str] = Field(min_length=1, max_length=8)
     success_criteria: list[str] = Field(default_factory=list, max_length=12)
     requires_verification: bool = False
+    depends_on: list[str] = Field(default_factory=list, max_length=20)
+    inputs: list[StepInputRef] = Field(default_factory=list, max_length=20)
+    outputs: list[StepOutputRef] = Field(default_factory=list, max_length=20)
 
     @field_validator("step_id", "objective")
     @classmethod
@@ -104,6 +208,16 @@ class PlanStep(BaseModel):
         cleaned = [value.strip() for value in values if value.strip()]
         if len(cleaned) != len(values):
             raise ValueError("success criteria must not be empty")
+        return cleaned
+
+    @field_validator("depends_on")
+    @classmethod
+    def validate_dependencies(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("depends_on must contain non-empty step IDs")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("depends_on must contain unique step IDs")
         return cleaned
 
 
@@ -139,6 +253,26 @@ class ExecutionPlan(BaseModel):
         step_ids = [step.step_id for step in self.steps]
         if len(set(step_ids)) != len(step_ids):
             raise ValueError("plan step_id values must be unique")
+        step_id_set = set(step_ids)
+        step_positions = {step_id: index for index, step_id in enumerate(step_ids)}
+        for index, step in enumerate(self.steps):
+            if step.step_id in step.depends_on:
+                raise ValueError("a plan step cannot depend on itself")
+            unknown_dependencies = set(step.depends_on) - step_id_set
+            if unknown_dependencies:
+                names = ", ".join(sorted(unknown_dependencies))
+                raise ValueError(f"plan step depends on unknown step(s): {names}")
+            if any(step_positions[dependency] >= index for dependency in step.depends_on):
+                raise ValueError("plan step dependencies must refer to earlier steps")
+            for input_ref in step.inputs:
+                if input_ref.from_step and input_ref.from_step not in step_id_set:
+                    raise ValueError(
+                        f"plan input references unknown step: {input_ref.from_step}"
+                    )
+                if input_ref.from_step and input_ref.from_step not in step.depends_on:
+                    raise ValueError(
+                        "artifact input source must also appear in depends_on"
+                    )
         permitted_skills = set(self.task.allowed_skills)
         for step in self.steps:
             forbidden = set(step.allowed_skills) - permitted_skills
@@ -198,33 +332,110 @@ class ToolObservation(BaseModel):
         return self
 
 
-class PlannerDecision(BaseModel):
-    """One autonomous Planner turn: inspect context, plan, or ask the user."""
+class _DecisionAttributeProxy:
+    """Keep the existing ``decision.action`` ergonomics over a RootModel."""
 
+    def __getattr__(self, name: str) -> Any:
+        try:
+            root = object.__getattribute__(self, "root")
+        except AttributeError as exc:  # pragma: no cover - defensive only
+            raise AttributeError(name) from exc
+        try:
+            return getattr(root, name)
+        except AttributeError as exc:
+            raise AttributeError(name) from exc
+
+    @property
+    def tool_name(self) -> str | None:
+        return getattr(self.root, "tool_name", None)
+
+    @property
+    def tool_input(self) -> dict[str, Any]:
+        return getattr(self.root, "tool_input", {})
+
+    @property
+    def complexity(self) -> ComplexityLevel | None:
+        return getattr(self.root, "complexity", None)
+
+    @property
+    def success_criteria(self) -> list[str]:
+        return getattr(self.root, "success_criteria", [])
+
+    @property
+    def steps(self) -> list[PlanStep]:
+        return getattr(self.root, "steps", [])
+
+    @property
+    def summary(self) -> str | None:
+        return getattr(self.root, "summary", None)
+
+    @property
+    def artifact_refs(self) -> list[dict[str, Any]]:
+        return getattr(self.root, "artifact_refs", [])
+
+    @property
+    def user_question(self) -> str | None:
+        return getattr(self.root, "user_question", None)
+
+    @property
+    def verification_decision(self) -> VerificationDecision | None:
+        return getattr(self.root, "verification_decision", None)
+
+    @property
+    def feedback(self) -> str | None:
+        return getattr(self.root, "feedback", None)
+
+
+class PlannerCallToolDecision(BaseModel):
     model_config = {"extra": "forbid"}
 
-    action: str
-    tool_name: str | None = None
+    action: Literal["call_tool"]
+    tool_name: str = Field(min_length=1)
     tool_input: dict[str, Any] = Field(default_factory=dict)
-    complexity: ComplexityLevel | None = None
-    success_criteria: list[str] = Field(default_factory=list)
-    steps: list[PlanStep] = Field(default_factory=list)
-    user_question: str | None = None
 
-    @model_validator(mode="after")
-    def validate_action_shape(self) -> "PlannerDecision":
-        if self.action == "call_tool":
-            if not self.tool_name:
-                raise ValueError("call_tool requires tool_name")
-        elif self.action == "plan":
-            if self.complexity is None or not self.success_criteria or not self.steps:
-                raise ValueError("plan requires complexity, success_criteria and steps")
-        elif self.action == "need_user":
-            if not self.user_question or not self.user_question.strip():
-                raise ValueError("need_user requires user_question")
-        else:
-            raise ValueError("unknown planner action")
-        return self
+    @field_validator("tool_name")
+    @classmethod
+    def normalize_tool_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("call_tool requires tool_name")
+        return value
+
+
+class PlannerPlanDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    action: Literal["plan"]
+    complexity: ComplexityLevel
+    success_criteria: list[str] = Field(min_length=1, max_length=20)
+    steps: list[PlanStep] = Field(min_length=1, max_length=20)
+
+
+class PlannerNeedUserDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    action: Literal["need_user"]
+    user_question: str = Field(min_length=1)
+
+    @field_validator("user_question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("need_user requires user_question")
+        return value
+
+
+class PlannerDecision(
+    _DecisionAttributeProxy,
+    RootModel[
+        Annotated[
+            PlannerCallToolDecision | PlannerPlanDecision | PlannerNeedUserDecision,
+            Field(discriminator="action"),
+        ]
+    ],
+):
+    """Discriminated Planner action union exposed as a gateway response model."""
 
 
 class PlannerResult(BaseModel):
@@ -249,29 +460,65 @@ class PlannerResult(BaseModel):
         return self
 
 
-class ExecutorDecision(BaseModel):
-    """One Executor turn: choose a permitted tool, finish, or request input."""
-
+class ExecutorCallToolDecision(BaseModel):
     model_config = {"extra": "forbid"}
 
-    action: str
-    tool_name: str | None = None
+    action: Literal["call_tool"]
+    tool_name: str = Field(min_length=1)
     tool_input: dict[str, Any] = Field(default_factory=dict)
-    summary: str | None = None
-    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
-    user_question: str | None = None
 
-    @model_validator(mode="after")
-    def validate_action_shape(self) -> "ExecutorDecision":
-        if self.action == "call_tool" and not self.tool_name:
+    @field_validator("tool_name")
+    @classmethod
+    def normalize_tool_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
             raise ValueError("call_tool requires tool_name")
-        if self.action == "complete" and not self.summary:
+        return value
+
+
+class ExecutorCompleteDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    action: Literal["complete"]
+    summary: str = Field(min_length=1)
+    artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+
+    @field_validator("summary")
+    @classmethod
+    def normalize_summary(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
             raise ValueError("complete requires summary")
-        if self.action == "need_user" and not self.user_question:
+        return value
+
+
+class ExecutorNeedUserDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    action: Literal["need_user"]
+    user_question: str = Field(min_length=1)
+
+    @field_validator("user_question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
             raise ValueError("need_user requires user_question")
-        if self.action not in {"call_tool", "complete", "need_user"}:
-            raise ValueError("unknown executor action")
-        return self
+        return value
+
+
+class ExecutorDecision(
+    _DecisionAttributeProxy,
+    RootModel[
+        Annotated[
+            ExecutorCallToolDecision
+            | ExecutorCompleteDecision
+            | ExecutorNeedUserDecision,
+            Field(discriminator="action"),
+        ]
+    ],
+):
+    """Discriminated Executor action union exposed as a gateway response model."""
 
 
 class ExecutorResult(BaseModel):
@@ -301,32 +548,46 @@ class ExecutorResult(BaseModel):
         return self
 
 
-class VerifierDecision(BaseModel):
-    """One Verifier turn: inspect evidence or route a machine-actionable next step."""
-
+class VerifierCallToolDecision(BaseModel):
     model_config = {"extra": "forbid"}
 
-    action: str
-    tool_name: str | None = None
+    action: Literal["call_tool"]
+    tool_name: str = Field(min_length=1)
     tool_input: dict[str, Any] = Field(default_factory=dict)
-    verification_decision: VerificationDecision | None = None
+
+    @field_validator("tool_name")
+    @classmethod
+    def normalize_tool_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("call_tool requires tool_name")
+        return value
+
+
+class VerifierDecideDecision(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    action: Literal["decide"]
+    verification_decision: VerificationDecision
     feedback: str | None = None
 
     @model_validator(mode="after")
-    def validate_action_shape(self) -> "VerifierDecision":
-        if self.action == "call_tool" and not self.tool_name:
-            raise ValueError("call_tool requires tool_name")
-        if self.action == "decide":
-            if self.verification_decision is None:
-                raise ValueError("decide requires verification_decision")
-            if (
-                self.verification_decision is not VerificationDecision.PASS
-                and not self.feedback
-            ):
-                raise ValueError("non-PASS verifier decisions require feedback")
-        if self.action not in {"call_tool", "decide"}:
-            raise ValueError("unknown verifier action")
+    def validate_feedback(self) -> "VerifierDecideDecision":
+        if self.verification_decision is not VerificationDecision.PASS and not self.feedback:
+            raise ValueError("non-PASS verifier decisions require feedback")
         return self
+
+
+class VerifierDecision(
+    _DecisionAttributeProxy,
+    RootModel[
+        Annotated[
+            VerifierCallToolDecision | VerifierDecideDecision,
+            Field(discriminator="action"),
+        ]
+    ],
+):
+    """Discriminated Verifier action union exposed as a gateway response model."""
 
 
 class VerifierResult(BaseModel):

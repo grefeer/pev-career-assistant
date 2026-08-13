@@ -155,7 +155,7 @@ def test_step_contract_met_accepts_batch_fetch_pages_and_skips_malformed_entries
     assert step_contract_met(_step("job-discovery"), [batch]) is True
 
 
-def test_step_contract_met_counts_verified_search_and_sheet_outcomes() -> None:
+def test_step_contract_does_not_close_on_search_or_sheet_index_only() -> None:
     empty_search = _observed(
         "search-public-job-pages",
         output={
@@ -165,7 +165,7 @@ def test_step_contract_met_counts_verified_search_and_sheet_outcomes() -> None:
             "results": [],
         },
     )
-    assert step_contract_met(_step("job-discovery"), [empty_search]) is True
+    assert step_contract_met(_step("job-discovery"), [empty_search]) is False
     sheet = _observed(
         "query-career-sheet-records",
         output={
@@ -175,7 +175,7 @@ def test_step_contract_met_counts_verified_search_and_sheet_outcomes() -> None:
             "query": {},
         },
     )
-    assert step_contract_met(_step("job-discovery"), [sheet]) is True
+    assert step_contract_met(_step("job-discovery"), [sheet]) is False
 
 
 def test_step_contract_met_for_the_three_report_skills() -> None:

@@ -39,8 +39,15 @@ def resolve_target_evidence(
     resolved = dict(target) if target is not None else {}
     resolved.update(
         {
-            "artifact_id": target_id,
-            "source_url": candidate.get("source_url"),
+            # Keep the canonical structured artifact identity separate from
+            # the model-selected reference.  Writing candidate_id back into
+            # artifact_id made downstream extract/tailoring lookups ambiguous.
+            "artifact_id": candidate.get("artifact_id") or target_id,
+            "selected_evidence_ref": target_id,
+            "candidate_id": candidate.get("candidate_id"),
+            "source_artifact_id": candidate.get("source_artifact_id"),
+            "source_url": candidate.get("page_source_url") or candidate.get("source_url"),
+            "apply_url": candidate.get("apply_url") or candidate.get("source_url"),
             "title": candidate.get("title"),
             "visible_text": candidate_text,
         }
@@ -57,6 +64,7 @@ def _find_raw_target(raw_evidence: object, target_id: str) -> dict[str, Any] | N
         if isinstance(item, dict) and (
             item.get("artifact_id") == target_id
             or item.get("source_url") == target_id
+            or f"observed:{item.get('content_hash')}" == target_id
         ):
             return item
     return None
@@ -80,7 +88,8 @@ def _find_structured_candidate(
             or target_id == candidate.get("source_url")
             or (
                 isinstance(target_source_url, str)
-                and target_source_url == candidate.get("source_url")
+                and target_source_url
+                in {candidate.get("source_url"), candidate.get("page_source_url")}
             )
         ):
             return candidate

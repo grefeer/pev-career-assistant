@@ -20,13 +20,18 @@ from backend.app.domain.agent_runtime import (
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.evidence_gate import (
-    completion_evidence_gate,
+    completion_evidence_gate as legacy_completion_evidence_gate,
+    has_blocked_evidence as legacy_has_blocked_evidence,
     has_known_deliverable_attempt,
-    has_blocked_evidence,
-    step_contract_met,
+    step_contract_met as legacy_step_contract_met,
+)
+from backend.app.services.agent_runtime.error_policy import (
+    TerminalContract,
+    build_terminal_contract,
 )
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
+from backend.app.services.agent_runtime.model_budget import ModelCallBudget
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
@@ -34,8 +39,10 @@ from backend.app.services.agent_runtime.schemas import (
     ExecutorResult,
     PlanStep,
     PlannerResult,
+    ReplanReason,
     VerifierResult,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
@@ -66,6 +73,50 @@ _RETRY_REPLAN_MARKER = "<retry_replan>"
 _STRUCTURED_FULL_TEXT_CHARS = 32_000
 
 
+class StepDependencyError(ValueError):
+    """A typed PlanStep input could not be resolved from prior run state."""
+
+
+def _context_value(context: dict[str, Any], name: str) -> Any:
+    """Read a dotted context path without allowing arbitrary object access."""
+    value: Any = context
+    for segment in name.split("."):
+        if not isinstance(value, dict) or segment not in value:
+            return None
+        value = value[segment]
+    return value
+
+
+def _task_input_value(task: AgentTaskRequest, name: str) -> Any:
+    """Resolve a typed context input from task roots or user context.
+
+    ``goal`` is a first-class task field rather than an entry in the free-form
+    context map. Supporting it here keeps PlanStep inputs structured without
+    forcing the Planner to duplicate the goal into mutable context.
+    """
+    if name == "goal":
+        return task.goal
+    if name == "allowed_skills":
+        return list(task.allowed_skills)
+    if name == "confirmed_profile_fact_fields":
+        facts = task.private_context.get("confirmed_profile_facts")
+        if isinstance(facts, dict):
+            return sorted(key for key in facts if isinstance(key, str))
+        return None
+    if name == "confirmed_profile_facts":
+        return task.private_context.get("confirmed_profile_facts")
+    if name.startswith("private_context."):
+        return _context_value(task.private_context, name.removeprefix("private_context."))
+    if name.startswith("context."):
+        name = name.removeprefix("context.")
+    return _context_value(task.context, name)
+
+
+def _is_private_task_input(name: str) -> bool:
+    """Identify input names that must never be copied into public model context."""
+    return name == "confirmed_profile_facts" or name.startswith("private_context.")
+
+
 @dataclass(frozen=True)
 class AgentRunResult:
     """Safe terminal or waiting summary returned by the application service."""
@@ -74,6 +125,7 @@ class AgentRunResult:
     status: RunStatus
     summary: str | None
     error_code: str | None = None
+    replan_reason: ReplanReason | None = None
 
 
 class AgentRuntime:
@@ -86,11 +138,16 @@ class AgentRuntime:
         executor: ExecutorAgent,
         verifier: VerifierAgent,
         agent_version: str,
+        skills: SkillRegistry | None = None,
     ) -> None:
         self._planner = planner
         self._executor = executor
         self._verifier = verifier
         self._agent_version = agent_version
+        # ``None`` is a deliberate migration mode for existing embedders. The
+        # application composition root always injects a registry, which turns
+        # on strict skill contracts and the final deterministic gate.
+        self._skills = skills
 
     def run(
         self,
@@ -133,6 +190,17 @@ class AgentRuntime:
         tool_budget = ToolCallBudget(
             task.budget.max_tool_calls, used=consumed_tool_calls
         )
+        consumed_model_requests, consumed_input_tokens, consumed_output_tokens = (
+            run_repository.model_usage_totals(db, run.id)
+        )
+        model_budget = ModelCallBudget(
+            task.budget.max_model_requests,
+            task.budget.max_input_tokens,
+            task.budget.max_output_tokens,
+            requests_used=consumed_model_requests,
+            input_tokens_used=consumed_input_tokens,
+            output_tokens_used=consumed_output_tokens,
+        )
         turn_budget = AgentTurnBudget(
             task.budget.max_agent_turns, used=consumed_turns
         )
@@ -143,7 +211,13 @@ class AgentRuntime:
         # plan). replans already consumed = plans beyond the first, i.e.
         # max(0, revision - 1). Recovering a crashed run must NOT reset this to
         # zero, or a budget already spent on replanning becomes spendable again.
-        replans = max(0, revision - 1)
+        replans = max(0, revision - 1, planning_task.replan_state.count)
+        accepted_plan_fingerprints: dict[str, int] = {}
+        for persisted in run_repository.list_plans(db, run.id):
+            fingerprint = self._plan_fingerprint_json(persisted.plan_json)
+            accepted_plan_fingerprints[fingerprint] = (
+                accepted_plan_fingerprints.get(fingerprint, 0) + 1
+            )
         trace = self._build_decision_trace(
             db,
             run.id,
@@ -162,6 +236,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    model_budget=model_budget,
                     deadline=deadline,
                 )
             except AgentModelGatewayError as error:
@@ -203,9 +278,45 @@ class AgentRuntime:
                         db,
                         run_id=run.id,
                         event_type="replan_isomorphic_guard",
-                        payload_json={"feedback": source_feedback},
+                        payload_json={
+                            "feedback": source_feedback,
+                            **build_terminal_contract(
+                                error_code="repeated_plan_fingerprint",
+                                source_role="planner",
+                                phase="planning",
+                            ).as_payload(),
+                        },
                     )
                     return AgentRunResult(run.id, RunStatus.waiting_user, question, None)
+            plan_fingerprint = self._plan_fingerprint(plan)
+            if accepted_plan_fingerprints.get(plan_fingerprint, 0) >= 2:
+                question = (
+                    "Planner 重复生成了已经执行过的计划，继续执行不会产生新证据。"
+                    "请补充信息或提供其他公开岗位来源。"
+                )
+                run_repository.finish_run(
+                    db,
+                    run,
+                    status=RunStatus.waiting_user,
+                    final_summary=question,
+                )
+                run_repository.append_event(
+                    db,
+                    run_id=run.id,
+                    event_type="replan_duplicate_guard",
+                    payload_json={
+                        "reason_code": "repeated_plan_fingerprint",
+                        **build_terminal_contract(
+                            error_code="repeated_plan_fingerprint",
+                            source_role="planner",
+                            phase="planning",
+                        ).as_payload(),
+                    },
+                )
+                return AgentRunResult(run.id, RunStatus.waiting_user, question, None)
+            accepted_plan_fingerprints[plan_fingerprint] = (
+                accepted_plan_fingerprints.get(plan_fingerprint, 0) + 1
+            )
             revision += 1
             run_repository.set_run_complexity(db, run, plan.complexity)
             persisted_plan = run_repository.create_plan(
@@ -228,6 +339,7 @@ class AgentRuntime:
             self._checkpoint(db)
             final_summary: str | None = None
             replan_feedback: str | None = None
+            step_outputs: dict[str, list[dict[str, str]]] = {}
             for sequence, plan_step in enumerate(plan.steps, start=1):
                 step = run_repository.create_step(
                     db,
@@ -238,26 +350,90 @@ class AgentRuntime:
                     allowed_skills=plan_step.allowed_skills,
                 )
                 self._checkpoint(db)
-                outcome = self._run_step(
-                    db=db,
-                    run_id=run.id,
-                    task=planning_task,
-                    plan=plan,
-                    plan_step=plan_step,
-                    persisted_step=step,
-                    context=context,
-                    trace=trace,
-                    tool_budget=tool_budget,
-                    turn_budget=turn_budget,
-                    deadline=deadline,
-                    replans=replans,
-                )
+                try:
+                    if self._skills is not None:
+                        port_error = self._skills.validate_step_ports(plan_step)
+                        if port_error:
+                            raise StepDependencyError(port_error)
+                    step_task, step_context = self._prepare_step_inputs(
+                        task=planning_task,
+                        context=context,
+                        plan_step=plan_step,
+                        step_outputs=step_outputs,
+                    )
+                except StepDependencyError as error:
+                    run_repository.append_event(
+                        db,
+                        run_id=run.id,
+                        event_type="step_dependency_gate_failed",
+                        payload_json={
+                            "sequence": sequence,
+                            "step_id": plan_step.step_id,
+                            "depends_on": plan_step.depends_on,
+                            "inputs": [
+                                input_ref.model_dump(mode="json")
+                                for input_ref in plan_step.inputs
+                            ],
+                            "error": str(error),
+                        },
+                    )
+                    outcome = self._request_replan(
+                        db,
+                        run.id,
+                        step,
+                        feedback=str(error),
+                        summary=str(error),
+                        output_artifact_refs=[],
+                        reason=ReplanReason.DEPENDENCY_UNAVAILABLE,
+                    )
+                else:
+                    outcome = self._run_step(
+                        db=db,
+                        run_id=run.id,
+                        task=step_task,
+                        plan=plan,
+                        plan_step=plan_step,
+                        persisted_step=step,
+                        context=step_context,
+                        trace=trace,
+                        tool_budget=tool_budget,
+                        turn_budget=turn_budget,
+                        model_budget=model_budget,
+                        deadline=deadline,
+                        replans=replans,
+                    )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
+                    replan_reason = outcome.replan_reason or ReplanReason.VERIFIER_REPLAN
                     break
                 if outcome.status is not RunStatus.running:
                     return outcome
+                tagged_outputs = self._tag_step_outputs(
+                    plan_step, list(step.output_artifact_refs_json or [])
+                )
+                step.output_artifact_refs_json = tagged_outputs
+                step_outputs[plan_step.step_id] = tagged_outputs
+                db.flush()
                 final_summary = outcome.summary or final_summary
+                blocked_domains = context.metadata.get("blocked_public_domains", [])
+                search_hashes = context.metadata.get("public_search_query_hashes", [])
+                if (
+                    isinstance(blocked_domains, list) and blocked_domains
+                ) or (
+                    isinstance(search_hashes, list) and search_hashes
+                ):
+                    planning_context = dict(planning_task.context)
+                    if isinstance(blocked_domains, list) and blocked_domains:
+                        planning_context["blocked_public_domains"] = sorted(
+                            domain for domain in blocked_domains if isinstance(domain, str)
+                        )
+                    if isinstance(search_hashes, list) and search_hashes:
+                        planning_context["public_search_query_hashes"] = sorted(
+                            value for value in search_hashes if isinstance(value, str)
+                        )
+                    planning_task = planning_task.model_copy(
+                        update={"context": planning_context}
+                    )
                 planning_task = self._with_observed_public_evidence(
                     db, planning_task, run.id
                 )
@@ -267,26 +443,54 @@ class AgentRuntime:
             if replan_feedback is not None:
                 replans += 1
                 if replans > task.budget.max_replans:
+                    question = (
+                        replan_feedback
+                        or "自动重规划次数已用尽，当前结果仍缺少可核验证据。"
+                        "请补充新的公开岗位来源或缺失条件后重试。"
+                    )
+                    terminal_contract = build_terminal_contract(
+                        error_code="replan_budget_exhausted",
+                        source_role="runtime",
+                        phase="planning",
+                    )
                     run_repository.finish_run(
                         db,
                         run,
-                        status=RunStatus.failed,
+                        status=RunStatus.waiting_user,
+                        final_summary=question,
                         error_code="replan_budget_exhausted",
                     )
                     run_repository.append_event(
                         db,
                         run_id=run.id,
-                        event_type="run_failed",
-                        payload_json={"error_code": "replan_budget_exhausted"},
+                        event_type="run_needs_user",
+                        payload_json={
+                            "question": question,
+                            **terminal_contract.as_payload(),
+                        },
                     )
                     return AgentRunResult(
-                        run.id, RunStatus.failed, None, "replan_budget_exhausted"
+                        run.id,
+                        RunStatus.waiting_user,
+                        question,
+                        "replan_budget_exhausted",
                     )
                 feedback_context = dict(planning_task.context)
                 feedback = list(feedback_context.get("verifier_feedback", []))
                 feedback.append(replan_feedback)
                 feedback_context["verifier_feedback"] = feedback
-                planning_task = task.model_copy(update={"context": feedback_context})
+                next_replan_state = planning_task.replan_state.requested(
+                    reason=replan_reason,
+                    feedback=replan_feedback,
+                    source_revision=revision,
+                    count=replans,
+                )
+                feedback_context["replan_state"] = next_replan_state.model_dump(
+                    mode="json"
+                )
+                planning_task = task.model_copy(
+                    update={"context": feedback_context, "replan_state": next_replan_state}
+                )
                 replan_source = (plan, replan_feedback)
                 continue
             run_repository.finish_run(
@@ -373,14 +577,22 @@ class AgentRuntime:
         trace,
         tool_budget: ToolCallBudget,
         turn_budget: AgentTurnBudget,
+        model_budget: ModelCallBudget | None = None,
         deadline: float | None = None,
         replans: int = 0,
     ) -> AgentRunResult:
         """Execute and conditionally verify one agent-defined planned outcome."""
         retries = 0
+        if model_budget is None:
+            model_budget = ModelCallBudget(
+                task.budget.max_model_requests,
+                task.budget.max_input_tokens,
+                task.budget.max_output_tokens,
+            )
         execution_task = task
         prior_observations = []
         prior_artifact_refs: list[dict[str, str]] = []
+        last_retry_progress_fingerprint: str | None = None
         while True:
             try:
                 execution = self._executor.run(
@@ -391,6 +603,7 @@ class AgentRuntime:
                     trace=trace,
                     tool_budget=tool_budget,
                     turn_budget=turn_budget,
+                    model_budget=model_budget,
                     deadline=deadline,
                     prior_observations=prior_observations,
                 )
@@ -436,11 +649,12 @@ class AgentRuntime:
                     ),
                     summary="步骤 Skill 范围冲突，已停止重复工具调用并请求重规划。",
                     output_artifact_refs=execution.artifact_refs,
+                    reason=ReplanReason.TOOL_SCOPE_CONFLICT,
                 )
             if execution.status == "needs_user":
                 if (
-                    step_contract_met(plan_step, execution.observations)
-                    and not has_blocked_evidence(execution.observations)
+                    self._step_contract_met(plan_step, execution.observations)
+                    and not self._has_blocked_evidence(execution.observations)
                 ):
                     # The executor asked the human even though the step's
                     # deliverable is already tool-backed (post-deliverable
@@ -463,6 +677,12 @@ class AgentRuntime:
                     persisted_step,
                     execution.user_question,
                     output_artifact_refs=observed_artifact_refs,
+                    terminal_contract=build_terminal_contract(
+                        observations=execution.observations,
+                        source_role="executor",
+                        phase="execution",
+                        artifact_count=len(observed_artifact_refs),
+                    ),
                 )
             if execution.error_code == "wall_clock_budget_exhausted":
                 # Wall-clock exhaustion is a transport/resource pause, not a
@@ -487,7 +707,7 @@ class AgentRuntime:
                     output_artifact_refs=observed_artifact_refs,
                 )
             if not self._requires_verification(plan, plan_step):
-                if has_known_deliverable_attempt(execution.observations) and not completion_evidence_gate(
+                if self._completion_gate_rejected(
                     plan_step, execution.observations, summary=execution.summary
                 ):
                     return self._wait_for_user(
@@ -526,8 +746,8 @@ class AgentRuntime:
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
                     if (
-                        step_contract_met(plan_step, execution.observations)
-                        and not has_blocked_evidence(execution.observations)
+                        self._step_contract_met(plan_step, execution.observations)
+                        and not self._has_blocked_evidence(execution.observations)
                     ):
                         # The verifier transport degraded after the step's
                         # deliverable was already tool-backed (invalid
@@ -583,6 +803,26 @@ class AgentRuntime:
                     output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.PASS:
+                if self._skills is not None and not self._skills.completion_evidence_gate(
+                    plan_step, execution.observations, summary=execution.summary
+                ):
+                    run_repository.append_event(
+                        db,
+                        run_id=run_id,
+                        event_type="verification_pass_rejected_by_contract",
+                        payload_json={
+                            "sequence": persisted_step.sequence,
+                            "reason": "deterministic_contract_not_satisfied",
+                        },
+                    )
+                    return self._wait_for_user(
+                        db,
+                        run_id,
+                        persisted_step,
+                        "Verifier 的 PASS 未通过 Skill 的确定性交付契约，不能将该步骤标记为完成。"
+                        "请补充工具产出或人工确认后重试。",
+                        output_artifact_refs=execution.artifact_refs,
+                    )
                 run_repository.finish_step(
                     db,
                     persisted_step,
@@ -603,6 +843,29 @@ class AgentRuntime:
                 )
                 return AgentRunResult(run_id, RunStatus.running, execution.summary)
             if verification.decision is VerificationDecision.RETRY_EXECUTOR:
+                progress_fingerprint = _execution_progress_fingerprint(execution)
+                if (
+                    last_retry_progress_fingerprint is not None
+                    and progress_fingerprint == last_retry_progress_fingerprint
+                ):
+                    feedback = verification.feedback or ""
+                    return self._wait_for_user(
+                        db,
+                        run_id,
+                        persisted_step,
+                        "Verifier 重试没有产生新的工具证据，继续调用将重复当前失败路径。"
+                        + (f"当前反馈：{feedback}。" if feedback else "")
+                        + "请提供新的岗位来源或补充缺失字段后重试。",
+                        output_artifact_refs=execution.artifact_refs,
+                        error_code="no_progress_duplicate",
+                        terminal_contract=build_terminal_contract(
+                            error_code="no_progress_duplicate",
+                            source_role="verifier",
+                            phase="verification",
+                            artifact_count=len(execution.artifact_refs),
+                        ),
+                    )
+                last_retry_progress_fingerprint = progress_fingerprint
                 retries += 1
                 run_repository.append_event(
                     db,
@@ -614,8 +877,8 @@ class AgentRuntime:
                     },
                 )
                 if (
-                    has_blocked_evidence(execution.observations)
-                    and not step_contract_met(plan_step, execution.observations)
+                    self._has_blocked_evidence(execution.observations)
+                    and not self._step_contract_met(plan_step, execution.observations)
                 ):
                     # The step's evidence is blocked (login/captcha/anti-bot/
                     # OCR-off or a deterministic per-URL failure) and the
@@ -643,6 +906,12 @@ class AgentRuntime:
                         + verification.feedback
                         + "。请人工确认该来源的岗位信息，或提供可公开访问的页面后重试。",
                         output_artifact_refs=execution.artifact_refs,
+                        terminal_contract=build_terminal_contract(
+                            observations=execution.observations,
+                            source_role="verifier",
+                            phase="verification",
+                            artifact_count=len(execution.artifact_refs),
+                        ),
                     )
                 if any(
                     observation.status == "failed"
@@ -665,6 +934,7 @@ class AgentRuntime:
                         feedback=verification.feedback,
                         summary=verification.feedback,
                         output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.TOOL_SCOPE_CONFLICT,
                     )
                 if retries <= task.budget.max_replans:
                     prior_observations = execution.observations
@@ -703,16 +973,12 @@ class AgentRuntime:
                 # (R009/R018/R033): a second identical exhaustion after the
                 # replan keeps the human hand-off. Blocked evidence always
                 # keeps the human hand-off.
-                prior_feedback = task.context.get("verifier_feedback") or []
-                if not isinstance(prior_feedback, list):
-                    prior_feedback = []
                 if (
-                    step_contract_met(plan_step, execution.observations)
-                    and not has_blocked_evidence(execution.observations)
+                    self._step_contract_met(plan_step, execution.observations)
+                    and not self._has_blocked_evidence(execution.observations)
                     and replans < task.budget.max_replans
-                    and not any(
-                        isinstance(entry, str) and _RETRY_REPLAN_MARKER in entry
-                        for entry in prior_feedback
+                    and not task.replan_state.conversion_used(
+                        ReplanReason.RETRY_CONTRACT_EXHAUSTED
                     )
                 ):
                     return self._request_replan(
@@ -722,6 +988,7 @@ class AgentRuntime:
                         feedback=verification.feedback,
                         summary=f"{verification.feedback} {_RETRY_REPLAN_MARKER}",
                         output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.RETRY_CONTRACT_EXHAUSTED,
                     )
                 return self._wait_for_user(
                     db,
@@ -731,17 +998,12 @@ class AgentRuntime:
                     output_artifact_refs=execution.artifact_refs,
                 )
             if verification.decision is VerificationDecision.NEED_USER:
-                prior_feedback = task.context.get("verifier_feedback") or []
-                if not isinstance(prior_feedback, list):
-                    prior_feedback = []
                 if (
-                    step_contract_met(plan_step, execution.observations)
-                    and not has_blocked_evidence(execution.observations)
+                    self._step_contract_met(plan_step, execution.observations)
+                    and not self._has_blocked_evidence(execution.observations)
                     and replans < task.budget.max_replans
-                    and not any(
-                        isinstance(entry, str)
-                        and _NEEDS_USER_REPLAN_MARKER in entry
-                        for entry in prior_feedback
+                    and not task.replan_state.conversion_used(
+                        ReplanReason.NEED_USER_CONTRACT
                     )
                 ):
                     # R009/R018/R033/R013: the verifier asks the human even
@@ -765,6 +1027,7 @@ class AgentRuntime:
                             f"{verification.feedback} {_NEEDS_USER_REPLAN_MARKER}"
                         ),
                         output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.NEED_USER_CONTRACT,
                     )
                 return self._wait_for_user(
                     db,
@@ -773,6 +1036,22 @@ class AgentRuntime:
                     verification.feedback,
                     output_artifact_refs=execution.artifact_refs,
                 )
+            if verification.decision is VerificationDecision.FAIL:
+                return self._wait_for_user(
+                    db,
+                    run_id,
+                    persisted_step,
+                    "Verifier 判定当前产出不满足任务要求："
+                    + (verification.feedback or "请补充岗位证据后重试。"),
+                    output_artifact_refs=execution.artifact_refs,
+                    error_code="verification_failed",
+                    terminal_contract=build_terminal_contract(
+                        error_code="verification_failed",
+                        source_role="verifier",
+                        phase="verification",
+                        artifact_count=len(execution.artifact_refs),
+                    ),
+                )
             return self._request_replan(
                 db,
                 run_id,
@@ -780,11 +1059,147 @@ class AgentRuntime:
                 feedback=verification.feedback,
                 summary=verification.feedback,
                 output_artifact_refs=execution.artifact_refs,
+                reason=ReplanReason.VERIFIER_REPLAN,
             )
 
+    def _requires_verification(self, plan: ExecutionPlan, plan_step: PlanStep) -> bool:
+        if self._skills is None:
+            return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
+        return self._skills.requires_verification(plan_step, plan.complexity.value)
+
     @staticmethod
-    def _requires_verification(plan: ExecutionPlan, plan_step: PlanStep) -> bool:
-        return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
+    def _prepare_step_inputs(
+        *,
+        task: AgentTaskRequest,
+        context: ToolContext,
+        plan_step: PlanStep,
+        step_outputs: dict[str, list[dict[str, str]]],
+    ) -> tuple[AgentTaskRequest, ToolContext]:
+        """Resolve typed context/artifact refs before the Executor is called."""
+        resolved_context: dict[str, Any] = {}
+        resolved_artifacts: dict[str, list[dict[str, str]]] = {}
+        resolved_private_inputs: set[str] = set()
+        for input_ref in plan_step.inputs:
+            if input_ref.kind == "context":
+                value = _task_input_value(task, input_ref.name)
+                if value is None:
+                    raise StepDependencyError(
+                        f"step {plan_step.step_id} requires context input '{input_ref.name}'"
+                    )
+                if _is_private_task_input(input_ref.name):
+                    # The private projection is already supplied separately to
+                    # the Executor. Record only that the declared input was
+                    # resolved; never echo its value into task.context, which
+                    # is visible in the generic model decision state.
+                    resolved_private_inputs.add(input_ref.name)
+                else:
+                    resolved_context[input_ref.name] = value
+                continue
+            source = step_outputs.get(input_ref.from_step or "", [])
+            if not source:
+                raise StepDependencyError(
+                    f"step {plan_step.step_id} requires artifact '{input_ref.name}' "
+                    f"from step '{input_ref.from_step}'"
+                )
+            matches = [
+                item
+                for item in source
+                if input_ref.name
+                in {
+                    item.get("output_name"),
+                    item.get("artifact_type"),
+                    item.get("tool"),
+                    item.get("artifact_id"),
+                }
+                and (
+                    input_ref.artifact_type is None
+                    or item.get("artifact_type") == input_ref.artifact_type
+                )
+            ]
+            if not matches and len(source) == 1 and input_ref.artifact_type is None:
+                matches = source
+            if not matches:
+                raise StepDependencyError(
+                    f"step {plan_step.step_id} cannot resolve artifact '{input_ref.name}' "
+                    f"from step '{input_ref.from_step}'"
+                )
+            resolved_artifacts[input_ref.name] = matches
+        if not resolved_context and not resolved_artifacts:
+            return task, context
+        input_payload = {
+            "context": resolved_context,
+            "artifacts": resolved_artifacts,
+            "private_inputs": sorted(resolved_private_inputs),
+        }
+        step_task = task.model_copy(
+            update={
+                "context": {
+                    **task.context,
+                    "resolved_step_inputs": input_payload,
+                }
+            }
+        )
+        step_metadata = dict(context.metadata)
+        step_metadata["resolved_step_inputs"] = input_payload
+        return step_task, ToolContext(
+            user_id=context.user_id,
+            run_id=context.run_id,
+            metadata=step_metadata,
+        )
+
+    @staticmethod
+    def _tag_step_outputs(
+        plan_step: PlanStep, refs: list[dict[str, Any]]
+    ) -> list[dict[str, str]]:
+        """Persist semantic output names alongside real artifact pointers."""
+        if not plan_step.outputs:
+            return refs
+        tagged: list[dict[str, str]] = []
+        for index, ref in enumerate(refs):
+            item = {key: str(value) for key, value in ref.items() if value is not None}
+            selected = next(
+                (
+                    output
+                    for output in plan_step.outputs
+                    if output.artifact_type
+                    and output.artifact_type == item.get("artifact_type")
+                ),
+                None,
+            )
+            if selected is None:
+                selected = plan_step.outputs[0] if len(plan_step.outputs) == 1 else plan_step.outputs[index % len(plan_step.outputs)]
+            item["output_name"] = selected.name
+            if selected.artifact_type and "artifact_type" not in item:
+                item["artifact_type"] = selected.artifact_type
+            tagged.append(item)
+        return tagged
+
+    def _step_contract_met(
+        self, step: PlanStep, observations: list
+    ) -> bool:
+        if self._skills is None:
+            return legacy_step_contract_met(step, observations)
+        return self._skills.step_contract_met(step, observations)
+
+    def _has_blocked_evidence(self, observations: list) -> bool:
+        if self._skills is None:
+            return legacy_has_blocked_evidence(observations)
+        return self._skills.has_blocked_evidence(observations)
+
+    def _completion_gate_rejected(
+        self,
+        step: PlanStep,
+        observations: list,
+        *,
+        summary: str | None,
+    ) -> bool:
+        if self._skills is None:
+            return has_known_deliverable_attempt(observations) and not legacy_completion_evidence_gate(
+                step, observations, summary=summary
+            )
+        return self._skills.has_completion_contract(step) and not self._skills.completion_evidence_gate(
+            step, observations, summary=summary
+        )
 
     @staticmethod
     def _plans_isomorphic(plan_a: ExecutionPlan, plan_b: ExecutionPlan) -> bool:
@@ -795,6 +1210,58 @@ class AgentRuntime:
         mask a structurally repeated plan (N4 guard).
         """
         return _normalize_plan_steps(plan_a) == _normalize_plan_steps(plan_b)
+
+    @staticmethod
+    def _plan_fingerprint(plan: ExecutionPlan) -> str:
+        """Hash the semantic plan shape before it is persisted or executed."""
+        payload = {
+            "complexity": plan.complexity.value,
+            "success_criteria": sorted(" ".join(item.split()) for item in plan.success_criteria),
+            "steps": [
+                {
+                    "objective": " ".join(step.objective.split()),
+                    "allowed_skills": sorted(step.allowed_skills),
+                    "requires_verification": step.requires_verification,
+                    "depends_on": sorted(step.depends_on),
+                    "inputs": [item.model_dump(mode="json") for item in step.inputs],
+                    "outputs": [item.model_dump(mode="json") for item in step.outputs],
+                }
+                for step in plan.steps
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _plan_fingerprint_json(plan_json: object) -> str:
+        """Hash an already persisted plan without trusting mutable model text."""
+        if not isinstance(plan_json, dict):
+            return hashlib.sha256(b"invalid-plan-json").hexdigest()
+        raw_steps = plan_json.get("steps")
+        payload = {
+            "complexity": plan_json.get("complexity"),
+            "success_criteria": sorted(
+                " ".join(str(item).split())
+                for item in plan_json.get("success_criteria", [])
+                if isinstance(item, str)
+            ),
+            "steps": [
+                {
+                    "objective": " ".join(str(step.get("objective", "")).split()),
+                    "allowed_skills": sorted(step.get("allowed_skills", [])),
+                    "requires_verification": bool(step.get("requires_verification", False)),
+                    "depends_on": sorted(step.get("depends_on", [])),
+                    "inputs": step.get("inputs", []),
+                    "outputs": step.get("outputs", []),
+                }
+                for step in raw_steps
+                if isinstance(step, dict)
+            ] if isinstance(raw_steps, list) else [],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
     @staticmethod
     def _build_decision_trace(
@@ -892,6 +1359,12 @@ class AgentRuntime:
             title = artifact.content_json.get("title")
             if isinstance(title, str):
                 item["title"] = title
+            quality = artifact.content_json.get("quality")
+            if isinstance(quality, str):
+                item["quality"] = quality
+            quality_signal = artifact.content_json.get("quality_signal")
+            if isinstance(quality_signal, str):
+                item["quality_signal"] = quality_signal
             candidates.append(item)
         context = dict(task.context)
         context["observed_public_evidence"] = candidates
@@ -916,6 +1389,22 @@ class AgentRuntime:
             # first evidence artifact has been persisted.
             evidence = task.context.get("observed_public_evidence", [])
         profile_facts = task.private_context.get("confirmed_profile_facts", {})
+        blocked_domains = task.context.get("blocked_public_domains", [])
+        if not isinstance(blocked_domains, list):
+            blocked_domains = []
+        state_domains = task.execution_state.get("blocked_public_domains", [])
+        if isinstance(state_domains, list):
+            blocked_domains = sorted(
+                {domain for domain in [*blocked_domains, *state_domains] if isinstance(domain, str)}
+            )
+        search_hashes = task.context.get("public_search_query_hashes", [])
+        if not isinstance(search_hashes, list):
+            search_hashes = []
+        state_search_hashes = task.execution_state.get("public_search_query_hashes", [])
+        if isinstance(state_search_hashes, list):
+            search_hashes = sorted(
+                {value for value in [*search_hashes, *state_search_hashes] if isinstance(value, str)}
+            )
         return ToolContext(
             user_id=user_id,
             run_id=run_id,
@@ -925,6 +1414,11 @@ class AgentRuntime:
                 "confirmed_profile_facts": profile_facts
                 if isinstance(profile_facts, dict)
                 else {},
+                "resolved_step_inputs": task.context.get(
+                    "resolved_step_inputs", {"context": {}, "artifacts": {}}
+                ),
+                "blocked_public_domains": blocked_domains,
+                "public_search_query_hashes": search_hashes,
             },
         )
 
@@ -964,10 +1458,14 @@ class AgentRuntime:
                         "effective_url": page.get("effective_url"),
                         "redirect_chain": page.get("redirect_chain", []),
                         "http_status": page.get("http_status"),
+                        "quality": page.get("quality"),
+                        "quality_signal": page.get("quality_signal"),
                     },
                 )
                 artifact_ref = {
                     "artifact_id": artifact.id,
+                    "artifact_type": "public_job_page",
+                    "tool": observation.tool_name,
                     "source_url": source_url,
                     "content_hash": content_hash,
                 }
@@ -1012,6 +1510,8 @@ class AgentRuntime:
             artifact_refs.append(
                 {
                     "artifact_id": artifact.id,
+                    "artifact_type": "job_search_results",
+                    "tool": observation.tool_name,
                     "source_url": source_url,
                     "content_hash": content_hash,
                 }
@@ -1056,6 +1556,8 @@ class AgentRuntime:
                 artifact_refs.append(
                     {
                         "artifact_id": artifact.id,
+                        "artifact_type": "structured_job_details",
+                        "tool": observation.tool_name,
                         "source_url": source_url,
                         "content_hash": content_hash,
                     }
@@ -1105,6 +1607,8 @@ class AgentRuntime:
             artifact_refs.append(
                 {
                     "artifact_id": artifact.id,
+                    "artifact_type": artifact_type,
+                    "tool": observation.tool_name,
                     "source_url": source_url,
                     "content_hash": content_hash,
                 }
@@ -1158,6 +1662,9 @@ class AgentRuntime:
                 run,
                 planner_result.user_question,
                 event_type="planner_needs_user",
+                terminal_contract=build_terminal_contract(
+                    error_code="need_user", source_role="planner", phase="planning"
+                ),
             )
         if planner_result.error_code == "wall_clock_budget_exhausted":
             # The planner ran out of wall-clock before producing a plan. This
@@ -1179,7 +1686,14 @@ class AgentRuntime:
             db,
             run_id=run_id,
             event_type="run_failed",
-            payload_json={"error_code": error_code},
+            payload_json={
+                "error_code": error_code,
+                **build_terminal_contract(
+                    error_code=error_code,
+                    source_role="planner",
+                    phase="planning",
+                ).as_payload(),
+            },
         )
         return AgentRunResult(run_id, RunStatus.failed, None, error_code)
 
@@ -1207,6 +1721,7 @@ class AgentRuntime:
         *,
         event_type: str,
         error_code: str | None = None,
+        terminal_contract: TerminalContract | None = None,
     ) -> AgentRunResult:
         """Finish a planner-paused run as ``waiting_user`` without an AgentStep.
 
@@ -1230,7 +1745,18 @@ class AgentRuntime:
             db,
             run_id=run_id,
             event_type=event_type,
-            payload_json={"question": question},
+            payload_json={
+                "question": question,
+                **(
+                    terminal_contract.as_payload()
+                    if terminal_contract is not None
+                    else build_terminal_contract(
+                        error_code=error_code,
+                        source_role="planner",
+                        phase="planning",
+                    ).as_payload()
+                ),
+            },
         )
         return AgentRunResult(run_id, RunStatus.waiting_user, question, error_code)
 
@@ -1285,6 +1811,7 @@ class AgentRuntime:
         feedback: str | None,
         summary: str,
         output_artifact_refs: list[dict[str, str]],
+        reason: ReplanReason = ReplanReason.VERIFIER_REPLAN,
     ) -> AgentRunResult:
         """Close a step as skipped with a replan_required outcome.
 
@@ -1308,9 +1835,16 @@ class AgentRuntime:
             payload_json={
                 "sequence": step.sequence,
                 "feedback": feedback,
+                "reason": reason.value,
             },
         )
-        return AgentRunResult(run_id, RunStatus.running, summary, "replan_required")
+        return AgentRunResult(
+            run_id,
+            RunStatus.running,
+            summary,
+            "replan_required",
+            reason,
+        )
 
     def _wait_for_user(
         self,
@@ -1321,6 +1855,7 @@ class AgentRuntime:
         *,
         output_artifact_refs: list[dict[str, str]] | None = None,
         error_code: str | None = None,
+        terminal_contract: TerminalContract | None = None,
     ) -> AgentRunResult:
         """Pause a step-bearing run for a human reply, recoverable via resume().
 
@@ -1350,7 +1885,19 @@ class AgentRuntime:
             db,
             run_id=run_id,
             event_type="run_needs_user",
-            payload_json={"question": question},
+            payload_json={
+                "question": question,
+                **(
+                    terminal_contract.as_payload()
+                    if terminal_contract is not None
+                    else build_terminal_contract(
+                        error_code=error_code,
+                        source_role="executor",
+                        phase="execution",
+                        artifact_count=len(output_artifact_refs or []),
+                    ).as_payload()
+                ),
+            },
         )
         return AgentRunResult(run_id, RunStatus.waiting_user, question, error_code)
 
@@ -1385,9 +1932,68 @@ class AgentRuntime:
             db,
             run_id=run_id,
             event_type="run_failed",
-            payload_json={"error_code": error_code},
+            payload_json={
+                "error_code": error_code,
+                **build_terminal_contract(
+                    error_code=error_code,
+                    source_role="runtime",
+                    phase="execution",
+                ).as_payload(),
+            },
         )
         return AgentRunResult(run_id, RunStatus.failed, None, error_code)
+
+
+def _execution_progress_fingerprint(execution: ExecutorResult) -> str:
+    """Fingerprint evidence identity, not database-generated artifact IDs.
+
+    Verifier retries may persist a fresh report row for the same source. Using
+    that row ID would look like progress and permit an infinite retry loop.
+    Stable source URLs, content hashes, candidate IDs and terminal reasons are
+    the meaningful progress signals.
+    """
+    observations: list[dict[str, Any]] = []
+    for observation in execution.observations:
+        output = observation.output if isinstance(observation.output, dict) else {}
+        pages = output.get("pages") if isinstance(output.get("pages"), list) else []
+        page_keys = [
+            {
+                "source_url": page.get("source_url"),
+                "content_hash": page.get("content_hash"),
+                "quality": page.get("quality"),
+            }
+            for page in pages
+            if isinstance(page, dict)
+        ]
+        candidates = output.get("candidates")
+        candidate_keys = []
+        if isinstance(candidates, list):
+            candidate_keys = [
+                {
+                    "candidate_id": item.get("candidate_id"),
+                    "source_artifact_id": item.get("source_artifact_id"),
+                    "source_url": item.get("source_url"),
+                    "content_hash": item.get("content_hash"),
+                }
+                for item in candidates
+                if isinstance(item, dict)
+            ]
+        observations.append(
+            {
+                "tool": observation.tool_name,
+                "status": observation.status,
+                "error_code": observation.error_code,
+                "source_url": output.get("source_url"),
+                "content_hash": output.get("content_hash"),
+                "terminal_reason": output.get("terminal_reason"),
+                "pages": page_keys,
+                "candidates": candidate_keys,
+            }
+        )
+    payload = {"observations": observations}
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _normalize_plan_steps(plan: ExecutionPlan) -> list[tuple[tuple[str, ...], str]]:
@@ -1435,7 +2041,14 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
     tool falls back to raw page evidence.
     """
     items: list[dict[str, Any]] = []
-    for artifact in run_repository.list_evidence_artifacts(db, run_id):
+    artifacts = run_repository.list_evidence_artifacts(db, run_id)
+    quality_by_source = {
+        artifact.source_url: artifact.content_json.get("quality")
+        for artifact in artifacts
+        if artifact.artifact_type == "public_job_page"
+        and isinstance(artifact.content_json.get("quality"), str)
+    }
+    for artifact in artifacts:
         raw_candidates = artifact.content_json.get("candidates")
         if not isinstance(raw_candidates, list):
             continue
@@ -1455,7 +2068,14 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     #: page pointer can also resolve by artifact identity.
                     "source_artifact_id": _evidence_artifact_id(candidate),
                     "source_url": source_url,
+                    "page_source_url": artifact.source_url,
+                    "apply_url": (
+                        candidate.get("apply_url")
+                        if isinstance(candidate.get("apply_url"), str)
+                        else None
+                    ),
                     "content_hash": artifact.content_hash,
+                    "source_quality": quality_by_source.get(source_url),
                     "title": title if isinstance(title, str) else None,
                     "locations": _string_list(candidate.get("locations")),
                     # Card-list extraction can land JD snippets in company_name
@@ -1483,7 +2103,8 @@ def _full_observed_public_evidence(
 ) -> list[dict[str, Any]]:
     """Hydrate persisted page pointers only at the deterministic tool boundary."""
     items: list[dict[str, Any]] = []
-    for artifact in run_repository.list_evidence_artifacts(db, run_id):
+    artifacts = run_repository.list_evidence_artifacts(db, run_id)
+    for artifact in artifacts:
         visible_text = artifact.content_json.get("visible_text")
         if not isinstance(visible_text, str) or not visible_text:
             continue
@@ -1493,7 +2114,14 @@ def _full_observed_public_evidence(
             "content_hash": artifact.content_hash,
             "visible_text": visible_text,
         }
-        for key in ("title", "effective_url", "redirect_chain", "http_status"):
+        for key in (
+            "title",
+            "effective_url",
+            "redirect_chain",
+            "http_status",
+            "quality",
+            "quality_signal",
+        ):
             value = artifact.content_json.get(key)
             if value not in (None, "", [], {}):
                 item[key] = value

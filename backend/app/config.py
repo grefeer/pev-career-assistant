@@ -167,6 +167,12 @@ class Settings(BaseSettings):
     agent_harness_max_agent_turns: int = Field(default=12, ge=1, le=100)
     agent_harness_max_tool_calls: int = Field(default=24, ge=1, le=200)
     agent_harness_max_replans: int = Field(default=2, ge=0, le=10)
+    agent_harness_max_model_requests: int = Field(default=128, ge=1, le=500)
+    agent_harness_max_input_tokens: int = Field(default=1_000_000, ge=1_000, le=2_000_000)
+    agent_harness_max_output_tokens: int = Field(default=200_000, ge=1_000, le=500_000)
+    # Provider-side per-request ceiling. The run-level output budget above is
+    # still shared across Planner, Executor and Verifier.
+    agent_harness_model_max_output_tokens: int = Field(default=4_096, ge=256, le=32_000)
     # Hard wall-clock ceiling per run (seconds). Unlike turn/tool budgets this
     # one is a transport/resource pause: exhausting it degrades to a recoverable
     # ``waiting_user`` (the clock window refreshes on resume) rather than a hard

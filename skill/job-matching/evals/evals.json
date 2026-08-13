@@ -1,0 +1,8 @@
+{
+  "skill": "job-matching",
+  "cases": [
+    {"name": "evidence-backed-match", "expect": "job_matching_report"},
+    {"name": "honest-empty-result", "expect": "no fabricated match"},
+    {"name": "missing-fact-is-unverified", "expect": "unverified_criteria"}
+  ]
+}

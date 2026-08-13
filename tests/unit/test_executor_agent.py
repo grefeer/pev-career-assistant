@@ -10,8 +10,11 @@ from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
 from backend.app.services.agent_runtime.executor_agent import (
     ExecutorAgent,
     _carried_counter,
+    _fetch_route_key,
     _input_hash,
     _load_execution_state,
+    _observed_fetch_urls,
+    _observed_fetch_route_counts,
     _snapshot_execution_state,
 )
 from backend.app.services.agent_runtime.observation_projection import (
@@ -74,6 +77,67 @@ class ScriptedGateway:
         assert instruction
         self.states.append(state)
         return response_model.model_validate(self.responses.pop(0))
+
+
+def test_observed_fetch_urls_only_tracks_successful_fetch_evidence() -> None:
+    observations = [
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={
+                "pages": [
+                    {
+                        "source_url": " https://jobs.example/1 ",
+                        "effective_url": "https://jobs.example/1?final=1",
+                    }
+                ]
+            },
+        ),
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="failed",
+            error_code="anti_bot_challenge",
+            output={"pages": [{"source_url": "https://jobs.example/2"}]},
+        ),
+        ToolObservation(
+            tool_name="search-public-job-pages",
+            status="succeeded",
+            output={"pages": [{"source_url": "https://jobs.example/3"}]},
+        ),
+    ]
+
+    assert _observed_fetch_urls(observations) == {
+        "https://jobs.example/1",
+        "https://jobs.example/1?final=1",
+    }
+
+
+def test_fetch_route_identity_ignores_query_churn_but_keeps_path() -> None:
+    assert _fetch_route_key("HTTPS://Jobs.Example/list?page=2") == (
+        "https://jobs.example/list"
+    )
+    assert _fetch_route_key("https://jobs.example/detail/1") != _fetch_route_key(
+        "https://jobs.example/detail/2"
+    )
+
+
+def test_fetch_route_counts_ignore_failed_observations() -> None:
+    observations = [
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={"pages": [{"source_url": "https://jobs.example/list?page=1"}]},
+        ),
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="failed",
+            error_code="anti_bot_challenge",
+            output={"pages": [{"source_url": "https://jobs.example/list?page=2"}]},
+        ),
+    ]
+    assert _observed_fetch_route_counts(observations) == {
+        "https://jobs.example/list": 1
+    }
 
 
 def test_executor_observes_failure_and_uses_a_second_allowed_tool() -> None:

@@ -593,7 +593,8 @@ def test_runtime_recovers_replan_budget_from_persisted_plans(db_session) -> None
     db_session.commit()
     registry = ToolRegistry()
     # Recovery forces one more replan. With the budget correctly recovered
-    # (replans resumes at 1), that third replan must exhaust max_replans == 1.
+    # (replans resumes at 1), the next replan becomes a human hand-off rather
+    # than a failed run.
     plan_decision = {
         "action": "plan", "complexity": "L2",
         "success_criteria": ["完整 JD"],
@@ -649,7 +650,7 @@ def test_runtime_recovers_replan_budget_from_persisted_plans(db_session) -> None
         db_session, user_id=user.id, run_id=run.id, task=task
     )
 
-    assert result.status is RunStatus.failed
+    assert result.status is RunStatus.waiting_user
     assert result.error_code == "replan_budget_exhausted"
     # Three plans now persisted: two seeded + one from the recovery replan.
     assert run_repository.count_plans(db_session, run.id) == 3
@@ -805,7 +806,7 @@ def test_runtime_retry_exhaustion_hands_a_stuck_step_to_the_human(db_session) ->
     )
 
     assert result.status is RunStatus.waiting_user
-    assert step.error_code == "need_user"
+    assert step.error_code == "no_progress_duplicate"
     assert "缺少来源标注" in result.summary
     events = run_repository.list_events(db_session, run.id)
     assert events[-1].event_type == "run_needs_user"
@@ -882,7 +883,7 @@ def test_runtime_fails_safely_when_verifier_replan_budget_is_exhausted(db_sessio
     )
 
     assert (result.status, result.error_code) == (
-        RunStatus.failed,
+        RunStatus.waiting_user,
         "replan_budget_exhausted",
     )
 
@@ -1146,7 +1147,8 @@ def test_runtime_enforces_one_global_tool_budget_across_planner_and_executor(db_
     assert (result.status, result.error_code) == (RunStatus.failed, "tool_budget_exhausted")
     assert execution_count == 1
     events = run_repository.list_events(db_session, result.run_id)
-    assert events[-1].payload_json == {"error_code": "tool_budget_exhausted"}
+    assert events[-1].payload_json["error_code"] == "tool_budget_exhausted"
+    assert events[-1].payload_json["failure_class"] == "budget_exhausted"
 
 
 def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session) -> None:
@@ -1345,6 +1347,8 @@ def test_runtime_replaces_model_artifact_claim_with_observed_public_evidence(db_
     assert step is not None
     assert step.output_artifact_refs_json == [{
         "artifact_id": step.output_artifact_refs_json[0]["artifact_id"],
+        "artifact_type": "public_job_page",
+        "tool": "fetch-job",
         "source_url": "https://jobs.example/1",
         "content_hash": "b" * 64,
     }]
@@ -1523,6 +1527,44 @@ def test_tool_context_structured_candidates_empty_without_extract_artifacts(db_s
     assert context.metadata["structured_job_candidates"] == []
 
 
+def test_structured_candidates_keep_source_page_quality_for_matching(db_session) -> None:
+    user = User(
+        id="user-quality", account="user-quality@example.test", nickname="quality",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="public_job_page",
+        source_url="https://jobs.example/list",
+        content_hash="page" * 16,
+        content_json={
+            "visible_text": "招聘首页 浏览岗位 联系我们",
+            "quality": "list_only",
+        },
+    )
+    run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="structured_job_details",
+        source_url="https://jobs.example/list",
+        content_hash="structured" * 8,
+        content_json={"candidates": [{"title": "候选岗位", "requirements": "Python"}]},
+    )
+
+    context = AgentRuntime._tool_context(
+        user_id=user.id, run_id=run.id, task=task, db=db_session
+    )
+    assert context.metadata["structured_job_candidates"][0]["source_quality"] == "list_only"
+
+
 def test_runtime_persists_every_page_from_one_batch_fetch_observation(db_session) -> None:
     user = User(
         id="user-a", account="user-a@example.test", nickname="user-a",
@@ -1584,7 +1626,8 @@ def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session
 
     assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
     events = run_repository.list_events(db_session, result.run_id)
-    assert events[-1].payload_json == {"error_code": "model_request_failed"}
+    assert events[-1].payload_json["error_code"] == "model_request_failed"
+    assert events[-1].payload_json["failure_class"] == "model_or_verifier_decision"
 
 
 def test_runtime_degrades_planner_invalid_model_to_waiting_for_user(db_session) -> None:

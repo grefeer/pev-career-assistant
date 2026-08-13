@@ -77,6 +77,13 @@ python scripts/validate.py --input output/draft_diffs.json \
 
 ## Full workflow
 
+When the user names a role but does not provide a target JD and the task is
+authorized for `job-discovery`, plan or request a preceding public-evidence
+capture step. Do not ask the user to paste a JD that the permitted discovery
+Skill can obtain. When confirmed candidate facts are available from the server,
+use them through the runtime's scoped private context; do not ask the user to
+upload the same resume again.
+
 There are four phases. The single-job path (L2) covers Phases 2-4; the
 differential path (L3) re-runs against an updated match analysis.
 
@@ -151,3 +158,14 @@ This skill is designed with usage levels. Start shallow; go deeper only when nee
 
 - `scripts/generate.py` - **L2**: LLM call -> tolerant JSON parse -> list of diff operations
 - `scripts/validate.py` - **L1/L2**: Validate diffs against confirmed facts + evidence refs (mirrors backend `validate_draft_diffs`)
+
+## PEV adapter boundary
+
+When activated by the backend PEV runtime, this Skill owns the tailoring
+decision, grounding rules, and user handoff policy. The runtime supplies only
+the lifecycle, scoped confirmed facts, typed preceding artifacts, budgets, and
+the deterministic `build-resume-tailoring-brief` adapter. If a public target JD
+is missing and `job-discovery` is allowed, plan that preceding Skill instead of
+asking the user to paste a JD. Missing optional preferences do not block a
+grounded draft; ask one question only when the target evidence or confirmed
+fact required by the output cannot be obtained through an allowed Skill.

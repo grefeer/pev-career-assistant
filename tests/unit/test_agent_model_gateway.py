@@ -438,13 +438,14 @@ def test_gateway_logs_failed_content_when_local_json_retry_exhausts(caplog) -> N
     messages = [record.getMessage() for record in caplog.records]
     parse_failures = [m for m in messages if "local-json parse failed" in m]
     assert len(parse_failures) == 3
-    assert all('{"action":"not-valid"}' in m for m in parse_failures)
+    assert all("content_sha256=" in m and "chars=" in m for m in parse_failures)
+    assert all('{"action":"not-valid"}' not in m for m in parse_failures)
     assert all("role=planner" in m for m in parse_failures)
     assert any("exhausted local-json retry" in m for m in messages)
 
 
-def test_gateway_logs_stage1_raw_content_when_local_recovery_fails(caplog) -> None:
-    """Stage-1 raw completion is logged when local recovery falls through to retry."""
+def test_gateway_does_not_log_stage1_raw_content_when_recovery_fails(caplog) -> None:
+    """Invalid model output logs metadata, never user/model completion text."""
     with caplog.at_level(logging.WARNING):
         result = LangChainModelGateway(StructuredInvalidWithRawUnrecoverableModel()).decide(
             role=AgentRole.planner,
@@ -455,9 +456,8 @@ def test_gateway_logs_stage1_raw_content_when_local_recovery_fails(caplog) -> No
 
     assert result.action == "need_user"
     messages = [record.getMessage() for record in caplog.records]
-    assert any(
-        "stage1 raw unrecoverable" in m and "not valid json at all" in m for m in messages
-    )
+    assert any("stage1 raw unrecoverable" in m and "chars=" in m for m in messages)
+    assert all("not valid json at all" not in m for m in messages)
 
 
 def test_gateway_factory_fails_closed_without_a_model_key(monkeypatch) -> None:

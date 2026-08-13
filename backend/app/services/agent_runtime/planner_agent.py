@@ -6,6 +6,14 @@ import time
 
 from backend.app.domain.agent_runtime import AgentRole
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.model_budget import (
+    ModelCallBudget,
+    estimate_input_tokens,
+)
+from backend.app.services.agent_runtime.prompt_rules import (
+    COMMON_RUNTIME_RULES,
+    PLANNER_RUNTIME_RULES,
+)
 from backend.app.services.agent_runtime.observation_projection import (
     record_observation,
     summarize_observations,
@@ -17,6 +25,7 @@ from backend.app.services.agent_runtime.schemas import (
     PlannerResult,
     ToolObservation,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
@@ -27,91 +36,54 @@ from backend.app.services.agent_runtime.context_manifest import (
 from backend.app.services.agent_runtime.tracing import DecisionTrace, decision_summary
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
+# Generic runtime prompt. Domain policy is loaded from the activated canonical
+# Skill package through ``SkillRegistry.prompt_policy``.
 _PLANNER_INSTRUCTION = (
     "## 角色\n"
-    "You are the Planner Agent. Observe only the supplied user-scoped context "
-    "and prior tool observations. You may call permitted low-risk context tools "
-    "when information is insufficient. Then produce an outcome-based plan with "
-    "success criteria and Skill authority, or ask the user a concrete question. "
-    "For a public job-discovery goal, an absent user-supplied URL is not by "
-    "itself missing context: the Executor can safely search public pages before "
-    "capturing evidence. Ask only for genuinely personal constraints or facts "
-    "that cannot be observed from public sources. "
-    "\n## 行为规则\n"
-    "Treat every explicitly requested user deliverable as a mandatory plan "
-    "outcome, not an optional suggestion. Decompose a multi-deliverable request "
-    "into one separate step per requested deliverable, and scope each step's "
-    "allowed_skills to the single Skill that produces that deliverable: a "
-    "job-discovery step (allowed_skills=[\"job-discovery\"]) captures public JD "
-    "evidence; a job-matching step (allowed_skills=[\"job-matching\"]) ranks "
-    "observed jobs against the profile; a resume-tailoring step "
-    "(allowed_skills=[\"resume-tailoring\"]) produces grounded resume changes; "
-    "a career-planning step (allowed_skills=[\"career-planning\"]) produces an "
-    "interview or preparation plan. Do not combine multiple Skills in one step, "
-    "because the Executor only sees tools for the current step's allowed_skills: "
-    "a discovery step that also promises a recommendation hides the matching "
-    "tool from the Executor and the deliverable is never produced. A request for "
-    "a ranked job recommendation must include a separate job-matching step after "
-    "discovery; a request for grounded resume changes must include a separate "
-    "resume-tailoring step; and a request for an interview or preparation plan "
-    "must include a separate career-planning step. Do not mark the plan "
-    "successful if an explicitly requested deliverable is omitted. "
-    "When confirmed profile fact fields are supplied, those facts already exist "
-    "on the server: plan the matching/tailoring work instead of asking the user "
-    "to upload the same resume again. The Executor can inspect the fact values "
-    "through its private, scoped context. "
-    "\n## 流程\n"
-    "When context.candidate_urls is a non-empty list, those URLs are "
-    "already-collected candidate job pages supplied by the user. Plan an "
-    "evidence-capture step scoped to exactly those URLs (the Executor must not "
-    "search the open web; search is hard-blocked while candidate URLs exist) "
-    "followed by one separate step per requested deliverable (job-matching, "
-    "resume-tailoring, career-planning). Never emit a plan whose only step is "
-    "job-discovery when the goal asks for ranking, matching, tailoring, or "
-    "planning: every requested deliverable must have its own step, or the "
-    "Executor has no tool with which to produce it. Copy every candidate URL "
-    "character-for-character into the step objective exactly as supplied; "
-    "never abbreviate, re-type, or guess URL characters, because a single "
-    "altered character turns a valid page into a 404 that blocks the run. "
-    "A chain_context note that mentions a previous session's captured evidence "
-    "refers to artifacts that do NOT exist in the current session: when "
-    "chain_context is present and candidate_urls are supplied, always plan a "
-    "job-discovery evidence-capture step over candidate_urls first, then the "
-    "deliverable step(s), so the Executor re-captures the pages itself. Never "
-    "plan a deliverable step that assumes pre-existing evidence artifacts "
-    "when the current context carries only candidate URLs."
-    "When a resume-tailoring, career-planning, or job-matching goal names a "
-    "role or skill set but supplies no JD text, no URL, and no candidate list, "
-    "that is not missing context: plan a preliminary job-discovery step whose "
-    "objective names the role and instructs the Executor to search public pages "
-    "and capture ONE representative public JD for that role, followed by the "
-    "deliverable step (tailoring, planning, or matching) grounded on that "
-    "captured evidence. The deliverable tools require an observed JD artifact "
-    "(target_artifact_id); without captured evidence the Executor cannot "
-    "produce the deliverable and will ask the user instead. Never ask the user "
-    "for a JD that can be obtained from public sources. Ask the user only when "
-    "the goal references a specific document that only the user can supply "
-    "(e.g. 'this JD', 'my pasted link', 'my resume text') or a genuinely "
-    "personal fact not in the confirmed profile. A goal that references "
-    "session entities such as 'these positions' without a corresponding "
-    "candidate list is likewise not missing context: plan a discovery step for "
-    "the named role and a job-matching step over the captured JDs. "
-    "When the goal names the recruitment data source (校招内推汇总表/内推台账/"
-    "招聘数据源/就业信息网), that source is an internal always-available "
-    "dataset, not a file the user must upload: plan a job-discovery step whose "
-    "objective instructs the Executor to query the data source for companies "
-    "updated within the goal's stated recency window, then verify each "
-    "company's jobs at its apply links. Never ask the user to provide or "
-    "upload that data source."
+    "You are the Planner role in a generic Planner-Executor-Verifier runtime.\n"
+    "## 行为规则\n"
+    "Inspect only supplied state, choose permitted low-risk tools when needed, "
+    "decompose independent deliverables into steps, keep each step within its "
+    "declared Skill authority, and declare typed inputs, outputs, and dependencies.\n"
+    "## 流程\n"
+    "A non-empty confirmed_profile_fact_fields list means the server already has "
+    "those confirmed private facts; do not ask the user to upload, paste, or repeat "
+    "their values. Field names are intentionally all the Planner needs; the scoped "
+    "Executor can use the values for an activated Skill. If a preceding step is "
+    "blocked, ask for the input that unblocks that step, never for unrelated private "
+    "fields that are already present. "
+    "The Executor receives only the activated Skill's least-privilege projection. "
+    "If an activated Skill requires an artifact that an allowed preceding Skill can "
+    "obtain from public or otherwise permitted evidence, plan that preceding step "
+    "instead of asking the user for a duplicate artifact. Ask only for information "
+    "that cannot be obtained through permitted tools or activated Skill instructions. "
+    "Do not ask a bundle of optional questions: missing preferences are not blockers. "
+    "Before asking, check context, private context, and every activated Skill; if a "
+    "permitted path can make useful progress, plan that path. Ask at most one concrete "
+    "question, and only when one missing input blocks every permitted path. "
+    "Never invent evidence, tool capability, or a completed deliverable.\n"
+    "## 输出契约\n"
+    "Return one outcome-based plan with explicit success criteria, or one concrete "
+    "user question."
+    "\n\n"
+    + COMMON_RUNTIME_RULES
+    + PLANNER_RUNTIME_RULES
 )
 
 
 class PlannerAgent:
     """Goal-oriented Planning loop; it is not a one-shot prompt template."""
 
-    def __init__(self, *, gateway: AgentModelGateway, tools: ToolRegistry) -> None:
+    def __init__(
+        self,
+        *,
+        gateway: AgentModelGateway,
+        tools: ToolRegistry,
+        skills: SkillRegistry | None = None,
+    ) -> None:
         self._gateway = gateway
         self._tools = tools
+        self._skills = skills
 
     def run(
         self,
@@ -121,6 +93,7 @@ class PlannerAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        model_budget: ModelCallBudget | None = None,
         deadline: float | None = None,
     ) -> PlannerResult:
         """Sense context and form a bounded execution plan for every request."""
@@ -138,6 +111,11 @@ class PlannerAgent:
         available_tools = self._tools.tool_catalog(
             role=AgentRole.planner, allowed_skills=allowed_skills
         )
+        available_executor_tools = self._tools.tool_catalog(
+            role=AgentRole.executor, allowed_skills=allowed_skills
+        )
+        premature_need_user_retries = 0
+        runtime_feedback: str | None = None
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return PlannerResult(
@@ -155,28 +133,53 @@ class PlannerAgent:
             # projections full and collapse older ones to identifier-only summary
             # lines when the accumulated list exceeds the character budget.
             summarized_observations = summarize_observations(observations_for_decision)
+            decision_state = {
+                "goal": task.goal,
+                "allowed_skills": task.allowed_skills,
+                "skill_policy": (
+                    self._skills.prompt_policy(task.allowed_skills)
+                    if self._skills is not None
+                    else ""
+                ),
+                "available_tools": available_tools,
+                "available_executor_tools": available_executor_tools,
+                "context": task.context,
+                "confirmed_profile_fact_fields": fact_fields,
+                "remaining_tool_calls": (
+                    tool_budget.remaining
+                    if tool_budget is not None
+                    else task.budget.max_tool_calls - len(observations)
+                ),
+                "remaining_agent_turns": (
+                    turn_budget.remaining
+                    if turn_budget is not None
+                    else task.budget.max_agent_turns - _turn - 1
+                ),
+                "observations": summarized_observations,
+                "replan_state": task.replan_state.model_dump(mode="json"),
+            }
+            if runtime_feedback:
+                decision_state["runtime_feedback"] = runtime_feedback
+            if model_budget is not None and not model_budget.try_reserve(
+                estimate_input_tokens(_PLANNER_INSTRUCTION, decision_state)
+            ):
+                return PlannerResult(
+                    status="failed",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                )
             decision = self._gateway.decide(
                 role=AgentRole.planner,
                 instruction=_PLANNER_INSTRUCTION,
-                state={
-                    "goal": task.goal,
-                    "allowed_skills": task.allowed_skills,
-                    "available_tools": available_tools,
-                    "context": task.context,
-                    "confirmed_profile_fact_fields": fact_fields,
-                    "remaining_tool_calls": (
-                        tool_budget.remaining if tool_budget is not None
-                        else task.budget.max_tool_calls - len(observations)
-                    ),
-                    "remaining_agent_turns": (
-                        turn_budget.remaining
-                        if turn_budget is not None
-                        else task.budget.max_agent_turns - _turn - 1
-                    ),
-                    "observations": summarized_observations,
-                },
+                state=decision_state,
                 response_model=PlannerDecision,
             )
+            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+                return PlannerResult(
+                    status="failed",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                )
             if trace is not None:
                 usage = self._gateway.last_usage
                 if isinstance(usage, dict):
@@ -225,6 +228,18 @@ class PlannerAgent:
                 return PlannerResult(
                     status="planned", plan=plan, observations=observations
                 )
+            if (
+                available_executor_tools
+                and premature_need_user_retries < 1
+                and _turn < task.budget.max_agent_turns - 1
+            ):
+                premature_need_user_retries += 1
+                runtime_feedback = (
+                    "Policy correction: permitted tools are still available. "
+                    "Do not ask the user yet. Re-check context and Skill policy; "
+                    "return a plan if any permitted path can make progress."
+                )
+                continue
             return PlannerResult(
                 status="needs_user",
                 observations=observations,

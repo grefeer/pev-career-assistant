@@ -6,6 +6,14 @@ import time
 
 from backend.app.domain.agent_runtime import AgentRole, VerificationDecision
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
+from backend.app.services.agent_runtime.model_budget import (
+    ModelCallBudget,
+    estimate_input_tokens,
+)
+from backend.app.services.agent_runtime.prompt_rules import (
+    COMMON_RUNTIME_RULES,
+    VERIFIER_RUNTIME_RULES,
+)
 from backend.app.services.agent_runtime.observation_projection import (
     observation_for_decision,
     record_observation,
@@ -21,6 +29,7 @@ from backend.app.services.agent_runtime.schemas import (
     VerifierDecision,
     VerifierResult,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolRegistry
@@ -33,38 +42,34 @@ from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 
 _VERIFIER_INSTRUCTION = (
     "## 角色\n"
-    "You are the Verifier Agent. Independently inspect the planned success "
-    "criteria, execution observations and artifact references. Use permitted "
-    "verification tools when needed, then return PASS, RETRY_EXECUTOR, REPLAN, "
-    "NEED_USER or FAIL. Do not treat an Executor claim as evidence. "
-    "\n## 行为规则\n"
-    "For a current outcome that promises a ranked recommendation, best treatment, "
-    "or best-fit role, do not return PASS unless execution_tool_calls include "
-    "match-observed-jobs. For a promised grounded resume change or preparation plan, "
-    "require build-resume-tailoring-brief or build-preparation-plan respectively. "
-    "Return RETRY_EXECUTOR with the missing tool-backed deliverable as feedback; "
-    "never accept a prose claim in place of that observation. "
-    "For a job-discovery step, the evidence is the captured page text artifact "
-    "itself; structured extraction (extract-observed-job-details/-batch) is an "
-    "optional enhancement, not a requirement. A list or card page that yields "
-    "no structured candidates is still valid evidence: do not RETRY_EXECUTOR "
-    "a discovery step solely because structured extraction produced nothing, "
-    "as long as raw page text was captured. Return PASS and let the "
-    "deliverable steps operate on the raw observed text. "
-    "A sheet-backed step (query-career-sheet-records) has the same contract: "
-    "the evidence is the persisted records artifact carrying content_hash and "
-    "source_url, not page text. Do not RETRY_EXECUTOR a sheet-backed step "
-    "solely because no page text was captured, as long as the sheet records "
-    "were returned with their evidence binding. "
+    "You are the Verifier role in a generic Planner-Executor-Verifier runtime.\n"
+    "## 行为规则\n"
+    "Independently compare the step contract with tool observations and persisted "
+    "artifact references. Use only permitted verification tools and never treat "
+    "prose as evidence.\n"
+    "## 输出契约\n"
+    "Return exactly one machine-actionable decision: PASS only when the activated "
+    "Skill contract is satisfied; otherwise choose RETRY_EXECUTOR, REPLAN, "
+    "NEED_USER, or FAIL with concise feedback."
+    "\n\n"
+    + COMMON_RUNTIME_RULES
+    + VERIFIER_RUNTIME_RULES
 )
 
 
 class VerifierAgent:
     """Bounded perceive–decide–act–observe verification loop."""
 
-    def __init__(self, *, gateway: AgentModelGateway, tools: ToolRegistry) -> None:
+    def __init__(
+        self,
+        *,
+        gateway: AgentModelGateway,
+        tools: ToolRegistry,
+        skills: SkillRegistry | None = None,
+    ) -> None:
         self._gateway = gateway
         self._tools = tools
+        self._skills = skills
 
     def run(
         self,
@@ -77,6 +82,7 @@ class VerifierAgent:
         trace: DecisionTrace | None = None,
         tool_budget: ToolCallBudget | None = None,
         turn_budget: AgentTurnBudget | None = None,
+        model_budget: ModelCallBudget | None = None,
         deadline: float | None = None,
     ) -> VerifierResult:
         """Verify a completed step through independent Agent-selected actions."""
@@ -104,6 +110,8 @@ class VerifierAgent:
         available_tools = self._tools.tool_catalog(
             role=AgentRole.verifier, allowed_skills=allowed_skills
         )
+        premature_need_user_retries = 0
+        runtime_feedback: str | None = None
         for _turn in range(task.budget.max_agent_turns):
             if deadline is not None and time.monotonic() >= deadline:
                 return VerifierResult(
@@ -123,35 +131,57 @@ class VerifierAgent:
             # projections full and collapse older ones to identifier-only summary
             # lines when the accumulated list exceeds the character budget.
             summarized_observations = summarize_observations(observations_for_decision)
+            decision_state = {
+                "goal": task.goal,
+                "plan": plan_json,
+                "step": step_json,
+                "skill_policy": (
+                    self._skills.prompt_policy(step.allowed_skills)
+                    if self._skills is not None
+                    else ""
+                ),
+                "available_tools": available_tools,
+                "execution": execution_json,
+                "execution_tool_calls": summarize_tool_call_history(
+                    execution.observations
+                ),
+                "remaining_tool_calls": (
+                    tool_budget.remaining
+                    if tool_budget is not None
+                    else task.budget.max_tool_calls - len(observations)
+                ),
+                "remaining_agent_turns": (
+                    turn_budget.remaining
+                    if turn_budget is not None
+                    else task.budget.max_agent_turns - _turn - 1
+                ),
+                "my_tool_calls": summarized_observations,
+                "replan_state": task.replan_state.model_dump(mode="json"),
+            }
+            if runtime_feedback:
+                decision_state["runtime_feedback"] = runtime_feedback
+            if model_budget is not None and not model_budget.try_reserve(
+                estimate_input_tokens(_VERIFIER_INSTRUCTION, decision_state)
+            ):
+                return VerifierResult(
+                    decision=VerificationDecision.NEED_USER,
+                    feedback="Model budget exhausted before independent verification.",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                )
             decision = self._gateway.decide(
                 role=AgentRole.verifier,
                 instruction=_VERIFIER_INSTRUCTION,
-                state={
-                    "goal": task.goal,
-                    "plan": plan_json,
-                    "step": step_json,
-                    "available_tools": available_tools,
-                    "execution": execution_json,
-                    "execution_tool_calls": summarize_tool_call_history(
-                        execution.observations
-                    ),
-                    "remaining_tool_calls": (
-                        tool_budget.remaining if tool_budget is not None
-                        else task.budget.max_tool_calls - len(observations)
-                    ),
-                    "remaining_agent_turns": (
-                        turn_budget.remaining
-                        if turn_budget is not None
-                        else task.budget.max_agent_turns - _turn - 1
-                    ),
-                    # The Verifier's own tool calls; the Executor's history is
-                    # exposed separately as execution_tool_calls so the model
-                    # cannot mistake its own (initially empty) list for the
-                    # executed step's evidence (R002 "observations 数组为空").
-                    "my_tool_calls": summarized_observations,
-                },
+                state=decision_state,
                 response_model=VerifierDecision,
             )
+            if model_budget is not None and not model_budget.record(self._gateway.last_usage):
+                return VerifierResult(
+                    decision=VerificationDecision.NEED_USER,
+                    feedback="Model budget exhausted after independent verification.",
+                    observations=observations,
+                    error_code="model_budget_exhausted",
+                )
             if trace is not None:
                 usage = self._gateway.last_usage
                 if isinstance(usage, dict):
@@ -195,6 +225,34 @@ class VerifierAgent:
                         payload=decision.tool_input,
                         allowed_skills=allowed_skills,
                     ),
+                )
+                continue
+            blocked_codes = {
+                "anti_bot_challenge",
+                "captcha",
+                "login_required",
+                "access_denied",
+                "domain_temporarily_blocked",
+                "source_unavailable",
+            }
+            has_blocked_evidence = any(
+                observation.error_code in blocked_codes
+                for observation in [*execution.observations, *observations]
+            )
+            if (
+                decision.verification_decision is VerificationDecision.NEED_USER
+                and available_tools
+                and not has_blocked_evidence
+                and premature_need_user_retries < 1
+                and _turn < task.budget.max_agent_turns - 1
+            ):
+                premature_need_user_retries += 1
+                runtime_feedback = (
+                    "Policy correction: NEED_USER is premature because no "
+                    "terminal access block is recorded and verifier tools remain. "
+                    "Choose RETRY_EXECUTOR only when a specific permitted action "
+                    "can produce new evidence; otherwise make the contract-based "
+                    "decision now."
                 )
                 continue
             return VerifierResult(

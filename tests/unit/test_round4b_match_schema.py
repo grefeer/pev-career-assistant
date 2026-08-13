@@ -283,13 +283,8 @@ def test_executor_dedups_identical_invalid_tool_input_reissue() -> None:
     assert result.execution_state["consecutive_stalls"] == 2
 
 
-def test_executor_distinct_invalid_payloads_each_count_one_wasted_turn() -> None:
-    """Genuinely NEW bad shapes still burn one wasted turn each (cap backstop).
-
-    Three different invalid payloads produce three wasted turns; the
-    total-waste cap (3) still hands the step to the human as the last line of
-    defense when tolerance cannot fix the shape.
-    """
+def test_executor_stops_repeated_invalid_input_signature_before_waste_cap() -> None:
+    """Equivalent field failures stop after one bounded correction attempt."""
     invocations = {"count": 0}
     registry, _captured = _registry_with_match_tool(invocations)
     task = _matching_task()
@@ -311,10 +306,10 @@ def test_executor_distinct_invalid_payloads_each_count_one_wasted_turn() -> None
     assert result.status == "needs_user"
     assert invocations["count"] == 0
     assert [obs.error_code for obs in result.observations] == [
-        "invalid_tool_input", "invalid_tool_input", "invalid_tool_input",
+        "invalid_tool_input", "invalid_tool_input",
     ]
-    assert "累计" in result.user_question
-    assert result.execution_state["total_wasted_turns"] == 3
+    assert "字段契约" in result.user_question
+    assert result.execution_state["total_wasted_turns"] == 1
 
 
 def test_executor_tolerated_payload_succeeds_and_records_normalization() -> None:

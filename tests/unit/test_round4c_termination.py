@@ -2,12 +2,10 @@
 
 Round-4 behaviors under test:
 
-* N3 RETRY-cap -> bounded replan - a verifier RETRY_EXECUTOR exhaustion over a
-  satisfied deterministic step contract (tool-backed deliverable, no blocked
-  evidence, replan budget remaining, once-per-run marker absent) converts to a
-  bounded REPLAN instead of an unnecessary human hand-off. Exhaustion with
-  blocked evidence (login/captcha/anti-bot) or an already-fired marker keeps
-  the waiting_user hand-off.
+* N3 retry progress gate - a verifier RETRY_EXECUTOR with an unchanged
+  evidence fingerprint is handed to the human before another executor or
+  planner loop can spend budget. New evidence may still trigger a bounded
+  replan.
 * N4 isomorphic-replan guard - when the replanned plan repeats the exact step
   sequence that already failed to converge AND the replan budget is exhausted
   (max_replans >= 2), the run terminates honestly as waiting_user instead of
@@ -22,8 +20,8 @@ Round-4 behaviors under test:
   soft-404 (页面不存在/职位已下线/职位不存在/页面已经过期 in title or body
   head, or "404" in title, with almost no JD body) fails as ``dead_link`` (a
   neutral failure, never needs_manual_review); public search is authorized
-  only after EVERY candidate URL failed (fetch error or dead link) - partial
-  or blocked failures never authorize search.
+  only after EVERY candidate URL failed or was blocked. Blocked domains are
+  filtered from the alternate-host search results.
 """
 
 from __future__ import annotations
@@ -39,7 +37,6 @@ from backend.app.db.models import AgentStep, User, UserRole
 from backend.app.domain.agent_runtime import (
     AgentRole,
     RunStatus,
-    StepStatus,
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.evidence_gate import is_blocked_error
@@ -61,9 +58,6 @@ from backend.app.services.career_skills.job_discovery import (
     PublicJobFetchError,
     fetch_public_job_page,
 )
-
-_RETRY_REPLAN_MARKER = "<retry_replan>"
-
 
 class EmptyInput(BaseModel):
     pass
@@ -335,21 +329,15 @@ def test_retry_cap_with_contract_met_routes_to_bounded_replan(db_session) -> Non
         ),
     )
 
-    # The third RETRY (retries=3 > max_replans=2) over the satisfied contract
-    # converted to a bounded replan; the replanned identical step passed.
-    assert result.status is RunStatus.succeeded
-    assert result.summary == "匹配完成"
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
+    # The second retry has the same evidence fingerprint as the first one, so
+    # the runtime hands off before spending a replan on an unchanged path.
+    assert result.status is RunStatus.waiting_user
+    assert "缺少匹配证据" in (result.summary or "")
+    assert _events(db_session, result.run_id).count("plan_created") == 1
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
     steps = _steps(db_session, result.run_id)
-    assert {step.error_code for step in steps} == {"replan_required", None}
-    skipped = [step for step in steps if step.error_code == "replan_required"]
-    assert skipped[0].status is StepStatus.skipped
-    # The converted summary (marker included) reached the replanned Planner.
-    planner_context = gateway.states[AgentRole.planner][1]["context"]
-    assert planner_context["verifier_feedback"] == [
-        f"缺少匹配证据 {_RETRY_REPLAN_MARKER}"
-    ]
+    assert len(steps) == 1
+    assert steps[0].error_code == "no_progress_duplicate"
 
 
 def test_retry_cap_conversion_is_once_per_run(db_session) -> None:
@@ -395,20 +383,15 @@ def test_retry_cap_conversion_is_once_per_run(db_session) -> None:
         ),
     )
 
-    # First exhaustion converted to a replan; the second identical one (marker
-    # already present in verifier_feedback) stays a human hand-off even though
-    # the replan budget would still allow another conversion.
+    # The unchanged evidence fingerprint is handed off immediately; no
+    # identical replan is persisted.
     assert result.status is RunStatus.waiting_user
     assert "缺少匹配证据" in (result.summary or "")
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
-    assert _events(db_session, result.run_id).count("plan_created") == 2
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
+    assert _events(db_session, result.run_id).count("plan_created") == 1
     steps = _steps(db_session, result.run_id)
-    assert len(steps) == 2
-    assert {step.error_code for step in steps} == {"replan_required", "need_user"}
-    planner_context = gateway.states[AgentRole.planner][1]["context"]
-    assert planner_context["verifier_feedback"] == [
-        f"缺少匹配证据 {_RETRY_REPLAN_MARKER}"
-    ]
+    assert len(steps) == 1
+    assert steps[0].error_code == "no_progress_duplicate"
 
 
 def test_retry_cap_keeps_waiting_user_when_blocked_evidence_present(db_session) -> None:
@@ -886,8 +869,8 @@ def test_search_stays_forbidden_while_any_candidate_unfailed(db_session) -> None
     assert search_obs[0]["error_code"] == "candidate_urls_already_supplied"
 
 
-def test_search_stays_forbidden_when_candidates_blocked(db_session) -> None:
-    """Blocked candidates never authorize search (security hard gate)."""
+def test_search_falls_back_when_all_candidates_are_blocked(db_session) -> None:
+    """Blocked candidates authorize a safe alternate-host search fallback."""
     user = _user("user-c-9")
     db_session.add(user)
     db_session.commit()
@@ -906,7 +889,7 @@ def test_search_stays_forbidden_when_candidates_blocked(db_session) -> None:
     observations = _search_observations(gateway)
     search_obs = [obs for obs in observations if obs["tool_name"] == "search-public-job-pages"]
     assert len(search_obs) == 1
-    assert search_obs[0]["error_code"] == "candidate_urls_already_supplied"
+    assert search_obs[0]["status"] == "succeeded"
 
 
 def test_search_authorized_after_all_candidates_failed(db_session) -> None:

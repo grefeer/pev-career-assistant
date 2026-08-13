@@ -37,6 +37,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import time
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -62,8 +63,10 @@ from backend.app.services.agent_runtime.runtime import AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 from backend.app.services.career_skills.registry import build_career_tool_registry
+from backend.app.services.career_skills.manifest import build_career_skill_registry
 from backend.app.services.profile_parser import extract_evidence_candidates
 from tests.conftest import settings_override
+from tests.question.eval_policy import audit_success_record, failure_trace, root_cause
 
 QUESTION_DIR = pathlib.Path(__file__).resolve().parent
 ALL_SKILLS = ["job-discovery", "job-matching", "resume-tailoring", "career-planning"]
@@ -257,10 +260,17 @@ def run_question(
         bounded: list[dict] = []
         for item in inherited_evidence:
             text = item.get("visible_text")
-            if not isinstance(text, str) or not text:
+            candidates = item.get("candidates")
+            if (not isinstance(text, str) or not text) and not isinstance(candidates, list):
                 continue
-            bounded.append({**item, "visible_text": text[:remaining_characters]})
-            remaining_characters -= min(len(text), remaining_characters)
+            bounded_item = dict(item)
+            bounded_item["visible_text"] = (
+                text[:remaining_characters] if isinstance(text, str) else ""
+            )
+            if isinstance(candidates, list):
+                bounded_item["candidates"] = candidates[:20]
+            bounded.append(bounded_item)
+            remaining_characters -= min(len(text), remaining_characters) if isinstance(text, str) else 0
             if remaining_characters <= 0:
                 break
         context["observed_public_evidence"] = bounded
@@ -284,11 +294,13 @@ def run_question(
     settings = settings_override(agent_harness_enabled=True)
     gateway = build_agent_model_gateway(settings)
     tools = build_career_tool_registry()
+    skills = build_career_skill_registry(tools)
     runtime = AgentRuntime(
-        planner=PlannerAgent(gateway=gateway, tools=tools),
-        executor=ExecutorAgent(gateway=gateway, tools=tools),
-        verifier=VerifierAgent(gateway=gateway, tools=tools),
+        planner=PlannerAgent(gateway=gateway, tools=tools, skills=skills),
+        executor=ExecutorAgent(gateway=gateway, tools=tools, skills=skills),
+        verifier=VerifierAgent(gateway=gateway, tools=tools, skills=skills),
         agent_version="pev-eval",
+        skills=skills,
     )
     result = runtime.run(db, user_id=user.id, task=task)
     wall_seconds = round(time.monotonic() - started, 1)
@@ -349,7 +361,22 @@ def run_question(
         if decision.get("verification_decision"):
             verifier_decisions.append(decision["verification_decision"])
 
-    return {
+    terminal_contract = None
+    for event in reversed(events):
+        payload = event.payload_json or {}
+        if isinstance(payload, dict) and "failure_class" in payload:
+            terminal_contract = {
+                key: payload[key]
+                for key in (
+                    "contract_version", "failure_class", "reason_code",
+                    "source_role", "phase", "resumable", "retry_allowed",
+                    "replan_allowed", "user_action", "evidence",
+                )
+                if key in payload
+            }
+            break
+
+    record = {
         "id": qid,
         "run_id": run_id,
         "question": doc["question"],
@@ -372,6 +399,9 @@ def run_question(
                     "sequence": index + 1,
                     "objective": planned.get("objective"),
                     "allowed_skills": planned.get("allowed_skills"),
+                    "depends_on": planned.get("depends_on", []),
+                    "inputs": planned.get("inputs", []),
+                    "outputs": planned.get("outputs", []),
                     "status": (
                         executed_by_sequence[index + 1].status.value
                         if index + 1 in executed_by_sequence
@@ -388,10 +418,30 @@ def run_question(
         },
         "turns": turn_summaries,
         "verifier_decisions": verifier_decisions,
+        "terminal_contract": terminal_contract,
         "artifacts": [
             {
+                "artifact_id": artifact.id,
                 "artifact_type": artifact.artifact_type,
                 "source_url": artifact.source_url,
+                "content_hash": artifact.content_hash,
+                "visible_text": (
+                    artifact.content_json.get("visible_text", "")[:12_000]
+                    if isinstance(artifact.content_json, dict)
+                    and isinstance(artifact.content_json.get("visible_text"), str)
+                    else ""
+                ),
+                "quality": (
+                    artifact.content_json.get("quality")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "candidates": (
+                    artifact.content_json.get("candidates")[:20]
+                    if isinstance(artifact.content_json, dict)
+                    and isinstance(artifact.content_json.get("candidates"), list)
+                    else None
+                ),
                 "created_by": artifact.created_by.value,
             }
             for artifact in artifacts
@@ -401,16 +451,42 @@ def run_question(
         "input_tokens": sum(turn.input_tokens or 0 for turn in turns),
         "output_tokens": sum(turn.output_tokens or 0 for turn in turns),
     }
+    record["success_audit"] = audit_success_record(record)
+    if result.status.value == "succeeded" and record["success_audit"]["status"] != "passed":
+        audit_status = record["success_audit"]["status"]
+        record["result"] = {
+            **record["result"],
+            "status": "waiting_user",
+            "error_code": "success_contract_not_satisfied",
+            "summary": (
+                "运行轨迹没有产生可核验的完整岗位页面，"
+                f"成功审计结果为 {audit_status}，不能计为成功。"
+            ),
+        }
+        record["terminal_contract"] = {
+            "contract_version": "terminal.v1",
+            "failure_class": "contract_or_policy_error",
+            "reason_code": "success_contract_not_satisfied",
+            "source_role": "eval_auditor",
+            "phase": "evaluation",
+            "resumable": True,
+            "retry_allowed": False,
+            "replan_allowed": False,
+            "user_action": "provide_public_job_url_or_jd_text",
+            "evidence": {"contract_met": False, "blocked": False, "artifact_count": len(artifacts)},
+        }
+    record["failure_trace"] = failure_trace(record)
+    record["root_cause"] = root_cause(record)
+    return record
 
 
 def run_chain(db: Session, cid: str, doc: dict, *, budget: AgentBudget) -> dict:
     """Run a chained question: link N+1 only runs when link N succeeded.
 
-    Each link is one full PEV run in a fresh session. A succeeded link's
-    collected artifacts (source_urls) become the next link's candidate_urls,
-    plus a chain_context note quoting the previous link's summary — the
-    question chain answers with real evidence instead of a fresh session
-    pretending earlier steps happened. The chain stops at the first
+    Each link is one full PEV run with a fresh database run id. A succeeded
+    link's collected artifacts and candidate URLs become the next link's
+    typed inherited evidence, so the chain preserves real source-backed
+    state instead of asking the next link to rediscover it. The chain stops at the first
     non-succeeded link (per the chained-question contract: 问题A回答完后
     (success后)再次回答问题B).
     """
@@ -428,43 +504,35 @@ def run_chain(db: Session, cid: str, doc: dict, *, budget: AgentBudget) -> dict:
                 artifact["source_url"]
                 for artifact in prev["artifacts"]
                 if artifact.get("source_url")
+                and artifact.get("artifact_type") in {
+                    "public_job_page", "structured_job_details"
+                }
             ]
             if prev_urls:
                 extra_context = {"candidate_urls": prev_urls}
             summary = (prev["result"].get("summary") or "").strip()
             if summary:
-                # Deliberately do NOT quote the previous link's artifact ids:
-                # this link is a fresh session with no persisted evidence, so
-                # the executor must re-capture the candidate URLs itself.
                 note = (
-                    f"上一环节（{prev['id']}）已完成岗位收集，但本环节是全新会话，"
-                    f"上一环节的证据工件在当前会话中不存在，必须基于 "
-                    f"candidate_urls 中的 URL 重新抓取岗位页面获取 JD 证据后，"
-                    f"才能进行本环节的任务。上一环节成果参考：{summary[:200]}"
+                    f"上一环节（{prev['id']}）已完成岗位收集；本环节继承其工具产出的来源证据，"
+                    f"如需补充来源只能使用公开且安全的 URL。上一环节成果参考：{summary[:200]}"
                 )
                 extra_context = {
                     **(extra_context or {}),
                     "chain_context": note,
                 }
-            # The previous link's URLs become this link's candidate_urls so the
-            # executor re-captures them itself: the harness only rebuilds
-            # observed_public_evidence from THIS run's persisted artifacts
-            # between steps (runtime._with_observed_public_evidence), so
-            # in-memory evidence injected from an earlier run would be wiped
-            # before any step after the first. Fetching candidates inside the
-            # link persists evidence rows that survive step boundaries.
         record = run_question(
             db,
             link_id,
             link_doc,
             budget=budget,
             extra_context=extra_context,
+            inherited_evidence=prev.get("artifacts") if records else None,
         )
         records.append(record)
         if record["result"]["status"] != "succeeded":
             break
     last = records[-1]
-    return {
+    record = {
         "id": cid,
         "type": "chain",
         "chain_length": len(links),
@@ -478,6 +546,11 @@ def run_chain(db: Session, cid: str, doc: dict, *, budget: AgentBudget) -> dict:
         "input_tokens": sum(r["input_tokens"] for r in records),
         "output_tokens": sum(r["output_tokens"] for r in records),
     }
+    record["failure_trace"] = failure_trace(last)
+    record["root_cause"] = root_cause(last)
+    record["terminal_contract"] = last.get("terminal_contract")
+    record["success_audit"] = last.get("success_audit")
+    return record
 
 
 def main() -> None:
@@ -534,9 +607,21 @@ def main() -> None:
                 print(f"RUN {qid}: {doc['question'][:60]}...", flush=True)
                 record = run_question(db, qid, doc, budget=DEFAULT_BUDGET)
             target = out_dir / f"{qid}.json"
-            target.write_text(
-                json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
+            # Replace atomically so the monitor never treats a half-written
+            # JSON document as a completed case.
+            target = (out_dir / f"{qid}.json").resolve()
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.stem}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                json.dump(record, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                temporary = pathlib.Path(handle.name)
+            temporary.replace(target)
             turns = (
                 sum(len(link["turns"]) for link in record["links"])
                 if "links" in record

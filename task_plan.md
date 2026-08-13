@@ -1,3 +1,56 @@
+# Task Plan: 本轮83案例全量在线评测与自适应优化
+
+# Task Plan: 10轮提示词快速迭代（前10个非链式案例）
+
+## 本轮目标
+仅通过修改 Planner、Executor、Verifier 的业务无关运行规则提示词，循环测试前10个非链式案例；每轮保存结果和工具调用归因，最多10轮，达到7/10 succeeded立即停止。
+
+## 固定测试集
+`Q011 Q013 Q017 Q028 Q034 Q040 Q045 Q046 Q055 Q057`
+
+## 迭代阶段
+- [ ] 第1轮：当前提示词基线
+- [ ] 第2轮：失败分流与 Planner 提问门槛
+- [ ] 第3轮：Executor 证据复用与工具选择
+- [ ] 第4轮：Verifier 交付契约与 PASS/RETRY
+- [ ] 第5轮：三角色协同状态读取
+- [ ] 第6轮：格式修复与行动一致性
+- [ ] 第7轮：预算/重复调用收敛
+- [ ] 第8轮：反爬边界下的最小交接
+- [ ] 第9轮：综合规则压缩与冲突消除
+- [ ] 第10轮：最终提示词验证
+
+## 停止条件
+- 任一轮直接成功数 >= 7：提前停止。
+- 完成第10轮：停止并报告最终成功数及不可通过的外部限制。
+
+## 非作弊边界
+- 不在提示词中写入岗位、公司、URL、岗位要求、答案或测试集专属事实。
+- 只增加角色决策规则、证据/工具使用注意事项、失败分流和交接边界。
+
+## 当前状态
+已完成测试集确认，准备运行第1轮。
+
+## 本轮目标
+运行83个顶层案例，每180秒统计状态；全量结束后按工具调用/失败轨迹评估，必要时修改提示词、Harness或工具层并完成回归验证。
+
+## 本轮阶段
+- [x] 启动83案例与180秒监控
+- [x] 完成全量状态统计和严格成功审计
+- [x] 按根因决定提示词/Harness/工具层改动
+- [x] 运行定向与全量回归
+- [x] 记录结果并交付结论
+
+## 当前状态
+已完成本轮全量评测、定向回归、提示词与 Harness 优化；所有新评测均写入独立目录，未覆盖历史结果。
+
+## 结果摘要
+- 全量目录：`tests/question/eval_results/round6_live_20260812_prompt_harness_adaptive/`
+- 直接按 83 个 manifest 顶层 ID 统计：1 succeeded、82 waiting_user、0 failed、0 unknown。
+- 定向目录：`tests/question/eval_results/round6_targeted_after_prompt_harness/`，16/16 waiting_user；主要由 Smartsheet 限流和公开来源证据不足造成。
+- R020 路由保护复测：fetch 48→12 次，wall-clock 328.3s→94.2s，终态从 `wall_clock_budget_exhausted` 改为可解释的 `no_progress_duplicate`。
+- 回归：`tests/unit` 1547 passed、1 warning；Ruff 通过。全仓 `pytest -q` 未采用，因历史 `temp/round5_worktrees` 被 pytest 自动收集导致 import mismatch。
+
 # Task Plan: waiting_user 优化执行（借鉴 job-board-aggregator + P0/P1/P2）
 
 ## Goal
@@ -75,3 +128,78 @@
 - 单题：17 succeeded / 51 waiting_user
 - 链接：26 succeeded / 8 waiting_user（34 链接）
 - tests/unit：1195 全绿、branch coverage 100%、ruff 通过
+
+## 2026-08-12 四轮闭环续跑
+
+### 方案融合
+- [x] 5 个子 agent 分别提出不同方案：运行时 DAG、canonical Skill 迁移、证据/来源路由、PEV policy compiler、可观测性闭环。
+- [x] 独立评估 agent 完成融合：先做 Artifact Port/工作流依赖，再做来源质量路由，再逐步编译 Skill 契约，最后低并发评测。
+
+### 第 1 轮：跨步骤 Artifact Port 与依赖门控
+- [x] `StepInputRef.artifact_type` 与输出类型标签接入运行时。
+- [x] 缺失/类型不匹配时记录 `step_dependency_gate_failed`，不再静默进入后续模型循环。
+- [x] 56 个 runtime/contract/skill tests 通过，Ruff 通过。
+
+### 第 2 轮：证据质量与链式继承
+- [x] 页面增加 `jd_complete/list_only/js_shell/empty` 质量信号。
+- [x] 链式评测传递 `artifact_id/content_hash/visible_text/quality`，不再要求下一环节重复抓取同一来源。
+- [x] discovery/runtime 回归集合 141 tests 通过，Ruff 通过。
+
+### 第 3 轮：Skill Artifact Port 编译
+- [x] `SkillDefinition` 增加 input/output `ArtifactPort`。
+- [x] career manifest 编译四个 PEV Skill 的 artifact 类型契约。
+- [x] 60 个 Skill/runtime 契约测试通过，Ruff 通过。
+
+### 第 4 轮：全量 live 评测与按阈值停止
+- [x] 4 个 worker 覆盖 83 题；首次启动的参数编排错误未计入业务结果，修正后重新启动。
+- [x] 3 分钟监视触发停止条件时为 47/83 完成：4 succeeded、40 waiting_user、3 failed。
+- [x] 因 `waiting_user > 30` 停止全部 8 个相关进程；无残留评测进程。
+- [x] 失败/等待聚类：28 个合规反爬或访问控制人工交接，8 个来源不足，2 个重复调用停滞；`sheet_rate_limited` 17 次，`duplicate_tool_call` 5 次。
+- [x] 修复招聘站根首页搜索误收、长文本首页误判为 JD、结构化 JD 丢失来源质量；新增监控脚本 `scripts/monitor_question_eval.ps1`。
+- [x] 修复后针对性集合 154 tests 通过，Ruff 通过。
+
+### 当前结论
+- 四轮优化和测试闭环已完成，但本轮只完成 47/83，成功数 4，未达到 65 success；不能声称达到用户设定的成功阈值。
+- 合规反爬/登录/验证码仍必须人工交接，不通过绕过安全限制提升成功数。
+
+## 用户追加要求：再做三轮 5+1 闭环
+
+目标：上一轮只算第 1 轮。本轮起再执行 3 轮，每轮固定顺序为：
+
+`5 个方向不同的独立方案 -> 1 个独立评估 -> 实现 -> 评测 -> 失败轨迹分析`
+
+停止条件：单轮评测累计超过 30 个非 `succeeded` 案例（`failed` 或
+`waiting_user`）立即停止，并保存该轮工具调用轨迹与原因聚类。
+
+- [x] 第 2 轮：来源配额/降级、重复调用、artifact 选择、Planner 契约、观测分析五方向方案
+- [x] 第 2 轮：独立评估、实现、测试与停止条件评测
+- [x] 第 3 轮：基于第 2 轮轨迹重新提出五个不同方向方案并评估
+- [x] 第 3 轮：实现、测试与停止条件评测
+- [x] 第 4 轮：基于第 3 轮轨迹重新提出五个不同方向方案并评估
+- [x] 第 4 轮：实现、离线验证与最终失败原因报告；在线评测按用户要求停止
+# Task Plan: PEV 通用规则提示词与 Harness 收敛
+
+## Goal
+在不把 career skill 业务流程硬编码进提示词的前提下，补强 Planner/Executor/Verifier 的通用行为规则，并修复仍能由 harness 防住的失败路径。
+
+## Phases
+- [x] Phase 1: 读取架构、提示词、决策 schema 与第5轮失败证据
+- [x] Phase 2: 设计通用规则边界，区分提示词职责与 harness 职责
+- [x] Phase 3: 实现提示词和必要 harness 修复
+- [x] Phase 4: 添加回归测试并运行定向/全量单元验证
+- [x] Phase 5: 总结改动、未解决问题与下一轮 live 验证口径
+
+## Key Questions
+1. 哪些失败是模型没有遵守通用执行规则，适合通过提示词改善？
+2. 哪些失败必须由 harness 强制拦截，不能依赖模型自律？
+3. 如何验证提示词改动没有把 skill 业务规则重新塞回 runtime？
+
+## Decisions Made
+- 提示词只包含角色职责、状态/证据/工具调用纪律和终止规则，不写招聘网站、搜索关键词或具体 skill 流程。
+- harness 继续拥有预算、权限、重复调用、证据契约、状态迁移和最终成功审计的决定权。
+
+## Errors Encountered
+- 待记录。
+
+## Status
+**Complete** - 提示词与 harness 补强完成；完整单元集、Ruff、compileall 均通过，下一步是重新进行 live A/B 评测。

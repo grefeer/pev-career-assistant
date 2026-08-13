@@ -21,6 +21,17 @@ def _sanitize_error_message(text: str, max_length: int = 500) -> str:
     """
     # Strip userinfo from URLs: https://user:pass@host -> https://[redacted]@host
     stripped = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^@]+@", r"\1[redacted]@", text)
+    # Strip common credential forms from provider and adapter exceptions.
+    stripped = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer [redacted]",
+        stripped,
+    )
+    stripped = re.sub(
+        r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|secret|authorization)\s*[:=]\s*([^\s,;]+)",
+        r"\1=[redacted]",
+        stripped,
+    )
     return stripped[:max_length]
 
 
@@ -38,12 +49,11 @@ def _validation_error_summary(exc: ValidationError, max_length: int = 500) -> st
     for entry in exc.errors():
         loc = ".".join(str(part) for part in entry.get("loc", ()))
         etype = entry.get("type", "validation_error")
-        msg = entry.get("msg", "")
         if loc:
-            entries.append(f"{loc}: {etype} ({msg})")
+            entries.append(f"{loc}: {etype}")
         else:
             # Model-level errors (e.g. wrong top-level type) have no field loc.
-            entries.append(f"{etype} ({msg})")
+            entries.append(str(etype))
     return _sanitize_error_message("invalid input: " + "; ".join(entries), max_length=max_length)
 
 ToolHandler = Callable[[ToolContext, BaseModel], BaseModel | Mapping[str, Any]]
@@ -60,6 +70,10 @@ class ToolDefinition:
     handler: ToolHandler
     skill_name: str | None = None
     description: str = ""
+    # ``None`` keeps old integrations source-compatible. Production skill
+    # adapters should set this explicitly so completion contracts do not infer
+    # deliverables from every executable helper.
+    is_deliverable: bool | None = None
 
 
 class ToolRegistry:
@@ -84,6 +98,11 @@ class ToolRegistry:
         # are now stale. Registration only happens at startup, so this clear
         # is free in the steady state.
         self._catalog_cache.clear()
+
+    @property
+    def definitions(self) -> tuple[ToolDefinition, ...]:
+        """Expose immutable registration metadata to the skill registry."""
+        return tuple(self._definitions.values())
 
     def tool_catalog(
         self,

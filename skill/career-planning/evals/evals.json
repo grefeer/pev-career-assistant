@@ -1,0 +1,8 @@
+{
+  "skill": "career-planning",
+  "cases": [
+    {"name": "target-jd-plan", "expect": "career_preparation_plan"},
+    {"name": "missing-target", "expect": "target_evidence_not_found"},
+    {"name": "no-fabricated-deadline", "expect": "relative_or_explicit_due_date"}
+  ]
+}

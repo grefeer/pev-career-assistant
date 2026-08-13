@@ -98,6 +98,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 from backend.app.services.career_skills.registry import (
                     build_career_tool_registry,
                 )
+                from backend.app.services.career_skills.manifest import (
+                    build_career_skill_registry,
+                )
 
                 runtime = getattr(app.state, "agent_runtime", None)
                 if not hasattr(app.state, "agent_runtime"):
@@ -106,11 +109,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     try:
                         gateway = build_agent_model_gateway(app.state.settings)
                         tools = build_career_tool_registry()
+                        skills = build_career_skill_registry(tools)
                         runtime = AgentRuntime(
-                            planner=PlannerAgent(gateway=gateway, tools=tools),
-                            executor=ExecutorAgent(gateway=gateway, tools=tools),
-                            verifier=VerifierAgent(gateway=gateway, tools=tools),
+                            planner=PlannerAgent(gateway=gateway, tools=tools, skills=skills),
+                            executor=ExecutorAgent(gateway=gateway, tools=tools, skills=skills),
+                            verifier=VerifierAgent(gateway=gateway, tools=tools, skills=skills),
                             agent_version="pev-1",
+                            skills=skills,
                         )
                         app.state.agent_runtime = runtime
                         owned_agent_runtime = runtime

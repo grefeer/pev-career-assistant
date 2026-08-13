@@ -15,13 +15,14 @@ import socket
 import subprocess
 import sys
 import threading
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import requests
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.target_evidence import resolve_target_evidence
 from backend.app.services.job_discovery.tools.batch_progress import run_parallel_with_progress
 from backend.app.services.job_discovery.tools.jd_extraction import extract_jd_candidates
 
@@ -395,6 +396,19 @@ class FetchPublicJobPageOutput(BaseModel):
     effective_url: str | None = None
     redirect_chain: list[str] = Field(default_factory=list)
     http_status: int | None = None
+    # Evidence quality is intentionally explicit so downstream Skills can
+    # distinguish a usable JD from a list shell without parsing prose.
+    quality: Literal["jd_complete", "list_only", "js_shell", "empty"] | None = None
+    quality_signal: str | None = None
+
+    @model_validator(mode="after")
+    def classify_quality(self) -> "FetchPublicJobPageOutput":
+        if self.quality is not None:
+            return self
+        quality, signal = _classify_page_quality(self.visible_text)
+        object.__setattr__(self, "quality", quality)
+        object.__setattr__(self, "quality_signal", signal)
+        return self
 
 
 class FetchPublicJobPagesInput(BaseModel):
@@ -459,6 +473,7 @@ class SearchPublicJobPagesOutput(BaseModel):
     source_url: str
     content_hash: str
     results: list[PublicJobSearchResult]
+    terminal_reason: Literal["candidates_found", "search_empty"] = "candidates_found"
 
 
 class ExtractObservedJobDetailsInput(BaseModel):
@@ -702,6 +717,37 @@ _ACCESS_BLOCK_TEXT_MARKERS = (
     "安全中心",
     "人机验证",
 )
+
+
+def _classify_page_quality(visible_text: str) -> tuple[
+    Literal["jd_complete", "list_only", "js_shell", "empty"], str
+]:
+    """Classify captured text without treating a card shell as a JD.
+
+    This is a routing signal, not a completion gate: the deterministic
+    extraction and evidence contracts still decide whether a Skill succeeded.
+    """
+    normalized = re.sub(r"\s+", "", visible_text or "")
+    if not normalized:
+        return "empty", "no_visible_text"
+    if len(normalized) < _MIN_USABLE_TEXT_CHARS:
+        return "js_shell", f"visible_chars<{_MIN_USABLE_TEXT_CHARS}"
+    head = normalized[:_JD_MARKER_SCAN_HEAD_CHARS].casefold()
+    jd_markers = {
+        *(_marker.replace(" ", "").casefold() for _marker in _JD_SECTION_MARKERS),
+        "requirements",
+        "qualifications",
+        "jobresponsibilities",
+        "whatyouwilldo",
+    }
+    if any(marker in head for marker in jd_markers):
+        return "jd_complete", "jd_section_marker"
+    if any(
+        marker in head
+        for marker in ("职位列表", "岗位列表", "招聘职位", "校招职位", "joblist", "jobcards")
+    ):
+        return "list_only", "list_marker_without_jd_section"
+    return "list_only", "usable_text_without_jd_section"
 
 
 def _detect_access_block(
@@ -1631,8 +1677,18 @@ def search_public_job_pages(
     becomes discovery evidence. The 360 fallback runs the raw query: it stays
     the unconstrained escape hatch, with the result filter still applied.
     """
-    del context
     query = payload.query
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    attempted = context.metadata.setdefault("public_search_query_hashes", [])
+    if not isinstance(attempted, list):
+        attempted = []
+        context.metadata["public_search_query_hashes"] = attempted
+    if query_hash in attempted or len(attempted) >= 2:
+        raise PublicJobFetchError(
+            "route_already_consumed",
+            message="本次运行的公开搜索路由已使用完毕，请转入人工确认或使用已有候选页面。",
+        )
+    attempted.append(query_hash)
     if "site:" not in query:
         query = query + " " + " OR ".join(_JOB_SEARCH_SITE_OPERATORS)
     search_parameters = {
@@ -1656,6 +1712,7 @@ def search_public_job_pages(
     parser.feed(html)
     results: list[PublicJobSearchResult] = []
     seen_urls: set[str] = set()
+    blocked_domains = _blocked_domains(context)
     def add_result(raw_result: dict[str, str], result_url: str | None) -> None:
         if result_url is None:
             return
@@ -1665,6 +1722,7 @@ def search_public_job_pages(
             or parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.hostname.endswith("bing.com")
+            or _domain_scope(result_url) in blocked_domains
             or not _is_plausible_public_job_result(raw_result, result_url, parsed.hostname)
         ):
             return
@@ -1706,6 +1764,7 @@ def search_public_job_pages(
         source_url=source_url,
         content_hash=hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest(),
         results=results,
+        terminal_reason="candidates_found" if results else "search_empty",
     )
 
 
@@ -1742,6 +1801,12 @@ def _is_plausible_public_job_result(
         value for value in (result.get("title"), result.get("snippet"))
         if isinstance(value, str)
     )
+    parsed = urlsplit(result_url)
+    if _is_allowed_job_host(hostname) and parsed.path.rstrip("/") == "":
+        # A recruiting homepage is a source index, not a direct job result.
+        # The Executor can still use an explicitly supplied homepage when the
+        # user asks for it, but search must not spend fetch budget on it.
+        return False
     lowered_url = result_url.lower()
     url_token_match = any(token in lowered_url for token in _JOB_RESULT_URL_TOKENS)
     if _is_allowed_job_host(hostname):
@@ -1974,15 +2039,33 @@ def _find_observed_evidence(
     context: ToolContext, artifact_id: str
 ) -> dict[str, object] | None:
     raw_evidence = context.metadata.get("observed_public_evidence")
-    if not isinstance(raw_evidence, list):
+    structured_candidates = context.metadata.get("structured_job_candidates", [])
+    if isinstance(raw_evidence, list):
+        for item in raw_evidence:
+            if not isinstance(item, dict):
+                continue
+            if (
+                item.get("artifact_id") == artifact_id
+                and item.get("artifact_type") == "job_search_results"
+            ):
+                raise PublicJobFetchError("search_artifact_requires_fetch")
+    resolved = resolve_target_evidence(raw_evidence, structured_candidates, artifact_id)
+    if resolved is None:
         return None
-    for item in raw_evidence:
-        if isinstance(item, dict) and (
-            item.get("artifact_id") == artifact_id
-            or f"observed:{item.get('content_hash')}" == artifact_id
-        ):
-            return item
-    return None
+    # Extract requires page-backed text.  A candidate-only projection without
+    # a raw page is not enough to manufacture public evidence.
+    source_artifact_id = resolved.get("source_artifact_id")
+    if source_artifact_id and isinstance(raw_evidence, list):
+        for item in raw_evidence:
+            if isinstance(item, dict) and (
+                item.get("artifact_id") == source_artifact_id
+                or f"observed:{item.get('content_hash')}" == source_artifact_id
+            ):
+                merged = dict(item)
+                merged.update(resolved)
+                merged["artifact_id"] = item.get("artifact_id") or resolved.get("artifact_id")
+                return merged
+    return resolved
 
 
 def _extract_jd_section(text: str, *, labels: tuple[str, ...]) -> str:
