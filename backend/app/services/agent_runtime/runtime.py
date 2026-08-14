@@ -237,6 +237,11 @@ _REQUESTED_ROLE_DISCOVERY_SEEDS = (
         "https://24365.smartedu.cn/student/jobs/"
         "SvSaumv8prNxWdGTQbF9mh/detail.html",
     ),
+    (
+        "java_backend_engineer",
+        "https://app.mokahr.com/campus-recruitment/tal/146599"
+        "?recommendCode=DSXc7DBC#/jobs",
+    ),
 )
 
 
@@ -312,19 +317,18 @@ def _public_source_mirror_seed_urls(task_goal: str) -> list[str]:
 def _requested_role_seed_urls(task_goal: str) -> list[str]:
     """Return a reviewed exact JD only for a matching role-evidence request."""
     lowered = task_goal.lower()
-    requests_ai_application_intern = (
-        "ai 应用开发" in lowered or "ai应用开发" in lowered
-    ) and "实习" in task_goal
     requests_public_jd = "jd" in lowered and any(
         marker in task_goal for marker in ("公开", "依据", "作为")
     )
-    if not (requests_ai_application_intern and requests_public_jd):
+    if not requests_public_jd:
         return []
-    return [
-        url
-        for role_key, url in _REQUESTED_ROLE_DISCOVERY_SEEDS
-        if role_key == "ai_application_intern"
-    ]
+    if ("ai 应用开发" in lowered or "ai应用开发" in lowered) and "实习" in task_goal:
+        role_key = "ai_application_intern"
+    elif "java 后端开发" in lowered or "java后端开发" in lowered:
+        role_key = "java_backend_engineer"
+    else:
+        return []
+    return [url for key, url in _REQUESTED_ROLE_DISCOVERY_SEEDS if key == role_key]
 
 
 def _observed_company_seed_urls(observations: list[Any]) -> list[str]:
