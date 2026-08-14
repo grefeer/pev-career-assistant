@@ -422,6 +422,86 @@ def test_needs_user_conversion_is_once_per_run(db_session) -> None:
     ]
 
 
+def test_completion_gate_rejection_converts_to_bounded_replan(db_session) -> None:
+    """An executor-declared success over an empty deliverable replans once."""
+    user = _user("user-c7")
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [
+            {
+                "action": "plan",
+                "complexity": "L2",
+                "success_criteria": ["有匹配报告"],
+                "steps": [
+                    {
+                        "step_id": "step-1",
+                        "objective": "完成匹配产出",
+                        "allowed_skills": ["job-matching"],
+                        "requires_verification": False,
+                    }
+                ],
+            },
+            {
+                "action": "plan",
+                "complexity": "L2",
+                "success_criteria": ["有匹配报告"],
+                "steps": [
+                    {
+                        "step_id": "step-2",
+                        "objective": "完成匹配产出",
+                        "allowed_skills": ["job-matching"],
+                        "requires_verification": False,
+                    }
+                ],
+            },
+        ],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
+            {"action": "complete", "summary": "匹配完成"},
+            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
+            {"action": "complete", "summary": "匹配完成"},
+        ],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="match-observed-jobs",
+            skill_name="job-matching",
+            input_model=EmptyInput,
+            output_model=MatchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://jobs.example/a",
+                "matches": [],
+            },
+        )
+    )
+
+    result = _runtime_for_gateway(gateway, registry).run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="匹配岗位",
+            allowed_skills=["job-matching"],
+            budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=2),
+        ),
+    )
+
+    # First gate rejection converted to a replan; the repeated rejection
+    # (marker already present) stays a human hand-off.
+    assert result.status is RunStatus.waiting_user
+    assert result.summary == (
+        "工具未产生可核验的交付物，当前总结不能视为完成。"
+        "请提供可公开访问的岗位页面或补充必要信息后重试。"
+    )
+    assert _events(db_session, result.run_id).count("verification_replan") == 1
+    steps = _steps(db_session, result.run_id)
+    assert len(steps) == 2
+    assert {step.error_code for step in steps} == {"replan_required", "need_user"}
+
+
 def test_needs_user_conversion_tolerates_non_list_verifier_feedback(db_session) -> None:
     """A malformed (non-list) verifier_feedback context cannot block the gate."""
     user = _user("user-c5")

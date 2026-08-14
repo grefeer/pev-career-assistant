@@ -2970,9 +2970,15 @@ def test_runtime_persists_public_search_results_as_discovery_evidence(db_session
         AgentRole.planner: [{
             "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
             "steps": [{"step_id": "search", "objective": "搜索岗位页面", "allowed_skills": ["job-discovery"]}],
+        }, {
+            # Completion-gate rejection now converts to a bounded replan once;
+            # the scripted second round ends in the human hand-off.
+            "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
+            "steps": [{"step_id": "search2", "objective": "搜索岗位页面", "allowed_skills": ["job-discovery"]}],
         }],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "search-jobs", "tool_input": {}},
+            {"action": "complete", "summary": "已找到公开岗位页面"},
             {"action": "complete", "summary": "已找到公开岗位页面"},
         ],
         AgentRole.verifier: [],
@@ -3170,9 +3176,15 @@ def test_runtime_persists_sheet_records_as_discovery_evidence(db_session) -> Non
         AgentRole.planner: [{
             "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
             "steps": [{"step_id": "search", "objective": "查询内推表", "allowed_skills": ["job-discovery"]}],
+        }, {
+            # Completion-gate rejection now converts to a bounded replan once;
+            # the scripted second round ends in the human hand-off.
+            "action": "plan", "complexity": "L2", "success_criteria": ["找到公开来源"],
+            "steps": [{"step_id": "search2", "objective": "查询内推表", "allowed_skills": ["job-discovery"]}],
         }],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {}},
+            {"action": "complete", "summary": "已从内推表找到记录"},
             {"action": "complete", "summary": "已从内推表找到记录"},
         ],
         AgentRole.verifier: [],

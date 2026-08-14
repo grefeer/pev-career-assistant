@@ -1441,6 +1441,36 @@ class AgentRuntime:
                     summary=execution.summary,
                     artifact_refs=execution.artifact_refs,
                 ):
+                    if (
+                        not self._step_has_blocked_evidence(
+                            plan_step, execution.observations, execution.artifact_refs
+                        )
+                        and replans < task.budget.max_replans
+                        and not task.replan_state.conversion_used(
+                            ReplanReason.RETRY_CONTRACT_EXHAUSTED
+                        )
+                    ):
+                        # The executor declared success but the deterministic
+                        # completion gate rejected the deliverable. Without
+                        # blocked evidence the human cannot fix what a
+                        # restructured step can: convert to a bounded REPLAN
+                        # (once per run, guarded by the replan budget); a
+                        # repeated rejection or any blocked evidence keeps
+                        # the human hand-off.
+                        return self._request_replan(
+                            db,
+                            run_id,
+                            persisted_step,
+                            feedback=(
+                                "交付物未通过完成门禁：工具未产生可核验的交付物，"
+                                "请重组该步骤以产生满足契约的主 artifact。"
+                            ),
+                            summary=(
+                                f"交付物未通过完成门禁 {_RETRY_REPLAN_MARKER}"
+                            ),
+                            output_artifact_refs=execution.artifact_refs,
+                            reason=ReplanReason.RETRY_CONTRACT_EXHAUSTED,
+                        )
                     return self._wait_for_user(
                         db,
                         run_id,
