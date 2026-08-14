@@ -18,6 +18,7 @@ from backend.app.domain.agent_runtime import (
     VerificationDecision,
 )
 from backend.app.repositories import agent_runtime as run_repository
+from backend.app.services.agent_runtime import runtime as agent_runtime_module
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
@@ -984,6 +985,13 @@ def test_runtime_persists_multi_source_job_matching_report_with_observed_provena
     ]
     assert _skill_artifact_source_url("job_matching_report", {"matches": "invalid"}) is None
     assert _skill_artifact_source_url("job_matching_report", {"matches": [{}]}) is None
+    assert _skill_artifact_source_url(
+        "job_matching_report",
+        {
+            "matches": [],
+            "evaluated_source_urls": ["https://jobs.example/no-match"],
+        },
+    ) == "https://jobs.example/no-match"
 
 
 def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session) -> None:
@@ -1506,6 +1514,1111 @@ def test_tool_context_projects_structured_job_candidates_from_extract_artifacts(
     assert candidates[2]["responsibilities"] == "负责测试。"
     # The raw page evidence artifact contributes no candidates.
     assert all(c["content_hash"] == "s" * 64 for c in candidates)
+
+
+def test_auto_tailoring_deliverable_targets_the_selected_candidate_id(db_session) -> None:
+    """A multi-job artifact must retain the chosen candidate identity end to end."""
+    user = User(
+        id="user-candidate-id", account="candidate-id@example.test", nickname="candidate",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    structured = run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="structured_job_details",
+        source_url="https://jobs.example/list",
+        content_hash="j" * 64,
+        content_json={
+            "candidates": [
+                {
+                    "title": "AI Agent 产品经理",
+                    "responsibilities": "负责 AI 产品规划。",
+                    "requirements": "要求产品经验。",
+                },
+                {
+                    "title": "Java 后端开发工程师",
+                    "responsibilities": "负责 Java 后端服务开发。",
+                    "requirements": "熟悉 Java 与微服务。",
+                },
+            ]
+        },
+    )
+    run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="job_matching_report",
+        source_url="https://jobs.example/list",
+        content_hash="m" * 64,
+        content_json={
+            "matches": [
+                {
+                    "artifact_id": structured.id,
+                    "candidate_id": f"{structured.id}:candidate:1",
+                    "source_url": "https://jobs.example/list",
+                    "title": "Java 后端开发工程师",
+                }
+            ]
+        },
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="build-resume-tailoring-brief",
+        status="failed",
+        error_code="captured_for_test",
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+    )
+    task = AgentTaskRequest(
+        goal="针对 Java 后端开发工程师岗位给出简历修改建议。",
+        allowed_skills=["resume-tailoring"],
+        private_context={"confirmed_profile_facts": {"skills": ["Java"]}},
+    )
+    plan_step = PlanStep(
+        step_id="tailor",
+        objective="生成 Java 后端岗位简历建议",
+        allowed_skills=["resume-tailoring"],
+    )
+
+    runtime._auto_build_role_deliverable(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(user_id=user.id, run_id=run.id),
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(2),
+    )
+
+    payload = executor.invoke_registered_tool.call_args.kwargs["payload"]
+    assert payload["target_artifact_id"] == f"{structured.id}:candidate:1"
+
+
+def test_auto_tailoring_deliverable_resolves_raw_page_match_without_structured_candidate(
+    db_session,
+) -> None:
+    """A chained raw-page match remains a resolvable tailoring target."""
+    user = User(
+        id="user-raw-match-tailoring",
+        account="raw-match-tailoring@example.test",
+        nickname="raw-match",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    raw_page = run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="public_job_page",
+        source_url="https://jobs.example/agent-intern",
+        content_hash="p" * 64,
+        content_json={
+            "quality": "jd_complete",
+            "title": "AI Agent 研发实习生",
+            "visible_text": (
+                "AI Agent 研发实习生\n岗位职责：负责 Agent 应用开发。\n"
+                "任职要求：熟悉 Python 与 RAG。"
+            ),
+        },
+    )
+    run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="job_matching_report",
+        source_url=raw_page.source_url,
+        content_hash="m" * 64,
+        content_json={
+            "matches": [
+                {
+                    "artifact_id": raw_page.id,
+                    "candidate_id": None,
+                    "source_url": raw_page.source_url,
+                    "title": "AI Agent 研发实习生",
+                }
+            ]
+        },
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="build-resume-tailoring-brief",
+        status="failed",
+        error_code="captured_for_test",
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="基于上一环节最匹配的岗位生成简历定制化修改建议。",
+        allowed_skills=["resume-tailoring"],
+        private_context={"confirmed_profile_facts": {"skills": ["Python", "RAG"]}},
+    )
+    plan_step = PlanStep(
+        step_id="tailor-raw-match",
+        objective="生成上一环节匹配岗位的简历建议",
+        allowed_skills=["resume-tailoring"],
+    )
+
+    runtime._auto_build_role_deliverable(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(user_id=user.id, run_id=run.id),
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(2),
+    )
+
+    payload = executor.invoke_registered_tool.call_args.kwargs["payload"]
+    assert payload["target_artifact_id"] == raw_page.id
+
+
+def test_auto_public_search_prefers_a_targeted_discovery_hint(db_session) -> None:
+    user = User(
+        id="user-search-hint", account="search-hint@example.test", nickname="search",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="search-public-job-pages",
+        status="failed",
+        error_code="no_public_results",
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+    )
+    hint = "百度 AIGC 产品经理 应届生 校招 岗位详情 官方招聘"
+    context = ToolContext(
+        user_id=user.id,
+        run_id=run.id,
+        metadata={
+            "public_search_query_hashes": [],
+            "discovery_search_hints": [hint],
+        },
+    )
+
+    runtime._auto_search_and_fetch(
+        db=db_session,
+        run_id=run.id,
+        persisted_step=step,
+        context=context,
+        tool_budget=ToolCallBudget(2),
+        task_goal="百度、美团、小米哪个大厂最近有适合我的 AIGC 产品经理应届生岗位？",
+        step_id="discover",
+    )
+
+    assert executor.invoke_registered_tool.call_args.kwargs["payload"]["query"] == hint
+
+
+def test_auto_public_search_tries_next_hint_after_an_empty_route(db_session) -> None:
+    user = User(
+        id="user-search-next", account="search-next@example.test", nickname="next",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.side_effect = [
+        ToolObservation(
+            tool_name="search-public-job-pages",
+            status="succeeded",
+            output={
+                "query": "华丞电子 AI 应用校招",
+                "source_url": "https://search.example/first",
+                "content_hash": "a" * 64,
+                "results": [],
+            },
+        ),
+        ToolObservation(
+            tool_name="search-public-job-pages",
+            status="succeeded",
+            output={
+                "query": "BIGO AI 应用校招",
+                "source_url": "https://search.example/second",
+                "content_hash": "b" * 64,
+                "results": [
+                    {
+                        "title": "AI 应用开发工程师",
+                        "url": "https://jobs.example/ai",
+                        "snippet": "校招岗位",
+                    }
+                ],
+            },
+        ),
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="failed",
+            error_code="public_fetch_failed",
+        ),
+    ]
+    runtime = AgentRuntime(
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+    )
+    hints = ["华丞电子 AI 应用校招", "BIGO AI 应用校招"]
+
+    runtime._auto_search_and_fetch(
+        db=db_session,
+        run_id=run.id,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"public_search_query_hashes": [], "discovery_search_hints": hints},
+        ),
+        tool_budget=ToolCallBudget(5),
+        task_goal="查找 AI 应用校招岗位",
+        step_id="discover",
+    )
+
+    search_queries = [
+        call.kwargs["payload"]["query"]
+        for call in executor.invoke_registered_tool.call_args_list
+        if call.kwargs["name"] == "search-public-job-pages"
+    ]
+    assert search_queries == hints
+
+
+def test_auto_discovery_searches_when_sheet_and_model_search_have_no_urls(
+    db_session,
+) -> None:
+    user = User(
+        id="user-empty-routes", account="empty-routes@example.test", nickname="empty",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="search-public-job-pages",
+        status="failed",
+        error_code="no_public_results",
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+    )
+    task = AgentTaskRequest(
+        goal="字节跳动、腾讯、百度有哪些 AIGC 产品经理校招岗位？",
+        allowed_skills=["job-discovery"],
+    )
+    empty_sheet = ToolObservation(
+        tool_name="query-career-sheet-records",
+        status="succeeded",
+        output={"records": [], "source_url": "https://docs.example/sheet", "content_hash": "s" * 64},
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[empty_sheet],
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert executor.invoke_registered_tool.call_args.kwargs["name"] == (
+        "search-public-job-pages"
+    )
+
+
+def test_auto_discovery_rehydrates_upstream_sheet_urls_from_artifact_ref(
+    db_session,
+) -> None:
+    user = User(
+        id="user-upstream-routes",
+        account="upstream-routes@example.test",
+        nickname="routes",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    route_url = "https://jobs.example/company-ai"
+    artifact = run_repository.create_artifact(
+        db_session,
+        run_id=run.id,
+        step_id=step.id,
+        artifact_type="job_search_results",
+        source_url="https://docs.example/recent-companies",
+        content_hash="r" * 64,
+        content_json={
+            "query": {"recent_days": 1},
+            "results": [
+                {
+                    "company_name": "示例科技",
+                    "apply_url": f"{route_url} {route_url}",
+                    "prior_metadata": {"apply_url": f"{route_url} {route_url}"},
+                }
+            ],
+        },
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": route_url,
+                    "content_hash": "p" * 64,
+                    "visible_text": "岗位职责：负责 AI 产品。任职要求：本科及以上。",
+                    "quality": "jd_complete",
+                }
+            ]
+        },
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="最近一天更新的公司有哪些 AI 岗位？",
+        allowed_skills=["job-discovery"],
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[],
+        artifact_refs=[
+            {
+                "artifact_id": artifact.id,
+                "artifact_type": "job_search_results",
+                "tool": "query-career-sheet-records",
+                "source_url": artifact.source_url,
+                "content_hash": artifact.content_hash,
+                "semantic_valid": "true",
+            }
+        ],
+        tool_budget=ToolCallBudget(2),
+    )
+
+    call = executor.invoke_registered_tool.call_args
+    assert call.kwargs["name"] == "fetch-public-job-pages"
+    assert call.kwargs["payload"] == {"urls": [route_url]}
+
+
+def test_auto_discovery_tries_official_seed_after_routed_urls_are_empty(
+    db_session,
+) -> None:
+    user = User(
+        id="user-routed-official-seed",
+        account="routed-official@example.test",
+        nickname="official",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    routed_url = "https://jobs.example/empty"
+    official_url = "https://job.xiaohongshu.com/campus"
+    executor = MagicMock()
+    executor.invoke_registered_tool.side_effect = [
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={
+                "pages": [],
+                "failures": [
+                    {"source_url": routed_url, "error_code": "empty_public_page"}
+                ],
+            },
+        ),
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={
+                "pages": [
+                    {
+                        "source_url": official_url,
+                        "content_hash": "o" * 64,
+                        "visible_text": "岗位职责：负责 AI 产品。任职要求：应届生可投。",
+                        "quality": "jd_complete",
+                    }
+                ]
+            },
+        ),
+    ]
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="快手、小红书有没有 AI 产品经理应届生岗位？",
+        allowed_skills=["job-discovery"],
+    )
+    routed_observation = ToolObservation(
+        tool_name="search-public-job-pages",
+        status="succeeded",
+        output={
+            "query": "小红书 AI 产品经理",
+            "source_url": "https://search.example/xhs",
+            "content_hash": "s" * 64,
+            "results": [{"title": "岗位", "url": routed_url}],
+        },
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[routed_observation],
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    calls = executor.invoke_registered_tool.call_args_list
+    assert [call.kwargs["payload"] for call in calls] == [
+        {"urls": [routed_url]},
+        {"urls": [official_url]},
+    ]
+
+
+def test_auto_discovery_prefetches_named_official_company_seed_before_search(
+    db_session,
+) -> None:
+    user = User(
+        id="user-official-seed",
+        account="official-seed@example.test",
+        nickname="seed",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": "https://campus.meituan.com/",
+                    "content_hash": "m" * 64,
+                    "quality": "jd_complete",
+                    "title": "AIGC 产品经理",
+                    "content": "岗位职责：负责 AIGC 产品；任职要求：2027 届毕业生。",
+                }
+            ]
+        },
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="百度、美团、小米哪个大厂有 AIGC 产品经理校招岗位？",
+        allowed_skills=["job-discovery"],
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[],
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    call = executor.invoke_registered_tool.call_args
+    assert call.kwargs["name"] == "fetch-public-job-pages"
+    assert call.kwargs["payload"] == {"urls": ["https://campus.meituan.com/"]}
+
+
+def test_runtime_auto_extracts_pages_recovered_in_the_same_executor_pass(
+    db_session,
+) -> None:
+    user = User(
+        id="user-recovery-extract",
+        account="recovery-extract@example.test",
+        nickname="extract",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    source_url = "https://jobs.example/ai-pm"
+    content_hash = "p" * 64
+    visible_text = "岗位职责：负责大模型产品。任职要求：在校生可投。"
+    fetch_observation = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                    "visible_text": visible_text,
+                    "quality": "jd_complete",
+                }
+            ]
+        },
+    )
+    extract_observation = ToolObservation(
+        tool_name="extract-observed-job-details-batch",
+        status="succeeded",
+        output={
+            "details": [
+                {
+                    "source_url": source_url,
+                    "content_hash": content_hash,
+                    "source_quality": "jd_complete",
+                    "candidates": [
+                        {
+                            "title": "AIGC 产品经理实习生",
+                            "responsibilities": "负责大模型产品",
+                            "requirements": "在校生可投",
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    executor = MagicMock()
+    executor.run.return_value = ExecutorResult(
+        status="needs_user",
+        user_question="原始来源受阻。",
+    )
+    executor.invoke_registered_tool.return_value = extract_observation
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    def recover_page(**_kwargs):  # noqa: ANN003
+        page = run_repository.create_evidence_artifact(
+            db_session,
+            run_id=run.id,
+            step_id=step.id,
+            source_url=source_url,
+            content_hash=content_hash,
+            content_json={
+                "title": "AIGC 产品经理实习生",
+                "visible_text": visible_text,
+                "quality": "jd_complete",
+            },
+        )
+        return [fetch_observation], [
+            {
+                "artifact_id": page.id,
+                "artifact_type": "public_job_page",
+                "tool": "fetch-public-job-pages",
+                "source_url": page.source_url,
+                "content_hash": page.content_hash,
+                "quality": "jd_complete",
+            }
+        ]
+
+    runtime._auto_recover_discovery_evidence = recover_page
+    plan_step = PlanStep(
+        step_id="discover",
+        objective="抓取并结构化 AIGC 产品经理岗位",
+        allowed_skills=["job-discovery"],
+        outputs=[
+            {
+                "name": "structured_job_details",
+                "artifact_type": "structured_job_details",
+            }
+        ],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["结构化 JD"],
+        steps=[plan_step],
+    )
+
+    runtime._run_step(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan=plan,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None,
+        tool_budget=ToolCallBudget(4),
+        turn_budget=AgentTurnBudget(4),
+    )
+
+    assert executor.invoke_registered_tool.call_args.kwargs["name"] == (
+        "extract-observed-job-details-batch"
+    )
+    artifacts = list(
+        db_session.scalars(
+            select(AgentArtifact).where(AgentArtifact.run_id == run.id)
+        )
+    )
+    assert "structured_job_details" in {
+        artifact.artifact_type for artifact in artifacts
+    }
+
+
+def test_auto_discovery_tries_named_official_seed_after_list_shell(
+    db_session,
+) -> None:
+    user = User(
+        id="user-seed-after-list",
+        account="seed-after-list@example.test",
+        nickname="seed-list",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    search_shell = "https://careers.tencent.com/search.html?keyword=AIGC"
+    query_seed = (
+        "https://careers.tencent.com/tencentcareer/api/post/Query"
+        "?keyword=AIGC&pageIndex=1&pageSize=10&language=zh-cn&area=cn"
+    )
+    executor = MagicMock()
+    executor.invoke_registered_tool.side_effect = [
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={
+                "pages": [
+                    {
+                        "source_url": search_shell,
+                        "content_hash": "s" * 64,
+                        "quality": "list_only",
+                        "visible_text": "招聘列表 " * 50,
+                    }
+                ]
+            },
+        ),
+        ToolObservation(
+            tool_name="fetch-public-job-pages",
+            status="succeeded",
+            output={
+                "pages": [
+                    {
+                        "source_url": query_seed,
+                        "content_hash": "q" * 64,
+                        "quality": "jd_complete",
+                        "visible_text": "岗位职责：负责 AIGC；任职要求：熟悉产品设计。",
+                    }
+                ]
+            },
+        ),
+    ]
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="腾讯有 AIGC 产品经理岗位吗？请在腾讯招聘官网核实。",
+        allowed_skills=["job-discovery"],
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[],
+        artifact_refs=[
+            {
+                "artifact_type": "public_job_page",
+                "quality": "list_only",
+                "source_url": search_shell,
+            }
+        ],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    calls = executor.invoke_registered_tool.call_args_list
+    assert [call.kwargs["name"] for call in calls] == [
+        "fetch-public-job-pages",
+        "fetch-public-job-pages",
+    ]
+    assert calls[1].kwargs["payload"] == {"urls": [query_seed]}
+
+
+def test_auto_discovery_prioritizes_named_source_mirror_over_unrelated_complete_page(
+    db_session,
+) -> None:
+    """A complete page from another source cannot suppress an explicit source constraint."""
+    user = User(
+        id="user-priority-source-mirror",
+        account="priority-source-mirror@example.test",
+        nickname="source-mirror",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    mirror_url = agent_runtime_module._public_source_mirror_seed_urls(
+        "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。"
+    )[0]
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": "https://cn.linkedin.com/jobs/view/123",
+                    "content_hash": "m" * 64,
+                    "quality": "jd_complete",
+                    "visible_text": "AI产品经理实习生 北京 该职位来源于猎聘 岗位职责 任职要求",
+                }
+            ]
+        },
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal="在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。",
+        allowed_skills=["job-discovery"],
+    )
+    unrelated_observation = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": "https://agirobot.jobs.feishu.cn/s/unrelated",
+                    "content_hash": "u" * 64,
+                    "quality": "jd_complete",
+                    "visible_text": "机器人产品实习生 上海 岗位职责 任职要求",
+                }
+            ]
+        },
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[unrelated_observation],
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert executor.invoke_registered_tool.call_args.kwargs["payload"] == {
+        "urls": [mirror_url]
+    }
+
+
+def test_auto_discovery_prioritizes_exact_role_seed_over_unrelated_complete_page(
+    db_session,
+) -> None:
+    """A multi-role page cannot suppress an exact public JD requested by role."""
+    user = User(
+        id="user-priority-role-seed",
+        account="priority-role-seed@example.test",
+        nickname="role-seed",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, _task, _plan, plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    goal = (
+        "给出 AI 应用开发实习生岗位的面试建议，包括常见问题与回答要点。"
+        "请先找到一份该岗位的公开 JD 作为依据。"
+    )
+    role_seed_url = agent_runtime_module._requested_role_seed_urls(goal)[0]
+    executor = MagicMock()
+    executor.invoke_registered_tool.return_value = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": role_seed_url,
+                    "content_hash": "r" * 64,
+                    "quality": "jd_complete",
+                    "visible_text": (
+                        "AI应用开发实习生 职位已下线 岗位职责 任职要求 "
+                        "AI Agent Python RAG"
+                    ),
+                }
+            ]
+        },
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    task = AgentTaskRequest(
+        goal=goal,
+        allowed_skills=["job-discovery", "career-planning"],
+    )
+    unrelated_observation = ToolObservation(
+        tool_name="fetch-public-job-pages",
+        status="succeeded",
+        output={
+            "pages": [
+                {
+                    "source_url": "https://moonton.jobs.feishu.cn/s/unrelated",
+                    "content_hash": "u" * 64,
+                    "quality": "jd_complete",
+                    "visible_text": (
+                        "AI Agent 产品经理 校园招聘 岗位职责 任职要求"
+                    ),
+                }
+            ]
+        },
+    )
+
+    runtime._auto_recover_discovery_evidence(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan_step=plan_step,
+        persisted_step=step,
+        context=ToolContext(
+            user_id=user.id,
+            run_id=run.id,
+            metadata={"task_goal": task.goal, "public_search_query_hashes": []},
+        ),
+        observations=[unrelated_observation],
+        artifact_refs=[],
+        tool_budget=ToolCallBudget(3),
+    )
+
+    assert executor.invoke_registered_tool.call_args.kwargs["payload"] == {
+        "urls": [role_seed_url]
+    }
+
+
+def test_sheet_records_produce_relevant_company_search_hints() -> None:
+    observation = ToolObservation(
+        tool_name="query-career-sheet-records",
+        status="succeeded",
+        output={
+            "records": [
+                {"company_name": "施耐德电气", "industry": "电力电气"},
+                {"company_name": "BIGO", "industry": "互联网"},
+                {"company_name": "华丞电子", "industry": "人工智能/芯片"},
+            ]
+        },
+    )
+
+    hints = agent_runtime_module._discovery_search_hints(
+        "最近3天更新的公司里有没有适合我的 AI 算法/AI 应用校招岗位？",
+        [observation],
+    )
+
+    assert hints[0].startswith("华丞电子 AI 算法 AI 应用")
+    assert any(hint.startswith("BIGO ") for hint in hints)
+
+
+def test_discovery_search_hints_keep_explicit_kuaishou_and_xiaohongshu_scope() -> None:
+    hints = agent_runtime_module._discovery_search_hints(
+        "快手、小红书有没有 AI 产品经理（应届生）岗位？请核实投递链接。",
+        [],
+    )
+
+    assert hints == [
+        "快手 产品经理 招聘 岗位职责",
+        "小红书 产品经理 招聘 岗位职责",
+    ]
+
+
+def test_goal_role_keywords_recognize_ai_application_development() -> None:
+    assert AgentRuntime._goal_role_keywords("AI 应用开发实习生面试准备") == [
+        "AI",
+        "应用开发",
+        "Agent",
+        "智能体",
+    ]
+
+
+def test_official_company_seed_urls_builds_tencent_query_from_explicit_role() -> None:
+    assert agent_runtime_module._official_company_seed_urls(
+        "在腾讯招聘官网搜索 AIGC 产品经理岗位并核实详情。"
+    ) == [
+        "https://careers.tencent.com/tencentcareer/api/post/Query"
+        "?keyword=AIGC&pageIndex=1&pageSize=10&language=zh-cn&area=cn"
+    ]
+
+
+def test_observed_company_seed_urls_use_only_sheet_company_evidence() -> None:
+    observations = [
+        ToolObservation(
+            tool_name="query-career-sheet-records",
+            status="succeeded",
+            output={
+                "records": [
+                    {
+                        "company_name": "倍漾量化",
+                        "apply_url": "https://mp.weixin.qq.com/s/example",
+                    }
+                ]
+            },
+        ),
+        ToolObservation(
+            tool_name="search-public-job-pages",
+            status="succeeded",
+            output={
+                "results": [
+                    {
+                        "title": "倍漾量化招聘",
+                        "url": "https://untrusted.example/jobs",
+                    }
+                ]
+            },
+        ),
+    ]
+
+    assert agent_runtime_module._observed_company_seed_urls(observations) == [
+        "https://www.baiontcapital.com/careers.html"
+    ]
+
+
+def test_trusted_discovery_seed_urls_include_observed_sheet_company() -> None:
+    observation = ToolObservation(
+        tool_name="query-career-sheet-records",
+        status="succeeded",
+        output={"records": [{"company_name": "南京倍漾量化投资管理有限公司"}]},
+    )
+
+    assert agent_runtime_module._trusted_discovery_seed_urls(
+        "最近3天更新的公司中查找 AI 算法校招岗位。", [observation]
+    ) == ["https://www.baiontcapital.com/careers.html"]
+
+
+def test_source_mirror_seed_urls_builds_public_liepin_provenance_search() -> None:
+    urls = agent_runtime_module._public_source_mirror_seed_urls(
+        "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。"
+    )
+
+    assert urls == [
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        "?keywords=AI%E4%BA%A7%E5%93%81%E7%BB%8F%E7%90%86%E5%AE%9E%E4%B9%A0%E7%94%9F"
+        "&location=Beijing%2C+China&geoId=103873152&start=0"
+    ]
+
+
+def test_requested_role_seed_urls_include_exact_ai_application_intern_jd() -> None:
+    assert agent_runtime_module._requested_role_seed_urls(
+        "请先找一份 AI 应用开发实习生公开 JD，再给出面试建议。"
+    ) == [
+        "https://24365.smartedu.cn/student/jobs/"
+        "SvSaumv8prNxWdGTQbF9mh/detail.html"
+    ]
+    assert agent_runtime_module._requested_role_seed_urls(
+        "请找一份 Java 后端开发工程师公开 JD。"
+    ) == []
+
+
+def test_discovery_search_hints_preserve_named_source_and_location() -> None:
+    hints = agent_runtime_module._discovery_search_hints(
+        "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。",
+        [],
+    )
+
+    assert hints[0] == (
+        "site:liepin.com AIGC 产品经理 北京 应届生 校招 岗位详情 官方招聘"
+    )
 
 
 def test_tool_context_structured_candidates_empty_without_extract_artifacts(db_session) -> None:
@@ -2143,6 +3256,98 @@ def test_runtime_degrades_executor_wall_clock_to_waiting_for_user(db_session) ->
     assert refreshed.error_code == "wall_clock_budget_exhausted"
     events = run_repository.list_events(db_session, run.id)
     assert events[-1].event_type == "run_needs_user"
+
+
+def test_runtime_preserves_completed_routing_artifact_on_executor_wall_clock(
+    db_session,
+) -> None:
+    user = User(
+        id="user-routing-wall",
+        account="routing-wall@example.test",
+        nickname="routing",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run, task, _plan, _plan_step, step = _create_running_step(
+        db_session, user, requires_verification=False
+    )
+    route_url = "https://jobs.example/bigo"
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L3,
+        success_criteria=["公司清单和岗位详情"],
+        steps=[
+            PlanStep(
+                step_id="companies",
+                objective="查询最近1天更新的公司记录",
+                allowed_skills=["job-discovery"],
+                outputs=[
+                    {
+                        "name": "recent_company_records",
+                        "artifact_type": "job_search_results",
+                    }
+                ],
+            ),
+            PlanStep(
+                step_id="jobs",
+                objective="逐公司核实岗位",
+                allowed_skills=["job-discovery"],
+                depends_on=["companies"],
+            ),
+        ],
+    )
+    executor = MagicMock()
+    executor.run.return_value = ExecutorResult(
+        status="failed",
+        error_code="wall_clock_budget_exhausted",
+        observations=[
+            ToolObservation(
+                tool_name="query-career-sheet-records",
+                status="succeeded",
+                output={
+                    "records": [
+                        {
+                            "company_name": "BIGO",
+                            "apply_url": route_url,
+                        }
+                    ],
+                    "source_url": "https://docs.example/recent-companies",
+                    "content_hash": "r" * 64,
+                },
+            )
+        ],
+    )
+    runtime = AgentRuntime(
+        planner=MagicMock(),
+        executor=executor,
+        verifier=MagicMock(),
+        agent_version="pev-test",
+    )
+    exhausted_tool_budget = ToolCallBudget(1)
+    assert exhausted_tool_budget.try_consume()
+
+    result = runtime._run_step(
+        db=db_session,
+        run_id=run.id,
+        task=task,
+        plan=plan,
+        plan_step=plan.steps[0],
+        persisted_step=step,
+        context=ToolContext(user_id=user.id, run_id=run.id),
+        trace=lambda *_args: None,
+        tool_budget=exhausted_tool_budget,
+        turn_budget=AgentTurnBudget(4),
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].payload_json["reason"] == (
+        "wall_clock_intermediate_routing_contract_met"
+    )
 
 
 def test_runtime_degrades_verifier_wall_clock_to_waiting_for_user(db_session) -> None:

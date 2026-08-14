@@ -221,8 +221,43 @@ def _target_matches_goal(goal: object, searchable: str) -> bool:
         (("java 后端", "java后端"), ("java", "后端")),
     )
     lowered_goal = goal.lower()
+    if any(marker in lowered_goal for marker in ("应届生", "应届", "校招", "实习生")) and not any(
+        marker in searchable
+        for marker in (
+            "应届生", "应届", "校招", "校园招聘", "毕业生", "campus",
+            "graduate", "实习生", "实习", "intern",
+        )
+    ):
+        return False
+    if "ai 应用开发" in lowered_goal or "ai应用开发" in lowered_goal:
+        return any(
+            marker in searchable for marker in ("ai", "人工智能", "大模型", "llm")
+        ) and any(
+            marker in searchable
+            for marker in (
+                "应用开发",
+                "应用研发",
+                "应用工程师",
+                "开发工程师",
+                "研发工程师",
+                "后端工程师",
+                "前端工程师",
+                "开发实习",
+                "研发实习",
+                "developer",
+                "engineer",
+            )
+        )
     for markers, evidence_terms in role_groups:
         if any(marker in lowered_goal for marker in markers):
+            if "产品经理" in markers:
+                if "产品经理" in lowered_goal and "产品经理" not in searchable:
+                    return False
+                if "aigc" in lowered_goal:
+                    return "aigc" in searchable
+                if "产品经理" not in lowered_goal:
+                    return "aigc" in searchable
+                return True
             return any(term in searchable for term in evidence_terms)
     return True
 

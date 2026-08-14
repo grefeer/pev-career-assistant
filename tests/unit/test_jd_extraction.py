@@ -22,6 +22,7 @@ from backend.app.services.job_discovery.tools.jd_extraction import (
     _extract_department,
     _extract_from_unstructured_text,
     _extract_locations,
+    _extract_published_at,
     _extract_referral_code,
     _extract_section,
     _extract_title,
@@ -343,6 +344,41 @@ def test_split_multi_job_page_iguopin_single_card_stays_whole() -> None:
     assert _split_multi_job_page(text) == [text]
 
 
+def test_extract_jaka_count_cards_ignores_search_chrome_and_splits_each_job() -> None:
+    """JAKA lists render title + vacancy count cards without brackets or a job id."""
+    text = (
+        "搜索职位\n"
+        "全部职位（2个）\n"
+        "技术服务工程师\n"
+        "10\n"
+        "上海、深圳\n"
+        "2026-06-12\n"
+        "职位描述：\n"
+        "负责机器人产品的现场技术服务与客户支持。\n"
+        "希望你是：\n"
+        "本科及以上学历，具备工程实践经验。\n"
+        "立即投递\n"
+        "具身智能算法研究员(感知方向)\n"
+        "1\n"
+        "上海\n"
+        "2026-03-10\n"
+        "职责描述：\n"
+        "负责具身智能感知算法研发与模型部署。\n"
+        "任职要求：\n"
+        "硕士及以上学历，熟悉 Python 与深度学习。\n"
+        "立即投递\n"
+    )
+
+    candidates = extract_jd_candidates(text, "https://www.jaka.com/zh/position")
+
+    assert [candidate.title for candidate in candidates] == [
+        "技术服务工程师",
+        "具身智能算法研究员(感知方向)",
+    ]
+    assert all(candidate.title != "搜索职位" for candidate in candidates)
+    assert "工程实践经验" in candidates[0].requirements
+
+
 def test_split_multi_job_page_liepin_beats_iguopin_when_both_brackets_match() -> None:
     """Liepin 【】 cards take precedence over Iguopin 「」 cards on one page."""
     text = (
@@ -405,6 +441,124 @@ def test_extract_jd_candidates_from_iguopin_feed_produces_per_job_candidates() -
     assert candidates[0].locations == ["上海"]
     assert candidates[0].company_name == "中远海运科技股份有限公司"
     assert candidates[1].locations == ["珠海市-横琴粤澳深度合作区"]
+
+
+def test_extract_jd_candidates_from_iguopin_detail_ignores_portal_chrome() -> None:
+    """Iguopin detail fields come from the JD, not global navigation or safety copy."""
+    text = (
+        "全国站[切换]\n首页国聘行动\n社会招聘校园招聘国聘高端招聘会高校专区\n"
+        "我要招人\n登录/注册\nJava后端开发工程师\n"
+        "更新于 2026-08-05举报\n"
+        "国聘平台免费提供发岗位、投简历服务，如遇收费请谨防上当受骗！\n"
+        "面议\n上海中远海运科技股份有限公司\n收藏\n申请职位\n"
+        "职位性质：社招\n招聘人数：1人\n最低学历：本科\n工作经验：3-5年\n"
+        "专业要求：理学，工学\n报名截止：2026-11-03 00:00:00\n"
+        "职位介绍\n数字后端工程师\n岗位职责：\n"
+        "1.参与完成系统设计、编码实现、性能优化及上线运维；\n"
+        "2.负责平台核心微服务模块的开发。\n岗位要求：\n"
+        "1.全日制本科及以上学历，硕士研究生优先；\n"
+        "2.三年以上 Java 后端开发经验，精通 Spring Boot 与 MySQL。\n"
+        "竞争力分析\n工作地点\n上海\n单位信息\n关注\n中\n"
+        "中远海运科技股份有限公司\n11 个在招职位\n国企\n"
+        "实习专区\n关于我们\n"
+    )
+
+    candidates = extract_jd_candidates(
+        text, "https://www.iguopin.com/job/detail?id=212414786778959376"
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.title == "Java后端开发工程师"
+    assert candidate.company_name == "中远海运科技股份有限公司"
+    assert candidate.recruitment_types == ["full_time"]
+    assert candidate.min_degree == "本科"
+    assert candidate.deadline_text == "2026-11-03 00:00:00"
+    assert "三年以上 Java 后端开发经验" in candidate.requirements
+    assert "专业要求" not in candidate.requirements
+    assert candidate.taxonomy[0] == "开发"
+
+
+def test_extract_jd_candidates_from_smartedu_detail_uses_exact_role_fields() -> None:
+    """Smartedu detail chrome must not replace its title, company, or JD sections."""
+    text = (
+        "职位详情-国家大学生就业服务平台\n首页\n毕业生\n实习岗位\n"
+        "ai应用开发实习生\n[\n兼职\n]\n——\n"
+        "ai应用开发实习生(北京/深圳/珠海)\n5.0\n-\n10.0\nK/月\n|\n"
+        "硕士及以上\n|\n招聘\n3\n人\n专业不限\n来源：\n"
+        "国家大学生就业服务平台\n000000\n职位已下线\n职位详情\n"
+        "职位描述： 1. 负责AI Agent系统的设计、开发和优化，包括记忆模块、"
+        "规划模块和工具调用模块；2. 开发基于大语言模型的智能体系统。 "
+        "职位要求： 1. 熟悉Python，具备良好的工程实践；"
+        "2. 熟悉大语言模型原理和应用。\n"
+        "珠海市横琴博贤智能科技有限公司\n所属行业\n计算机软件\n"
+        "公司性质\n港澳台公司\n公司规模\n100-499人\n"
+        "网站介绍\n国家大学生就业服务平台\n"
+    )
+
+    candidates = extract_jd_candidates(
+        text,
+        "https://24365.smartedu.cn/student/jobs/"
+        "SvSaumv8prNxWdGTQbF9mh/detail.html",
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.title == "ai应用开发实习生(北京/深圳/珠海)"
+    assert candidate.company_name == "珠海市横琴博贤智能科技有限公司"
+    assert candidate.locations == ["北京", "深圳", "珠海"]
+    assert candidate.recruitment_types == ["internship"]
+    assert candidate.min_degree == "硕士"
+    assert "负责AI Agent系统" in candidate.responsibilities
+    assert "熟悉Python" in candidate.requirements
+    assert "所属行业" not in candidate.requirements
+    assert candidate.taxonomy[0] == "开发"
+    assert "Source page explicitly states 职位已下线" in candidate.normalization_warnings
+
+
+def test_extract_jd_candidates_prefers_nowcoder_detail_heading_over_navigation() -> None:
+    """Nowcoder navigation labels must not replace the actual detail title/company."""
+    text = (
+        "多模态ocr后处理算法工程师_腾讯校招_牛客网\n"
+        "首页\n题库\n公司真题\n发布职位\n发布职位、邀约牛人\n"
+        "校招\n职位详情页\n多模态ocr后处理算法工程师\n"
+        "15-80K * 15薪\n算法工程师\n深圳\n硕士\n"
+        "岗位职责\n负责文档数据解析、清洗与大模型训练支持。\n"
+        "岗位要求\n拥有多模态、自然语言处理或计算机视觉背景。\n"
+        "腾讯科技（上海）有限公司·技术\n"
+    )
+
+    candidates = extract_jd_candidates(
+        text, "https://www.nowcoder.com/jobs/detail/356582"
+    )
+
+    assert candidates[0].title == "多模态ocr后处理算法工程师"
+    assert candidates[0].company_name == "腾讯"
+
+
+def test_extract_jd_candidates_splits_meituan_rendered_job_feed() -> None:
+    """Meituan's rendered feed carries repeated complete jobs on one public page."""
+    text = (
+        "校园招聘\n筛选\n全部校招职位（448）\n"
+        "大模型算法实习生\n日常实习\n北京市\n更新于2026/08/14\n"
+        "核心本地商业-基础研发平台\n岗位职责\n"
+        "1. 参与大模型后训练和 Agentic RL 优化。\n岗位要求\n"
+        "熟悉 Python 和深度学习。\n"
+        "美团-C 端AI 产品实习生\n日常实习\n北京市\n更新于2026/08/14\n"
+        "核心本地商业-基础研发平台\n岗位职责\n岗位职责：\n"
+        "1. 负责 AI 原生应用产品调研和用户需求收集。\n岗位要求\n"
+        "具备产品分析能力，2027 届优先。\n"
+    )
+
+    candidates = extract_jd_candidates(text, "https://campus.meituan.com/")
+
+    assert [candidate.title for candidate in candidates] == [
+        "大模型算法实习生",
+        "美团-C 端AI 产品实习生",
+    ]
+    assert candidates[1].locations == ["北京市"]
+    assert candidates[1].published_at == "2026/08/14"
+    assert "AI 原生应用产品调研" in candidates[1].responsibilities
 
 
 def test_extract_jd_candidates_from_liepin_feed_produces_per_job_candidates() -> None:
@@ -541,6 +695,11 @@ def test_extract_apply_method_missing() -> None:
 def test_extract_deadline() -> None:
     assert _extract_deadline("截止日期: 2026-12-31") == "2026-12-31"
     assert _extract_deadline("一段完全无关的普通描述文本内容") is None
+
+
+def test_extract_published_at_accepts_absolute_and_relative_source_markers() -> None:
+    assert _extract_published_at("发布时间：2026-08-14") == "2026-08-14"
+    assert _extract_published_at("作者昵称 3天前 关注") == "3天前"
 
 
 def test_extract_referral_code() -> None:

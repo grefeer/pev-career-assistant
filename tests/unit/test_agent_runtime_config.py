@@ -36,3 +36,14 @@ def test_shared_budgets_reject_invalid_maximum_and_stop_at_the_exact_cap(budget_
     assert budget.try_consume() is True
     assert budget.remaining == 0
     assert budget.try_consume() is False
+
+
+def test_tool_budget_can_atomically_reserve_one_call_for_runtime_recovery() -> None:
+    budget = ToolCallBudget(3)
+
+    assert budget.try_consume(reserve=1) is True
+    assert budget.try_consume(reserve=1) is True
+    assert budget.try_consume(reserve=1) is False
+    assert budget.remaining == 1
+    assert budget.try_consume() is True
+    assert budget.remaining == 0

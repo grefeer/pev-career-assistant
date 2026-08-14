@@ -660,9 +660,10 @@ def build_agent_chat_model(
     }
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
-    is_deepseek_v4 = "deepseek" in base_url.lower() and settings.agent_harness_model.startswith(
-        "deepseek-v4"
-    )
+    # Keyed on the model name, not the base URL: an OPENAI_BASE_URL
+    # override pointing at a DeepSeek-compatible gateway must not silently
+    # re-enable thinking mode or drop the json_mode transport.
+    is_deepseek_v4 = settings.agent_harness_model.startswith("deepseek-v4")
     if is_deepseek_v4:
         kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
     structured_method = "json_mode" if is_deepseek_v4 else "json_schema"

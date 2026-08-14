@@ -33,6 +33,7 @@ from backend.app.services.career_skills.job_discovery import (
     _infer_official_page_locations,
     _infer_official_page_title,
     _infer_recruitment_types,
+    _is_plausible_public_job_result,
     _is_public_url,
     _render_with_playwright,
     _fetch_validated,
@@ -89,6 +90,23 @@ def test_page_quality_separates_jd_list_shell_and_empty_evidence() -> None:
     )
     assert homepage.quality == "list_only"
     assert homepage.quality_signal == "usable_text_without_jd_section"
+
+
+def test_page_quality_accepts_long_portal_pages_with_inline_jd_sections() -> None:
+    page = FetchPublicJobPageOutput(
+        artifact_id="inline",
+        source_url="https://jobs.example/portal",
+        title="招聘职位列表",
+        visible_text=(
+            "导航与公司介绍 " * 400
+            + "职位描述：负责 AI 应用开发。希望你是：熟悉 Python。"
+            + " 工作职责：负责模型服务。任职要求：具备工程经验。"
+        ),
+        content_hash="i" * 64,
+    )
+
+    assert page.quality == "jd_complete"
+    assert page.quality_signal == "inline_jd_sections"
 
 
 def test_fetch_public_job_page_returns_hashable_visible_evidence(monkeypatch) -> None:
@@ -383,6 +401,110 @@ def test_search_public_job_pages_rejects_a_recruiting_homepage(monkeypatch) -> N
     assert result.results == []
 
 
+def test_search_reserves_the_third_route_for_runtime_recovery(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: SimpleNamespace(
+            text=(
+                '<li class="b_algo"><h2><a href="https://careers.example/jobs/agent">'
+                "AI Agent 开发工程师</a></h2><p>招聘岗位职责</p></li>"
+            ),
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    attempted = ["a" * 64, "b" * 64]
+    payload = SearchPublicJobPagesInput(query="AI Agent 招聘 岗位职责", max_results=5)
+
+    with pytest.raises(PublicJobFetchError, match="route_already_consumed"):
+        search_public_job_pages(
+            ToolContext(
+                user_id="user-a",
+                run_id="run-model",
+                metadata={"public_search_query_hashes": list(attempted)},
+            ),
+            payload,
+        )
+
+    recovery_context = ToolContext(
+        user_id="user-a",
+        run_id="run-runtime",
+        metadata={
+            "public_search_query_hashes": list(attempted),
+            "runtime_auto_search": True,
+        },
+    )
+    result = search_public_job_pages(recovery_context, payload)
+
+    assert [item.url for item in result.results] == [
+        "https://careers.example/jobs/agent"
+    ]
+    assert len(recovery_context.metadata["public_search_query_hashes"]) == 3
+
+
+def test_runtime_targeted_search_does_not_force_unrelated_site_operators(
+    monkeypatch,
+) -> None:
+    requested_urls: list[str] = []
+
+    def fake_get(url: str, *args, **kwargs):
+        requested_urls.append(url)
+        return SimpleNamespace(
+            text=(
+                '<li class="b_algo"><h2><a href="https://www.bigo.sg/careers/jobs/ai">'
+                "BIGO AI 应用开发工程师</a></h2><p>招聘岗位职责</p></li>"
+            ),
+            encoding="utf-8",
+            apparent_encoding="utf-8",
+            raise_for_status=lambda: None,
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        fake_get,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    query = "BIGO AI 应用 招聘 岗位职责"
+
+    result = search_public_job_pages(
+        ToolContext(
+            user_id="user-a",
+            run_id="run-runtime",
+            metadata={"runtime_auto_search": True},
+        ),
+        SearchPublicJobPagesInput(query=query, max_results=5),
+    )
+
+    sent_query = parse_qs(urlsplit(requested_urls[0]).query)["q"][0]
+    assert sent_query == query
+    assert [item.url for item in result.results] == [
+        "https://www.bigo.sg/careers/jobs/ai"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("url", "hostname"),
+    [
+        ("https://www.51job.com/", "www.51job.com"),
+        ("https://careers.tencent.com/home.html", "careers.tencent.com"),
+    ],
+)
+def test_search_result_filter_rejects_generic_recruiting_home_variants(
+    url: str, hostname: str
+) -> None:
+    result = {"title": "招聘职位", "snippet": "浏览最新岗位与招聘信息"}
+
+    assert not _is_plausible_public_job_result(result, url, hostname)
+
+
 def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job_result(monkeypatch) -> None:
     """A provider fallback preserves direct provenance instead of inventing URLs."""
     responses = iter([
@@ -420,6 +542,45 @@ def test_search_public_job_pages_uses_a_public_360_fallback_when_bing_has_no_job
         "url": "https://careers.example/jobs/agent",
         "snippet": None,
     }]
+
+
+def test_search_uses_mobile_sogou_when_bing_and_360_are_empty(monkeypatch) -> None:
+    """The final public provider exposes Chinese job-detail URLs without JS."""
+    responses = iter([
+        SimpleNamespace(text="<html></html>", raise_for_status=lambda: None),
+        SimpleNamespace(text="<html></html>", raise_for_status=lambda: None),
+        SimpleNamespace(
+            text="""
+            <html><body>
+              <a href="./id=list/tc?clk=1&amp;url=https%3A%2F%2Fwww.iguopin.com%2Fjob%2Flist%3Fkeyword%3DJava">
+                Java 招聘信息 - 国聘列表
+              </a>
+              <a href="./id=x/tc?clk=1&amp;url=https%3A%2F%2Fm.nowcoder.com%2Fjob%2F44540%2Fdetail%3FjobId%3D39026">
+                视觉算法实习生 - BIGO招聘内推 - 牛客网
+              </a>
+            </body></html>
+            """,
+            raise_for_status=lambda: None,
+        ),
+    ])
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.get",
+        lambda *args, **kwargs: next(responses),
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+
+    result = search_public_job_pages(
+        ToolContext(user_id="user-a", run_id="run-a"),
+        SearchPublicJobPagesInput(query="BIGO AI 应用 招聘", max_results=1),
+    )
+
+    assert result.source_url.startswith("https://m.sogou.com/web/searchList.jsp?")
+    assert [item.url for item in result.results] == [
+        "https://m.nowcoder.com/job/44540/detail?jobId=39026"
+    ]
 
 
 def test_search_qualifies_the_query_with_recruiting_site_operators(monkeypatch) -> None:
@@ -599,6 +760,194 @@ def test_search_keeps_juejin_pins_and_drops_non_job_posts(monkeypatch) -> None:
 
     assert [item.url for item in result.results] == [
         "https://juejin.cn/pin/6931214116753244174"
+    ]
+
+
+def test_named_juejin_recent_search_paginates_official_api_and_proves_zero_match(
+    monkeypatch,
+) -> None:
+    """A named recent-source request may close negatively only after the
+    official result set is exhausted and the requested hard constraints are
+    evaluated against timestamped records."""
+    now = 1_786_680_000
+    calls: list[tuple[str, str]] = []
+
+    def article(
+        article_id: str, title: str, brief: str, *, age_days: int
+    ) -> dict[str, object]:
+        return {
+            "result_type": 2,
+            "result_model": {
+                "article_info": {
+                    "article_id": article_id,
+                    "title": title,
+                    "brief_content": brief,
+                    "ctime": str(now - age_days * 86_400),
+                }
+            },
+        }
+
+    def fake_fetch(url: str) -> SimpleNamespace:
+        query = parse_qs(urlsplit(url).query)
+        keyword = query["query"][0]
+        cursor = query["cursor"][0]
+        calls.append((keyword, cursor))
+        if keyword == "招聘" and cursor == "0":
+            payload = {
+                "err_no": 0,
+                "data": [
+                    article(
+                        "7670000000000000001",
+                        "AI 招聘系统架构拆解",
+                        "介绍企业招聘软件，不是招聘岗位。",
+                        age_days=1,
+                    ),
+                    article(
+                        "7670000000000000002",
+                        "【校招】AIGC 产品经理（应届生）",
+                        "北京岗位，欢迎应届生投递。",
+                        age_days=4,
+                    ),
+                ],
+                "cursor": "next",
+                "has_more": True,
+            }
+        elif keyword == "招聘" and cursor == "next":
+            payload = {
+                "err_no": 0,
+                "data": [
+                    article(
+                        "7670000000000000003",
+                        "前端开发实习生招聘",
+                        "2027 届校招岗位。",
+                        age_days=2,
+                    )
+                ],
+                "cursor": "done",
+                "has_more": False,
+            }
+        else:
+            payload = {
+                "err_no": 0,
+                "data": [],
+                "cursor": "done",
+                "has_more": False,
+            }
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: payload,
+            raise_for_status=lambda: None,
+        )
+        return SimpleNamespace(response=response)
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._fetch_validated",
+        fake_fetch,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.time.time", lambda: now
+    )
+
+    result = search_public_job_pages(
+        ToolContext(
+            user_id="u",
+            run_id="r",
+            metadata={
+                "task_goal": (
+                    "稀土掘金社区最近3天的招聘帖里，有没有适合我的 "
+                    "AIGC 产品经理（应届生）岗位？"
+                )
+            },
+        ),
+        SearchPublicJobPagesInput(
+            query="site:juejin.cn AIGC 产品经理 应届生 招聘",
+            max_results=5,
+        ),
+    )
+
+    assert result.provider == "juejin_official_search"
+    assert result.source_scope == "juejin.cn"
+    assert result.time_window_days == 3
+    assert result.coverage_complete is True
+    assert result.terminal_reason == "search_empty"
+    assert result.results == []
+    assert result.scanned_result_count == 2
+    assert result.matched_result_count == 0
+    assert ("招聘", "next") in calls
+    assert {keyword for keyword, _cursor in calls} == {"招聘", "内推", "校招"}
+
+
+def test_named_juejin_recent_search_returns_only_recent_hard_constraint_matches(
+    monkeypatch,
+) -> None:
+    now = 1_786_680_000
+
+    def fake_fetch(url: str) -> SimpleNamespace:
+        keyword = parse_qs(urlsplit(url).query)["query"][0]
+        records = []
+        if keyword == "招聘":
+            records = [
+                {
+                    "result_type": 2,
+                    "result_model": {
+                        "article_info": {
+                            "article_id": "7670000000000000004",
+                            "title": "【校招】AIGC 产品经理（应届生）招聘",
+                            "brief_content": "北京岗位，负责生成式 AI 产品设计，欢迎应届生投递。",
+                            "ctime": str(now - 86_400),
+                        }
+                    },
+                },
+                {
+                    "result_type": 2,
+                    "result_model": {
+                        "article_info": {
+                            "article_id": "7670000000000000005",
+                            "title": "【校招】AIGC 算法工程师招聘",
+                            "brief_content": "欢迎应届生投递。",
+                            "ctime": str(now - 86_400),
+                        }
+                    },
+                },
+            ]
+        payload = {
+            "err_no": 0,
+            "data": records,
+            "cursor": "done",
+            "has_more": False,
+        }
+        return SimpleNamespace(
+            response=SimpleNamespace(
+                status_code=200,
+                json=lambda: payload,
+                raise_for_status=lambda: None,
+            )
+        )
+
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._fetch_validated",
+        fake_fetch,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.time.time", lambda: now
+    )
+
+    result = search_public_job_pages(
+        ToolContext(
+            user_id="u",
+            run_id="r",
+            metadata={
+                "task_goal": "稀土掘金最近3天 AIGC 产品经理（应届生）招聘帖"
+            },
+        ),
+        SearchPublicJobPagesInput(query="稀土掘金 AIGC 产品经理 招聘"),
+    )
+
+    assert result.coverage_complete is True
+    assert result.terminal_reason == "candidates_found"
+    assert result.matched_result_count == 1
+    assert [item.url for item in result.results] == [
+        "https://juejin.cn/post/7670000000000000004"
     ]
 
 
@@ -914,6 +1263,7 @@ def test_extract_observed_job_details_returns_structured_fields_only_from_captur
         "recruitment_types": [],
         "apply_url": "https://jobs.example/ai-agent",
         "deadline_text": None,
+        "published_at": None,
         "confidence": 1.0,
         "evidence_refs": [{
             "artifact_id": "artifact-ai-agent",
@@ -973,6 +1323,98 @@ def test_extract_observed_job_details_handles_official_page_without_labeled_titl
     assert candidate.locations == ["北京市"]
     assert candidate.responsibilities == "负责 AI Agent 的设计与研发。"
     assert candidate.requirements == "熟悉 Python、RAG 和 Agent 开发框架。"
+
+
+def test_extract_observed_job_details_normalizes_linkedin_liepin_mirror_header() -> None:
+    """A public LinkedIn mirror must keep the real JD, not login/recommendation chrome."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-linkedin-liepin",
+            "source_url": "https://cn.linkedin.com/jobs/view/ai-product-manager-123",
+            "content_hash": "d" * 64,
+            "quality": "jd_complete",
+            "visible_text": (
+                "北京牛客科技有限公司正在招聘AI产品经理实习生 (北京市) | 领英\n"
+                "跳到主要内容\n登录\n马上加入\nAI产品经理实习生\n"
+                "北京牛客科技有限公司\n北京市\n申请\n"
+                "该职位来源于猎聘 协助完成 AI 产品需求分析。"
+                "参与大模型、Agent 和知识库功能设计。 "
+                "任职要求 本科或研究生在读，熟悉 Prompt、RAG。\n"
+                "Show more\nShow less\n职位级别\n实习\n"
+                "相似职位\nAIGC内容安全产品经理-CapCut\n字节跳动\n"
+            ),
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-linkedin-liepin"),
+    )
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.title == "AI产品经理实习生"
+    assert candidate.company_name == "北京牛客科技有限公司"
+    assert candidate.locations == ["北京市"]
+    assert candidate.responsibilities == (
+        "该职位来源于猎聘 协助完成 AI 产品需求分析。参与大模型、Agent 和知识库功能设计。"
+    )
+    assert candidate.requirements == "本科或研究生在读，熟悉 Prompt、RAG。"
+    assert "相似职位" not in candidate.requirements
+
+
+def test_extract_observed_job_details_splits_baiont_official_career_roles() -> None:
+    """One official multi-role page must yield one evidence-bound candidate per JD."""
+    source_url = "https://www.baiontcapital.com/careers.html"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={"observed_public_evidence": [{
+            "artifact_id": "artifact-baiont",
+            "source_url": source_url,
+            "content_hash": "e" * 64,
+            "quality": "jd_complete",
+            "visible_text": """
+倍漾量化
+职业机会
+Career Opportunities
+量化策略研究员
+岗位职责:
+开发和优化量化交易模型，研究机器学习方法。
+要求：
+精通 Python/C++，数学基础扎实。
+机器学习算法工程师
+岗位职责:
+开发和优化金融市场预测的机器学习模型，设计数据处理管道。
+要求：
+精通机器学习、Python、PyTorch/TensorFlow，有顶会论文经验。
+Agent 后端工程师
+岗位职责:
+设计与落地 AI Agent 系统，构建 Tool Calling、RAG 自动化工作流。
+要求：
+熟悉 Context Engineering、Function Calling、RAG、Agent Loop。
+您可将简历投递至：
+jobs@baiontcapital.com
+""",
+        }]},
+    )
+
+    result = extract_observed_job_details(
+        context,
+        ExtractObservedJobDetailsInput(artifact_id="artifact-baiont"),
+    )
+
+    assert [candidate.title for candidate in result.candidates] == [
+        "量化策略研究员",
+        "机器学习算法工程师",
+        "Agent 后端工程师",
+    ]
+    assert all(candidate.company_name == "倍漾量化" for candidate in result.candidates)
+    assert all(candidate.apply_url == source_url for candidate in result.candidates)
+    assert "PyTorch/TensorFlow" in result.candidates[1].requirements
+    assert "Tool Calling" in result.candidates[2].responsibilities
 
 
 def test_extract_observed_job_details_derives_social_type_and_clears_resolved_location_warning() -> None:
@@ -2482,6 +2924,70 @@ def test_batch_fetch_expands_js_card_list_into_detail_pages(monkeypatch) -> None
     # detail pages carry real JD body, not the empty card shell
     assert "岗位职责" in result.pages[1].visible_text
     assert result.pages[0].title == "校招职位列表"
+
+
+def test_batch_fetch_expands_tencent_public_query_post_ids(monkeypatch) -> None:
+    from backend.app.services.career_skills import job_discovery as jd
+
+    query_url = (
+        "https://careers.tencent.com/tencentcareer/api/post/Query"
+        "?keyword=AIGC&pageIndex=1&pageSize=10&language=zh-cn&area=cn"
+    )
+    raw_json = json.dumps(
+        {
+            "Code": 200,
+            "Data": {
+                "Posts": [
+                    {"PostId": "2067084416139833344", "RecruitPostName": "AIGC 导演"},
+                    {"PostId": "2066766694350974976", "RecruitPostName": "产品经理"},
+                    {"PostId": "2067084416139833344", "RecruitPostName": "重复记录"},
+                    {"PostId": "../not-an-id", "RecruitPostName": "非法记录"},
+                ]
+            },
+        },
+        ensure_ascii=False,
+    )
+    list_page = FetchPublicJobPageOutput(
+        artifact_id="query",
+        source_url=query_url,
+        title="腾讯招聘公开职位查询",
+        visible_text="职位列表 " * 80,
+        content_hash="q" * 64,
+        quality="list_only",
+    )
+    detail_page = FetchPublicJobPageOutput(
+        artifact_id="detail",
+        source_url=(
+            "https://careers.tencent.com/jobdesc.html?postId=2067084416139833344"
+        ),
+        title="AIGC 导演",
+        visible_text=_jd_body("AIGC 导演"),
+        content_hash="d" * 64,
+        quality="jd_complete",
+    )
+    monkeypatch.setattr(
+        jd,
+        "_fetch_public_page_requests_with_html",
+        lambda _url: (list_page, raw_json),
+    )
+    captured_links: list[str] = []
+
+    def fake_expand(_url, links, _body, **_kwargs):  # noqa: ANN001
+        captured_links.extend(links)
+        return [detail_page]
+
+    monkeypatch.setattr(jd, "_expand_from_list_links", fake_expand)
+
+    result = fetch_public_job_pages(
+        ToolContext(user_id="u", run_id="r"),
+        FetchPublicJobPagesInput(urls=[query_url]),
+    )
+
+    assert captured_links == [
+        "https://careers.tencent.com/jobdesc.html?postId=2067084416139833344",
+        "https://careers.tencent.com/jobdesc.html?postId=2066766694350974976",
+    ]
+    assert [page.source_url for page in result.pages] == [query_url, detail_page.source_url]
 
 
 def test_batch_fetch_skips_expansion_when_page_already_has_jd_text(monkeypatch) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -46,6 +47,7 @@ class ResumeTailoringBriefOutput(BaseModel):
     target_artifact_id: str
     target_title: str | None
     source_url: str
+    source_attribution: str | None = None
     supported_keywords: list[str]
     missing_keywords: list[str]
     safe_actions: list[str]
@@ -80,6 +82,10 @@ def build_resume_tailoring_brief(
             raise ResumeTailoringError("target_evidence_incomplete")
         target_title = target.get("title") if isinstance(target.get("title"), str) else None
         job_text = f"{target_title or ''}\n{visible_text}".lower()
+        if not _target_source_matches_goal(
+            context.metadata.get("task_goal"), source_url, job_text
+        ):
+            raise ResumeTailoringError("target_source_mismatch")
         if not _target_matches_goal(context.metadata.get("task_goal"), job_text):
             raise ResumeTailoringError("target_role_mismatch")
     else:
@@ -128,6 +134,7 @@ def build_resume_tailoring_brief(
         target_artifact_id=payload.target_artifact_id,
         target_title=target_title,
         source_url=source_url,
+        source_attribution=_source_attribution(source_url, job_text),
         supported_keywords=supported,
         missing_keywords=missing,
         safe_actions=actions,
@@ -155,10 +162,57 @@ def _target_matches_goal(goal: object, searchable: str) -> bool:
         (("java 后端", "java后端"), ("java", "后端")),
     )
     lowered_goal = goal.lower()
+    if any(marker in lowered_goal for marker in ("应届生", "应届", "校招", "实习生")) and not any(
+        marker in searchable
+        for marker in (
+            "应届生", "应届", "校招", "校园招聘", "毕业生", "campus",
+            "graduate", "实习生", "实习", "intern",
+        )
+    ):
+        return False
     for markers, evidence_terms in role_groups:
         if any(marker in lowered_goal for marker in markers):
+            if "产品经理" in markers:
+                if "产品经理" in lowered_goal and "产品经理" not in searchable:
+                    return False
+                if "aigc" in lowered_goal:
+                    return any(
+                        marker in searchable
+                        for marker in (
+                            "aigc",
+                            "生成式ai",
+                            "生成式人工智能",
+                            "大模型",
+                            "llm",
+                            "prompt",
+                            "rag",
+                            "ai agent",
+                        )
+                    )
+                if "产品经理" not in lowered_goal:
+                    return "aigc" in searchable
+                return True
             return any(term in searchable for term in evidence_terms)
     return True
+
+
+def _source_attribution(source_url: str, job_text: str) -> str | None:
+    """Return only an attribution stated by the captured source evidence."""
+    host = (urlsplit(source_url).hostname or "").lower().rstrip(".")
+    if host == "liepin.com" or host.endswith(".liepin.com"):
+        return "猎聘"
+    if "该职位来源于猎聘" in job_text:
+        return "猎聘"
+    return None
+
+
+def _target_source_matches_goal(
+    goal: object, source_url: str, job_text: str
+) -> bool:
+    """Enforce an explicitly named source using only captured attribution."""
+    if not isinstance(goal, str) or "猎聘" not in goal:
+        return True
+    return _source_attribution(source_url, job_text) == "猎聘"
 
 
 def _structured_target_evidence(

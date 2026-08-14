@@ -129,6 +129,60 @@ def test_preparation_plan_resolves_candidate_id_from_structured_evidence() -> No
     assert result.jd_topics == ["python", "rag"]
 
 
+def test_preparation_plan_rejects_algorithm_role_for_ai_application_goal() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "给出 AI 应用开发实习生岗位的面试建议。",
+            "structured_job_candidates": [
+                {
+                    "candidate_id": "algorithm-intern",
+                    "source_url": "https://jobs.example/algorithm",
+                    "title": "机器人强化学习算法实习生",
+                    "full_text": "负责运动控制与强化学习算法研究，要求熟悉 PyTorch。",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(CareerPlanningError, match="target_role_mismatch"):
+        build_preparation_plan(
+            context,
+            BuildPreparationPlanInput(
+                target_artifact_id="algorithm-intern",
+                focus_keywords=["PyTorch"],
+            ),
+        )
+
+
+def test_preparation_plan_rejects_product_role_for_ai_application_goal() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "给出 AI 应用开发实习生岗位的面试建议。",
+            "structured_job_candidates": [
+                {
+                    "candidate_id": "product-intern",
+                    "source_url": "https://jobs.example/product",
+                    "title": "AI Agent 产品经理实习生",
+                    "full_text": "负责 Agent 平台和 RAG 产品方案设计。",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(CareerPlanningError, match="target_role_mismatch"):
+        build_preparation_plan(
+            context,
+            BuildPreparationPlanInput(
+                target_artifact_id="product-intern",
+                focus_keywords=["Agent"],
+            ),
+        )
+
+
 def test_preparation_plan_rejects_invalid_keywords_and_missing_target_evidence() -> None:
     with pytest.raises(ValidationError):
         BuildPreparationPlanInput(target_artifact_id="jd", focus_keywords=[" "])

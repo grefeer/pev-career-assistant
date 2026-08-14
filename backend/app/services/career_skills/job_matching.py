@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 import re
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -198,6 +199,9 @@ class MatchObservedJobsOutput(BaseModel):
 
     matches: list[ObservedJobMatch]
     unresolved_ranking_criteria: list[str] = Field(default_factory=list)
+    evaluated_candidate_count: int = Field(default=0, ge=0)
+    evaluated_source_urls: list[str] = Field(default_factory=list)
+    no_match_reason: Literal["no_candidate_satisfied_constraints"] | None = None
 
 
 _COMPENSATION_RE = re.compile(
@@ -234,6 +238,20 @@ _INVALID_TITLE_MARKERS = (
     "安全防范",
     "查看全部",
 )
+_GRADUATE_MARKERS = (
+    "应届",
+    "校招",
+    "校园招聘",
+    "毕业生",
+    "校园",
+    "campus",
+    "graduate",
+    "实习生",
+    "实习",
+    "intern",
+    "internship",
+)
+_RECENT_DAYS_RE = re.compile(r"(?:最近|近)\s*(\d+)\s*天")
 
 
 def match_observed_jobs(
@@ -250,12 +268,24 @@ def match_observed_jobs(
     candidates = context.metadata.get("structured_job_candidates", [])
     goal_role_terms = _goal_role_terms(context.metadata.get("task_goal"))
     matches: list[ObservedJobMatch] = []
+    evaluated_candidate_count = 0
+    evaluated_source_urls: list[str] = []
     if isinstance(candidates, list) and candidates:
-        for candidate in candidates:
-            if not isinstance(candidate, dict):
-                continue
-            if not _is_primary_detail_candidate(candidate):
-                continue
+        evaluated_candidates = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict) and _is_primary_detail_candidate(candidate)
+        ]
+        evaluated_candidate_count = len(evaluated_candidates)
+        evaluated_source_urls = list(
+            dict.fromkeys(
+                source_url
+                for candidate in evaluated_candidates
+                if isinstance((source_url := candidate.get("source_url")), str)
+                and source_url
+            )
+        )
+        for candidate in evaluated_candidates:
             if not _candidate_meets_goal_constraints(
                 candidate,
                 context.metadata.get("task_goal"),
@@ -263,7 +293,16 @@ def match_observed_jobs(
             ):
                 continue
             if not _source_allowed_for_goal(
-                candidate.get("source_url"), context.metadata.get("task_goal")
+                candidate.get("source_url"),
+                context.metadata.get("task_goal"),
+                evidence_text="\n".join(
+                    value
+                    for value in (
+                        candidate.get("page_text_prefix"),
+                        candidate.get("full_text"),
+                    )
+                    if isinstance(value, str)
+                ),
             ):
                 continue
             match = _match_candidate(candidate, payload, goal_role_terms=goal_role_terms)
@@ -271,6 +310,21 @@ def match_observed_jobs(
                 matches.append(match)
     else:
         matches = _match_raw_evidence(context, payload, goal_role_terms=goal_role_terms)
+        raw_evidence = context.metadata.get("observed_public_evidence", [])
+        evaluated_raw = [
+            item
+            for item in raw_evidence
+            if isinstance(item, dict)
+            and item.get("quality") not in {"list_only", "js_shell", "empty"}
+            and isinstance(item.get("source_url"), str)
+            and bool(item.get("source_url"))
+            and isinstance(item.get("visible_text"), str)
+            and bool(str(item.get("visible_text")).strip())
+        ] if isinstance(raw_evidence, list) else []
+        evaluated_candidate_count = len(evaluated_raw)
+        evaluated_source_urls = list(
+            dict.fromkeys(str(item["source_url"]) for item in evaluated_raw)
+        )
     matches = _prefer_goal_role_matches(matches, context.metadata.get("task_goal"))
     matches.sort(key=lambda match: (-match.score, match.title or "", match.artifact_id))
     selected_matches = matches[: payload.limit]
@@ -282,6 +336,13 @@ def match_observed_jobs(
     return MatchObservedJobsOutput(
         matches=selected_matches,
         unresolved_ranking_criteria=unresolved,
+        evaluated_candidate_count=evaluated_candidate_count,
+        evaluated_source_urls=evaluated_source_urls,
+        no_match_reason=(
+            "no_candidate_satisfied_constraints"
+            if evaluated_candidate_count > 0 and not selected_matches
+            else None
+        ),
     )
 
 
@@ -311,7 +372,11 @@ def _match_raw_evidence(
             for value in (artifact_id, source_url, visible_text)
         ):
             continue
-        if not _source_allowed_for_goal(source_url, context.metadata.get("task_goal")):
+        if not _source_allowed_for_goal(
+            source_url,
+            context.metadata.get("task_goal"),
+            evidence_text=visible_text,
+        ):
             continue
         title = item.get("title")
         normalized_title = title if isinstance(title, str) else None
@@ -325,6 +390,9 @@ def _match_raw_evidence(
                 excerpt=visible_text,
                 payload=payload,
                 goal_role_terms=goal_role_terms,
+                recency_verified=_candidate_recency_verified(
+                    item, context.metadata.get("task_goal")
+                ),
             )
         )
     return matches
@@ -386,6 +454,9 @@ def _match_candidate(
         excerpt=excerpt,
         payload=payload,
         goal_role_terms=goal_role_terms,
+        recency_verified=_candidate_recency_verified(
+            item, None
+        ),
     )
 
 
@@ -400,6 +471,16 @@ def _is_primary_detail_candidate(candidate: dict[str, Any]) -> bool:
     page_title = candidate.get("page_title")
     page_text_prefix = candidate.get("page_text_prefix")
     title = candidate.get("title")
+    if (
+        isinstance(source_url, str)
+        and isinstance(page_source_url, str)
+        and source_url == page_source_url
+        and _is_known_official_multi_role_page(page_source_url)
+    ):
+        # Baiont's official career page intentionally contains repeated,
+        # independently parsed JD blocks on one URL.  They are not the
+        # recommendation cards filtered by the single-detail checks below.
+        return True
     if isinstance(page_title, str) and isinstance(title, str) and page_title.strip():
         if title.strip().lower() not in page_title.lower():
             return False
@@ -419,20 +500,46 @@ def _is_primary_detail_candidate(candidate: dict[str, Any]) -> bool:
     return candidate_id.endswith(":candidate:0")
 
 
-def _source_allowed_for_goal(source_url: object, goal: object) -> bool:
+def _is_known_official_multi_role_page(source_url: str) -> bool:
+    parsed = urlparse(source_url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return host in {
+        "baiontcapital.com",
+        "www.baiontcapital.com",
+        "baiont.ai",
+        "www.baiont.ai",
+    } and parsed.path.rstrip("/").lower().endswith("/careers.html")
+
+
+def _source_allowed_for_goal(
+    source_url: object,
+    goal: object,
+    *,
+    evidence_text: object = None,
+) -> bool:
     """Enforce explicit source/channel constraints without inventing evidence."""
     if not isinstance(source_url, str) or not source_url:
         return False
     if not isinstance(goal, str) or not goal.strip():
         return True
     goal_lower = goal.lower()
+    host = (urlparse(source_url).hostname or "").lower().rstrip(".")
+    path = urlparse(source_url).path.lower()
+    if "猎聘" in goal:
+        if host == "liepin.com" or host.endswith(".liepin.com"):
+            return True
+        text = evidence_text if isinstance(evidence_text, str) else ""
+        is_linkedin_public_job = (
+            (host == "linkedin.com" or host.endswith(".linkedin.com"))
+            and path.startswith("/jobs/view/")
+        )
+        return is_linkedin_public_job and "该职位来源于猎聘" in text
     channel_required = any(
         marker in goal_lower
         for marker in ("国聘", "官网", "中国移动", "中国联通", "10086", "10010")
     )
     if not channel_required:
         return True
-    host = (urlparse(source_url).hostname or "").lower().rstrip(".")
     allowed_hosts = (
         "iguopin.com",
         "10086.cn",
@@ -454,6 +561,7 @@ def _score_job(
     excerpt: str,
     payload: MatchObservedJobsInput,
     goal_role_terms: list[str] | None = None,
+    recency_verified: bool | None = None,
 ) -> ObservedJobMatch:
     """Score one job unit from its searchable text, exposing unverified criteria."""
     matched = [keyword for keyword in payload.profile_keywords if keyword in searchable]
@@ -468,6 +576,7 @@ def _score_job(
         matched_locations=matched_locations,
         compensation_text=compensation_text,
         observed_company_types=observed_company_types,
+        recency_verified=recency_verified,
     )
     role_hits = sum(1 for term in goal_role_terms or [] if term.lower() in searchable)
     score = min(100, len(matched) * 34 + role_hits * 15)
@@ -504,13 +613,14 @@ def _candidate_meets_goal_constraints(
     title_text = title.strip() if isinstance(title, str) else ""
     if title_text and any(marker in title_text for marker in _INVALID_TITLE_MARKERS):
         return False
-    searchable = "\n".join(
-        str(candidate.get(key) or "")
-        for key in ("title", "company_name", "locations", "responsibilities", "requirements")
-    ).lower()
+    searchable = _candidate_searchable_text(candidate)
     goal_lower = goal.lower()
     if "产品经理" in goal_lower or "aigc" in goal_lower:
-        role_terms = ("产品经理", "aigc")
+        role_terms = ("产品经理",) if "产品经理" in goal_lower else ()
+        if "aigc" in goal_lower:
+            role_terms = (*role_terms, "aigc")
+    elif "ai 应用开发" in goal_lower or "ai应用开发" in goal_lower:
+        role_terms = ("ai", "应用开发", "agent", "智能体")
     elif "大模型应用开发" in goal_lower or "llm 应用" in goal_lower or "llm应用" in goal_lower:
         role_terms = ("大模型", "应用开发", "llm", "agent")
     elif "前端开发" in goal_lower:
@@ -520,13 +630,28 @@ def _candidate_meets_goal_constraints(
     else:
         role_terms = ()
     profile_role_terms = _profile_role_terms(profile_facts)
-    if profile_role_terms:
-        role_terms = tuple(dict.fromkeys((*role_terms, *profile_role_terms)))
-    if role_terms and not any(term.lower() in searchable for term in role_terms):
+    if role_terms and not _role_constraint_satisfied(
+        role_terms, searchable, profile_role_terms
+    ):
         return False
 
     requested_locations = [term for term in _GOAL_LOCATION_TERMS if term in goal]
     if requested_locations and not any(term.lower() in searchable for term in requested_locations):
+        return False
+
+    if _requires_graduate_scope(goal, profile_facts):
+        recruitment_types = candidate.get("recruitment_types")
+        recruitment_text = " ".join(
+            item for item in recruitment_types if isinstance(item, str)
+        ).lower() if isinstance(recruitment_types, list) else ""
+        if not any(marker in f"{searchable}\n{recruitment_text}" for marker in _GRADUATE_MARKERS):
+            return False
+
+    recent_days = _requested_recent_days(goal)
+    if recent_days is not None and not _candidate_recency_verified(candidate, goal):
+        # A recent-posting requirement is a hard user constraint. Missing an
+        # authoritative timestamp is not permission to infer freshness from a
+        # crawl time or a deadline, so the candidate is excluded.
         return False
 
     experience_match = re.search(r"(\d+)\s*年(?:经验|工作经验)", goal)
@@ -546,6 +671,162 @@ def _candidate_meets_goal_constraints(
     # conservatively: a candidate is not eligible when any mandatory-looking
     # minimum exceeds the user's stated experience.
     return not minimum_years or max(minimum_years) <= target_years
+
+
+def _role_constraint_satisfied(
+    goal_terms: tuple[str, ...],
+    searchable: str,
+    profile_terms: tuple[str, ...],
+) -> bool:
+    """Apply all explicit compound terms without over-constraining synonyms."""
+    if "产品经理" in goal_terms:
+        if "产品经理" not in searchable:
+            return False
+        if "aigc" in goal_terms or "aigc" in profile_terms:
+            return any(
+                marker in searchable
+                for marker in (
+                    "aigc",
+                    "生成式ai",
+                    "生成式人工智能",
+                    "大模型",
+                    "llm",
+                    "prompt",
+                    "rag",
+                    "ai agent",
+                )
+            )
+        return True
+    if "java" in goal_terms and "后端" in goal_terms:
+        return "java" in searchable and "后端" in searchable
+    if "ai" in goal_terms and "应用开发" in goal_terms:
+        return any(
+            marker in searchable for marker in ("ai", "人工智能", "大模型", "llm")
+        ) and any(
+            marker in searchable
+            for marker in (
+                "应用开发",
+                "应用研发",
+                "应用工程师",
+                "开发工程师",
+                "研发工程师",
+                "后端工程师",
+                "前端工程师",
+                "开发实习",
+                "研发实习",
+                "developer",
+                "engineer",
+            )
+        )
+    return any(term.lower() in searchable for term in goal_terms)
+
+
+def _candidate_searchable_text(candidate: dict[str, Any]) -> str:
+    """Flatten only evidence fields that are safe for deterministic matching."""
+    parts: list[str] = []
+    for key in (
+        "title",
+        "company_name",
+        "responsibilities",
+        "requirements",
+        "full_text",
+        "deadline_text",
+    ):
+        value = candidate.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+    for key in ("locations", "recruitment_types", "skills"):
+        value = candidate.get(key)
+        if isinstance(value, list):
+            parts.extend(item for item in value if isinstance(item, str))
+    return "\n".join(parts).lower()
+
+
+def _requires_graduate_scope(goal: str, profile_facts: object) -> bool:
+    text = goal.lower()
+    if isinstance(profile_facts, dict):
+        text += "\n" + "\n".join(
+            str(value).lower() for value in profile_facts.values()
+        )
+    return any(marker in text for marker in ("应届生", "应届", "校招", "实习生"))
+
+
+def _requested_recent_days(goal: object) -> int | None:
+    if not isinstance(goal, str):
+        return None
+    match = _RECENT_DAYS_RE.search(goal)
+    return int(match.group(1)) if match else None
+
+
+def _candidate_recency_verified(
+    candidate: dict[str, Any], goal: object
+) -> bool:
+    timestamp = next(
+        (
+            candidate.get(key)
+            for key in (
+                "updated_at",
+                "published_at",
+                "posted_at",
+                "publish_time",
+                "update_time",
+            )
+            if candidate.get(key) not in (None, "")
+        ),
+        None,
+    )
+    observed = _parse_observed_date(timestamp)
+    if observed is None:
+        return False
+    recent_days = _requested_recent_days(goal)
+    if recent_days is None:
+        return True
+    age_days = (datetime.now(timezone.utc).date() - observed).days
+    return 0 <= age_days <= recent_days
+
+
+def _parse_observed_date(value: object) -> date | None:
+    if isinstance(value, (int, float)):
+        seconds = float(value) / (1000 if float(value) > 10_000_000_000 else 1)
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc).date()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    today = datetime.now(timezone.utc).date()
+    if cleaned in {"今天", "刚刚", "刚刚发布", "today"}:
+        return today
+    if cleaned in {"昨天", "yesterday"}:
+        return today - timedelta(days=1)
+    relative_match = re.fullmatch(
+        r"(\d+)\s*(年前|个月前|天前|小时前|分钟前)", cleaned, re.IGNORECASE
+    )
+    if relative_match:
+        amount = int(relative_match.group(1))
+        unit = relative_match.group(2).lower()
+        days = {
+            "年前": 365 * amount,
+            "个月前": 30 * amount,
+            "天前": amount,
+            "小时前": 0,
+            "分钟前": 0,
+        }[unit]
+        return today - timedelta(days=days)
+    iso_match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", cleaned)
+    if iso_match:
+        try:
+            return date(
+                int(iso_match.group(1)),
+                int(iso_match.group(2)),
+                int(iso_match.group(3)),
+            )
+        except ValueError:
+            return None
+    return None
 
 
 def _profile_role_terms(profile_facts: object) -> tuple[str, ...]:
@@ -583,6 +864,8 @@ def _prefer_goal_role_matches(
     lowered_goal = goal.lower()
     if any(marker in lowered_goal for marker in ("产品经理", "aigc")):
         terms = ("产品经理", "aigc")
+    elif any(marker in lowered_goal for marker in ("ai 应用开发", "ai应用开发")):
+        terms = ("ai", "应用开发", "agent", "智能体")
     elif any(marker in lowered_goal for marker in ("大模型应用开发", "llm 应用", "llm应用")):
         terms = ("大模型", "应用开发", "llm", "agent")
     elif "前端开发" in lowered_goal:
@@ -608,6 +891,7 @@ def _unverified_criteria(
     matched_locations: list[str],
     compensation_text: str | None,
     observed_company_types: list[str],
+    recency_verified: bool | None = None,
 ) -> list[str]:
     """Surface omitted evidence rather than silently ranking from assumptions."""
     unverified: list[str] = []
@@ -618,7 +902,6 @@ def _unverified_criteria(
             unverified.append(criterion)
         elif criterion == "company_type" and not observed_company_types:
             unverified.append(criterion)
-        elif criterion == "recency":
-            # Captured pages currently do not preserve an authoritative publish time.
+        elif criterion == "recency" and not recency_verified:
             unverified.append(criterion)
     return unverified

@@ -173,6 +173,90 @@ def test_planner_trims_unrequested_trailing_resume_step() -> None:
     assert [step.step_id for step in trimmed.steps] == ["match"]
 
 
+def test_planner_appends_explicitly_requested_resume_tailoring_step() -> None:
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "plan",
+                "complexity": "L3",
+                "success_criteria": ["找到岗位并定制简历"],
+                "steps": [
+                    {
+                        "step_id": "discover",
+                        "objective": "抓取并结构化北京 AIGC 产品经理 JD",
+                        "allowed_skills": ["job-discovery"],
+                        "outputs": [
+                            {
+                                "name": "structured_job_details",
+                                "artifact_type": "structured_job_details",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="找北京 AIGC 产品经理（应届生）岗位，并定制针对性简历。",
+        allowed_skills=["job-discovery", "resume-tailoring"],
+    )
+
+    result = PlannerAgent(gateway=gateway, tools=ToolRegistry()).run(
+        task=task,
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "planned"
+    assert result.plan is not None
+    assert [step.allowed_skills for step in result.plan.steps] == [
+        ["job-discovery"],
+        ["resume-tailoring"],
+    ]
+    tailoring = result.plan.steps[-1]
+    assert tailoring.depends_on == ["discover"]
+    assert tailoring.inputs[0].artifact_type == "structured_job_details"
+    assert tailoring.outputs[0].artifact_type == "resume_tailoring_brief"
+
+
+def test_planner_trims_unrequested_matching_after_discovery_constraints() -> None:
+    """“适合我的” constrains discovery; it does not request a separate ranking report."""
+    task = AgentTaskRequest(
+        goal="快手、小红书有没有适合我的 AI 产品经理（应届生）岗位？请核实投递链接。",
+        allowed_skills=["job-discovery", "job-matching"],
+    )
+    plan = ExecutionPlan.model_validate(
+        {
+            "task": task.model_dump(),
+            "created_by": "planner",
+            "complexity": "L3",
+            "success_criteria": ["核实岗位和投递链接"],
+            "steps": [
+                {
+                    "step_id": "discover",
+                    "objective": "发现并核实岗位",
+                    "allowed_skills": ["job-discovery"],
+                },
+                {
+                    "step_id": "match",
+                    "objective": "生成匹配报告",
+                    "allowed_skills": ["job-matching"],
+                    "depends_on": ["discover"],
+                },
+                {
+                    "step_id": "validate",
+                    "objective": "再次验证匹配岗位链接",
+                    "allowed_skills": ["job-discovery"],
+                    "depends_on": ["match"],
+                },
+            ],
+        }
+    )
+
+    trimmed = PlannerAgent._trim_unrequested_trailing_steps(task, plan)
+
+    assert [step.step_id for step in trimmed.steps] == ["discover"]
+
+
 def test_planner_downgrades_invalid_execution_plan_to_recoverable_wait() -> None:
     gateway = ScriptedGateway(
         [
@@ -299,3 +383,31 @@ def test_planner_normalizes_known_model_artifact_port_alias() -> None:
     assert result.plan is not None
     assert result.plan.steps[0].outputs[0].artifact_type == "job_matching_report"
     assert len(gateway.states) == 1
+
+
+def test_seeded_career_fallback_does_not_treat_generic_suitable_word_as_matching() -> None:
+    """Discovery wording such as “适合我的岗位” must not invent a matching deliverable."""
+    skills = SkillRegistry(
+        [
+            SkillDefinition(name="job-discovery"),
+            SkillDefinition(name="job-matching"),
+            SkillDefinition(name="resume-tailoring"),
+            SkillDefinition(name="career-planning"),
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="哪些公司发布了适合我的大模型应用开发岗位？请验证投递链接。",
+        allowed_skills=[
+            "job-discovery",
+            "job-matching",
+            "resume-tailoring",
+            "career-planning",
+        ],
+    )
+
+    plan = PlannerAgent(
+        gateway=ScriptedGateway([]), tools=ToolRegistry(), skills=skills
+    )._build_seeded_career_fallback(task)
+
+    assert plan is not None
+    assert [step.allowed_skills for step in plan.steps] == [["job-discovery"]]

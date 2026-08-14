@@ -202,6 +202,207 @@ _SOURCE_UNAVAILABLE_QUESTION = (
 )
 
 
+def _is_intermediate_job_routing_step(
+    plan: ExecutionPlan, step: PlanStep
+) -> bool:
+    """True only for a non-final step whose sole output routes job discovery."""
+    try:
+        step_index = next(
+            index for index, candidate in enumerate(plan.steps)
+            if candidate.step_id == step.step_id
+        )
+    except StopIteration:
+        return False
+    return (
+        step_index < len(plan.steps) - 1
+        and len(step.outputs) == 1
+        and step.outputs[0].artifact_type == "job_search_results"
+    )
+
+
+def _normalized_step_tool_input(
+    plan: ExecutionPlan,
+    step: PlanStep,
+    tool_name: str | None,
+    tool_input: dict[str, Any],
+    *,
+    task: AgentTaskRequest | None = None,
+    context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Normalize model inputs only where deterministic evidence owns the choice.
+
+    A goal may explicitly require "list recent companies, then inspect each
+    company for roles".  Profile-derived role keywords belong to the later JD
+    step; applying them to the inventory query can turn a non-empty recent
+    company list into an empty result and make the model search indefinitely.
+
+    A downstream tailoring step has a similar authority boundary: the model
+    may choose an artifact identifier, but it may not spend calls on an older
+    candidate that violates the goal's role/location/source constraints when a
+    valid structured candidate is already present.  Re-selecting here changes
+    only the identifier and keywords sent to the deterministic tool; it never
+    creates evidence.
+    """
+    if (
+        tool_name == "build-resume-tailoring-brief"
+        and task is not None
+        and context is not None
+    ):
+        return _normalized_tailoring_tool_input(task, context, tool_input)
+    if (
+        tool_name != "query-career-sheet-records"
+        or not _is_intermediate_job_routing_step(plan, step)
+        or "公司" not in step.objective
+        or not any(marker in step.objective for marker in ("清单", "记录", "更新"))
+        or any(marker in step.objective.lower() for marker in ("岗位", "jd"))
+    ):
+        return tool_input
+    normalized = dict(tool_input)
+    normalized["role_keywords"] = []
+    return normalized
+
+
+def _normalized_tailoring_tool_input(
+    task: AgentTaskRequest,
+    context: ToolContext,
+    tool_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Route tailoring to a real goal-constrained structured JD candidate."""
+    raw_candidates = context.metadata.get("structured_job_candidates")
+    if not isinstance(raw_candidates, list):
+        return tool_input
+    from backend.app.services.career_skills.job_matching import (
+        _candidate_meets_goal_constraints,
+        _source_allowed_for_goal,
+    )
+
+    profile_facts = context.metadata.get("confirmed_profile_facts")
+    eligible: list[dict[str, Any]] = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        evidence_text = _tailoring_candidate_text(candidate)
+        source_url = candidate.get("page_source_url") or candidate.get("source_url")
+        if not _candidate_meets_goal_constraints(
+            candidate, task.goal, profile_facts
+        ) or not _source_allowed_for_goal(
+            source_url,
+            task.goal,
+            evidence_text=evidence_text,
+        ):
+            continue
+        eligible.append(candidate)
+    if not eligible:
+        return tool_input
+
+    requested_id = tool_input.get("target_artifact_id")
+    raw_keywords = tool_input.get("target_keywords")
+    requested_keywords = (
+        [value.strip() for value in raw_keywords if isinstance(value, str) and value.strip()]
+        if isinstance(raw_keywords, list)
+        else []
+    )
+    exact_candidate = next(
+        (
+            candidate
+            for candidate in eligible
+            if requested_id == candidate.get("candidate_id")
+        ),
+        None,
+    )
+    alias_matches = [
+        candidate
+        for candidate in eligible
+        if requested_id in _tailoring_candidate_identifiers(candidate)
+    ]
+    selection_pool = alias_matches or eligible
+    selected = exact_candidate or max(
+        selection_pool,
+        key=lambda candidate: sum(
+            1
+            for keyword in requested_keywords
+            if keyword.lower() in _tailoring_candidate_text(candidate).lower()
+        ),
+    )
+    candidate_id = selected.get("candidate_id") or selected.get("artifact_id")
+    if not isinstance(candidate_id, str) or not candidate_id:
+        return tool_input
+
+    evidence_text = _tailoring_candidate_text(selected).lower()
+    keywords = [value for value in requested_keywords if value.lower() in evidence_text]
+    for value in ("RAG", "Prompt", "Agent", "大模型", "AI"):
+        if value.lower() in evidence_text and value.lower() not in {
+            item.lower() for item in keywords
+        }:
+            keywords.append(value)
+    if not keywords:
+        title = selected.get("title")
+        if isinstance(title, str) and title.strip():
+            keywords = [title.strip()]
+    normalized = dict(tool_input)
+    normalized["target_artifact_id"] = candidate_id
+    if keywords:
+        normalized["target_keywords"] = keywords[:30]
+    return normalized
+
+
+def _tailoring_candidate_identifiers(candidate: dict[str, Any]) -> set[str]:
+    return {
+        value
+        for value in (
+            candidate.get("candidate_id"),
+            candidate.get("artifact_id"),
+            candidate.get("source_artifact_id"),
+            candidate.get("source_url"),
+            candidate.get("page_source_url"),
+        )
+        if isinstance(value, str) and value
+    }
+
+
+def _tailoring_candidate_text(candidate: dict[str, Any]) -> str:
+    parts = [
+        candidate.get(key)
+        for key in (
+            "title",
+            "company_name",
+            "responsibilities",
+            "requirements",
+            "full_text",
+            "page_text_prefix",
+        )
+    ]
+    for key in ("locations", "recruitment_types", "skills"):
+        value = candidate.get(key)
+        if isinstance(value, list):
+            parts.extend(value)
+    return "\n".join(value for value in parts if isinstance(value, str) and value)
+
+
+def _intermediate_job_routing_observation_succeeded(
+    plan: ExecutionPlan,
+    step: PlanStep,
+    observation: ToolObservation,
+) -> bool:
+    if (
+        not _is_intermediate_job_routing_step(plan, step)
+        or observation.status != "succeeded"
+        or observation.tool_name
+        not in {"query-career-sheet-records", "search-public-job-pages"}
+        or not isinstance(observation.output, dict)
+    ):
+        return False
+    collection_name = (
+        "records"
+        if observation.tool_name == "query-career-sheet-records"
+        else "results"
+    )
+    collection = observation.output.get(collection_name)
+    return isinstance(collection, list) and any(
+        isinstance(item, dict) for item in collection
+    )
+
+
 def _summarize_succeeded_call(
     tool_name: str, tool_input: dict[str, Any]
 ) -> dict[str, str]:
@@ -499,6 +700,13 @@ class ExecutorAgent:
             name=name,
             context=context,
             payload=payload,
+        )
+
+    def has_registered_tool(self, name: str) -> bool:
+        """Report whether a runtime normalization tool is actually available."""
+        return any(
+            definition.name == name and AgentRole.executor in definition.allowed_roles
+            for definition in self._tools.definitions
         )
 
     def _scoped_out_tool_names(self, allowed_skills: frozenset[str]) -> frozenset[str]:
@@ -822,6 +1030,14 @@ class ExecutorAgent:
                     usage,
                 )
             if decision.action == "call_tool":
+                tool_input = _normalized_step_tool_input(
+                    plan,
+                    step,
+                    decision.tool_name,
+                    decision.tool_input,
+                    task=task,
+                    context=context,
+                )
                 if (
                     decision.tool_name == "search-public-job-pages"
                     and _has_unfailed_candidate_urls(
@@ -859,11 +1075,11 @@ class ExecutorAgent:
                     )
                     continue
                 if any(
-                    decision.tool_name == name and decision.tool_input == payload
+                    decision.tool_name == name and tool_input == payload
                     for name, payload in stable_failed_calls
                 ) or (
                     decision.tool_name,
-                    _input_hash(decision.tool_input),
+                    _input_hash(tool_input),
                 ) in prior_stable_failed_hashes:
                     # The identical call already failed with a stable error
                     # code (rate-limited sheet API, forbidden tool, unknown
@@ -893,7 +1109,7 @@ class ExecutorAgent:
                         ),
                     )
                     continue
-                requested_fetch_urls = set(_payload_fetch_urls(decision.tool_input))
+                requested_fetch_urls = set(_payload_fetch_urls(tool_input))
                 fetch_observations = [*(prior_observations or []), *observations]
                 observed_fetch_urls = _observed_fetch_urls(fetch_observations)
                 observed_route_counts = _observed_fetch_route_counts(fetch_observations)
@@ -965,11 +1181,11 @@ class ExecutorAgent:
                         execution_state=current_state(),
                     )
                 if any(
-                    decision.tool_name == name and decision.tool_input == payload
+                    decision.tool_name == name and tool_input == payload
                     for name, payload in succeeded_calls
                 ) or (
                     decision.tool_name,
-                    _input_hash(decision.tool_input),
+                    _input_hash(tool_input),
                 ) in prior_succeeded_hashes:
                     consecutive_stalls += 1
                     total_wasted_turns += 1
@@ -998,19 +1214,47 @@ class ExecutorAgent:
                     )
                     continue
                 consecutive_stalls = 0
-                if tool_budget is not None and not tool_budget.try_consume():
-                    return ExecutorResult(
-                        status="failed",
-                        summary="Tool-call budget exhausted before executing the next action.",
-                        observations=observations,
-                        error_code="tool_budget_exhausted",
-                        execution_state=current_state(),
+                if tool_budget is not None:
+                    reserve = (
+                        1
+                        if decision.tool_name == "search-public-job-pages"
+                        else 0
                     )
+                    if not tool_budget.try_consume(reserve=reserve):
+                        if (
+                            decision.tool_name == "search-public-job-pages"
+                            and tool_budget.remaining
+                        ):
+                            total_wasted_turns += 1
+                            record_observation(
+                                observations,
+                                observations_for_decision,
+                                ToolObservation(
+                                    tool_name=decision.tool_name,
+                                    status="failed",
+                                    error_code="route_already_consumed",
+                                    error_message=(
+                                        "已保留最后一次工具调用给运行时的"
+                                        "确定性来源恢复。"
+                                    ),
+                                ),
+                            )
+                            continue
+                        return ExecutorResult(
+                            status="failed",
+                            summary=(
+                                "Tool-call budget exhausted before executing "
+                                "the next action."
+                            ),
+                            observations=observations,
+                            error_code="tool_budget_exhausted",
+                            execution_state=current_state(),
+                        )
                 observation = self._tools.invoke(
                     role=AgentRole.executor,
                     name=decision.tool_name or "",
                     context=tool_context,
-                    payload=decision.tool_input,
+                    payload=tool_input,
                     allowed_skills=allowed_skills,
                 )
                 record_observation(observations, observations_for_decision, observation)
@@ -1030,7 +1274,7 @@ class ExecutorAgent:
                         execution_state=current_state(),
                     )
                 if observation.status == "succeeded":
-                    succeeded_calls.append((decision.tool_name, decision.tool_input))
+                    succeeded_calls.append((decision.tool_name, tool_input))
                     if (
                         decision.tool_name == "search-public-job-pages"
                         and isinstance(observation.output, dict)
@@ -1051,6 +1295,15 @@ class ExecutorAgent:
                                 ),
                                 execution_state=current_state(),
                             )
+                    if _intermediate_job_routing_observation_succeeded(
+                        plan, step, observation
+                    ):
+                        return ExecutorResult(
+                            status="succeeded",
+                            summary="已完成当前公司的来源路由清单，交由后续步骤逐项核验。",
+                            observations=observations,
+                            execution_state=current_state(),
+                        )
                 else:
                     if observation.error_code in _RUN_WIDE_UNAVAILABLE_CODES:
                         unavailable_tools.add(decision.tool_name or "")
@@ -1078,7 +1331,7 @@ class ExecutorAgent:
                         # proven dead, feeding the search-authorization ledger.
                         failed_candidate_urls.update(
                             url
-                            for url in _payload_fetch_urls(decision.tool_input)
+                            for url in _payload_fetch_urls(tool_input)
                             if url in candidate_urls
                         )
                     if observation.error_code in _STABLE_FAILURE_ERROR_CODES:
@@ -1088,7 +1341,7 @@ class ExecutorAgent:
                         # call. The first failure still counts once toward the
                         # total-waste cap: it produced no new evidence.
                         stable_failed_calls.append(
-                            (decision.tool_name, decision.tool_input)
+                            (decision.tool_name, tool_input)
                         )
                     # The tool was invoked but did not produce a new succeeded
                     # observation. Count this as a wasted turn for the total

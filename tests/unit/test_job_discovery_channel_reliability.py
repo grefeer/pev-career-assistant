@@ -309,6 +309,32 @@ def test_html_link_collector_mirrors_rendered_link_filters(monkeypatch) -> None:
     ]
 
 
+def test_html_link_collector_accepts_linkedin_localized_public_job_details(
+    monkeypatch,
+) -> None:
+    """LinkedIn's public guest index is served on ``www`` but links to the
+    localized ``cn`` detail host.  Keep that one audited cross-subdomain route
+    while rejecting unrelated LinkedIn paths and lookalike hosts."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._is_public_url",
+        lambda url: url.startswith("https://"),
+    )
+    html = (
+        '<a href="https://cn.linkedin.com/jobs/view/ai-product-intern-123">职位</a>'
+        '<a href="https://cn.linkedin.com/company/example">公司</a>'
+        '<a href="https://linkedin.com.evil.example/jobs/view/456">仿冒</a>'
+    )
+    collector = jd._HtmlLinkCollector(
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+    )
+
+    collector.feed(html)
+
+    assert collector.links == [
+        "https://cn.linkedin.com/jobs/view/ai-product-intern-123"
+    ]
+
+
 def _card_list_html(urls: list[str]) -> str:
     anchors = "".join(f'<a href="{url}">{i}号职位</a>' for i, url in enumerate(urls))
     return (
@@ -434,7 +460,7 @@ def test_list_expansion_prioritizes_detail_routes_over_navigation(monkeypatch) -
     assert [page.source_url for page in pages[: len(detail_urls)]] == detail_urls
 
 
-def test_iguopin_list_detail_probe_reports_anonymous_access_denial(monkeypatch) -> None:
+def test_iguopin_list_detail_probe_scopes_anonymous_denial_to_the_api(monkeypatch) -> None:
     page = FetchPublicJobPageOutput(
         artifact_id="list-1",
         source_url="https://www.iguopin.com/job/list?keyword=Java",
@@ -464,7 +490,39 @@ def test_iguopin_list_detail_probe_reports_anonymous_access_denial(monkeypatch) 
     error = jd._probe_iguopin_detail_access(page.source_url, page)
 
     assert error is not None
-    assert error.code == "access_denied"
+    assert error.code == "iguopin_detail_api_denied"
+
+
+def test_iguopin_list_uses_public_record_ids_only_as_detail_routes(monkeypatch) -> None:
+    """Public list IDs may route to public pages without trusting API JD fields."""
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery._assert_public_url",
+        lambda _url: None,
+    )
+    monkeypatch.setattr(
+        "backend.app.services.career_skills.job_discovery.requests.post",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "code": 200,
+                "data": {
+                    "list": [
+                        {"job_id": "job-1", "job_name": "must not become evidence"},
+                        {"id": "job-2", "requirements": "must not become evidence"},
+                    ]
+                },
+            },
+        ),
+    )
+
+    urls = jd._iguopin_list_detail_urls(
+        "https://www.iguopin.com/job/list?keyword=Java"
+    )
+
+    assert urls == [
+        "https://www.iguopin.com/job/detail?id=job-1",
+        "https://www.iguopin.com/job/detail?id=job-2",
+    ]
 
 
 def test_hebut_detail_fetch_expands_recent_public_campus_indexes(monkeypatch) -> None:

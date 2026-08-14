@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from backend.app.services.agent_runtime.error_policy import (
     ErrorPolicy,
     default_error_policy,
@@ -81,7 +82,27 @@ _DISCOVERY_DETAIL_TOOLS = frozenset(
 
 def _discovery_observation_is_valid(observation: ToolObservation) -> bool:
     """Require a page-backed JD/detail, not a search index, for completion."""
-    if observation.tool_name in {"search-public-job-pages", "query-career-sheet-records"}:
+    if observation.tool_name == "search-public-job-pages":
+        output = observation.output or {}
+        return (
+            output.get("provider") == "juejin_official_search"
+            and output.get("source_scope") == "juejin.cn"
+            and output.get("coverage_complete") is True
+            and isinstance(output.get("time_window_days"), int)
+            and output["time_window_days"] > 0
+            and isinstance(output.get("scanned_result_count"), int)
+            and output["scanned_result_count"] >= 0
+            and output.get("matched_result_count") == 0
+            and output.get("terminal_reason") == "search_empty"
+            and output.get("results") == []
+            and isinstance(output.get("source_url"), str)
+            and output["source_url"].startswith(
+                "https://api.juejin.cn/search_api/v1/search"
+            )
+            and isinstance(output.get("content_hash"), str)
+            and bool(output["content_hash"])
+        )
+    if observation.tool_name == "query-career-sheet-records":
         return False
     if observation.tool_name in _DISCOVERY_DETAIL_TOOLS:
         output = observation.output or {}
@@ -109,6 +130,65 @@ def _discovery_observation_is_valid(observation: ToolObservation) -> bool:
         and page.get("quality") in {None, "jd_complete"}
         for page in pages
     )
+
+
+def _matching_observation_is_meaningful(observation: ToolObservation) -> bool:
+    output = observation.output or {}
+    matches = output.get("matches")
+    if not isinstance(matches, list):
+        return False
+    if not matches:
+        evaluated_source_urls = output.get("evaluated_source_urls")
+        return (
+            isinstance(output.get("evaluated_candidate_count"), int)
+            and output["evaluated_candidate_count"] > 0
+            and isinstance(evaluated_source_urls, list)
+            and any(
+                isinstance(source_url, str) and bool(source_url)
+                for source_url in evaluated_source_urls
+            )
+            and output.get("no_match_reason")
+            == "no_candidate_satisfied_constraints"
+        )
+    return any(
+        isinstance(match, dict)
+        and isinstance(match.get("source_url"), str)
+        and bool(match["source_url"])
+        and isinstance(match.get("evidence_excerpt"), str)
+        and bool(match["evidence_excerpt"].strip())
+        for match in matches
+    )
+
+
+def _tailoring_observation_is_meaningful(observation: ToolObservation) -> bool:
+    output = observation.output or {}
+    return all(
+        isinstance(output.get(key), str) and bool(output[key].strip())
+        for key in ("target_artifact_id", "source_url")
+    ) and isinstance(output.get("safe_actions"), list) and bool(output["safe_actions"])
+
+
+def _planning_observation_is_meaningful(observation: ToolObservation) -> bool:
+    output = observation.output or {}
+    return all(
+        isinstance(output.get(key), list) and bool(output[key])
+        for key in ("jd_topics", "actions", "plan_items")
+    )
+
+
+def skill_observation_is_semantically_valid(
+    tool_name: str, output: dict[str, Any] | None
+) -> bool:
+    """Mirror the strict business payload checks for persisted artifact refs."""
+    observation = ToolObservation(tool_name=tool_name, status="succeeded", output=output)
+    checks = {
+        "search-public-job-pages": _discovery_observation_is_valid,
+        "match-observed-jobs": _matching_observation_is_meaningful,
+        "build-resume-tailoring-brief": _tailoring_observation_is_meaningful,
+        "build-preparation-plan": _planning_observation_is_meaningful,
+    }
+    checker = checks.get(tool_name)
+    return checker(observation) if checker else True
 
 
 def career_error_policy() -> ErrorPolicy:
@@ -163,17 +243,25 @@ def build_career_skill_registry(
             # Search/sheet are discovery routes, not completion deliverables.
             # Only a captured public page or a source-bound extraction can
             # close a job-discovery step.
-            deliverable_tools = _DISCOVERY_EVIDENCE_TOOLS | _DISCOVERY_DETAIL_TOOLS
+            deliverable_tools = (
+                _DISCOVERY_EVIDENCE_TOOLS
+                | _DISCOVERY_DETAIL_TOOLS
+                | frozenset({"search-public-job-pages"})
+            )
             checker = _discovery_observation_is_valid
+            semantic_checker = checker
         elif name == "job-matching":
             deliverable_tools = frozenset({"match-observed-jobs"})
             checker = None
+            semantic_checker = _matching_observation_is_meaningful
         elif name == "resume-tailoring":
             deliverable_tools = frozenset({"build-resume-tailoring-brief"})
             checker = None
+            semantic_checker = _tailoring_observation_is_meaningful
         else:
             deliverable_tools = frozenset({"build-preparation-plan"})
             checker = None
+            semantic_checker = _planning_observation_is_meaningful
         package = packages.get(name)
         definitions.append(
             SkillDefinition(
@@ -183,6 +271,7 @@ def build_career_skill_registry(
                     deliverable_tools=deliverable_tools,
                     description=f"{name} must produce a registered tool-backed deliverable",
                     observation_check=checker,
+                    semantic_check=semantic_checker,
                 ),
                 verification_policy=(
                     VerificationPolicy.REQUIRED

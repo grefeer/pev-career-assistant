@@ -18,6 +18,7 @@ Round-1/B behaviors:
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import MagicMock
 
 from pydantic import BaseModel
 
@@ -38,6 +39,12 @@ from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
     PlanStep,
+    VerifierResult,
+)
+from backend.app.services.agent_runtime.skill_definition import (
+    CompletionContract,
+    SkillDefinition,
+    SkillRegistry,
 )
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_context import ToolContext
@@ -69,6 +76,12 @@ class WechatOutput(BaseModel):
     url: str
     status: str | None = None
     reason: str | None = None
+
+
+class SheetQueryOutput(BaseModel):
+    source_url: str
+    content_hash: str
+    records: list[dict[str, str]]
 
 
 class MatchOutput(BaseModel):
@@ -244,6 +257,83 @@ def _register_discovery_tools(
     )
 
 
+def _strict_discovery_skills() -> SkillRegistry:
+    """Mirror production: route lists alone are not final discovery JDs."""
+
+    def has_page(observation) -> bool:
+        output = observation.output or {}
+        return bool(output.get("pages"))
+
+    return SkillRegistry(
+        [
+            SkillDefinition(
+                name="job-discovery",
+                completion_contract=CompletionContract(
+                    deliverable_tools=frozenset({"fetch-public-job-pages"}),
+                    observation_check=has_page,
+                    semantic_check=has_page,
+                ),
+            )
+        ]
+    )
+
+
+def _register_sheet_query_tool(registry: ToolRegistry) -> None:
+    registry.register(
+        ToolDefinition(
+            name="query-career-sheet-records",
+            skill_name="job-discovery",
+            input_model=EmptyInput,
+            output_model=SheetQueryOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://docs.example/recent-companies",
+                "content_hash": "s" * 64,
+                "records": [
+                    {
+                        "company_name": "华丞电子",
+                        "apply_url": "https://mp.weixin.qq.com/s/x",
+                    }
+                ],
+            },
+        )
+    )
+
+
+def _routing_step_plan(
+    task: AgentTaskRequest, plan: ExecutionPlan
+) -> tuple[ExecutionPlan, PlanStep]:
+    routing_step = PlanStep(
+        step_id="step-1",
+        objective="查询最近更新的公司清单",
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+        outputs=[
+            {
+                "name": "recent_companies",
+                "artifact_type": "job_search_results",
+            }
+        ],
+    )
+    downstream_step = PlanStep(
+        step_id="step-2",
+        objective="抓取公司岗位详情",
+        allowed_skills=["job-discovery"],
+        depends_on=[routing_step.step_id],
+        requires_verification=True,
+        outputs=[
+            {
+                "name": "job_pages",
+                "artifact_type": "public_job_page",
+            }
+        ],
+    )
+    return (
+        plan.model_copy(update={"task": task, "steps": [routing_step, downstream_step]}),
+        routing_step,
+    )
+
+
 def _blocked_wechat_handler(_context, _payload) -> dict[str, object]:
     """Mirror the OCR-gated WeChat tool: succeeded output, blocked marker."""
     return {
@@ -332,6 +422,51 @@ def test_b2_keeps_human_handoff_when_blocked_evidence_exists(db_session) -> None
     ]
 
 
+def test_verifier_wall_clock_rescues_already_persisted_contract(db_session) -> None:
+    user = _user("user-wall-contract")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+    )
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "fetch-public-job-pages",
+                    "tool_input": {"urls": ["https://jobs.example/1"]},
+                },
+                {"action": "complete", "summary": "岗位证据已持久化。"},
+            ],
+            AgentRole.verifier: [],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(registry)
+    runtime = _runtime_for_gateway(gateway, registry)
+    runtime._verifier = MagicMock()
+    runtime._verifier.run.return_value = VerifierResult(
+        decision="FAIL",
+        feedback="Wall-clock budget exhausted before verification.",
+        error_code="wall_clock_budget_exhausted",
+    )
+
+    result = _run_step(
+        runtime, db_session, run, user, task, plan, plan_step, step
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "verifier_rescue_succeeded"
+    assert events[-1].payload_json["reason"] == "wall_clock_budget_contract_met"
+
+
 # ---------------------------------------------------------------------------
 # B3 - executor needs_user rescue when the deliverable is already persisted
 # ---------------------------------------------------------------------------
@@ -396,6 +531,288 @@ def test_b3_keeps_human_handoff_without_deliverable_or_with_blocked_evidence(db_
     assert "executor_rescue_succeeded" not in [
         event.event_type for event in run_repository.list_events(db_session, run.id)
     ]
+
+
+def test_verifier_need_user_accepts_verified_zero_match_discovery(db_session) -> None:
+    """An exhaustive, evidenced zero-match answer is a completed answer, not a hand-off."""
+    user = _user("user-negative-discovery")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+        budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=0),
+    )
+    task = task.model_copy(
+        update={"goal": "腾讯最近发布的校招信息里，有适合我的 AI 算法岗位吗？"}
+    )
+    plan = plan.model_copy(update={"task": task})
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "fetch-public-job-pages",
+                    "tool_input": {"urls": ["https://jobs.example/1"]},
+                },
+                {
+                    "action": "complete",
+                    "summary": "已核实官方岗位；未发现满足校招约束的 AI 算法岗位。",
+                },
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "decide",
+                    "verification_decision": "NEED_USER",
+                    "feedback": "现有岗位均为社招，请确认是否接受社招岗位。",
+                }
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(registry)
+
+    result = _run_step(
+        _runtime_for_gateway(gateway, registry),
+        db_session,
+        run,
+        user,
+        task,
+        plan,
+        plan_step,
+        step,
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "verifier_rescue_succeeded"
+    assert events[-1].payload_json["reason"] == (
+        "verified_negative_discovery_contract_met"
+    )
+
+
+def test_verifier_need_user_does_not_rescue_non_question_negative_discovery(
+    db_session,
+) -> None:
+    """An imperative discovery task still hands off when its requested result is absent."""
+    user = _user("user-negative-discovery-command")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+        budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=0),
+    )
+    task = task.model_copy(update={"goal": "请找到腾讯校招 AI 算法岗位。"})
+    plan = plan.model_copy(update={"task": task})
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "fetch-public-job-pages",
+                    "tool_input": {"urls": ["https://jobs.example/1"]},
+                },
+                {"action": "complete", "summary": "未发现符合要求的岗位。"},
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "decide",
+                    "verification_decision": "NEED_USER",
+                    "feedback": "未交付用户要求的岗位。",
+                }
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(registry)
+
+    result = _run_step(
+        _runtime_for_gateway(gateway, registry),
+        db_session,
+        run,
+        user,
+        task,
+        plan,
+        plan_step,
+        step,
+    )
+
+    assert result.status is RunStatus.waiting_user
+    assert step.status is StepStatus.failed
+    assert "verified_negative_discovery_contract_met" not in [
+        event.payload_json.get("reason")
+        for event in run_repository.list_events(db_session, run.id)
+    ]
+
+
+def test_intermediate_sheet_routing_step_ignores_executor_downstream_block(
+    db_session,
+) -> None:
+    user = _user("user-routing-executor")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, _plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+    )
+    plan, routing_step = _routing_step_plan(task, plan)
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "query-career-sheet-records",
+                    "tool_input": {},
+                },
+                {
+                    "action": "call_tool",
+                    "tool_name": "fetch-wechat-article",
+                    "tool_input": {"url": "https://mp.weixin.qq.com/s/x"},
+                },
+                {"action": "need_user", "user_question": "微信正文受阻。"},
+            ],
+            AgentRole.verifier: [],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(registry, wechat_handler=_blocked_wechat_handler)
+    _register_sheet_query_tool(registry)
+
+    result = _run_step(
+        _runtime_for_gateway(gateway, registry),
+        db_session,
+        run,
+        user,
+        task,
+        plan,
+        routing_step,
+        step,
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "executor_rescue_succeeded"
+    assert events[-1].payload_json["reason"] == "intermediate_routing_contract_met"
+
+
+def test_strict_intermediate_routing_accepts_only_url_bearing_sheet_artifact(
+    db_session,
+) -> None:
+    user = _user("user-routing-strict")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, _plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+    )
+    plan, routing_step = _routing_step_plan(task, plan)
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "query-career-sheet-records",
+                    "tool_input": {},
+                },
+                {"action": "need_user", "user_question": "后续页面需要确认。"},
+            ],
+            AgentRole.verifier: [],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(
+        registry, pages_handler=lambda _context, _payload: {"pages": []}
+    )
+    _register_sheet_query_tool(registry)
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+        skills=_strict_discovery_skills(),
+    )
+
+    result = _run_step(
+        runtime, db_session, run, user, task, plan, routing_step, step
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    assert step.output_artifact_refs_json[0]["semantic_valid"] == "true"
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].payload_json["reason"] == "intermediate_routing_contract_met"
+
+
+def test_intermediate_sheet_routing_step_ignores_verifier_downstream_request(
+    db_session,
+) -> None:
+    user = _user("user-routing-verifier")
+    db_session.add(user)
+    db_session.commit()
+    run, task, plan, _plan_step, step = _create_running_step(
+        db_session,
+        user,
+        allowed_skills=["job-discovery"],
+        requires_verification=True,
+    )
+    plan, routing_step = _routing_step_plan(task, plan)
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "query-career-sheet-records",
+                    "tool_input": {},
+                },
+                {"action": "complete", "summary": "最近公司清单已生成。"},
+            ],
+            AgentRole.verifier: [
+                {
+                    "action": "decide",
+                    "verification_decision": "NEED_USER",
+                    "feedback": "请提供后续公司的完整 JD。",
+                }
+            ],
+        }
+    )
+    registry = ToolRegistry()
+    _register_discovery_tools(registry)
+    _register_sheet_query_tool(registry)
+
+    result = _run_step(
+        _runtime_for_gateway(gateway, registry),
+        db_session,
+        run,
+        user,
+        task,
+        plan,
+        routing_step,
+        step,
+    )
+
+    assert result.status is RunStatus.running
+    assert step.status is StepStatus.succeeded
+    events = run_repository.list_events(db_session, run.id)
+    assert events[-1].event_type == "executor_rescue_succeeded"
+    assert events[-1].payload_json["reason"] == "intermediate_routing_contract_met"
+    assert gateway.states[AgentRole.verifier] == []
+    assert "verification_replan" not in [event.event_type for event in events]
 
 
 # ---------------------------------------------------------------------------

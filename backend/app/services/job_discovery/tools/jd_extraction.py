@@ -26,7 +26,7 @@ _RESPONSIBILITIES_HEADERS: list[re.Pattern] = [
 ]
 
 _REQUIREMENTS_HEADERS: list[re.Pattern] = [
-    re.compile(r"(?:任职要求|任职资格|岗位要求|职位要求|资格要求|招聘要求|应聘条件|基本要求|专业要求|requirements|qualifications|what you.?ll need|required skills|basic requirements)", re.IGNORECASE),
+    re.compile(r"(?:任职要求|任职资格|岗位要求|职位要求|资格要求|招聘要求|应聘条件|基本要求|专业要求|希望你是|requirements|qualifications|what you.?ll need|required skills|basic requirements)", re.IGNORECASE),
 ]
 
 _LOCATION_PATTERNS: list[re.Pattern] = [
@@ -47,7 +47,22 @@ _APPLY_METHOD_PATTERNS: list[re.Pattern] = [
 ]
 
 _DEADLINE_PATTERNS: list[re.Pattern] = [
-    re.compile(r"(?:截止日期|截止时间|招聘截止|deadline|closing date|expires?)\s*[:：]?\s*(.+?)(?:\n|$)", re.IGNORECASE),
+    re.compile(r"(?:截止日期|截止时间|招聘截止|报名截止|deadline|closing date|expires?)\s*[:：]?\s*(.+?)(?:\n|$)", re.IGNORECASE),
+]
+
+_IGUOPIN_REQUIREMENTS_HEADERS: list[re.Pattern] = [
+    re.compile(r"(?:任职资格|岗位要求|职位要求|资格要求)\s*[:：]?", re.IGNORECASE)
+]
+
+_PUBLISHED_AT_PATTERNS: list[re.Pattern] = [
+    re.compile(
+        r"(?:发布时间|发布于|发表于|更新于|posted\s*(?:on|at)?|published\s*(?:on|at)?)\s*[:：]?\s*"
+        r"(\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<![\u4e00-\u9fff\w])((?:\d+)\s*(?:年前|个月前|天前|小时前|分钟前))\s*(?:关注|$)"
+    ),
 ]
 
 _REFERRAL_CODE_PATTERNS: list[re.Pattern] = [
@@ -117,6 +132,26 @@ _CARD_LIST_SPLIT_RE: re.Pattern = re.compile(
 _IGUOPIN_CARD_SPLIT_RE: re.Pattern = re.compile(
     rf"(?m)^(?P<title>.{{2,60}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
     r"「\s*(?P<city>[^「」\n]{0,30})\s*」"
+)
+
+# JAKA-style career lists render every opening as ``title`` followed by a
+# small vacancy count and a location line. There is no bracket block or job-id
+# marker, so the other card splitters cannot identify the individual JDs.
+_COUNT_CARD_SPLIT_RE: re.Pattern = re.compile(
+    rf"(?m)^(?P<title>.{{2,60}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
+    r"(?P<count>\d{1,3})\n"
+    r"(?P<city>[^\n]{1,40})$"
+)
+
+# Meituan's rendered campus feed uses a title/type/city/update tuple before
+# each inline JD. The page contains the actual responsibilities for hundreds
+# of roles, so treating it as one blob loses both the requested role and its
+# update date even though the public evidence is complete.
+_UPDATED_JOB_CARD_SPLIT_RE: re.Pattern = re.compile(
+    rf"(?m)^(?P<title>.{{2,80}}?(?:{_CARD_TITLE_ROLE_SUFFIXES}).{{0,30}}?)\n"
+    r"(?P<recruitment>日常实习|转正实习|应届校招|社会招聘|社招|校招)\n"
+    r"(?P<city>[^\n]{2,40})\n"
+    r"更新于(?P<updated>\d{4}[-/.]\d{1,2}[-/.]\d{1,2})$"
 )
 
 # Liepin-style portals render every opening as a card whose title line is
@@ -197,6 +232,29 @@ def _normalize_bracket_card_segment(
     return header + card_text[match.start() - segment_start:].strip()
 
 
+def _normalize_count_card_segment(
+    card_text: str, match: re.Match, segment_start: int
+) -> str:
+    """Prefix one title/count/location card with extractable headers."""
+    title = match.group("title").strip()
+    header = f"职位名称：{title}\n"
+    city = match.group("city").strip()
+    if re.fullmatch(r"[\u4e00-\u9fff·、\-]{2,40}", city):
+        header += f"工作地点：{city}\n"
+    return header + card_text[match.start() - segment_start:].strip()
+
+
+def _normalize_updated_job_card_segment(
+    card_text: str, match: re.Match, segment_start: int
+) -> str:
+    """Prefix one rendered title/type/city/update card with labeled fields."""
+    header = f"职位名称：{match.group('title').strip()}\n"
+    city = match.group("city").strip()
+    if city:
+        header += f"工作地点：{city}\n"
+    return header + card_text[match.start() - segment_start:].strip()
+
+
 def _split_multi_job_page(text: str) -> list[str]:
     """Split page text containing multiple job postings into segments.
 
@@ -269,11 +327,51 @@ def _split_multi_job_page(text: str) -> list[str]:
             segments.append(_normalize_bracket_card_segment(text[start:end], m, start))
         return segments
 
+    # Pattern 3b: rendered title/type/city/update feeds. Require two cards to
+    # avoid reinterpreting an ordinary detail page with an update label.
+    updated_card_matches = list(_UPDATED_JOB_CARD_SPLIT_RE.finditer(text))
+    if len(updated_card_matches) >= 2:
+        segments = []
+        for i, match in enumerate(updated_card_matches):
+            start = match.start()
+            end = (
+                updated_card_matches[i + 1].start()
+                if i + 1 < len(updated_card_matches)
+                else len(text)
+            )
+            segments.append(
+                _normalize_updated_job_card_segment(text[start:end], match, start)
+            )
+        return segments
+
+    # Pattern 6: title + vacancy-count + location cards (JAKA). Require at
+    # least two cards so an ordinary JD containing a standalone number is not
+    # reinterpreted as a listing.
+    count_matches = list(_COUNT_CARD_SPLIT_RE.finditer(text))
+    if len(count_matches) >= 2:
+        segments = []
+        for i, match in enumerate(count_matches):
+            start = match.start()
+            end = (
+                count_matches[i + 1].start()
+                if i + 1 < len(count_matches)
+                else len(text)
+            )
+            segments.append(
+                _normalize_count_card_segment(text[start:end], match, start)
+            )
+        return segments
+
     return [text]
 
 
 def _extract_title(text: str) -> tuple[str | None, float]:
     """Extract job title from text using keyword heuristics."""
+    portal_detail = re.search(
+        r"^职位详情页\s*\n\s*([^\n]{2,80})\s*$", text, re.MULTILINE
+    )
+    if portal_detail:
+        return portal_detail.group(1).strip(), 0.9
     for pattern in _TITLE_PATTERNS:
         m = pattern.search(text)
         if m:
@@ -285,6 +383,13 @@ def _extract_title(text: str) -> tuple[str | None, float]:
 
 def _extract_company(text: str) -> tuple[str | None, float]:
     """Extract company name from text using keyword heuristics."""
+    nowcoder_document_title = re.search(
+        r"^[^_\n]+_([^_\n]{2,40}?)(?:校招|社招|招聘|实习|内推)_牛客网\s*$",
+        text,
+        re.MULTILINE,
+    )
+    if nowcoder_document_title:
+        return nowcoder_document_title.group(1).strip(), 0.9
     for pattern in _COMPANY_PATTERNS:
         m = pattern.search(text)
         if m:
@@ -317,11 +422,20 @@ def _extract_section(text: str, header_patterns: list[re.Pattern]) -> str:
             start = m.end()
             # Look for next section header to delimit this section
             remainder = text[start:]
+            # Some rendered portals emit both a tab label and the page's own
+            # identical heading (``岗位职责\n岗位职责：``). Skip that immediate
+            # duplicate so the delimiter scan does not return an empty body.
+            leading = remainder.lstrip(" \t\r\n：:")
+            for same_header in header_patterns:
+                duplicate = same_header.match(leading)
+                if duplicate is not None:
+                    remainder = leading[duplicate.end():].lstrip(" \t\r\n：:")
+                    break
             # Find the next line that looks like a heading
             next_header = re.search(
                 r"\n\s*(?:岗位职责|工作职责|职位描述|任职要求|岗位要求|"
                 r"职位要求|资格要求|任职资格|专业要求|工作地点|投递方式|截止日期|"
-                r"公司介绍|公司简介|关于我们|responsibilities|"
+                r"希望你是|竞争力分析|单位信息|公司介绍|公司简介|关于我们|responsibilities|"
                 r"requirements|qualifications|location|about us)\s*[:：]?\s*\n",
                 remainder,
                 re.IGNORECASE,
@@ -397,6 +511,17 @@ def _extract_deadline(text: str) -> str | None:
     return None
 
 
+def _extract_published_at(text: str) -> str | None:
+    """Extract an explicit posting timestamp, never a crawl timestamp."""
+    for pattern in _PUBLISHED_AT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                return value
+    return None
+
+
 def _extract_referral_code(text: str) -> str | None:
     """Extract referral / referral code."""
     for pattern in _REFERRAL_CODE_PATTERNS:
@@ -433,6 +558,103 @@ def _extract_priority(text: str) -> str:
     if _PRIORITY_PREFERRED_RE.search(text):
         return "preferred"
     return "unknown"
+
+
+def _iguopin_detail_overrides(text: str, url: str) -> dict[str, object]:
+    """Extract Iguopin detail fields without inheriting global portal chrome."""
+    if not re.match(
+        r"https?://(?:www\.)?iguopin\.com/job/detail(?:[?#]|$)", url, re.IGNORECASE
+    ):
+        return {}
+
+    overrides: dict[str, object] = {}
+    title_match = re.search(
+        r"(?m)^([^\n]{2,80})\n更新于\s*\d{4}[-/.]\d{1,2}[-/.]\d{1,2}举报\s*$",
+        text,
+    )
+    if title_match:
+        overrides["title"] = title_match.group(1).strip()
+
+    unit_match = re.search(
+        r"(?s)(?:^|\n)单位信息\s*\n(.+?)(?:\n\d+\s*个在招职位|\n频道链接|$)",
+        text,
+    )
+    if unit_match:
+        for line in unit_match.group(1).splitlines():
+            candidate = line.strip()
+            if (
+                len(candidate) >= 3
+                and candidate not in {"关注", "单位信息"}
+                and not candidate.endswith("在招职位")
+            ):
+                overrides["company"] = candidate
+                break
+
+    nature_match = re.search(r"(?m)^职位性质\s*[:：]\s*([^\n]+)", text)
+    if nature_match:
+        overrides["recruitment_types"] = _detect_recruitment_types(
+            nature_match.group(1)
+        )
+
+    degree_match = re.search(r"(?m)^最低学历\s*[:：]\s*([^\n]+)", text)
+    if degree_match:
+        overrides["min_degree"] = _extract_min_degree(degree_match.group(1))
+
+    requirements = _extract_section(text, _IGUOPIN_REQUIREMENTS_HEADERS)
+    if requirements:
+        overrides["requirements"] = requirements
+    return overrides
+
+
+def _smartedu_detail_overrides(text: str, url: str) -> dict[str, object]:
+    """Extract one 24365 detail JD without inheriting national-site chrome."""
+    if not re.match(
+        r"https?://24365\.smartedu\.cn/student/jobs/[^/?#]+/detail\.html(?:[?#]|$)",
+        url,
+        re.IGNORECASE,
+    ):
+        return {}
+
+    overrides: dict[str, object] = {}
+    title_match = re.search(
+        r"(?m)^([^\n]{2,100}(?:实习生|工程师|开发|经理|岗位)\([^\n()]{2,80}\))\s*$",
+        text,
+    )
+    if not title_match:
+        title_match = re.search(
+            r"(?m)^([^\n]{2,100}(?:实习生|工程师|开发|经理|岗位))\n\[\n(?:兼职|全职)",
+            text,
+        )
+    if title_match:
+        title = title_match.group(1).strip()
+        overrides["title"] = title
+        location_match = re.search(r"\(([^()]+)\)\s*$", title)
+        if location_match:
+            overrides["locations"] = [
+                item.strip()
+                for item in re.split(r"[/、,，]", location_match.group(1))
+                if item.strip()
+            ]
+        overrides["recruitment_types"] = _detect_recruitment_types(title)
+
+    company_match = re.search(
+        r"(?m)^([^\n]{3,100}(?:有限公司|公司|研究院|大学|学校|中心))\n所属行业\s*$",
+        text,
+    )
+    if company_match:
+        overrides["company"] = company_match.group(1).strip()
+
+    sections_match = re.search(
+        r"(?s)职位描述\s*[:：]\s*(.*?)\s*职位要求\s*[:：]\s*(.*?)"
+        r"(?=\n[^\n]{3,100}(?:有限公司|公司|研究院|大学|学校|中心)\n所属行业(?:\n|$)|$)",
+        text,
+    )
+    if sections_match:
+        overrides["responsibilities"] = sections_match.group(1).strip()
+        overrides["requirements"] = sections_match.group(2).strip()
+    if "职位已下线" in text:
+        overrides["closed"] = True
+    return overrides
 
 
 def _estimate_confidence(
@@ -500,9 +722,31 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
         recruitment_types = _detect_recruitment_types(segment)
         apply_method = _extract_apply_method(segment)
         deadline = _extract_deadline(segment)
+        published_at = _extract_published_at(segment)
         referral_code = _extract_referral_code(segment)
         min_degree = _extract_min_degree(segment)
         priority = _extract_priority(segment)
+
+        iguopin_overrides = _iguopin_detail_overrides(segment, url)
+        smartedu_overrides = _smartedu_detail_overrides(segment, url)
+        title = iguopin_overrides.get("title", title)
+        company = iguopin_overrides.get("company", company)
+        recruitment_types = iguopin_overrides.get(
+            "recruitment_types", recruitment_types
+        )
+        min_degree = iguopin_overrides.get("min_degree", min_degree)
+        requirements = iguopin_overrides.get("requirements", requirements)
+
+        title = smartedu_overrides.get("title", title)
+        company = smartedu_overrides.get("company", company)
+        locations = smartedu_overrides.get("locations", locations)
+        recruitment_types = smartedu_overrides.get(
+            "recruitment_types", recruitment_types
+        )
+        responsibilities = smartedu_overrides.get(
+            "responsibilities", responsibilities
+        )
+        requirements = smartedu_overrides.get("requirements", requirements)
 
         has_section_content = bool(responsibilities or requirements)
 
@@ -526,6 +770,8 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
             warnings.append("No responsibilities or requirements sections found")
         if not locations:
             warnings.append("No location information found")
+        if smartedu_overrides.get("closed"):
+            warnings.append("Source page explicitly states 职位已下线")
 
         # ── Build description_text ──
         desc_parts = []
@@ -568,6 +814,7 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
             apply_url=url,
             application_channel_json=apply_method,
             deadline_text=deadline,
+            published_at=published_at,
             referral_code=referral_code,
             confidence=confidence,
             normalization_warnings=warnings,
@@ -577,7 +824,14 @@ def extract_jd_candidates(page_text: str, url: str) -> list[NormalizedJobCandida
             # serialized as a dict; optional input for downstream scoring.
             strength=analyze_job_strength(description_text).to_dict(),
             # B2: deterministic taxonomy [level1, level2], [] when unclassified.
-            taxonomy=taxonomy_tags(f"{title or ''}\n{description_text}"),
+            # Known detail-page chrome contains unrelated portal/category
+            # text. Its explicit title is the authoritative role signal;
+            # ordinary sources retain the richer title + section classifier.
+            taxonomy=taxonomy_tags(
+                str(title or "")
+                if iguopin_overrides or smartedu_overrides
+                else f"{title or ''}\n{description_text}"
+            ),
         )
 
         results.append(candidate)
@@ -709,6 +963,7 @@ def _extract_from_unstructured_text(text: str, url: str) -> NormalizedJobCandida
     recruitment_types = _detect_recruitment_types(text)
     locations = _extract_locations(text)
     deadline = _extract_deadline(text)
+    published_at = _extract_published_at(text)
     referral_code = _extract_referral_code(text)
 
     return NormalizedJobCandidate(
@@ -719,6 +974,7 @@ def _extract_from_unstructured_text(text: str, url: str) -> NormalizedJobCandida
         recruitment_types=recruitment_types,
         apply_url=url,
         deadline_text=deadline,
+        published_at=published_at,
         referral_code=referral_code,
         confidence=0.30,
         min_degree=_extract_min_degree(text),

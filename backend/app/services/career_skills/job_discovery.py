@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 import hashlib
 import ipaddress
@@ -15,8 +16,10 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
+import uuid
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 import requests
@@ -136,6 +139,25 @@ def _prioritize_detail_links(links: list[str]) -> list[str]:
         url
         for _, url in sorted(
             enumerate(links), key=lambda item: (-score(item[1]), item[0])
+        )
+    ]
+
+
+def _prioritize_direct_search_results(
+    results: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Rank direct detail results ahead of list/search shells, stably."""
+    urls = [item["url"] for item in results if isinstance(item.get("url"), str)]
+    ordered_urls = _prioritize_detail_links(urls)
+    ranks = {url: index for index, url in enumerate(ordered_urls)}
+    return [
+        item
+        for _index, item in sorted(
+            enumerate(results),
+            key=lambda pair: (
+                ranks.get(str(pair[1].get("url")), len(ranks)),
+                pair[0],
+            ),
         )
     ]
 
@@ -378,6 +400,9 @@ _JOB_SEARCH_SITE_OPERATORS = (
     "site:job.ncss.cn",
 )
 _MAX_PUBLIC_SEARCH_ROUTES = 3
+_JUEJIN_SEARCH_API_URL = "https://api.juejin.cn/search_api/v1/search"
+_JUEJIN_RECENT_SEARCH_QUERIES = ("招聘", "内推", "校招")
+_JUEJIN_MAX_SEARCH_PAGES_PER_QUERY = 8
 
 
 class PublicJobFetchError(RuntimeError):
@@ -496,6 +521,116 @@ _IGUOPIN_LIST_HOSTS = frozenset({"iguopin.com", "www.iguopin.com"})
 _IGUOPIN_API_ORIGIN = "https://gp-api.iguopin.com"
 _IGUOPIN_RECOMMEND_PATH = "/api/jobs/v1/recom-job"
 _IGUOPIN_DETAIL_PATH = "/api/jobs/v3/info"
+_TENCENT_CAREERS_HOST = "careers.tencent.com"
+_TENCENT_QUERY_PATH = "/tencentcareer/api/post/query"
+
+
+def _iguopin_list_detail_urls(url: str) -> list[str]:
+    """Derive public detail-page routes from IGUOPIN's anonymous list IDs.
+
+    Only the opaque record ID is consumed. Titles, dates, requirements, and
+    every other API field are deliberately ignored: the resulting public web
+    pages must still be fetched and hashed before they can become evidence.
+    """
+    parsed = urlsplit(url)
+    if (
+        (parsed.hostname or "").lower() not in _IGUOPIN_LIST_HOSTS
+        or not parsed.path.lower().startswith("/job")
+    ):
+        return []
+    keyword = parse_qs(parsed.query).get("keyword", [""])[0].strip()
+    if not keyword:
+        return []
+    recommend_url = _IGUOPIN_API_ORIGIN + _IGUOPIN_RECOMMEND_PATH
+    _assert_public_url(recommend_url)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Origin": "https://www.iguopin.com",
+        "Referer": "https://www.iguopin.com/",
+        "User-Agent": _PUBLIC_FETCH_HEADERS["User-Agent"],
+    }
+    try:
+        response = requests.post(
+            recommend_url,
+            json={
+                "search": {"page": 1, "page_size": 20, "keyword": keyword},
+                "recom": {
+                    "update_time": True,
+                    "company_nature": True,
+                    "hot_job": True,
+                },
+            },
+            timeout=20,
+            allow_redirects=False,
+            headers=headers,
+        )
+    except requests.RequestException:
+        return []
+    if response.status_code in {401, 403}:
+        raise PublicJobFetchError(
+            "iguopin_detail_api_denied", status_code=response.status_code
+        )
+    try:
+        envelope = response.json()
+    except ValueError:
+        return []
+    if isinstance(envelope, dict) and str(envelope.get("code")) in {"401", "403"}:
+        raise PublicJobFetchError(
+            "iguopin_detail_api_denied", status_code=int(envelope["code"])
+        )
+    records = envelope.get("data") if isinstance(envelope, dict) else None
+    if isinstance(records, dict):
+        records = records.get("list") or records.get("records") or records.get("rows")
+    if not isinstance(records, list):
+        return []
+    urls: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        job_id = record.get("job_id") or record.get("id")
+        if job_id is None:
+            continue
+        detail_url = "https://www.iguopin.com/job/detail?" + urlencode(
+            {"id": str(job_id)}
+        )
+        _assert_public_url(detail_url)
+        if detail_url not in urls:
+            urls.append(detail_url)
+    return urls
+
+
+def _tencent_query_detail_urls(url: str, response_body: str) -> list[str]:
+    """Derive same-origin Tencent detail routes from public query record IDs."""
+    parsed = urlsplit(url)
+    if (
+        (parsed.hostname or "").lower() != _TENCENT_CAREERS_HOST
+        or parsed.path.lower() != _TENCENT_QUERY_PATH
+    ):
+        return []
+    try:
+        envelope = json.loads(response_body)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    data = envelope.get("Data") if isinstance(envelope, dict) else None
+    records = data.get("Posts") if isinstance(data, dict) else None
+    if not isinstance(records, list):
+        return []
+    urls: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        post_id = str(record.get("PostId") or "")
+        if not re.fullmatch(r"\d{6,32}", post_id):
+            continue
+        detail_url = (
+            "https://careers.tencent.com/jobdesc.html?"
+            + urlencode({"postId": post_id})
+        )
+        _assert_public_url(detail_url)
+        if detail_url not in urls:
+            urls.append(detail_url)
+    return urls
 
 
 def _probe_iguopin_detail_access(url: str, page: FetchPublicJobPageOutput) -> PublicJobFetchError | None:
@@ -548,13 +683,17 @@ def _probe_iguopin_detail_access(url: str, page: FetchPublicJobPageOutput) -> Pu
     except requests.RequestException:
         return None
     if response.status_code in {401, 403}:
-        return PublicJobFetchError("access_denied", status_code=response.status_code)
+        return PublicJobFetchError(
+            "iguopin_detail_api_denied", status_code=response.status_code
+        )
     try:
         envelope = response.json()
     except ValueError:
         return None
     if isinstance(envelope, dict) and str(envelope.get("code")) in {"401", "403"}:
-        return PublicJobFetchError("access_denied", status_code=int(envelope["code"]))
+        return PublicJobFetchError(
+            "iguopin_detail_api_denied", status_code=int(envelope["code"])
+        )
     records = envelope.get("data") if isinstance(envelope, dict) else None
     if isinstance(records, dict):
         records = records.get("list") or records.get("records") or records.get("rows")
@@ -583,7 +722,7 @@ def _probe_iguopin_detail_access(url: str, page: FetchPublicJobPageOutput) -> Pu
         return None
     if detail_response.status_code in {401, 403}:
         return PublicJobFetchError(
-            "access_denied", status_code=detail_response.status_code
+            "iguopin_detail_api_denied", status_code=detail_response.status_code
         )
     try:
         detail_envelope = detail_response.json()
@@ -591,7 +730,7 @@ def _probe_iguopin_detail_access(url: str, page: FetchPublicJobPageOutput) -> Pu
         return None
     if isinstance(detail_envelope, dict) and str(detail_envelope.get("code")) in {"401", "403"}:
         return PublicJobFetchError(
-            "access_denied", status_code=int(detail_envelope["code"])
+            "iguopin_detail_api_denied", status_code=int(detail_envelope["code"])
         )
     return None
 
@@ -641,6 +780,12 @@ class PublicJobSearchResult(BaseModel):
     snippet: str | None = None
 
 
+class PublicCommunityScanRecord(PublicJobSearchResult):
+    """One timestamped record inspected during an official community scan."""
+
+    published_at: str
+
+
 class SearchPublicJobPagesOutput(BaseModel):
     """Search evidence that lets the Executor choose a public page to inspect next."""
 
@@ -649,6 +794,16 @@ class SearchPublicJobPagesOutput(BaseModel):
     content_hash: str
     results: list[PublicJobSearchResult]
     terminal_reason: Literal["candidates_found", "search_empty"] = "candidates_found"
+    provider: Literal["public_web_search", "juejin_official_search"] = (
+        "public_web_search"
+    )
+    source_scope: str | None = None
+    time_window_days: int | None = Field(default=None, ge=1, le=365)
+    coverage_complete: bool = False
+    scanned_result_count: int = Field(default=0, ge=0)
+    matched_result_count: int = Field(default=0, ge=0)
+    scan_queries: list[str] = Field(default_factory=list)
+    scan_evidence: list[PublicCommunityScanRecord] = Field(default_factory=list)
 
 
 class ExtractObservedJobDetailsInput(BaseModel):
@@ -668,6 +823,7 @@ class ExtractedJobDetails(BaseModel):
     recruitment_types: list[str]
     apply_url: str | None
     deadline_text: str | None
+    published_at: str | None = None
     confidence: float
     evidence_refs: list[dict[str, str]]
     normalization_warnings: list[str]
@@ -839,6 +995,45 @@ class _SoSearchResultParser(HTMLParser):
         self._title_parts = []
 
 
+class _SogouMobileSearchResultParser(HTMLParser):
+    """Read direct targets embedded in Sogou mobile result-wrapper URLs."""
+
+    def __init__(self, source_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self._source_url = source_url
+        self.results: list[dict[str, str]] = []
+        self._url: str | None = None
+        self._title_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag != "a" or self._url is not None:
+            return
+        href = dict(attrs).get("href")
+        if not isinstance(href, str) or not href:
+            return
+        wrapper = urlsplit(urljoin(self._source_url, href))
+        direct_url = parse_qs(wrapper.query).get("url", [None])[0]
+        if isinstance(direct_url, str) and direct_url.startswith(("http://", "https://")):
+            self._url = direct_url
+            self._title_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._url is None:
+            return
+        normalized = " ".join(data.split())
+        if normalized:
+            self._title_parts.append(normalized)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._url is None:
+            return
+        title = " ".join(self._title_parts)
+        if title:
+            self.results.append({"title": title, "url": self._url})
+        self._url = None
+        self._title_parts = []
+
+
 def _is_public_url(url: str) -> bool:
     """True only for http(s), userinfo-free hosts resolving to a global IP.
 
@@ -918,6 +1113,22 @@ def _classify_page_quality(visible_text: str) -> tuple[
     }
     if any(marker in head for marker in jd_markers):
         return "jd_complete", "jd_section_marker"
+    # Some official career portals render the full JD bodies inline below a
+    # long navigation header. The old head-only rule classified those pages as
+    # list_only even though the visible evidence already contained repeated
+    # responsibilities/requirements sections. Treat that bounded, explicit
+    # inline-JD shape as complete; it remains source-backed and extraction
+    # still decides which candidate rows are usable.
+    inline_markers = (
+        "职位描述",
+        "工作职责",
+        "岗位职责",
+        "任职要求",
+        "希望你是",
+    )
+    inline_marker_count = sum(normalized.count(marker) for marker in inline_markers)
+    if len(normalized) >= _MIN_REAL_JD_TEXT_CHARS and inline_marker_count >= 2:
+        return "jd_complete", "inline_jd_sections"
     if any(
         marker in head
         for marker in ("职位列表", "岗位列表", "招聘职位", "校招职位", "joblist", "jobcards")
@@ -1384,10 +1595,6 @@ def fetch_public_job_page(
         return adapter_page
     try:
         page = _fetch_public_page_requests(payload.url)
-        probe_error = _probe_iguopin_detail_access(payload.url, page)
-        if probe_error is not None:
-            _remember_blocked_domain(context, payload.url, probe_error)
-            raise probe_error
         return page
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, payload.url, error)
@@ -1403,10 +1610,6 @@ def fetch_public_job_page(
             visible_text=rendered_text,
             status_code=rendered_status,
         )
-        probe_error = _probe_iguopin_detail_access(payload.url, page)
-        if probe_error is not None:
-            _remember_blocked_domain(context, payload.url, probe_error)
-            raise probe_error
         return page
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, payload.url, error)
@@ -1570,7 +1773,9 @@ def _collect_page_links(page: Any, origin_url: str) -> list[str]:
             continue
         if not _is_public_url(href):
             continue
-        if urlsplit(href).hostname != origin_host:
+        if not _same_host_or_linkedin_public_detail(
+            origin_url, href, origin_host=origin_host
+        ):
             continue
         path = urlsplit(href).path.lower()
         if not any(token in path for token in _JOB_RESULT_URL_TOKENS):
@@ -1580,6 +1785,40 @@ def _collect_page_links(page: Any, origin_url: str) -> list[str]:
         seen.add(href)
         links.append(href)
     return links
+
+
+def _same_host_or_linkedin_public_detail(
+    origin_url: str,
+    target_url: str,
+    *,
+    origin_host: str | None = None,
+) -> bool:
+    """Allow one audited cross-subdomain list route used by LinkedIn.
+
+    LinkedIn's anonymous job-search endpoint lives on ``www.linkedin.com``
+    while its public details are localized to hosts such as
+    ``cn.linkedin.com``.  This exception is deliberately narrower than an
+    eTLD+1 match: only the guest search API may emit it, and only
+    ``/jobs/view/`` details on a real LinkedIn subdomain are accepted.
+    """
+    origin = urlsplit(origin_url)
+    target = urlsplit(target_url)
+    effective_origin_host = origin_host or origin.hostname
+    if target.hostname == effective_origin_host:
+        return True
+    origin_hostname = (effective_origin_host or "").lower().rstrip(".")
+    target_hostname = (target.hostname or "").lower().rstrip(".")
+    return (
+        origin_hostname == "www.linkedin.com"
+        and origin.path.startswith(
+            "/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        )
+        and (
+            target_hostname == "linkedin.com"
+            or target_hostname.endswith(".linkedin.com")
+        )
+        and target.path.startswith("/jobs/view/")
+    )
 
 
 class _HtmlLinkCollector(HTMLParser):
@@ -1633,7 +1872,9 @@ class _HtmlLinkCollector(HTMLParser):
             return
         if not _is_public_url(resolved):
             return
-        if urlsplit(resolved).hostname != self._origin_host:
+        if not _same_host_or_linkedin_public_detail(
+            self._origin_url, resolved, origin_host=self._origin_host
+        ):
             return
         path = urlsplit(resolved).path.lower()
         if not any(token in path for token in _JOB_RESULT_URL_TOKENS):
@@ -1837,18 +2078,42 @@ def _fetch_one_with_expansion(
     else:
         collector = _HtmlLinkCollector(url)
         collector.feed(raw_html)
-        probe_error = _probe_iguopin_detail_access(url, page)
-        if probe_error is not None:
-            _remember_blocked_domain(context, url, probe_error)
-            if failure_sink is None:
-                raise probe_error
-            _persist_fetch_failure(
-                failure_sink,
-                failure_lock,
-                source_url=url,
-                error=probe_error,
-            )
+        tencent_links = _tencent_query_detail_urls(url, raw_html)
+        if tencent_links:
+            return [
+                page,
+                *_expand_from_list_links(
+                    url,
+                    tencent_links,
+                    page.visible_text,
+                    context=context,
+                    failure_sink=failure_sink,
+                    failure_lock=failure_lock,
+                ),
+            ]
+        try:
+            iguopin_links = _iguopin_list_detail_urls(url)
+        except PublicJobFetchError as probe_error:
+            if failure_sink is not None:
+                _persist_fetch_failure(
+                    failure_sink,
+                    failure_lock,
+                    source_url=url,
+                    error=probe_error,
+                )
             return [page]
+        if iguopin_links:
+            return [
+                page,
+                *_expand_from_list_links(
+                    url,
+                    iguopin_links,
+                    page.visible_text,
+                    context=context,
+                    failure_sink=failure_sink,
+                    failure_lock=failure_lock,
+                ),
+            ]
         campus_pages = _expand_official_campus_detail(
             url,
             page,
@@ -1884,18 +2149,29 @@ def _fetch_one_with_expansion(
     except PublicJobFetchError as error:
         _remember_blocked_domain(context, url, error)
         raise
-    probe_error = _probe_iguopin_detail_access(url, list_page)
-    if probe_error is not None:
-        _remember_blocked_domain(context, url, probe_error)
-        if failure_sink is None:
-            raise probe_error
-        _persist_fetch_failure(
-            failure_sink,
-            failure_lock,
-            source_url=url,
-            error=probe_error,
-        )
+    try:
+        iguopin_links = _iguopin_list_detail_urls(url)
+    except PublicJobFetchError as probe_error:
+        if failure_sink is not None:
+            _persist_fetch_failure(
+                failure_sink,
+                failure_lock,
+                source_url=url,
+                error=probe_error,
+            )
         return [list_page]
+    if iguopin_links:
+        return [
+            list_page,
+            *_expand_from_list_links(
+                url,
+                iguopin_links,
+                list_page.visible_text,
+                context=context,
+                failure_sink=failure_sink,
+                failure_lock=failure_lock,
+            ),
+        ]
     campus_pages = _expand_official_campus_detail(
         url,
         list_page,
@@ -1979,6 +2255,233 @@ def fetch_public_job_pages(
     return FetchPublicJobPagesOutput(pages=pages, failures=failures)
 
 
+def _juejin_recent_days(context: ToolContext) -> int | None:
+    """Return the explicit recent window for a named Juejin source request.
+
+    The official adapter is deliberately narrow: a generic web query must not
+    silently become an exhaustive-source claim. Juejin must be named in the
+    original task goal and the goal must state a window supported by its
+    public search period filter (at most seven days).
+    """
+    task_goal = context.metadata.get("task_goal")
+    if not isinstance(task_goal, str) or not any(
+        marker in task_goal.lower() for marker in ("稀土掘金", "juejin")
+    ):
+        return None
+    match = re.search(r"(?:最近|近|过去|过去的)\s*(\d+)\s*(?:天|日)", task_goal)
+    if match is None:
+        return None
+    recent_days = int(match.group(1))
+    return recent_days if 1 <= recent_days <= 7 else None
+
+
+def _juejin_article_projection(item: object) -> dict[str, object] | None:
+    """Project one official search result onto bounded, auditable fields."""
+    if not isinstance(item, dict) or item.get("result_type") != 2:
+        return None
+    result_model = item.get("result_model")
+    article_info = (
+        result_model.get("article_info") if isinstance(result_model, dict) else None
+    )
+    if not isinstance(article_info, dict):
+        return None
+    article_id = str(article_info.get("article_id") or "").strip()
+    title = article_info.get("title")
+    ctime = article_info.get("ctime")
+    if (
+        not re.fullmatch(r"\d{8,32}", article_id)
+        or not isinstance(title, str)
+        or not title.strip()
+        or not str(ctime).isdigit()
+    ):
+        return None
+    snippet = article_info.get("brief_content")
+    return {
+        "article_id": article_id,
+        "title": " ".join(title.split())[:240],
+        "snippet": (
+            " ".join(snippet.split())[:500]
+            if isinstance(snippet, str) and snippet.strip()
+            else None
+        ),
+        "published_timestamp": int(str(ctime)),
+    }
+
+
+_JUEJIN_RECRUITMENT_POST_RE = re.compile(
+    r"(?:校园招聘|校招|实习生招聘|招聘(?:正式)?启动|招聘岗位|"
+    r"内推码|投递简历|欢迎.{0,12}投递|岗位职责|职位要求)",
+    re.IGNORECASE,
+)
+
+
+def _juejin_record_matches_goal(record: dict[str, object], task_goal: str) -> bool:
+    """Apply only explicit role/cohort hard constraints to one recent post."""
+    searchable = " ".join(
+        value
+        for value in (record.get("title"), record.get("snippet"))
+        if isinstance(value, str)
+    )
+    lowered = searchable.lower()
+    goal_lowered = task_goal.lower()
+    if _JUEJIN_RECRUITMENT_POST_RE.search(searchable) is None:
+        return False
+    if "产品经理" in task_goal and "产品经理" not in searchable:
+        return False
+    if "aigc" in goal_lowered and not any(
+        marker in lowered for marker in ("aigc", "生成式", "大模型", "ai 产品")
+    ):
+        return False
+    if any(marker in task_goal for marker in ("应届", "校招", "毕业生")) and not any(
+        marker in searchable
+        for marker in ("应届", "校招", "校园招聘", "毕业生", "届")
+    ):
+        return False
+    return True
+
+
+def _search_juejin_recent_posts(
+    context: ToolContext,
+    payload: SearchPublicJobPagesInput,
+    *,
+    recent_days: int,
+) -> SearchPublicJobPagesOutput:
+    """Exhaust Juejin's official recent search and filter exact task bounds."""
+    _assert_public_url(_JUEJIN_SEARCH_API_URL)
+    task_goal = str(context.metadata.get("task_goal") or "")
+    records_by_id: dict[str, dict[str, object]] = {}
+    coverage_complete = True
+    for keyword in _JUEJIN_RECENT_SEARCH_QUERIES:
+        cursor = "0"
+        exhausted = False
+        for _page_index in range(_JUEJIN_MAX_SEARCH_PAGES_PER_QUERY):
+            request_url = _JUEJIN_SEARCH_API_URL + "?" + urlencode(
+                {
+                    "query": keyword,
+                    "id_type": 0,
+                    "cursor": cursor,
+                    "limit": 20,
+                    # Juejin's public UI maps period=2 to 最近一周. The
+                    # requested <=7-day bound is applied again below using
+                    # each article's official ctime.
+                    "search_type": 2,
+                    "sort_type": 0,
+                    "version": 1,
+                    "uuid": str(uuid.uuid4()),
+                }
+            )
+            try:
+                fetched = _fetch_validated(request_url)
+                response = fetched.response
+                response.raise_for_status()
+                envelope = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                raise PublicJobFetchError("public_search_failed") from exc
+            if not isinstance(envelope, dict) or envelope.get("err_no") not in {0, "0"}:
+                raise PublicJobFetchError("public_search_failed")
+            raw_records = envelope.get("data")
+            if not isinstance(raw_records, list):
+                raise PublicJobFetchError("public_search_failed")
+            for raw_record in raw_records:
+                record = _juejin_article_projection(raw_record)
+                if record is not None:
+                    records_by_id[str(record["article_id"])] = record
+            has_more = envelope.get("has_more") is True
+            next_cursor = str(envelope.get("cursor") or "")
+            if not has_more:
+                exhausted = True
+                break
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+        if not exhausted:
+            coverage_complete = False
+
+    now_timestamp = int(time.time())
+    cutoff_timestamp = now_timestamp - recent_days * 86_400
+    window_records = [
+        record
+        for record in records_by_id.values()
+        if cutoff_timestamp <= int(record["published_timestamp"]) <= now_timestamp
+    ]
+    window_records.sort(
+        key=lambda record: (-int(record["published_timestamp"]), str(record["article_id"]))
+    )
+    matched_records = [
+        record
+        for record in window_records
+        if _juejin_record_matches_goal(record, task_goal)
+    ]
+
+    def to_scan_record(record: dict[str, object]) -> PublicCommunityScanRecord:
+        timestamp = int(record["published_timestamp"])
+        return PublicCommunityScanRecord(
+            title=str(record["title"]),
+            url=f"https://juejin.cn/post/{record['article_id']}",
+            snippet=(
+                str(record["snippet"])
+                if isinstance(record.get("snippet"), str)
+                else None
+            ),
+            published_at=datetime.fromtimestamp(
+                timestamp, tz=timezone.utc
+            ).isoformat(),
+        )
+
+    scan_evidence = [to_scan_record(record) for record in window_records]
+    results = [
+        PublicJobSearchResult(
+            title=item.title,
+            url=item.url,
+            snippet=item.snippet,
+        )
+        for item in scan_evidence
+        if item.url
+        in {
+            f"https://juejin.cn/post/{record['article_id']}"
+            for record in matched_records[: payload.max_results]
+        }
+    ]
+    hash_payload = {
+        "source": _JUEJIN_SEARCH_API_URL,
+        "queries": list(_JUEJIN_RECENT_SEARCH_QUERIES),
+        "recent_days": recent_days,
+        "coverage_complete": coverage_complete,
+        "records": [
+            {
+                "article_id": record["article_id"],
+                "title": record["title"],
+                "snippet": record["snippet"],
+                "published_timestamp": record["published_timestamp"],
+            }
+            for record in window_records
+        ],
+    }
+    content_hash = hashlib.sha256(
+        json.dumps(
+            hash_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return SearchPublicJobPagesOutput(
+        query=payload.query,
+        source_url=_JUEJIN_SEARCH_API_URL,
+        content_hash=content_hash,
+        results=results,
+        terminal_reason="candidates_found" if results else "search_empty",
+        provider="juejin_official_search",
+        source_scope="juejin.cn",
+        time_window_days=recent_days,
+        coverage_complete=coverage_complete,
+        scanned_result_count=len(window_records),
+        matched_result_count=len(matched_records),
+        scan_queries=list(_JUEJIN_RECENT_SEARCH_QUERIES),
+        scan_evidence=scan_evidence,
+    )
+
+
 def search_public_job_pages(
     context: ToolContext, payload: SearchPublicJobPagesInput
 ) -> SearchPublicJobPagesOutput:
@@ -1997,13 +2500,26 @@ def search_public_job_pages(
     if not isinstance(attempted, list):
         attempted = []
         context.metadata["public_search_query_hashes"] = attempted
-    if query_hash in attempted or len(attempted) >= _MAX_PUBLIC_SEARCH_ROUTES:
+    route_limit = (
+        _MAX_PUBLIC_SEARCH_ROUTES
+        if context.metadata.get("runtime_auto_search") is True
+        else _MAX_PUBLIC_SEARCH_ROUTES - 1
+    )
+    if query_hash in attempted or len(attempted) >= route_limit:
         raise PublicJobFetchError(
             "route_already_consumed",
             message="本次运行的公开搜索路由已使用完毕，请转入人工确认或使用已有候选页面。",
         )
     attempted.append(query_hash)
-    if "site:" not in query:
+    juejin_recent_days = _juejin_recent_days(context)
+    if juejin_recent_days is not None:
+        return _search_juejin_recent_posts(
+            context, payload, recent_days=juejin_recent_days
+        )
+    if (
+        "site:" not in query
+        and context.metadata.get("runtime_auto_search") is not True
+    ):
         query = query + " " + " OR ".join(_JOB_SEARCH_SITE_OPERATORS)
     search_parameters = {
         "q": query,
@@ -2073,6 +2589,38 @@ def search_public_job_pages(
             add_result(raw_result, raw_result["url"])
             if len(results) >= payload.max_results:
                 break
+    if not results:
+        # Sogou's mobile HTML exposes the direct public target in the wrapper's
+        # ``url`` query parameter and gives materially better Chinese job-query
+        # recall than the two desktop providers. We decode only that declared
+        # target; ``add_result`` still applies host/path quality filtering and
+        # the full public-URL/blocked-domain security checks before returning it.
+        mobile_source_url = "https://m.sogou.com/web/searchList.jsp?" + urlencode(
+            {"keyword": payload.query}
+        )
+        try:
+            mobile_response = requests.get(
+                mobile_source_url,
+                timeout=20,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Linux; Android 12; Pixel 5) "
+                        "AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+                    )
+                },
+            )
+            mobile_response.raise_for_status()
+        except requests.RequestException:
+            pass
+        else:
+            html = mobile_response.text
+            source_url = mobile_source_url
+            mobile_parser = _SogouMobileSearchResultParser(mobile_source_url)
+            mobile_parser.feed(html)
+            for raw_result in _prioritize_direct_search_results(mobile_parser.results):
+                add_result(raw_result, raw_result["url"])
+                if len(results) >= payload.max_results:
+                    break
     return SearchPublicJobPagesOutput(
         query=payload.query,
         source_url=source_url,
@@ -2116,14 +2664,26 @@ def _is_plausible_public_job_result(
         if isinstance(value, str)
     )
     parsed = urlsplit(result_url)
-    if _is_allowed_job_host(hostname) and parsed.path.rstrip("/") == "":
+    allowed_host = _is_allowed_job_host(hostname)
+    normalized_path = parsed.path.rstrip("/").lower()
+    generic_page = normalized_path.rsplit("/", 1)[-1] in {
+        "home",
+        "home.html",
+        "index",
+        "index.html",
+    }
+    if allowed_host and (normalized_path == "" or generic_page):
         # A recruiting homepage is a source index, not a direct job result.
         # The Executor can still use an explicitly supplied homepage when the
         # user asks for it, but search must not spend fetch budget on it.
         return False
-    lowered_url = result_url.lower()
-    url_token_match = any(token in lowered_url for token in _JOB_RESULT_URL_TOKENS)
-    if _is_allowed_job_host(hostname):
+    path_and_query = f"{parsed.path}?{parsed.query}".lower()
+    url_token_match = any(
+        token in path_and_query
+        for token in _JOB_RESULT_URL_TOKENS
+        if "." not in token
+    )
+    if allowed_host:
         return url_token_match or _JOB_RESULT_TEXT_RE.search(searchable_text) is not None
     return url_token_match
 
@@ -2171,6 +2731,16 @@ def extract_observed_job_details(
     source_quality = evidence.get("quality")
     if source_quality not in {"jd_complete", "list_only", "js_shell", "empty"}:
         source_quality = None
+    official_records = _parse_known_official_career_records(visible_text, source_url)
+    if official_records is not None:
+        return _adapter_details_output(
+            payload.artifact_id,
+            source_url,
+            content_hash,
+            official_records,
+            evidence_ref,
+            source_quality=source_quality,
+        )
     adapter_records = _parse_adapter_evidence(visible_text)
     if adapter_records is not None:
         return _adapter_details_output(
@@ -2272,6 +2842,7 @@ def extract_observed_job_details(
                 recruitment_types=recruitment_types,
                 apply_url=candidate.apply_url,
                 deadline_text=candidate.deadline_text,
+                published_at=candidate.published_at,
                 confidence=round(candidate.confidence, 4),
                 evidence_refs=[evidence_ref],
                 normalization_warnings=warnings,
@@ -2306,6 +2877,57 @@ def extract_observed_job_details_batch(
 
 
 _ADAPTER_RECORD_KEYS = frozenset({"title", "description", "apply_url"})
+
+
+def _parse_known_official_career_records(
+    text: str, source_url: str
+) -> list[dict[str, Any]] | None:
+    """Split stable official multi-role career pages into per-JD records.
+
+    The Baiont careers page renders every opening in one HTML document using
+    repeated ``title -> 岗位职责 -> 要求`` blocks.  Treating that whole page as
+    one JD lets a late requirement line become the title and merges unrelated
+    roles.  This parser only segments captured text from Baiont's verified
+    official hosts; it does not add facts or fetch a secondary source.
+    """
+    host = (urlsplit(source_url).hostname or "").lower().rstrip(".")
+    if host not in {
+        "baiontcapital.com",
+        "www.baiontcapital.com",
+        "baiont.ai",
+        "www.baiont.ai",
+    }:
+        return None
+    pattern = re.compile(
+        r"^(?P<title>[^\r\n]{2,80})\r?\n"
+        r"岗位职责\s*[:：]\s*\r?\n"
+        r"(?P<responsibilities>.*?)\r?\n"
+        r"要求\s*[:：]\s*\r?\n"
+        r"(?P<requirements>.*?)"
+        r"(?=\r?\n[^\r\n]{2,80}\r?\n岗位职责\s*[:：]"
+        r"|\r?\n您可将简历投递至\s*[:：]?|\Z)",
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    records: list[dict[str, Any]] = []
+    for match in pattern.finditer(text):
+        title = " ".join(match.group("title").split()).strip()
+        responsibilities = " ".join(
+            match.group("responsibilities").split()
+        ).strip()
+        requirements = " ".join(match.group("requirements").split()).strip()
+        if not title or not responsibilities:
+            continue
+        records.append(
+            {
+                "title": title,
+                "company": "倍漾量化",
+                "description": (
+                    f"岗位职责：{responsibilities}\n任职要求：{requirements}"
+                ),
+                "apply_url": source_url,
+            }
+        )
+    return records or None
 
 
 def _parse_adapter_evidence(text: str) -> list[dict[str, Any]] | None:
@@ -2525,6 +3147,49 @@ def _prepare_portal_extraction_text(text: str, source_url: str) -> str:
         location = re.search(r"工作地点：([^\n]+)", text)
         if location:
             prefixes.append(f"工作地点：{location.group(1).strip()}")
+    elif (
+        (host == "linkedin.com" or host.endswith(".linkedin.com"))
+        and path.startswith("/jobs/view/")
+    ):
+        # LinkedIn's anonymous detail renderer puts login controls before the
+        # JD and appends a large "similar jobs" feed after it.  Its first line
+        # is nevertheless a stable, captured header and named-source mirrors
+        # carry an explicit attribution marker in the JD body.  Re-label only
+        # those observed fields and bound the body at the first page-chrome
+        # marker so recommendation titles cannot become the selected role.
+        header = re.match(
+            r"^(?P<company>[^\r\n]+?)正在招聘(?P<title>[^\r\n]+?)\s*"
+            r"\((?P<location>[^)\r\n]+)\)\s*\|\s*领英(?:\r?\n|$)",
+            text,
+        )
+        if header:
+            prefixes.extend(
+                [
+                    f"职位名称：{header.group('title').strip()}",
+                    f"公司名称：{header.group('company').strip()}",
+                    f"工作地点：{header.group('location').strip()}",
+                ]
+            )
+        source_marker_index = text.find("该职位来源于猎聘")
+        if source_marker_index >= 0:
+            observed_jd = text[source_marker_index:]
+            observed_jd = re.split(
+                r"(?:\r?\n)(?:Show more|Show less|职位级别|相似职位)(?:\r?\n|$)",
+                observed_jd,
+                maxsplit=1,
+            )[0]
+            sections = re.split(r"\s+任职要求\s+", observed_jd, maxsplit=1)
+            responsibilities = " ".join(sections[0].split()).strip()
+            requirements = (
+                " ".join(sections[1].split()).strip() if len(sections) == 2 else ""
+            )
+            scoped = [*prefixes]
+            if responsibilities:
+                scoped.append(f"岗位职责：{responsibilities}")
+            if requirements:
+                scoped.append(f"任职要求：{requirements}")
+            if scoped:
+                return "\n".join(scoped)
     return "\n".join(prefixes + [body]) if prefixes else text
 
 

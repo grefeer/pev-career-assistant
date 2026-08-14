@@ -1,6 +1,9 @@
 """Behavior tests for evidence-bound PEV job matching."""
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.career_skills.manifest import (
+    skill_observation_is_semantically_valid,
+)
 from backend.app.services.career_skills.job_matching import (
     MatchObservedJobsInput,
     match_observed_jobs,
@@ -184,6 +187,53 @@ def test_match_prefers_structured_candidates_over_raw_page_evidence() -> None:
     assert all(match.artifact_id != "page" for match in result.matches)
 
 
+def test_ai_application_development_goal_excludes_unrelated_ai_algorithm_intern() -> None:
+    """AI application development is a role constraint, not any AI internship."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "给出 AI 应用开发实习生岗位的面试建议。",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "agent-intern",
+                    "source_url": "https://jobs.example/agent",
+                    "content_hash": "a" * 64,
+                    "title": "AI Agent 研发实习生",
+                    "recruitment_types": ["internship"],
+                    "responsibilities": "负责 Agent 应用开发与多智能体系统工程。",
+                    "requirements": "熟悉 Python 与 RAG。",
+                },
+                {
+                    "artifact_id": "algorithm-intern",
+                    "source_url": "https://jobs.example/algorithm",
+                    "content_hash": "b" * 64,
+                    "title": "机器人强化学习算法实习生",
+                    "recruitment_types": ["internship"],
+                    "responsibilities": "负责运动控制与强化学习算法研究。",
+                    "requirements": "熟悉 PyTorch。",
+                },
+                {
+                    "artifact_id": "product-intern",
+                    "source_url": "https://jobs.example/product",
+                    "content_hash": "c" * 64,
+                    "title": "AI Agent 产品经理实习生",
+                    "recruitment_types": ["internship"],
+                    "responsibilities": "负责 Agent 平台和 RAG 产品方案设计。",
+                    "requirements": "理解大模型应用场景。",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["Python", "Agent"]),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["agent-intern"]
+
+
 def test_match_structured_candidates_score_from_sections_and_locations() -> None:
     context = ToolContext(
         user_id="user-a",
@@ -356,6 +406,50 @@ def test_match_respects_explicit_official_channel_constraints() -> None:
     assert [match.artifact_id for match in result.matches] == ["official"]
 
 
+def test_match_accepts_only_explicit_liepin_provenance_on_public_mirror() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "在猎聘网找北京的 AIGC 产品经理（应届生）岗位。",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "verified-mirror",
+                    "source_url": "https://cn.linkedin.com/jobs/view/ai-pm-1",
+                    "source_quality": "jd_complete",
+                    "title": "AI产品经理实习生",
+                    "locations": ["北京"],
+                    "responsibilities": "负责大模型产品设计、Prompt 与 RAG 效果优化。",
+                    "requirements": "在校生可投，每周实习四天。",
+                    "recruitment_types": ["internship"],
+                    "page_text_prefix": "AI产品经理实习生 北京市 该职位来源于猎聘 岗位职责",
+                },
+                {
+                    "artifact_id": "unattributed-mirror",
+                    "source_url": "https://cn.linkedin.com/jobs/view/ai-pm-2",
+                    "source_quality": "jd_complete",
+                    "title": "AI产品经理实习生",
+                    "locations": ["北京"],
+                    "responsibilities": "负责大模型产品设计、Prompt 与 RAG 效果优化。",
+                    "requirements": "在校生可投，每周实习四天。",
+                    "recruitment_types": ["internship"],
+                    "page_text_prefix": "AI产品经理实习生 北京市 岗位职责",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(
+            profile_keywords=["产品经理", "大模型"],
+            preferred_locations=["北京"],
+        ),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["verified-mirror"]
+
+
 def test_match_ignores_recommendation_cards_from_detail_page() -> None:
     context = ToolContext(
         user_id="user-a",
@@ -400,3 +494,166 @@ def test_match_ignores_recommendation_cards_from_detail_page() -> None:
     )
 
     assert [match.artifact_id for match in result.matches] == ["main"]
+
+
+def test_match_keeps_independent_roles_from_baiont_official_career_page() -> None:
+    source_url = "https://www.baiontcapital.com/careers.html"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "基于上一环节岗位找最匹配的岗位。",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "baiont",
+                    "candidate_id": "baiont:candidate:0",
+                    "source_quality": "jd_complete",
+                    "source_url": source_url,
+                    "page_source_url": source_url,
+                    "page_title": "倍漾量化",
+                    "page_text_prefix": "机器学习算法工程师 Agent 后端工程师",
+                    "title": "机器学习算法工程师",
+                    "responsibilities": "开发机器学习模型",
+                    "requirements": "熟悉 Python 和 PyTorch",
+                },
+                {
+                    "artifact_id": "baiont",
+                    "candidate_id": "baiont:candidate:1",
+                    "source_quality": "jd_complete",
+                    "source_url": source_url,
+                    "page_source_url": source_url,
+                    "page_title": "倍漾量化",
+                    "page_text_prefix": "机器学习算法工程师 Agent 后端工程师",
+                    "title": "Agent 后端工程师",
+                    "responsibilities": "设计 AI Agent 与 RAG 自动化工作流",
+                    "requirements": "熟悉 Tool Calling 和 Agent Loop",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["Agent", "RAG"], limit=1),
+    )
+
+    assert result.matches[0].title == "Agent 后端工程师"
+    assert {match.title for match in result.matches} == {
+        "Agent 后端工程师",
+        "机器学习算法工程师",
+    }
+
+
+def test_match_requires_all_explicit_role_and_graduate_constraints() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "北京 AIGC 产品经理（应届生）岗位",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "generic-product",
+                    "source_url": "https://jobs.example/generic",
+                    "title": "产品经理",
+                    "locations": ["北京"],
+                    "responsibilities": "负责产品规划",
+                    "requirements": "校招岗位",
+                    "recruitment_types": ["campus"],
+                },
+                {
+                    "artifact_id": "aigc-campus",
+                    "source_url": "https://jobs.example/aigc",
+                    "title": "AIGC 产品经理",
+                    "locations": ["北京"],
+                    "responsibilities": "负责 AIGC 产品规划",
+                    "requirements": "面向应届生校招",
+                    "recruitment_types": ["campus"],
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["AIGC"], preferred_locations=["北京"]),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["aigc-campus"]
+
+
+def test_match_requires_authoritative_recent_timestamp_for_recent_goal() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "最近1天更新的北京 AIGC 产品经理（应届生）岗位",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "missing-date",
+                    "source_url": "https://jobs.example/missing",
+                    "title": "AIGC 产品经理",
+                    "locations": ["北京"],
+                    "responsibilities": "负责 AIGC 产品",
+                    "requirements": "校招，应届生",
+                    "recruitment_types": ["campus"],
+                },
+                {
+                    "artifact_id": "fresh",
+                    "source_url": "https://jobs.example/fresh",
+                    "title": "AIGC 产品经理",
+                    "locations": ["北京"],
+                    "responsibilities": "负责 AIGC 产品",
+                    "requirements": "校招，应届生",
+                    "recruitment_types": ["campus"],
+                    "updated_at": "2026-08-14",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(
+            profile_keywords=["AIGC"],
+            preferred_locations=["北京"],
+            ranking_criteria=["recency"],
+        ),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["fresh"]
+    assert result.matches[0].unverified_ranking_criteria == []
+
+
+def test_match_emits_a_semantic_report_when_verified_candidates_do_not_qualify() -> None:
+    """A source-backed zero-match answer is a deliverable, not missing evidence."""
+    source_url = "https://www.iguopin.com/job/detail?id=old"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "最近1天更新的 Java 后端开发工程师（3年经验）岗位",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "old-role",
+                    "source_url": source_url,
+                    "title": "软件开发工程师（后端）",
+                    "responsibilities": "负责 Java 后端设计、开发和维护。",
+                    "requirements": "要求 5-10 年经验。",
+                    "updated_at": "2024-07-29",
+                }
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["Java"], ranking_criteria=["recency"]),
+    )
+
+    assert result.matches == []
+    assert result.evaluated_candidate_count == 1
+    assert result.evaluated_source_urls == [source_url]
+    assert result.no_match_reason == "no_candidate_satisfied_constraints"
+    assert skill_observation_is_semantically_valid(
+        "match-observed-jobs", result.model_dump(mode="json")
+    )

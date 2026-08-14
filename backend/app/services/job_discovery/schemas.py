@@ -18,6 +18,7 @@ class NormalizedJobCandidate:
     apply_url: str | None = None
     application_channel_json: dict | None = None
     deadline_text: str | None = None
+    published_at: str | None = None
     referral_code: str | None = None
     confidence: float = 0.0
     evidence_refs: list[dict] = field(default_factory=list)

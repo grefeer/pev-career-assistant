@@ -47,6 +47,7 @@ class CompletionContract:
     deliverable_tools: frozenset[str]
     description: str = ""
     observation_check: ObservationCheck | None = None
+    semantic_check: ObservationCheck | None = None
 
     def accepts(self, observation: ToolObservation) -> bool:
         if observation.status != "succeeded":
@@ -54,6 +55,18 @@ class CompletionContract:
         if observation.tool_name not in self.deliverable_tools:
             return False
         return self.observation_check(observation) if self.observation_check else True
+
+    def evidence_accepts(self, observation: ToolObservation) -> bool:
+        """Require both the tool boundary and a meaningful business payload.
+
+        ``accepts`` remains the lightweight tool-attempt contract used by the
+        compatibility facade and by the Executor's early completion hint. The
+        runtime completion gate uses this stricter method so a successful tool
+        call with an empty report cannot close a user-visible step.
+        """
+        if not self.accepts(observation):
+            return False
+        return self.semantic_check(observation) if self.semantic_check else True
 
 
 @dataclass(frozen=True)
@@ -293,10 +306,21 @@ class SkillRegistry:
         summary_present = isinstance(summary, str) and bool(summary.strip())
         contract_declared = self.has_completion_contract(step)
         observation_contract_met = self.step_contract_met(step, observations)
+        semantic_observation_contract_met = contract_declared and all(
+            any(
+                definition.completion_contract.evidence_accepts(observation)
+                for observation in observations
+            )
+            for skill_name in step.allowed_skills
+            if (definition := self.get(skill_name)) is not None
+            and definition.completion_contract is not None
+        )
         trusted_artifact_contract_met = self._trusted_artifact_contract_met(
             step, artifact_refs
         )
-        contract_met = observation_contract_met or trusted_artifact_contract_met
+        contract_met = (
+            semantic_observation_contract_met or trusted_artifact_contract_met
+        )
         # A bounded batch may contain both usable public pages and per-URL
         # anti-bot/adapter failures.  Once a trusted deliverable exists, the
         # failed URLs are partial coverage diagnostics, not a reason to discard
@@ -315,6 +339,7 @@ class SkillRegistry:
             "summary_present": summary_present,
             "contract_declared": contract_declared,
             "observation_contract_met": observation_contract_met,
+            "semantic_observation_contract_met": semantic_observation_contract_met,
             "trusted_artifact_contract_met": trusted_artifact_contract_met,
             "contract_met": contract_met,
             "blocked": blocked,
@@ -362,6 +387,20 @@ class SkillRegistry:
             return ref.get("quality") == "jd_complete"
         if artifact_type == "structured_job_details":
             return ref.get("source_quality") in {None, "jd_complete"}
+        if artifact_type == "job_search_results":
+            # A routable result list is an intermediate input, not a final
+            # discovery deliverable. Only a deterministic source-specific
+            # coverage proof may satisfy the final contract through a search
+            # artifact.
+            return ref.get("completion_valid") == "true"
+        if artifact_type in {
+            "job_matching_report",
+            "resume_tailoring_brief",
+            "career_preparation_plan",
+        }:
+            # These refs are persisted after the deterministic semantic check.
+            # A bare model/tool-shaped ref must not rescue an empty report.
+            return ref.get("semantic_valid") == "true"
         return True
 
     def has_blocked_evidence(self, observations: Sequence[ToolObservation]) -> bool:

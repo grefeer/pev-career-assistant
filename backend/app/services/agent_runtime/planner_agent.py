@@ -6,7 +6,7 @@ import time
 
 from pydantic import ValidationError
 
-from backend.app.domain.agent_runtime import AgentRole
+from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
 from backend.app.services.agent_runtime.model_gateway import AgentModelGateway
 from backend.app.services.agent_runtime.model_budget import (
     ModelCallBudget,
@@ -329,6 +329,7 @@ class PlannerAgent:
                             error_code="invalid_execution_plan",
                         )
                 plan = self._trim_unrequested_trailing_steps(task, plan)
+                plan = self._ensure_requested_deliverable_steps(task, plan)
                 return PlannerResult(
                     status="planned", plan=plan, observations=observations
                 )
@@ -358,21 +359,20 @@ class PlannerAgent:
     def _build_seeded_career_fallback(
         self, task: AgentTaskRequest
     ) -> ExecutionPlan | None:
-        """Build a narrow deterministic plan when seeded career planning is malformed.
+        """Build a narrow deterministic plan when career planning is malformed.
 
-        This is only enabled for the production career registry and explicit
-        candidate URLs.  It repairs model schema/dependency noise without
-        inventing a source or bypassing a site boundary; the Executor still
-        has to fetch and validate every public page.
+        This is only enabled for the production career registry. With seeded
+        URLs it preserves those user/chain-provided routes; without seeds it
+        starts from the registered public-search tool. It repairs model
+        schema/dependency noise without inventing a source or bypassing a site
+        boundary; the Executor still has to fetch and validate every page.
         """
         if self._skills is None:
             return None
         candidate_urls = task.context.get("candidate_urls")
-        if not (
-            isinstance(candidate_urls, list)
-            and any(isinstance(url, str) and url.strip() for url in candidate_urls)
-        ):
-            return None
+        has_candidate_urls = isinstance(candidate_urls, list) and any(
+            isinstance(url, str) and url.strip() for url in candidate_urls
+        )
         permitted = set(task.allowed_skills)
         if "job-discovery" not in permitted:
             return None
@@ -383,9 +383,11 @@ class PlannerAgent:
                 objective="从候选公开 URL 抓取并规范化可追溯 JD 证据。",
                 allowed_skills=["job-discovery"],
                 success_criteria=["至少产出一个有效结构化 JD artifact"],
-                inputs=[
-                    StepInputRef(kind="context", name="candidate_urls")
-                ],
+                inputs=(
+                    [StepInputRef(kind="context", name="candidate_urls")]
+                    if has_candidate_urls
+                    else []
+                ),
                 outputs=[
                     StepOutputRef(
                         name="structured_job_details",
@@ -400,7 +402,10 @@ class PlannerAgent:
         goal = task.goal
         needs_matching = (
             "job-matching" in permitted
-            and any(marker in goal for marker in ("匹配", "筛选", "最适合", "最匹配"))
+            and any(
+                marker in goal
+                for marker in ("匹配", "筛选", "最适合", "最匹配")
+            )
         )
         needs_tailoring = (
             "resume-tailoring" in permitted
@@ -528,7 +533,36 @@ class PlannerAgent:
             marker in goal
             for marker in ("面试", "准备", "计划", "回答要点", "career preparation", "interview")
         )
+        wants_matching = any(
+            marker in goal
+            for marker in (
+                "匹配",
+                "匹配度",
+                "排序",
+                "排名",
+                "筛选",
+                "最适合",
+                "最匹配",
+            )
+        )
         steps = list(plan.steps)
+        if not wants_matching:
+            for index, step in enumerate(steps):
+                if (
+                    index > 0
+                    and "job-matching" in set(step.allowed_skills)
+                    and any(
+                        "job-discovery" in set(prior.allowed_skills)
+                        for prior in steps[:index]
+                    )
+                ):
+                    # A model can insert matching in the middle and then hang
+                    # a redundant link-validation step from its report. The
+                    # already-completed discovery prefix owns page validation;
+                    # truncate at the first unrequested deliverable instead of
+                    # retaining descendants with now-unresolvable inputs.
+                    steps = steps[:index]
+                    break
         while steps:
             skills = set(steps[-1].allowed_skills)
             if "resume-tailoring" in skills and not wants_tailoring:
@@ -537,7 +571,112 @@ class PlannerAgent:
             if "career-planning" in skills and not wants_planning:
                 steps.pop()
                 continue
+            if (
+                len(steps) > 1
+                and "job-matching" in skills
+                and not wants_matching
+                and any(
+                    "job-discovery" in set(step.allowed_skills)
+                    for step in steps[:-1]
+                )
+            ):
+                steps.pop()
+                continue
             break
         if len(steps) == len(plan.steps):
             return plan
         return plan.model_copy(update={"steps": steps})
+
+    @staticmethod
+    def _ensure_requested_deliverable_steps(
+        task: AgentTaskRequest, plan: ExecutionPlan
+    ) -> ExecutionPlan:
+        """Append an omitted explicit resume deliverable to valid evidence plans.
+
+        A model can return a schema-valid discovery-only plan even when the
+        user explicitly asked for resume tailoring.  The repair is narrow: it
+        runs only when that Skill is authorized, the goal names the
+        deliverable, and an existing step already declares a compatible,
+        traceable job-evidence artifact.  No source or candidate is invented.
+        """
+        goal = task.goal.lower()
+        wants_tailoring = any(
+            marker in goal
+            for marker in ("简历", "定制", "修改建议", "resume", "tailor")
+        )
+        if (
+            not wants_tailoring
+            or "resume-tailoring" not in set(task.allowed_skills)
+            or any(
+                "resume-tailoring" in set(step.allowed_skills)
+                for step in plan.steps
+            )
+        ):
+            return plan
+        accepted_sources = (
+            "job_matching_report",
+            "structured_job_details",
+            "public_job_page",
+        )
+        source_step: PlanStep | None = None
+        source_artifact: str | None = None
+        for candidate in reversed(plan.steps):
+            artifact_types = {
+                output.artifact_type
+                for output in candidate.outputs
+                if output.artifact_type is not None
+            }
+            source_artifact = next(
+                (
+                    artifact_type
+                    for artifact_type in accepted_sources
+                    if artifact_type in artifact_types
+                ),
+                None,
+            )
+            if source_artifact is not None:
+                source_step = candidate
+                break
+        if source_step is None or source_artifact is None:
+            return plan
+        used_ids = {step.step_id for step in plan.steps}
+        step_id = "tailor_resume"
+        suffix = 2
+        while step_id in used_ids:
+            step_id = f"tailor_resume_{suffix}"
+            suffix += 1
+        steps = [
+            *plan.steps,
+            PlanStep(
+                step_id=step_id,
+                objective="针对已核验岗位生成基于已确认事实的简历修改建议。",
+                allowed_skills=["resume-tailoring"],
+                success_criteria=["产出可审阅的简历定制 brief"],
+                depends_on=[source_step.step_id],
+                inputs=[
+                    StepInputRef(
+                        kind="artifact",
+                        name=source_artifact,
+                        from_step=source_step.step_id,
+                        artifact_type=source_artifact,
+                    )
+                ],
+                outputs=[
+                    StepOutputRef(
+                        name="resume_tailoring_brief",
+                        artifact_type="resume_tailoring_brief",
+                    )
+                ],
+            ),
+        ]
+        return ExecutionPlan(
+            task=task,
+            created_by=AgentRole.planner,
+            complexity=(
+                ComplexityLevel.L3
+                if plan.complexity is ComplexityLevel.L3 or len(steps) >= 3
+                else ComplexityLevel.L2
+            ),
+            success_criteria=plan.success_criteria,
+            steps=steps,
+        )

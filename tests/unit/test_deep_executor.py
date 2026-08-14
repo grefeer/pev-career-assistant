@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import ClassVar
 
@@ -29,6 +30,7 @@ from backend.app.services.agent_runtime.skill_definition import (
     SkillRegistry,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
+from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.career_skills.manifest import build_career_skill_registry
@@ -41,6 +43,30 @@ class EchoInput(BaseModel):
 
 class EchoOutput(BaseModel):
     value: str
+
+
+class SearchInput(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+class SearchOutput(BaseModel):
+    source_url: str
+    content_hash: str
+    results: list[dict[str, str]]
+
+
+class SheetInput(BaseModel):
+    company_keywords: list[str] = []
+    role_keywords: list[str] = []
+    location_keywords: list[str] = []
+    recent_days: int | None = None
+
+
+class SheetOutput(BaseModel):
+    records: list[dict[str, object]]
+    source_url: str
+    content_hash: str
 
 
 class Gateway:
@@ -125,6 +151,81 @@ def test_deep_executor_bridges_business_tool_and_structured_terminal_state() -> 
     assert result.observations[0].output == {"value": "ok"}
 
 
+def test_deep_executor_reserves_last_tool_call_from_repeated_public_search() -> None:
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search-public-job-pages",
+                        "args": {"query": query, "max_results": 5},
+                        "id": f"search-{index}",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+            for index, query in enumerate(("快手 AI 产品", "小红书 AI 产品", "更多 AI 产品"), 1)
+        ]
+        + [
+            '{"status":"needs_user","summary":"搜索已耗尽",'
+            '"user_question":"请提供新的岗位来源。","artifact_refs":[]}'
+        ]
+    )
+    calls: list[str] = []
+
+    def search_handler(context: ToolContext, payload: SearchInput) -> dict[str, object]:
+        calls.append(payload.query)
+        attempted = context.metadata.setdefault("public_search_query_hashes", [])
+        attempted.append(hashlib.sha256(payload.query.encode("utf-8")).hexdigest())
+        return {
+            "source_url": f"https://search.example/{len(calls)}",
+            "content_hash": str(len(calls)) * 64,
+            "results": [],
+        }
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="search-public-job-pages",
+            skill_name="job-discovery",
+            input_model=SearchInput,
+            output_model=SearchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=search_handler,
+        )
+    )
+    task, plan, step = _inputs()
+    budget = ToolCallBudget(3)
+
+    result = DeepExecutorAgent(
+        gateway=Gateway(model),
+        tools=registry,
+        skills=None,
+        skill_root=Path("skill"),
+    ).run(
+        task=task,
+        plan=plan,
+        step=step,
+        context=ToolContext(
+            user_id="user",
+            run_id="run-search-reserve",
+            metadata={"public_search_query_hashes": []},
+        ),
+        tool_budget=budget,
+    )
+
+    assert result.status == "needs_user", (
+        result.error_code,
+        result.summary,
+        [(item.status, item.error_code) for item in result.observations],
+        result.execution_state,
+    )
+    assert calls == ["快手 AI 产品", "小红书 AI 产品"]
+    assert result.observations[-1].error_code == "route_already_consumed"
+    assert budget.remaining == 1
+
+
 def test_deep_executor_stops_at_clean_deliverable_without_an_extra_model_turn() -> None:
     model = ScriptedModel(
         [
@@ -170,6 +271,102 @@ def test_deep_executor_stops_at_clean_deliverable_without_an_extra_model_turn() 
     assert result.error_code is None
     assert result.summary == "已通过 Skill 完成契约并生成可核验的工具交付物。"
     assert result.execution_state["succeeded_calls"][0]["tool"] == "echo-tool"
+
+
+def test_deep_executor_finishes_recent_company_routing_before_next_model_call() -> None:
+    captured: list[SheetInput] = []
+    registry = ToolRegistry()
+
+    def query_handler(_context, payload):  # noqa: ANN001
+        captured.append(payload)
+        return {
+            "records": [
+                {
+                    "company_name": "BIGO",
+                    "apply_url": "https://jobs.example/bigo",
+                    "updated_at": "2026-08-14",
+                }
+            ],
+            "source_url": "https://docs.example/recent-companies",
+            "content_hash": "a" * 64,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="query-career-sheet-records",
+            skill_name="job-discovery",
+            input_model=SheetInput,
+            output_model=SheetOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=query_handler,
+        )
+    )
+    model = ScriptedModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "query-career-sheet-records",
+                        "args": {
+                            "role_keywords": ["AIGC 产品经理"],
+                            "recent_days": 1,
+                        },
+                        "id": "query-companies",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="先列出最近1天更新的公司清单，再逐公司核实 AIGC 产品经理岗位。",
+        allowed_skills=["job-discovery"],
+    )
+    steps = [
+        PlanStep(
+            step_id="companies",
+            objective="查询招聘数据源中最近1天更新的公司记录",
+            allowed_skills=["job-discovery"],
+            outputs=[
+                StepOutputRef(
+                    name="recent_company_records",
+                    artifact_type="job_search_results",
+                )
+            ],
+        ),
+        PlanStep(
+            step_id="jobs",
+            objective="逐公司抓取并提取岗位详情",
+            allowed_skills=["job-discovery"],
+            depends_on=["companies"],
+        ),
+    ]
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L3,
+        success_criteria=["公司清单和岗位详情"],
+        steps=steps,
+    )
+
+    result = DeepExecutorAgent(
+        gateway=Gateway(model),
+        tools=registry,
+        skills=None,
+        skill_root=Path("skill"),
+    ).run(
+        task=task,
+        plan=plan,
+        step=steps[0],
+        context=ToolContext(user_id="user", run_id="run-routing"),
+    )
+
+    assert result.status == "succeeded"
+    assert captured[0].role_keywords == []
+    assert result.execution_state["succeeded_calls"][0]["tool"] == (
+        "query-career-sheet-records"
+    )
 
 
 def test_deep_executor_consumes_one_pev_turn_for_multiple_internal_calls() -> None:

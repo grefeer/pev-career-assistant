@@ -106,7 +106,7 @@ Key files: `runtime.py` (orchestrator), `planner_agent.py` / `executor_agent.py`
 
 ### Model Gateway Notes
 
-- DeepSeek `deepseek-v4-*` models must use `temperature=0`, `extra_body={"thinking":{"type":"disabled"}}`, and `prefer_local_json_validation=True` (schema-first, then local JSON retry, then `invalid_model_response`). A final `invalid_model_response` degrades the run to `waiting_user` (recoverable) — it does not fail the run.
+- DeepSeek `deepseek-v4-*` models must use `temperature=0` and `extra_body={"thinking":{"type":"disabled"}}`, and run through the provider `json_mode` structured transport (`prefer_local_json_validation=False`, keyed on the **model name**, not the base URL — an `OPENAI_BASE_URL` override must not change it). The fallback ladder stays: provider structured output -> local JSON retry -> `invalid_model_response`. A final `invalid_model_response` degrades the run to `waiting_user` (recoverable) — it does not fail the run.
 - The model key is read only from the environment (`DEEPSEEK_API_KEY` / `OPENAI_API_KEY`); never hardcode or log it.
 
 ### Database Changes

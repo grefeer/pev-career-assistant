@@ -370,7 +370,7 @@ flowchart LR
 
 - 三角色共享**同一个** gateway 与 tool registry 实例。
 - 若 `agent_harness_enabled=false` 或缺少 `DEEPSEEK_API_KEY`：runtime=`None`，API 返回 503 `agent_harness_unavailable`/`agent_harness_disabled`，而非崩溃。
-- 模型网关：DeepSeek `deepseek-v4*` 时 `temperature=0`、`extra_body={"thinking":{"type":"disabled"}}`、`prefer_local_json_validation=True`（schema 优先，失败回退本地 JSON 校验 + 1 次重试，再失败抛 `invalid_model_response`）。
+- 模型网关：DeepSeek `deepseek-v4*` 时 `temperature=0`、`extra_body={"thinking":{"type":"disabled"}}`，走官方 `json_mode` 结构化输出（`prefer_local_json_validation=False`；识别依据是**模型名**而非 base_url，`OPENAI_BASE_URL` 覆盖不得改变它）。降级链：结构化输出失败 → 回退本地 JSON 校验 + 1 次重试 → 再失败抛 `invalid_model_response`。
 
 ---
 

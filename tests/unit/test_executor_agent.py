@@ -15,6 +15,7 @@ from backend.app.services.agent_runtime.executor_agent import (
     _load_execution_state,
     _observed_fetch_urls,
     _observed_fetch_route_counts,
+    _normalized_step_tool_input,
     _snapshot_execution_state,
 )
 from backend.app.services.agent_runtime.observation_projection import (
@@ -58,6 +59,19 @@ class DetailsOutput(BaseModel):
     title: str
 
 
+class SheetQueryInput(BaseModel):
+    company_keywords: list[str] = []
+    role_keywords: list[str] = []
+    location_keywords: list[str] = []
+    recent_days: int | None = None
+
+
+class SheetQueryOutput(BaseModel):
+    records: list[dict[str, Any]]
+    source_url: str
+    content_hash: str
+
+
 class ScriptedGateway:
     """A deterministic model boundary double; executor and registry remain real."""
 
@@ -77,6 +91,219 @@ class ScriptedGateway:
         assert instruction
         self.states.append(state)
         return response_model.model_validate(self.responses.pop(0))
+
+
+def test_executor_completes_recent_company_routing_step_after_sheet_result() -> None:
+    captured: list[SheetQueryInput] = []
+    registry = ToolRegistry()
+
+    def query_handler(_context, payload):  # noqa: ANN001
+        captured.append(payload)
+        return {
+            "records": [
+                {
+                    "company_name": "BIGO",
+                    "apply_url": "https://jobs.example/bigo",
+                    "updated_at": "2026-08-14",
+                }
+            ],
+            "source_url": "https://docs.example/recent-companies",
+            "content_hash": "a" * 64,
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="query-career-sheet-records",
+            skill_name="job-discovery",
+            input_model=SheetQueryInput,
+            output_model=SheetQueryOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=query_handler,
+        )
+    )
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "call_tool",
+                "tool_name": "query-career-sheet-records",
+                "tool_input": {
+                    "role_keywords": ["AIGC 产品经理"],
+                    "recent_days": 1,
+                },
+            }
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="先列出最近1天更新的公司清单，再逐公司核实 AIGC 产品经理岗位。",
+        allowed_skills=["job-discovery"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L3,
+        success_criteria=["公司清单和岗位证据"],
+        steps=[
+            PlanStep(
+                step_id="companies",
+                objective="查询招聘数据源中最近1天更新的公司记录",
+                allowed_skills=["job-discovery"],
+                outputs=[
+                    {
+                        "name": "recent_company_records",
+                        "artifact_type": "job_search_results",
+                    }
+                ],
+            ),
+            PlanStep(
+                step_id="jobs",
+                objective="逐公司抓取并提取岗位详情",
+                allowed_skills=["job-discovery"],
+                depends_on=["companies"],
+            ),
+        ],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task,
+        plan=plan,
+        step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "succeeded"
+    assert len(gateway.states) == 1
+    assert captured[0].recent_days == 1
+    assert captured[0].role_keywords == []
+    assert [observation.tool_name for observation in result.observations] == [
+        "query-career-sheet-records"
+    ]
+
+
+def test_executor_normalizes_tailoring_target_to_goal_constrained_source() -> None:
+    """A model-selected unrelated artifact cannot consume the tailoring call."""
+    task = AgentTaskRequest(
+        goal="在猎聘网找北京的 AIGC 产品经理（应届生）岗位，并定制简历。",
+        allowed_skills=["resume-tailoring"],
+    )
+    step = PlanStep(
+        step_id="tailor",
+        objective="针对匹配岗位生成简历建议",
+        allowed_skills=["resume-tailoring"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["简历建议"],
+        steps=[step],
+    )
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "structured_job_candidates": [
+                {
+                    "candidate_id": "structured-wrong:candidate:0",
+                    "artifact_id": "structured-wrong",
+                    "source_artifact_id": "page-wrong",
+                    "source_url": "https://agirobot.jobs.feishu.cn/s/robot",
+                    "title": "机器人产品实习生",
+                    "locations": ["上海"],
+                    "recruitment_types": ["internship"],
+                    "responsibilities": "协助机器人产品设计。",
+                    "requirements": "在校生。",
+                },
+                {
+                    "candidate_id": "structured-valid:candidate:0",
+                    "artifact_id": "structured-valid",
+                    "source_artifact_id": "page-valid",
+                    "source_url": "https://cn.linkedin.com/jobs/view/ai-pm-123",
+                    "page_source_url": "https://cn.linkedin.com/jobs/view/ai-pm-123",
+                    "title": "AI产品经理实习生",
+                    "locations": ["北京市"],
+                    "recruitment_types": ["internship"],
+                    "responsibilities": "该职位来源于猎聘，参与大模型和 Agent 产品设计。",
+                    "requirements": "在校本科生，熟悉 Prompt 和 RAG。",
+                    "full_text": (
+                        "AI产品经理实习生 北京市 该职位来源于猎聘 "
+                        "参与大模型和 Agent 产品设计，在校本科生，熟悉 Prompt 和 RAG。"
+                    ),
+                },
+            ]
+        },
+    )
+
+    normalized = _normalized_step_tool_input(
+        plan,
+        step,
+        "build-resume-tailoring-brief",
+        {
+            "target_artifact_id": "structured-wrong:candidate:0",
+            "target_keywords": ["AIGC"],
+        },
+        task=task,
+        context=context,
+    )
+
+    assert normalized["target_artifact_id"] == "structured-valid:candidate:0"
+    assert normalized["target_keywords"] == ["RAG", "Prompt", "Agent", "大模型", "AI"]
+
+
+def test_executor_disambiguates_shared_artifact_with_requested_keywords() -> None:
+    """A multi-role page artifact must resolve to its relevant candidate, not index 0."""
+    task = AgentTaskRequest(
+        goal="基于上一环节找到的岗位和我的简历，为最匹配的岗位生成修改建议。",
+        allowed_skills=["resume-tailoring"],
+    )
+    step = PlanStep(
+        step_id="tailor",
+        objective="针对匹配岗位生成简历建议",
+        allowed_skills=["resume-tailoring"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["简历建议"],
+        steps=[step],
+    )
+    source_url = "https://www.baiontcapital.com/careers.html"
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "structured_job_candidates": [
+                {
+                    "candidate_id": "baiont:candidate:0",
+                    "artifact_id": "baiont",
+                    "source_url": source_url,
+                    "title": "量化策略研究员",
+                    "responsibilities": "开发量化策略",
+                    "requirements": "熟悉 Python",
+                },
+                {
+                    "candidate_id": "baiont:candidate:1",
+                    "artifact_id": "baiont",
+                    "source_url": source_url,
+                    "title": "Agent 后端工程师",
+                    "responsibilities": "设计 AI Agent 与 RAG 工作流",
+                    "requirements": "熟悉 Tool Calling 和 Agent Loop",
+                },
+            ]
+        },
+    )
+
+    normalized = _normalized_step_tool_input(
+        plan,
+        step,
+        "build-resume-tailoring-brief",
+        {"target_artifact_id": "baiont", "target_keywords": ["Agent", "RAG"]},
+        task=task,
+        context=context,
+    )
+
+    assert normalized["target_artifact_id"] == "baiont:candidate:1"
+    assert normalized["target_keywords"] == ["Agent", "RAG", "AI"]
 
 
 def test_observed_fetch_urls_only_tracks_successful_fetch_evidence() -> None:

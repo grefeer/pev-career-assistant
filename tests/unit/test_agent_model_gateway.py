@@ -564,6 +564,40 @@ def test_gateway_factory_configures_deepseek_thinking_mode(monkeypatch) -> None:
     assert gateway._structured_method == "json_mode"
 
 
+def test_gateway_factory_deepseek_v4_keys_on_model_not_base_url(monkeypatch) -> None:
+    """deepseek-v4 detection follows the model name, not the base URL.
+
+    A custom OPENAI_BASE_URL (e.g. a DeepSeek-compatible gateway whose host
+    does not contain "deepseek") must still disable thinking and select
+    json_mode for a deepseek-v4 model - the documented pitfall guard must not
+    silently disappear under an environment override.
+    """
+    captured: dict[str, object] = {}
+
+    class CapturingChatModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_api_key", lambda: "key"
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.provider_config.get_base_url",
+        lambda: "https://gateway.example.com/v1",
+    )
+    monkeypatch.setattr(
+        "backend.app.services.agent_runtime.model_gateway.ChatOpenAI", CapturingChatModel
+    )
+
+    gateway = build_agent_model_gateway(
+        settings_override(agent_harness_model="deepseek-v4-chat")
+    )
+
+    assert isinstance(gateway, LangChainModelGateway)
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert gateway._structured_method == "json_mode"
+
+
 def test_gateway_last_usage_none_when_no_usage_metadata() -> None:
     """last_usage is None when the model provides no usage metadata."""
     model = RecordingModel({"action": "need_user", "user_question": "请确认城市。"})
@@ -923,9 +957,12 @@ def test_build_agent_model_gateway_passes_catalog_flag_from_settings(monkeypatch
         CapturingGateway,
     )
 
-    # Test with the setting enabled
+    # Test with the setting enabled (non-v4 model: transport stays json_schema)
     build_agent_model_gateway(
-        settings_override(agent_harness_catalog_in_system_prompt=True)
+        settings_override(
+            agent_harness_model="deepseek-v3-chat",
+            agent_harness_catalog_in_system_prompt=True,
+        )
     )
     assert captured["catalog_in_system_prompt"] is True
     assert captured["structured_method"] == "json_schema"
@@ -934,7 +971,10 @@ def test_build_agent_model_gateway_passes_catalog_flag_from_settings(monkeypatch
     # Test with the setting disabled (default)
     captured.clear()
     build_agent_model_gateway(
-        settings_override(agent_harness_catalog_in_system_prompt=False)
+        settings_override(
+            agent_harness_model="deepseek-v3-chat",
+            agent_harness_catalog_in_system_prompt=False,
+        )
     )
     assert captured["catalog_in_system_prompt"] is False
     assert captured["structured_method"] == "json_schema"

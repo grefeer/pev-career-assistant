@@ -210,6 +210,83 @@ def test_step_contract_met_for_the_three_report_skills() -> None:
     assert step_contract_met(_step("job-matching"), [tailoring]) is False
 
 
+def test_completion_gate_rejects_empty_business_reports() -> None:
+    registry = build_career_skill_registry(build_career_tool_registry())
+    cases = [
+        ("job-matching", "match-observed-jobs", {"matches": []}),
+        ("resume-tailoring", "build-resume-tailoring-brief", {"safe_actions": []}),
+        ("career-planning", "build-preparation-plan", {"plan_items": []}),
+    ]
+    for skill, tool_name, output in cases:
+        assert registry.completion_evidence_gate(
+            _step(skill),
+            [_observed(tool_name, output=output)],
+            summary="tool returned",
+        ) is False
+
+
+def test_completion_gate_accepts_nonempty_business_reports() -> None:
+    registry = build_career_skill_registry(build_career_tool_registry())
+    assert registry.completion_evidence_gate(
+        _step("job-matching"),
+        [_observed(
+            "match-observed-jobs",
+            output={
+                "matches": [{
+                    "source_url": "https://jobs.example/1",
+                    "evidence_excerpt": "负责 AI 产品设计",
+                }]
+            },
+        )],
+        summary="tool returned",
+    ) is True
+
+
+def test_job_discovery_contract_accepts_only_complete_official_negative_scan() -> None:
+    registry = build_career_skill_registry(build_career_tool_registry())
+    step = _step("job-discovery")
+    official_empty = _observed(
+        "search-public-job-pages",
+        output={
+            "query": "site:juejin.cn AIGC 产品经理 招聘",
+            "source_url": "https://api.juejin.cn/search_api/v1/search",
+            "content_hash": "a" * 64,
+            "results": [],
+            "terminal_reason": "search_empty",
+            "provider": "juejin_official_search",
+            "source_scope": "juejin.cn",
+            "time_window_days": 3,
+            "coverage_complete": True,
+            "scanned_result_count": 42,
+            "matched_result_count": 0,
+        },
+    )
+    ordinary_empty = _observed(
+        "search-public-job-pages",
+        output={
+            "query": "AIGC 产品经理 招聘",
+            "source_url": "https://www.bing.com/search?q=x",
+            "content_hash": "b" * 64,
+            "results": [],
+            "terminal_reason": "search_empty",
+        },
+    )
+
+    assert registry.completion_evidence_gate(
+        step, [official_empty], summary="最近3天核验完成，未找到匹配岗位。"
+    ) is True
+    assert registry.completion_evidence_gate(
+        step, [ordinary_empty], summary="未找到。"
+    ) is False
+
+    incomplete = official_empty.model_copy(
+        update={"output": {**official_empty.output, "coverage_complete": False}}
+    )
+    assert registry.completion_evidence_gate(
+        step, [incomplete], summary="未找到。"
+    ) is False
+
+
 def test_step_contract_met_ignores_failed_observations() -> None:
     failed = _observed(
         "fetch-public-job-page", status="failed", error_code="public_fetch_failed"

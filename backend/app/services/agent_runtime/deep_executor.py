@@ -579,6 +579,8 @@ class DeepExecutorAgent:
         context_holder = {"value": context}
         script_runner = SkillScriptRunner(skill_dir)
         wrapped_tools = self._build_tools(
+            task=task,
+            plan=plan,
             step=step,
             context_holder=context_holder,
             allowed_skills=frozenset(allowed_skills),
@@ -852,6 +854,8 @@ class DeepExecutorAgent:
     def _build_tools(
         self,
         *,
+        task: AgentTaskRequest,
+        plan: ExecutionPlan,
         step: PlanStep,
         context_holder: dict[str, ToolContext],
         allowed_skills: frozenset[str],
@@ -862,7 +866,11 @@ class DeepExecutorAgent:
         script_runner: SkillScriptRunner,
     ) -> list[Any]:
         from langchain_core.tools import StructuredTool
-        from backend.app.services.agent_runtime.executor_agent import _with_observed_page
+        from backend.app.services.agent_runtime.executor_agent import (
+            _intermediate_job_routing_observation_succeeded,
+            _normalized_step_tool_input,
+            _with_observed_page,
+        )
         from backend.app.services.agent_runtime.observation_projection import (
             observation_for_decision,
         )
@@ -902,8 +910,21 @@ class DeepExecutorAgent:
                 )
                 ledger.wasted(consecutive=True)
                 return append_observation(blocked)
-            if tool_budget is not None and not tool_budget.try_consume():
-                raise _DeepExecutorBudgetError("tool_budget_exhausted")
+            if tool_budget is not None:
+                reserve = 1 if name == "search-public-job-pages" else 0
+                if not tool_budget.try_consume(reserve=reserve):
+                    if name == "search-public-job-pages" and tool_budget.remaining:
+                        exhausted_route = ToolObservation(
+                            tool_name=name,
+                            status="failed",
+                            error_code="route_already_consumed",
+                            error_message=(
+                                "已保留最后一次工具调用给运行时的确定性来源恢复。"
+                            ),
+                        )
+                        ledger.record(name, payload, exhausted_route)
+                        return append_observation(exhausted_route)
+                    raise _DeepExecutorBudgetError("tool_budget_exhausted")
             return None
 
         definitions = [
@@ -918,6 +939,14 @@ class DeepExecutorAgent:
                 _definition=definition,
                 **payload: Any,
             ) -> str:
+                payload = _normalized_step_tool_input(
+                    plan,
+                    step,
+                    _definition.name,
+                    payload,
+                    task=task,
+                    context=context_holder["value"],
+                )
                 duplicate_result = guard_call(_definition.name, payload)
                 if duplicate_result is not None:
                     return duplicate_result
@@ -940,6 +969,12 @@ class DeepExecutorAgent:
                     context_holder["value"].metadata.get("public_search_query_hashes", [])
                 )
                 ledger.record(_definition.name, payload, observation)
+                if _intermediate_job_routing_observation_succeeded(
+                    plan, step, observation
+                ):
+                    raise _DeepExecutorCompletionError(
+                        "已完成当前公司的来源路由清单，交由后续步骤逐项核验。"
+                    )
                 completion_summary = self._completion_summary(step, observations)
                 if completion_summary is not None:
                     raise _DeepExecutorCompletionError(completion_summary)
@@ -1104,9 +1139,14 @@ class DeepExecutorAgent:
         """Return a stable summary only for a clean, skill-owned deliverable."""
         if self._skills is None:
             return None
-        if not self._skills.step_contract_met(step, observations):
+        diagnostics = self._skills.completion_evidence_diagnostics(
+            step,
+            observations,
+            summary="deterministic completion candidate",
+        )
+        if not diagnostics["contract_met"]:
             return None
-        if self._skills.has_blocked_evidence(observations):
+        if diagnostics["blocked"]:
             return None
         if not self._declared_outputs_covered(step, observations):
             return None

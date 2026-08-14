@@ -101,6 +101,8 @@ def test_runtime_prompts_contain_decision_table_without_domain_workflow() -> Non
     assert "只有在没有任何允许路径" in _PLANNER_INSTRUCTION
     assert "工具成功不等于步骤完成" in _EXECUTOR_INSTRUCTION
     assert "RETRY_EXECUTOR 的前提" in _VERIFIER_INSTRUCTION
+    assert "存在性问题" in _VERIFIER_INSTRUCTION
+    assert "真实负结论" in _VERIFIER_INSTRUCTION
 
 
 def test_planner_need_user_is_not_mislabeled_as_invalid_model_output() -> None:

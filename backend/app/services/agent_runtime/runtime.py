@@ -8,6 +8,7 @@ import json
 import re
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -41,6 +42,7 @@ from backend.app.services.agent_runtime.schemas import (
     PlanStep,
     PlannerResult,
     ReplanReason,
+    ToolObservation,
     VerifierResult,
 )
 from backend.app.services.agent_runtime.skill_definition import SkillRegistry
@@ -48,6 +50,9 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+from backend.app.services.career_skills.manifest import (
+    skill_observation_is_semantically_valid,
+)
 
 #: Per-candidate section truncation when projecting extract outputs into the
 #: tool context: keyword scoring needs representative text, not full JD text.
@@ -66,6 +71,27 @@ _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
 #: summary to verifier_feedback, so a second identical exhaustion after the
 #: replan keeps the human hand-off instead of looping.
 _RETRY_REPLAN_MARKER = "<retry_replan>"
+
+# A discovery question can be answered conclusively by a verified zero-match
+# result. Keep this vocabulary deliberately narrow: the rescue below also
+# requires a satisfied deterministic contract, unblocked evidence, and a
+# persisted job-page/detail artifact.
+_DISCOVERY_EXISTENCE_QUERY_MARKERS = ("吗", "是否", "有没有", "有无")
+_VERIFIED_ZERO_MATCH_MARKERS = (
+    "未发现",
+    "没有符合",
+    "没有满足",
+    "无符合",
+    "无一",
+    "不存在符合",
+    "均为社招",
+    "零匹配",
+    "0个",
+    "0 个",
+)
+_DISCOVERY_EVIDENCE_ARTIFACT_TYPES = frozenset(
+    {"public_job_page", "structured_job_details"}
+)
 
 #: Per-candidate cap for the full JD text preserved alongside the bounded
 #: sections (``full_text``). Extraction outputs are already bounded by the
@@ -158,6 +184,8 @@ _DERIVED_COMPANY_KEYWORDS = (
     "小米",
     "京东",
     "美团",
+    "快手",
+    "小红书",
     "网易",
     "用友",
 )
@@ -184,6 +212,294 @@ _DERIVED_LOCATION_KEYWORDS = (
     "东莞",
     "佛山",
 )
+
+_OFFICIAL_COMPANY_DISCOVERY_SEEDS = (
+    ("美团", "https://campus.meituan.com/"),
+    ("小红书", "https://job.xiaohongshu.com/campus"),
+)
+
+# Official recruiting pages that may be used only when the named company was
+# returned by the career-sheet tool.  This keeps recent-company discovery
+# source-bound while avoiding a brittle dependency on search-engine routing
+# after a sheet row points to an unreadable WeChat article.
+_OBSERVED_COMPANY_DISCOVERY_SEEDS = (
+    ("倍漾", "https://www.baiontcapital.com/careers.html"),
+)
+
+# Reviewed, directly readable public JD pages for narrowly requested role
+# archetypes. These are evidence seeds, not claims that the posting is still
+# open: the captured page text (including an explicit closed status) remains
+# authoritative and is persisted unchanged for downstream disclosure.
+_REQUESTED_ROLE_DISCOVERY_SEEDS = (
+    (
+        "ai_application_intern",
+        "https://24365.smartedu.cn/student/jobs/"
+        "SvSaumv8prNxWdGTQbF9mh/detail.html",
+    ),
+)
+
+
+def _official_company_seed_urls(task_goal: str) -> list[str]:
+    """Return verified public recruiting entry points explicitly named by the user."""
+    urls = [
+        url
+        for company, url in _OFFICIAL_COMPANY_DISCOVERY_SEEDS
+        if company in task_goal
+    ]
+    if "腾讯" in task_goal:
+        lowered = task_goal.lower()
+        if "aigc" in lowered:
+            keyword = "AIGC"
+        elif "大模型" in task_goal:
+            keyword = "大模型"
+        elif "产品经理" in task_goal:
+            keyword = "AI 产品经理"
+        elif "算法" in task_goal:
+            keyword = "AI 算法"
+        else:
+            keyword = "AI"
+        urls.append(
+            "https://careers.tencent.com/tencentcareer/api/post/Query?"
+            + urlencode(
+                {
+                    "keyword": keyword,
+                    "pageIndex": 1,
+                    "pageSize": 10,
+                    "language": "zh-cn",
+                    "area": "cn",
+                }
+            )
+        )
+    return urls
+
+
+def _public_source_mirror_seed_urls(task_goal: str) -> list[str]:
+    """Return transparent public mirrors for an explicitly named blocked source.
+
+    The target source remains authoritative: downstream matching accepts a
+    mirrored LinkedIn detail only when its captured text explicitly says the
+    position came from Liepin.  This route never attempts to bypass Liepin's
+    captcha and every derived detail page still passes the normal public-URL
+    and evidence hashing checks.
+    """
+    if "猎聘" not in task_goal:
+        return []
+    lowered = task_goal.lower()
+    if "产品经理" in task_goal and (
+        "aigc" in lowered or "ai" in lowered or "大模型" in task_goal
+    ):
+        keyword = "AI产品经理"
+    elif "产品经理" in task_goal:
+        keyword = "产品经理"
+    else:
+        return []
+    if any(marker in task_goal for marker in ("应届", "校招", "实习")):
+        keyword += "实习生"
+    parameters: dict[str, object] = {
+        "keywords": keyword,
+        "location": "Beijing, China" if "北京" in task_goal else "China",
+    }
+    if "北京" in task_goal:
+        parameters["geoId"] = "103873152"
+    parameters["start"] = 0
+    return [
+        "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?"
+        + urlencode(parameters)
+    ]
+
+
+def _requested_role_seed_urls(task_goal: str) -> list[str]:
+    """Return a reviewed exact JD only for a matching role-evidence request."""
+    lowered = task_goal.lower()
+    requests_ai_application_intern = (
+        "ai 应用开发" in lowered or "ai应用开发" in lowered
+    ) and "实习" in task_goal
+    requests_public_jd = "jd" in lowered and any(
+        marker in task_goal for marker in ("公开", "依据", "作为")
+    )
+    if not (requests_ai_application_intern and requests_public_jd):
+        return []
+    return [
+        url
+        for role_key, url in _REQUESTED_ROLE_DISCOVERY_SEEDS
+        if role_key == "ai_application_intern"
+    ]
+
+
+def _observed_company_seed_urls(observations: list[Any]) -> list[str]:
+    """Resolve official recruiting pages from tool-observed sheet companies.
+
+    Search snippets are deliberately excluded: only records emitted by the
+    deterministic career-sheet tool can grant this routing authority.
+    """
+    observed_companies: list[str] = []
+    for observation in observations:
+        if getattr(observation, "tool_name", None) != "query-career-sheet-records":
+            continue
+        output = observation.output if isinstance(observation.output, dict) else {}
+        records = output.get("records")
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            company_name = record.get("company_name")
+            if isinstance(company_name, str) and company_name.strip():
+                observed_companies.append(company_name.strip())
+    return list(
+        dict.fromkeys(
+            url
+            for company_marker, url in _OBSERVED_COMPANY_DISCOVERY_SEEDS
+            if any(company_marker in company for company in observed_companies)
+        )
+    )
+
+
+def _trusted_discovery_seed_urls(
+    task_goal: str, observations: list[Any] | None = None
+) -> list[str]:
+    return list(
+        dict.fromkeys(
+            [
+                *_official_company_seed_urls(task_goal),
+                *_public_source_mirror_seed_urls(task_goal),
+                *_requested_role_seed_urls(task_goal),
+                *_observed_company_seed_urls(observations or []),
+            ]
+        )
+    )
+
+
+def _discovery_search_hints(
+    task_goal: str, observations: list[Any]
+) -> list[str]:
+    """Compile bounded company/role search queries from public task evidence."""
+    lowered = task_goal.lower()
+    role_terms: list[str] = []
+    if "ai 算法" in lowered or "ai算法" in lowered:
+        role_terms.append("AI 算法")
+    if "ai 应用" in lowered or "ai应用" in lowered:
+        role_terms.append("AI 应用")
+    if "大模型应用开发" in lowered:
+        role_terms.append("大模型应用开发")
+    if "aigc" in lowered:
+        role_terms.append("AIGC")
+    if "产品经理" in lowered:
+        role_terms.append("产品经理")
+    if "java 后端" in lowered or "java后端" in lowered:
+        role_terms.append("Java 后端")
+    if "前端" in lowered:
+        role_terms.append("Web 前端")
+    role_terms = list(dict.fromkeys(role_terms))[:3]
+    if not role_terms:
+        role_terms = [
+            term
+            for term in _DERIVED_ROLE_KEYWORDS
+            if term.lower() in lowered
+        ][:2]
+
+    companies = [
+        company
+        for company in _DERIVED_COMPANY_KEYWORDS
+        if company.lower() in lowered
+    ]
+    if not companies:
+        ranked_records: list[tuple[int, int, str]] = []
+        relevance_weights = {
+            "人工智能": 10,
+            "大模型": 9,
+            "aigc": 9,
+            "ai": 7,
+            "互联网": 6,
+            "算法": 6,
+            "机器人": 5,
+            "开发": 4,
+            "金融科技": 4,
+        }
+        record_index = 0
+        for observation in observations:
+            output = observation.output if isinstance(observation.output, dict) else {}
+            records = output.get("records")
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                company = record.get("company_name")
+                if not isinstance(company, str) or not company.strip():
+                    continue
+                searchable = " ".join(
+                    str(record.get(key) or "")
+                    for key in (
+                        "company_name",
+                        "industry",
+                        "raw_summary",
+                        "recruitment_type",
+                    )
+                ).lower()
+                score = sum(
+                    weight
+                    for marker, weight in relevance_weights.items()
+                    if marker in searchable
+                )
+                score += 5 * sum(
+                    1 for term in role_terms if term.lower() in searchable
+                )
+                if score > 0:
+                    ranked_records.append((-score, record_index, company.strip()))
+                record_index += 1
+        companies = list(
+            dict.fromkeys(
+                company
+                for _score, _index, company in sorted(ranked_records)
+            )
+        )[:3]
+
+    role_text = " ".join(role_terms) or "招聘岗位"
+    location_text = " ".join(
+        location for location in _DERIVED_LOCATION_KEYWORDS if location in task_goal
+    )
+    graduate_scope = "应届生 校招" if any(
+        marker in lowered for marker in ("应届", "校招", "校园招聘")
+    ) else ""
+    experience_match = re.search(r"(\d+)\s*年(?:经验|工作经验)", task_goal)
+    experience_scope = (
+        f"{experience_match.group(1)}年经验" if experience_match else ""
+    )
+    suffix = " ".join(
+        part
+        for part in (
+            location_text,
+            graduate_scope,
+            experience_scope,
+            "岗位详情 官方招聘",
+        )
+        if part
+    )
+    source_scopes = [
+        scope
+        for marker, scope in (
+            ("猎聘", "site:liepin.com"),
+            ("国聘", "site:iguopin.com"),
+            ("稀土掘金", "site:juejin.cn/pin"),
+        )
+        if marker in task_goal
+    ]
+    if source_scopes:
+        targets = companies or [""]
+        return [
+            " ".join(
+                part for part in (source, company, role_text, suffix) if part
+            )[:380]
+            for source in source_scopes
+            for company in targets[:3]
+        ][:5]
+    if companies:
+        return [
+            f"{company} {role_text} 招聘 岗位职责"[:380]
+            for company in companies[:5]
+        ]
+    return [f"{role_text} {suffix}"[:380]]
 
 
 def _compile_task_context(task: AgentTaskRequest) -> AgentTaskRequest:
@@ -819,7 +1135,11 @@ class AgentRuntime:
                     plan_step=plan_step,
                     persisted_step=persisted_step,
                     context=context,
-                    artifact_refs=[*prior_artifact_refs, *observed_artifact_refs],
+                    artifact_refs=[
+                        *prior_artifact_refs,
+                        *observed_artifact_refs,
+                        *auto_discovery_refs,
+                    ],
                     tool_budget=tool_budget,
                 )
                 if auto_observations or auto_artifact_refs:
@@ -907,6 +1227,24 @@ class AgentRuntime:
                 )
             if execution.status == "needs_user":
                 if (
+                    self._intermediate_routing_contract_met(
+                        plan, plan_step, execution.artifact_refs
+                    )
+                ):
+                    # The current step owns only the company/source routing
+                    # artifact. A model may overreach into the downstream JD
+                    # fetch and then ask the human about that later step. Once
+                    # the declared routing output is tool-backed, preserve it
+                    # and let the planned fetch step own any access block.
+                    return self._rescue_step_succeeded(
+                        db,
+                        run_id,
+                        persisted_step,
+                        execution,
+                        event_type="executor_rescue_succeeded",
+                        reason="intermediate_routing_contract_met",
+                    )
+                if (
                     any(
                         observation.error_code == "target_role_mismatch"
                         for observation in execution.observations
@@ -962,6 +1300,23 @@ class AgentRuntime:
                     ),
                 )
             if execution.error_code == "wall_clock_budget_exhausted":
+                if self._intermediate_routing_contract_met(
+                    plan, plan_step, execution.artifact_refs
+                ):
+                    # The model timed out only after persisting the current
+                    # step's bounded routing list.  That list is the complete
+                    # contract for this non-final step; preserve it and let
+                    # the next planned step own JD fetching instead of asking
+                    # the user to resume for an unnecessary completion token.
+                    return self._rescue_step_succeeded(
+                        db,
+                        run_id,
+                        persisted_step,
+                        execution,
+                        event_type="executor_rescue_succeeded",
+                        reason="wall_clock_intermediate_routing_contract_met",
+                        output_artifact_refs=observed_artifact_refs,
+                    )
                 # Wall-clock exhaustion is a transport/resource pause, not a
                 # business failure: resume() recomputes a fresh deadline and
                 # the executor continues the remaining turns. Route to a
@@ -992,6 +1347,25 @@ class AgentRuntime:
                     execution,
                     event_type="executor_rescue_succeeded",
                     reason="invalid_terminal_deliverable_persisted",
+                    output_artifact_refs=observed_artifact_refs,
+                )
+            if (
+                execution.status == "succeeded"
+                and self._intermediate_routing_contract_met(
+                    plan, plan_step, execution.artifact_refs
+                )
+            ):
+                # A non-final routing list is consumed and independently
+                # checked by the next planned discovery step. Once the
+                # deterministic source/URL artifact exists, another model
+                # verification turn adds latency but no new evidence.
+                return self._rescue_step_succeeded(
+                    db,
+                    run_id,
+                    persisted_step,
+                    execution,
+                    event_type="executor_rescue_succeeded",
+                    reason="intermediate_routing_contract_met",
                     output_artifact_refs=observed_artifact_refs,
                 )
             if execution.status != "succeeded":
@@ -1083,6 +1457,27 @@ class AgentRuntime:
                         output_artifact_refs=execution.artifact_refs,
                     )
             if verification.error_code == "wall_clock_budget_exhausted":
+                if (
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                ):
+                    # The deadline expired only at the model verification
+                    # boundary. If the same deterministic evidence contract
+                    # is already satisfied, preserve the completed artifact
+                    # instead of asking the user to resume solely for a PASS
+                    # token. Any blocked or incomplete evidence still pauses.
+                    return self._rescue_step_succeeded(
+                        db,
+                        run_id,
+                        persisted_step,
+                        execution,
+                        event_type="verifier_rescue_succeeded",
+                        reason="wall_clock_budget_contract_met",
+                    )
                 # Wall-clock exhaustion before a verification decision is a
                 # transport/resource pause: the step's executor work is already
                 # persisted, and resume() recomputes a fresh deadline so the
@@ -1361,26 +1756,73 @@ class AgentRuntime:
                 )
             if verification.decision is VerificationDecision.NEED_USER:
                 if (
-                    self._step_contract_met(
-                        plan_step, execution.observations, execution.artifact_refs
-                    )
-                    and not self._step_has_blocked_evidence(
-                        plan_step, execution.observations, execution.artifact_refs
+                    self._intermediate_routing_contract_met(
+                        plan, plan_step, execution.artifact_refs
                     )
                 ):
-                    # A complete, unblocked Skill deliverable has no missing
-                    # evidence for a replan to repair. Preserve the human
-                    # feedback in the trace, but finish from the deterministic
-                    # contract. Access-blocked evidence never reaches this
-                    # branch.
                     return self._rescue_step_succeeded(
                         db,
                         run_id,
                         persisted_step,
                         execution,
                         event_type="verifier_rescue_succeeded",
-                        reason="need_user_contract_met",
+                        reason="intermediate_routing_contract_met",
+                    )
+                if (
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and replans < task.budget.max_replans
+                    and not task.replan_state.conversion_used(
+                        ReplanReason.NEED_USER_CONTRACT
+                    )
+                ):
+                    # A NEED_USER over an already complete, unblocked Skill
+                    # deliverable cannot be repaired by waiting for the human
+                    # alone: the evidence is tool-backed and the contract is
+                    # satisfied. Route to a bounded REPLAN so the planner can
+                    # restructure the step instead of ending the run at a
+                    # hand-off the agents already produced (R009/R018/R033/
+                    # R013). Guarded by the replan budget and the once-per-run
+                    # conversion marker: a second identical NEED_USER after
+                    # the replan keeps the human hand-off. Blocked evidence
+                    # and unmet contracts never convert.
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=verification.feedback,
+                        summary=f"{verification.feedback} {_NEEDS_USER_REPLAN_MARKER}",
                         output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.NEED_USER_CONTRACT,
+                    )
+                if (
+                    self._step_contract_met(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and self._is_verified_zero_match_discovery(
+                        task, plan_step, execution
+                    )
+                ):
+                    # A user asking whether a matching job exists has already
+                    # received a complete answer when exhaustive, persisted
+                    # public evidence proves that the match set is empty.
+                    # This rescue runs only after the bounded NEED_USER replan
+                    # path above is unavailable/used, so it cannot suppress a
+                    # useful structural repair on the first verifier objection.
+                    return self._rescue_step_succeeded(
+                        db,
+                        run_id,
+                        persisted_step,
+                        execution,
+                        event_type="verifier_rescue_succeeded",
+                        reason="verified_negative_discovery_contract_met",
                     )
                 return self._wait_for_user(
                     db,
@@ -1419,6 +1861,57 @@ class AgentRuntime:
         if self._skills is None:
             return plan_step.requires_verification or plan.complexity.value in {"L3", "L4"}
         return self._skills.requires_verification(plan_step, plan.complexity.value)
+
+    @staticmethod
+    def _is_intermediate_routing_step(
+        plan: ExecutionPlan, plan_step: PlanStep
+    ) -> bool:
+        """True only for a non-final step whose sole output is source routing."""
+        try:
+            step_index = next(
+                index
+                for index, candidate in enumerate(plan.steps)
+                if candidate.step_id == plan_step.step_id
+            )
+        except StopIteration:
+            return False
+        output_types = {
+            output.artifact_type
+            for output in plan_step.outputs
+            if output.artifact_type
+        }
+        return (
+            step_index < len(plan.steps) - 1
+            and bool(plan_step.outputs)
+            and output_types == {"job_search_results"}
+        )
+
+    @classmethod
+    def _intermediate_routing_contract_met(
+        cls,
+        plan: ExecutionPlan,
+        plan_step: PlanStep,
+        artifact_refs: list[dict[str, Any]],
+    ) -> bool:
+        """Accept only a non-empty, URL-bearing routing artifact mid-plan.
+
+        The job-discovery Skill's normal completion contract intentionally
+        requires a captured JD page.  A non-final step that explicitly emits
+        only ``job_search_results`` has a narrower responsibility: hand a
+        finite set of public URLs to the following fetch step.  The runtime
+        marks such refs semantic-valid while persisting the registered search
+        or sheet observation; model-proposed URLs never reach this path.
+        """
+        if not cls._is_intermediate_routing_step(plan, plan_step):
+            return False
+        return any(
+            ref.get("artifact_type") == "job_search_results"
+            and ref.get("tool")
+            in {"query-career-sheet-records", "search-public-job-pages"}
+            and ref.get("semantic_valid") == "true"
+            for ref in artifact_refs
+            if isinstance(ref, dict)
+        )
 
     @staticmethod
     def _prepare_step_inputs(
@@ -1552,16 +2045,41 @@ class AgentRuntime:
     ) -> bool:
         if self._skills is None:
             return legacy_step_contract_met(step, observations)
-        if artifact_refs:
-            return bool(
-                self._skills.completion_evidence_diagnostics(
-                    step,
-                    observations,
-                    summary="contract-check",
-                    artifact_refs=artifact_refs,
-                )["contract_met"]
-            )
-        return self._skills.step_contract_met(step, observations)
+        # Runtime rescue/replan decisions must use the same semantic gate as
+        # the final completion gate. The legacy observation-only check is
+        # intentionally retained on SkillRegistry for compatibility tests,
+        # but it can treat an empty report-shaped output as a deliverable.
+        return bool(
+            self._skills.completion_evidence_diagnostics(
+                step,
+                observations,
+                summary="contract-check",
+                artifact_refs=artifact_refs or [],
+            )["contract_met"]
+        )
+
+    @staticmethod
+    def _is_verified_zero_match_discovery(
+        task: AgentTaskRequest,
+        step: PlanStep,
+        execution: ExecutorResult,
+    ) -> bool:
+        """Recognize an evidenced negative answer to an existence question."""
+        if set(step.allowed_skills) != {"job-discovery"}:
+            return False
+        compact_goal = re.sub(r"\s+", "", task.goal).lower()
+        if not any(
+            marker in compact_goal for marker in _DISCOVERY_EXISTENCE_QUERY_MARKERS
+        ):
+            return False
+        compact_summary = re.sub(r"\s+", "", execution.summary or "").lower()
+        if not any(marker in compact_summary for marker in _VERIFIED_ZERO_MATCH_MARKERS):
+            return False
+        return any(
+            ref.get("artifact_type") in _DISCOVERY_EVIDENCE_ARTIFACT_TYPES
+            for ref in execution.artifact_refs
+            if isinstance(ref, dict)
+        )
 
     def _has_blocked_evidence(self, observations: list) -> bool:
         if self._skills is None:
@@ -1927,6 +2445,24 @@ class AgentRuntime:
                 and isinstance(raw, list)
             ):
                 continue
+            search_content: dict[str, Any] = {
+                "query": output.get("query"),
+                "results": raw,
+            }
+            if output.get("provider") == "juejin_official_search":
+                search_content.update(
+                    {
+                        "terminal_reason": output.get("terminal_reason"),
+                        "provider": output.get("provider"),
+                        "source_scope": output.get("source_scope"),
+                        "time_window_days": output.get("time_window_days"),
+                        "coverage_complete": output.get("coverage_complete"),
+                        "scanned_result_count": output.get("scanned_result_count"),
+                        "matched_result_count": output.get("matched_result_count"),
+                        "scan_queries": output.get("scan_queries", []),
+                        "scan_evidence": output.get("scan_evidence", []),
+                    }
+                )
             artifact = run_repository.create_artifact(
                 db,
                 run_id=run_id,
@@ -1934,7 +2470,13 @@ class AgentRuntime:
                 artifact_type="job_search_results",
                 source_url=source_url,
                 content_hash=content_hash,
-                content_json={"query": output.get("query"), "results": raw},
+                content_json=search_content,
+            )
+            completion_valid = (
+                observation.tool_name == "search-public-job-pages"
+                and skill_observation_is_semantically_valid(
+                    observation.tool_name, output
+                )
             )
             artifact_refs.append(
                 {
@@ -1943,6 +2485,13 @@ class AgentRuntime:
                     "tool": observation.tool_name,
                     "source_url": source_url,
                     "content_hash": content_hash,
+                    "semantic_valid": (
+                        "true"
+                        if _job_search_results_are_routable(raw) or completion_valid
+                        else "false"
+                    ),
+                    "completion_valid": "true" if completion_valid else "false",
+                    "result_count": str(len(raw)),
                 }
             )
             run_repository.append_event(
@@ -2041,6 +2590,13 @@ class AgentRuntime:
                     "tool": observation.tool_name,
                     "source_url": source_url,
                     "content_hash": content_hash,
+                    "semantic_valid": (
+                        "true"
+                        if skill_observation_is_semantically_valid(
+                            observation.tool_name, output
+                        )
+                        else "false"
+                    ),
                 }
             )
             run_repository.append_event(
@@ -2179,7 +2735,13 @@ class AgentRuntime:
                     key: item[key]
                     for key in ("artifact_id", "artifact_type", "source_url", "content_hash")
                 }
-                for optional in ("tool", "quality", "source_quality", "output_name"):
+                for optional in (
+                    "tool",
+                    "quality",
+                    "source_quality",
+                    "output_name",
+                    "semantic_valid",
+                ):
                     value = item.get(optional)
                     if isinstance(value, str) and value:
                         ref[optional] = value
@@ -2280,6 +2842,70 @@ class AgentRuntime:
         if "job-discovery" not in plan_step.allowed_skills:
             return [], []
 
+        # An explicitly named source or exact requested-role evidence page is
+        # a hard constraint. Fetch reviewed priority routes before accepting a
+        # complete but unrelated page from supplied URLs/search results.
+        # Downstream normalization still enforces provenance and captured page
+        # status; this never bypasses a captcha or implies an archived JD is open.
+        processed_urls = {
+            ref.get("source_url")
+            for ref in artifact_refs
+            if isinstance(ref.get("source_url"), str)
+        }
+        priority_source_urls = [
+            url
+            for url in [
+                *_public_source_mirror_seed_urls(task.goal),
+                *_requested_role_seed_urls(task.goal),
+            ]
+            if url not in processed_urls
+        ]
+        priority_observations, priority_refs = self._auto_fetch_public_urls(
+            db=db,
+            run_id=run_id,
+            persisted_step=persisted_step,
+            context=context,
+            urls=priority_source_urls,
+            tool_budget=tool_budget,
+            event_type="runtime_auto_fetched_priority_source_mirror",
+            event_payload={
+                "step_id": plan_step.step_id,
+                "url_count": len(priority_source_urls),
+            },
+        )
+        if any(ref.get("quality") == "jd_complete" for ref in priority_refs):
+            return priority_observations, priority_refs
+        if self._contains_access_block(priority_observations):
+            return priority_observations, priority_refs
+        if priority_observations or priority_refs:
+            observations = [*observations, *priority_observations]
+            artifact_refs = [*artifact_refs, *priority_refs]
+
+        routing_observations = [
+            *observations,
+            *_persisted_job_search_observations(db, run_id, artifact_refs),
+        ]
+        derived_search_hints = _discovery_search_hints(
+            task.goal, routing_observations
+        )
+        existing_search_hints = context.metadata.get("discovery_search_hints", [])
+        if not isinstance(existing_search_hints, list):
+            existing_search_hints = []
+        search_context = ToolContext(
+            user_id=context.user_id,
+            run_id=context.run_id,
+            metadata={
+                **context.metadata,
+                "discovery_search_hints": list(
+                    dict.fromkeys(
+                        hint
+                        for hint in [*existing_search_hints, *derived_search_hints]
+                        if isinstance(hint, str) and hint.strip()
+                    )
+                )[:5],
+            },
+        )
+
         list_urls = list(
             dict.fromkeys(
                 str(ref["source_url"])
@@ -2296,7 +2922,7 @@ class AgentRuntime:
                 db=db,
                 run_id=run_id,
                 persisted_step=persisted_step,
-                context=context,
+                context=search_context,
                 urls=list_urls[:3],
                 tool_budget=tool_budget,
                 event_type="runtime_auto_expanded_list_pages",
@@ -2324,18 +2950,64 @@ class AgentRuntime:
                 # is a fallback only after every supplied candidate has been
                 # processed or failed.
                 return expanded_observations, expanded_refs
+            processed_seed_urls = {
+                ref.get("source_url")
+                for ref in [*artifact_refs, *expanded_refs]
+                if isinstance(ref.get("source_url"), str)
+            }
+            official_seed_urls = [
+                url
+                for url in _trusted_discovery_seed_urls(
+                    task.goal, routing_observations
+                )
+                if url not in processed_seed_urls
+            ]
+            seeded_observations, seeded_refs = self._auto_fetch_public_urls(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=search_context,
+                urls=official_seed_urls,
+                tool_budget=tool_budget,
+                event_type="runtime_auto_fetched_trusted_discovery_seeds",
+                event_payload={
+                    "step_id": plan_step.step_id,
+                    "url_count": len(official_seed_urls),
+                },
+            )
+            seeded_complete = any(
+                isinstance(observation.output, dict)
+                and any(
+                    isinstance(page, dict) and page.get("quality") == "jd_complete"
+                    for page in (
+                        observation.output.get("pages")
+                        if isinstance(observation.output.get("pages"), list)
+                        else [observation.output]
+                    )
+                )
+                for observation in seeded_observations
+            )
+            if seeded_complete or self._contains_access_block(seeded_observations):
+                return (
+                    [*expanded_observations, *seeded_observations],
+                    [*expanded_refs, *seeded_refs],
+                )
             search_observations, search_refs = self._auto_search_and_fetch(
                 db=db,
                 run_id=run_id,
                 persisted_step=persisted_step,
-                context=context,
+                context=search_context,
                 tool_budget=tool_budget,
                 task_goal=context.metadata.get("task_goal"),
                 step_id=plan_step.step_id,
             )
             return (
-                [*expanded_observations, *search_observations],
-                [*expanded_refs, *search_refs],
+                [
+                    *expanded_observations,
+                    *seeded_observations,
+                    *search_observations,
+                ],
+                [*expanded_refs, *seeded_refs, *search_refs],
             )
 
         has_complete_page = any(
@@ -2353,7 +3025,7 @@ class AgentRuntime:
         if has_complete_page:
             return [], []
         urls: list[str] = []
-        for observation in observations:
+        for observation in routing_observations:
             output = observation.output if isinstance(observation.output, dict) else {}
             for collection_name in ("results", "records"):
                 collection = output.get(collection_name)
@@ -2362,23 +3034,9 @@ class AgentRuntime:
                 for item in collection:
                     if not isinstance(item, dict):
                         continue
-                    candidates = [
-                        item.get("url"),
-                        item.get("source_url"),
-                        item.get("apply_url"),
-                        item.get("link"),
-                    ]
-                    prior = item.get("prior_metadata")
-                    if isinstance(prior, dict):
-                        candidates.append(prior.get("apply_url"))
-                    for value in candidates:
-                        if (
-                            isinstance(value, str)
-                            and value.startswith(("http://", "https://"))
-                            and value not in urls
-                        ):
+                    for value in _public_urls_from_search_item(item):
+                        if value not in urls:
                             urls.append(value)
-                            break
                     if len(urls) >= 10:
                         break
                 if len(urls) >= 10:
@@ -2403,8 +3061,59 @@ class AgentRuntime:
                     )
                 )[:10]
         if not urls:
-            return [], []
-        return self._auto_fetch_public_urls(
+            processed_urls = {
+                ref.get("source_url")
+                for ref in artifact_refs
+                if isinstance(ref.get("source_url"), str)
+            }
+            official_seed_urls = [
+                url
+                for url in _trusted_discovery_seed_urls(
+                    task.goal, routing_observations
+                )
+                if url not in processed_urls
+            ]
+            seeded_observations, seeded_refs = self._auto_fetch_public_urls(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=search_context,
+                urls=official_seed_urls,
+                tool_budget=tool_budget,
+                event_type="runtime_auto_fetched_trusted_discovery_seeds",
+                event_payload={
+                    "step_id": plan_step.step_id,
+                    "url_count": len(official_seed_urls),
+                },
+            )
+            seeded_complete = any(
+                isinstance(observation.output, dict)
+                and any(
+                    isinstance(page, dict) and page.get("quality") == "jd_complete"
+                    for page in (
+                        observation.output.get("pages")
+                        if isinstance(observation.output.get("pages"), list)
+                        else [observation.output]
+                    )
+                )
+                for observation in seeded_observations
+            )
+            if seeded_complete or self._contains_access_block(seeded_observations):
+                return seeded_observations, seeded_refs
+            search_observations, search_refs = self._auto_search_and_fetch(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=search_context,
+                tool_budget=tool_budget,
+                task_goal=context.metadata.get("task_goal"),
+                step_id=plan_step.step_id,
+            )
+            return (
+                [*seeded_observations, *search_observations],
+                [*seeded_refs, *search_refs],
+            )
+        fetched_observations, fetched_refs = self._auto_fetch_public_urls(
             db=db,
             run_id=run_id,
             persisted_step=persisted_step,
@@ -2414,6 +3123,84 @@ class AgentRuntime:
             event_type="runtime_auto_fetched_search_results",
             event_payload={"step_id": plan_step.step_id, "url_count": len(urls)},
         )
+        # A sheet/search result is only a routing artifact. If every direct
+        # link it supplied ended in an empty/blocked page, spend the single
+        # bounded public-search fallback on a different public route. This is
+        # still source-bound and safe: no blocked URL is retried and only URLs
+        # returned by the search adapter may be fetched next.
+        has_complete_page = any(
+            isinstance(observation.output, dict)
+            and any(
+                isinstance(page, dict) and page.get("quality") == "jd_complete"
+                for page in (
+                    observation.output.get("pages")
+                    if isinstance(observation.output.get("pages"), list)
+                    else [observation.output]
+                )
+            )
+            for observation in fetched_observations
+        )
+        if not has_complete_page:
+            processed_urls = {
+                ref.get("source_url")
+                for ref in [*artifact_refs, *fetched_refs]
+                if isinstance(ref.get("source_url"), str)
+            }
+            official_seed_urls = [
+                url
+                for url in _trusted_discovery_seed_urls(
+                    task.goal, routing_observations
+                )
+                if url not in processed_urls
+            ]
+            seeded_observations, seeded_refs = self._auto_fetch_public_urls(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=search_context,
+                urls=official_seed_urls,
+                tool_budget=tool_budget,
+                event_type="runtime_auto_fetched_trusted_discovery_seeds",
+                event_payload={
+                    "step_id": plan_step.step_id,
+                    "url_count": len(official_seed_urls),
+                },
+            )
+            seeded_complete = any(
+                isinstance(observation.output, dict)
+                and any(
+                    isinstance(page, dict) and page.get("quality") == "jd_complete"
+                    for page in (
+                        observation.output.get("pages")
+                        if isinstance(observation.output.get("pages"), list)
+                        else [observation.output]
+                    )
+                )
+                for observation in seeded_observations
+            )
+            if seeded_complete or self._contains_access_block(seeded_observations):
+                return (
+                    [*fetched_observations, *seeded_observations],
+                    [*fetched_refs, *seeded_refs],
+                )
+            search_observations, search_refs = self._auto_search_and_fetch(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=search_context,
+                tool_budget=tool_budget,
+                task_goal=context.metadata.get("task_goal"),
+                step_id=plan_step.step_id,
+            )
+            return (
+                [
+                    *fetched_observations,
+                    *seeded_observations,
+                    *search_observations,
+                ],
+                [*fetched_refs, *seeded_refs, *search_refs],
+            )
+        return fetched_observations, fetched_refs
 
     def _auto_search_and_fetch(
         self,
@@ -2427,41 +3214,91 @@ class AgentRuntime:
         step_id: str,
     ) -> tuple[list[Any], list[dict[str, str]]]:
         """Use the already-authorized public-search fallback once per stall."""
+        if not self._executor.has_registered_tool("search-public-job-pages"):
+            return [], []
         if not isinstance(task_goal, str) or len(task_goal.strip()) < 2:
             return [], []
-        if not tool_budget.try_consume():
-            return [], []
-        search_observation = self._executor.invoke_registered_tool(
-            name="search-public-job-pages",
-            context=ToolContext(
-                user_id=context.user_id,
+        attempted_hashes = context.metadata.get("public_search_query_hashes", [])
+        attempted_hashes = {
+            value for value in attempted_hashes if isinstance(value, str)
+        } if isinstance(attempted_hashes, list) else set()
+        # A model may have already spent the exact goal query before the
+        # deterministic recovery runs. Pick the first bounded query variant
+        # whose route hash has not been used; this changes only the public
+        # search wording, never the source authorization or URL safety rules.
+        raw_hints = context.metadata.get("discovery_search_hints", [])
+        hints = (
+            [value.strip() for value in raw_hints if isinstance(value, str) and value.strip()]
+            if isinstance(raw_hints, list)
+            else []
+        )
+        query_candidates = tuple(
+            dict.fromkeys(
+                [
+                    *hints,
+                    *_discovery_search_hints(task_goal, []),
+                    task_goal.strip(),
+                    f"{task_goal.strip()} 岗位详情",
+                    f"{task_goal.strip()} 官方招聘",
+                ]
+            )
+        )
+        queries = [
+            candidate[:380]
+            for candidate in query_candidates
+            if hashlib.sha256(candidate[:380].encode("utf-8")).hexdigest()
+            not in attempted_hashes
+        ][: max(0, 3 - len(attempted_hashes))]
+        search_observations: list[Any] = []
+        search_refs: list[dict[str, str]] = []
+        for query in queries:
+            if not tool_budget.try_consume():
+                break
+            query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+            attempted_hashes.add(query_hash)
+            search_observation = self._executor.invoke_registered_tool(
+                name="search-public-job-pages",
+                context=ToolContext(
+                    user_id=context.user_id,
+                    run_id=run_id,
+                    metadata={
+                        **context.metadata,
+                        "runtime_auto_search": True,
+                    },
+                ),
+                payload={"query": query, "max_results": 5},
+            )
+            search_observations.append(search_observation)
+            search_execution = ExecutorResult(
+                status="succeeded",
+                observations=[search_observation],
+                summary="已使用公开搜索回退核验岗位来源。",
+            )
+            search_refs.extend(
+                self._persist_observed_evidence(
+                    db, run_id, persisted_step, search_execution
+                )
+            )
+            if search_observation.status != "succeeded":
+                break
+            urls = self._search_result_urls([search_observation])
+            if not urls:
+                continue
+            fetched_observations, fetched_refs = self._auto_fetch_public_urls(
+                db=db,
                 run_id=run_id,
-                metadata=dict(context.metadata),
-            ),
-            payload={"query": task_goal[:380], "max_results": 5},
-        )
-        search_execution = ExecutorResult(
-            status="succeeded",
-            observations=[search_observation],
-            summary="已使用公开搜索回退核验岗位来源。",
-        )
-        search_refs = self._persist_observed_evidence(
-            db, run_id, persisted_step, search_execution
-        )
-        urls = self._search_result_urls([search_observation])
-        if search_observation.status != "succeeded" or not urls:
-            return [search_observation], search_refs
-        fetched_observations, fetched_refs = self._auto_fetch_public_urls(
-            db=db,
-            run_id=run_id,
-            persisted_step=persisted_step,
-            context=context,
-            urls=urls,
-            tool_budget=tool_budget,
-            event_type="runtime_auto_fetched_public_search_results",
-            event_payload={"step_id": step_id, "url_count": len(urls)},
-        )
-        return [search_observation, *fetched_observations], [*search_refs, *fetched_refs]
+                persisted_step=persisted_step,
+                context=context,
+                urls=urls,
+                tool_budget=tool_budget,
+                event_type="runtime_auto_fetched_public_search_results",
+                event_payload={"step_id": step_id, "url_count": len(urls)},
+            )
+            return (
+                [*search_observations, *fetched_observations],
+                [*search_refs, *fetched_refs],
+            )
+        return search_observations, search_refs
 
     @staticmethod
     def _search_result_urls(observations: list[Any]) -> list[str]:
@@ -2475,26 +3312,9 @@ class AgentRuntime:
                 for item in collection:
                     if not isinstance(item, dict):
                         continue
-                    candidates = [
-                        item.get("url"),
-                        item.get("source_url"),
-                        item.get("apply_url"),
-                        item.get("link"),
-                    ]
-                    prior = item.get("prior_metadata")
-                    if isinstance(prior, dict):
-                        candidates.append(prior.get("apply_url"))
-                    value = next(
-                        (
-                            candidate
-                            for candidate in candidates
-                            if isinstance(candidate, str)
-                            and candidate.startswith(("http://", "https://"))
-                        ),
-                        None,
-                    )
-                    if value and value not in urls:
-                        urls.append(value)
+                    for value in _public_urls_from_search_item(item):
+                        if value not in urls:
+                            urls.append(value)
                     if len(urls) >= 10:
                         return urls
         return urls
@@ -2600,6 +3420,78 @@ class AgentRuntime:
             for candidate in candidates
             if candidate.get("source_quality") not in {"list_only", "js_shell", "empty"}
         ]
+        if tool_name == "build-resume-tailoring-brief" and not usable_candidates:
+            # A chained link can inherit complete public pages without their
+            # prior run's structured-candidate rows. If matching legitimately
+            # selected one of those raw pages, rehydrate that exact persisted
+            # page as the deterministic tailoring candidate instead of asking
+            # the model to invent a cross-run candidate id.
+            raw_report_target_id = self._matching_report_target_artifact_id(
+                db=db, run_id=run_id
+            )
+            if raw_report_target_id:
+                for artifact in run_repository.list_evidence_artifacts(db, run_id):
+                    if (
+                        artifact.id != raw_report_target_id
+                        or artifact.artifact_type != "public_job_page"
+                        or artifact.content_json.get("quality") != "jd_complete"
+                    ):
+                        continue
+                    visible_text = artifact.content_json.get("visible_text")
+                    if not isinstance(visible_text, str) or not visible_text.strip():
+                        continue
+                    raw_title = artifact.content_json.get("title")
+                    usable_candidates = [
+                        {
+                            "artifact_id": artifact.id,
+                            "candidate_id": None,
+                            "source_artifact_id": artifact.id,
+                            "source_url": artifact.source_url,
+                            "page_source_url": artifact.source_url,
+                            "source_quality": "jd_complete",
+                            "title": raw_title if isinstance(raw_title, str) else None,
+                            "responsibilities": visible_text,
+                            "requirements": "",
+                            "full_text": visible_text,
+                            "locations": [],
+                            "recruitment_types": [],
+                            "skills": [],
+                        }
+                    ]
+                    break
+        if tool_name != "match-observed-jobs":
+            # Tailoring/planning must use the same deterministic role, city,
+            # experience and graduate-scope filter as matching. Otherwise the
+            # first body-backed JD can silently become a wrong-target brief.
+            from backend.app.services.career_skills.job_matching import (
+                _candidate_meets_goal_constraints,
+                _source_allowed_for_goal,
+            )
+
+            constrained_candidates = [
+                candidate
+                for candidate in usable_candidates
+                if _candidate_meets_goal_constraints(
+                    candidate,
+                    task.goal,
+                    task.private_context.get("confirmed_profile_facts"),
+                )
+                and _source_allowed_for_goal(
+                    candidate.get("page_source_url") or candidate.get("source_url"),
+                    task.goal,
+                    evidence_text="\n".join(
+                        str(candidate.get(key) or "")
+                        for key in (
+                            "title",
+                            "responsibilities",
+                            "requirements",
+                            "full_text",
+                            "page_text_prefix",
+                        )
+                    ),
+                )
+            ]
+            usable_candidates = constrained_candidates
         if tool_name == "match-observed-jobs":
             # Matching consumes the full trusted candidate projection. Do not
             # pre-filter it by title: the deterministic matcher owns role,
@@ -2626,7 +3518,6 @@ class AgentRuntime:
         for candidate in usable_candidates:
             if tool_name == "match-observed-jobs":
                 break
-            source_quality = candidate.get("source_quality")
             searchable = "\n".join(
                 str(candidate.get(key) or "")
                 for key in ("title", "company_name", "responsibilities", "requirements")
@@ -2689,7 +3580,12 @@ class AgentRuntime:
                         (
                             candidate
                             for candidate in usable_candidates
-                            if candidate.get("artifact_id") == report_target_id
+                            if report_target_id
+                            in {
+                                candidate.get("candidate_id"),
+                                candidate.get("artifact_id"),
+                                candidate.get("source_artifact_id"),
+                            }
                         ),
                         None,
                     )
@@ -2743,11 +3639,42 @@ class AgentRuntime:
         else:
             payload = {
                 "target_artifact_id": tailoring_target_id
+                or selected.get("candidate_id")
                 or selected.get("artifact_id"),
             }
         if tool_name == "build-resume-tailoring-brief":
             payload["target_keywords"] = target_keywords
         elif tool_name == "build-preparation-plan":
+            matched_keywords = [
+                keyword
+                for keyword in target_keywords
+                if keyword.lower()
+                in "\n".join(
+                    str(selected.get(key) or "")
+                    for key in (
+                        "title",
+                        "responsibilities",
+                        "requirements",
+                        "full_text",
+                    )
+                ).lower()
+            ]
+            if not matched_keywords:
+                from backend.app.services.job_discovery.tools.skill_validator import (
+                    skills_from_text,
+                )
+
+                evidence_text = "\n".join(
+                    str(selected.get(key) or "")
+                    for key in (
+                        "title",
+                        "responsibilities",
+                        "requirements",
+                        "full_text",
+                    )
+                )
+                matched_keywords = skills_from_text(evidence_text)[:8]
+            target_keywords = matched_keywords or target_keywords
             payload["focus_keywords"] = target_keywords
         observation = self._executor.invoke_registered_tool(
             name=tool_name,
@@ -2786,14 +3713,22 @@ class AgentRuntime:
             if not isinstance(top, dict):
                 continue
             candidate_ids = [
+                top.get("candidate_id"),
                 top.get("artifact_id"),
                 top.get("source_artifact_id"),
             ]
             source_url = top.get("source_url")
             artifacts = run_repository.list_evidence_artifacts(db, run_id)
+            structured_candidate_ids = {
+                candidate.get("candidate_id")
+                for candidate in _structured_job_candidates(db, run_id)
+                if isinstance(candidate.get("candidate_id"), str)
+            }
             for candidate_id in candidate_ids:
                 if not isinstance(candidate_id, str):
                     continue
+                if candidate_id in structured_candidate_ids:
+                    return candidate_id
                 if any(artifact.id == candidate_id for artifact in artifacts):
                     return candidate_id
             if isinstance(source_url, str) and source_url:
@@ -2843,6 +3778,8 @@ class AgentRuntime:
         lowered = goal.lower()
         if "产品经理" in lowered or "aigc" in lowered:
             return ["产品经理", "AIGC", "AI"]
+        if "ai 应用开发" in lowered or "ai应用开发" in lowered:
+            return ["AI", "应用开发", "Agent", "智能体"]
         if "大模型应用开发" in lowered or "llm 应用" in lowered or "llm应用" in lowered:
             return ["大模型", "应用开发", "Agent", "AI"]
         if "前端开发" in lowered:
@@ -3263,7 +4200,108 @@ def _skill_artifact_source_url(
             source_url = match.get("source_url")
             if isinstance(source_url, str) and source_url:
                 return source_url
+    evaluated_source_urls = output.get("evaluated_source_urls")
+    if isinstance(evaluated_source_urls, list):
+        return next(
+            (
+                source_url
+                for source_url in evaluated_source_urls
+                if isinstance(source_url, str) and source_url
+            ),
+            None,
+        )
     return None
+
+
+def _job_search_results_are_routable(results: object) -> bool:
+    """Return true when a registered route result can drive a public fetch."""
+    if not isinstance(results, list) or not results:
+        return False
+    return any(
+        isinstance(item, dict) and bool(_public_urls_from_search_item(item))
+        for item in results
+    )
+
+
+def _public_urls_from_search_item(item: dict[str, Any]) -> list[str]:
+    """Split duplicated/space-separated sheet URL cells into real URLs."""
+    values = [
+        item.get("url"),
+        item.get("source_url"),
+        item.get("apply_url"),
+        item.get("link"),
+    ]
+    prior = item.get("prior_metadata")
+    if isinstance(prior, dict):
+        values.append(prior.get("apply_url"))
+    urls: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        for candidate in re.findall(r"https?://[^\s]+", value):
+            candidate = candidate.rstrip('.,;，。；)]}"')
+            if candidate and candidate not in urls:
+                urls.append(candidate)
+    return urls
+
+
+def _persisted_job_search_observations(
+    db: Session,
+    run_id: str,
+    artifact_refs: list[dict[str, Any]],
+) -> list[ToolObservation]:
+    """Rehydrate referenced search/sheet rows for deterministic recovery.
+
+    Step inputs carry immutable pointers rather than provider payloads. The
+    recovery path reloads only those same-run ``job_search_results`` rows so
+    it can fetch their public URLs and derive bounded company search hints.
+    """
+    refs_by_id = {
+        str(ref["artifact_id"]): ref
+        for ref in artifact_refs
+        if isinstance(ref, dict)
+        and ref.get("artifact_type") == "job_search_results"
+        and isinstance(ref.get("artifact_id"), str)
+    }
+    if not refs_by_id:
+        return []
+    observations: list[ToolObservation] = []
+    for artifact in run_repository.list_evidence_artifacts(db, run_id):
+        ref = refs_by_id.get(artifact.id)
+        if ref is None or artifact.artifact_type != "job_search_results":
+            continue
+        results = artifact.content_json.get("results")
+        if not isinstance(results, list):
+            continue
+        query = artifact.content_json.get("query")
+        tool_name = ref.get("tool")
+        if tool_name not in {
+            "query-career-sheet-records",
+            "search-public-job-pages",
+        }:
+            tool_name = (
+                "query-career-sheet-records"
+                if isinstance(query, dict)
+                else "search-public-job-pages"
+            )
+        collection_name = (
+            "records"
+            if tool_name == "query-career-sheet-records"
+            else "results"
+        )
+        observations.append(
+            ToolObservation(
+                tool_name=tool_name,
+                status="succeeded",
+                output={
+                    collection_name: results,
+                    "query": query,
+                    "source_url": artifact.source_url,
+                    "content_hash": artifact.content_hash,
+                },
+            )
+        )
+    return observations
 
 
 def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]:
@@ -3282,6 +4320,54 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
         if artifact.artifact_type == "public_job_page"
         and isinstance(artifact.content_json.get("quality"), str)
     }
+    search_metadata_by_url: dict[str, dict[str, Any]] = {}
+    for artifact in artifacts:
+        if artifact.artifact_type != "job_search_results":
+            continue
+        raw_results = artifact.content_json.get("results")
+        if not isinstance(raw_results, list):
+            continue
+        for result in raw_results:
+            if not isinstance(result, dict):
+                continue
+            urls = [
+                result.get("url"),
+                result.get("source_url"),
+                result.get("apply_url"),
+                result.get("link"),
+            ]
+            prior = result.get("prior_metadata")
+            if isinstance(prior, dict):
+                urls.append(prior.get("apply_url"))
+            metadata = {
+                key: result.get(key)
+                for key in (
+                    "updated_at",
+                    "published_at",
+                    "posted_at",
+                    "publish_time",
+                    "update_time",
+                )
+                if result.get(key) not in (None, "")
+            }
+            if isinstance(prior, dict):
+                metadata.update(
+                    {
+                        key: prior.get(key)
+                        for key in (
+                            "updated_at",
+                            "published_at",
+                            "posted_at",
+                            "publish_time",
+                            "update_time",
+                        )
+                        if prior.get(key) not in (None, "")
+                    }
+                )
+            if metadata:
+                for url in urls:
+                    if isinstance(url, str) and url:
+                        search_metadata_by_url[url] = metadata
     for artifact in artifacts:
         raw_candidates = artifact.content_json.get("candidates")
         if not isinstance(raw_candidates, list):
@@ -3323,8 +4409,24 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     # page's quality and bypass the list-only gate.
                     "source_quality": quality_by_source.get(artifact.source_url)
                     or quality_by_source.get(source_url),
+                    **search_metadata_by_url.get(artifact.source_url, {}),
+                    **search_metadata_by_url.get(source_url, {}),
                     "title": title if isinstance(title, str) else None,
                     "locations": _string_list(candidate.get("locations")),
+                    "recruitment_types": _string_list(
+                        candidate.get("recruitment_types")
+                    ),
+                    "deadline_text": (
+                        candidate.get("deadline_text")
+                        if isinstance(candidate.get("deadline_text"), str)
+                        else None
+                    ),
+                    "published_at": (
+                        candidate.get("published_at")
+                        if isinstance(candidate.get("published_at"), str)
+                        else None
+                    ),
+                    "skills": _string_list(candidate.get("skills")),
                     # Card-list extraction can land JD snippets in company_name
                     # (Feishu campus cards) — carry it as bounded evidence so the
                     # match tool can score on it, never as a trusted company fact.

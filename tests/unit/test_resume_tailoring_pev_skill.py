@@ -181,3 +181,65 @@ def test_resume_brief_emits_only_missing_gap_when_no_keyword_is_supported_by_fac
     assert result.safe_actions == [
         "Python、RAG 尚无已确认事实：仅在能补充项目证据时添加，不得虚构。",
     ]
+
+
+def test_resume_brief_accepts_aigc_synonyms_and_preserves_liepin_attribution() -> None:
+    """A named-source mirror stays valid only with its exact captured attribution marker."""
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "在猎聘网找北京的 AIGC 产品经理（应届生）岗位，并定制简历。",
+            "observed_public_evidence": [{
+                "artifact_id": "linkedin-liepin-jd",
+                "source_url": "https://cn.linkedin.com/jobs/view/ai-product-manager-123",
+                "content_hash": "f" * 64,
+                "title": "AI产品经理实习生",
+                "visible_text": (
+                    "AI产品经理实习生 北京市 该职位来源于猎聘 "
+                    "参与大模型、Agent、Prompt 和 RAG 产品设计；本科生可申请。"
+                ),
+            }],
+            "confirmed_profile_facts": {"skills": ["Prompt", "RAG"]},
+        },
+    )
+
+    result = build_resume_tailoring_brief(
+        context,
+        BuildResumeTailoringBriefInput(
+            target_artifact_id="linkedin-liepin-jd",
+            target_keywords=["Prompt", "RAG"],
+        ),
+    )
+
+    assert result.target_title == "AI产品经理实习生"
+    assert result.source_url == "https://cn.linkedin.com/jobs/view/ai-product-manager-123"
+    assert result.source_attribution == "猎聘"
+    assert result.supported_keywords == ["prompt", "rag"]
+
+
+def test_resume_brief_rejects_named_source_mirror_without_attribution_marker() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "在猎聘网找北京的 AIGC 产品经理实习岗位，并定制简历。",
+            "observed_public_evidence": [{
+                "artifact_id": "linkedin-unattributed",
+                "source_url": "https://cn.linkedin.com/jobs/view/ai-product-manager-456",
+                "content_hash": "e" * 64,
+                "title": "AI产品经理实习生",
+                "visible_text": "北京 大模型 Agent 产品设计，实习生可申请。",
+            }],
+            "confirmed_profile_facts": {"skills": ["Agent"]},
+        },
+    )
+
+    with pytest.raises(ResumeTailoringError, match="target_source_mismatch"):
+        build_resume_tailoring_brief(
+            context,
+            BuildResumeTailoringBriefInput(
+                target_artifact_id="linkedin-unattributed",
+                target_keywords=["Agent"],
+            ),
+        )
