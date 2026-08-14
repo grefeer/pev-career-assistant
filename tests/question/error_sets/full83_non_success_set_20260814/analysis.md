@@ -287,3 +287,14 @@ _EXECUTOR_OPERATING_PROCEDURE 不包含 prompt_rules.py 的中文运行时规则
 
 **迭代 4 候选（待 iter2 结果确认）**：R021 加中国移动/中国联通关键词 iguopin(国聘) 种子；R038 补"contract 要求全量规范化时批处理所有 jd_complete 页面"流程点；Q134/R047 视结果再定。
 
+## iter2 评估结果（迭代1代码，6a8a06a，07:47 完成）
+
+**19 succeeded / 8 waiting_user / 1 failed**（基线 0/28 成功）。C002 C007 C010 C011 C015?（否）转成功者：C002 C007 C010 C011 Q011? 等。
+剩余 9 题：C008(L1 猎聘 Java 反爬，本次撞上)、C015(要求 ≥3 个 talent.baidu.com GRADUATE jd_complete，baidu SPA 不稳定)、
+Q028(resume-tailoring 终态不可解析)、Q046(5 个 iguopin JD 全部 no_match)、Q115(前端 JD，access_denied 后 stall)、
+R013(百度/美团/小米 AIGC PM，tool_budget_exhausted 硬失败)、R025(广州/深圳前端 tailoring，target_evidence_not_found)、
+R043(上海猎聘 Java 硬来源 + script_must_be_python)、R045(AIGC PM brief，target_source_mismatch)。
+
+**迭代 5（006a607）**：C006/C007/C008/C009-L1 补 iguopin 角色搜索备用种子（猎聘 landing 反爬是间歇性的）。
+**iter3 启动**：剩余 9 题，HEAD 代码（含迭代2/3/4/5 全部修复），单线程。
+
