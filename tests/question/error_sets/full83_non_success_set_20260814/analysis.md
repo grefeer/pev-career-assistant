@@ -1,4 +1,4 @@
-﻿# full83_single_20260814_215826 28 个非成功用例画像
+# full83_single_20260814_215826 28 个非成功用例画像
 
 ## C002  [waiting_user] err= rc=adapter:empty_result role=executor/execution resumable=True
 Q: null
@@ -268,4 +268,22 @@ summary: 模型未返回可解析的终态，但当前步骤的交付证据尚�
 4. Executor 规则新增：目标对象与用户要求不符时换语义匹配目标重试，连续两次同类失败即收尾（修复 R045 的 5 次 brief 失败预算燃烧）。
 
 **预期**：Q057/R042/C002/C015/R040/R047 及 liepin 反爬组（Q011 Q046 Q055 Q071 Q115 R024 R027 R043 C010 C011）大概率转成功；R045 部分改善；Q028/R021/R038/R013/Q134/C007-L2/C008-L2 留待迭代 2。
+
+## 迭代 2/3 修复记录
+
+**关键发现**：评估实际使用 Classic Planner + Deep Executor + Classic Verifier；Deep Executor 的英文
+_EXECUTOR_OPERATING_PROCEDURE 不包含 prompt_rules.py 的中文运行时规则；_bounded_context_metadata
+刻意不投影 confirmed_profile_facts（有单测锁定），事实经 private_context 送达模型。
+
+**迭代 2（ac5a43e）**：
+1. 完成门禁拒绝（执行器宣告成功但契约未满足、非核验步骤）→ 有界 REPLAN 一次（shared RETRY_CONTRACT_EXHAUSTED marker）。
+2. Planner 规则：禁止规划任务上下文与上游都没有的 context 输入（R013）。
+3. Executor 规则：下游工具必须传入已确认事实。
+
+**迭代 3（5866fb0）**：
+1. Deep Executor 流程新增：target_role/target_source mismatch → 换语义匹配候选，同类失败两次即收手（R045）；
+   声明 confirmed-facts 输入端口的工具必须从 private_context 原样传入事实（C008-L2）。
+2. 运行时：Deep Executor 终态不可解析且契约未满足 → 有界 REPLAN 一次（Q011/Q028/Q071/R047 类）。
+
+**迭代 4 候选（待 iter2 结果确认）**：R021 加中国移动/中国联通关键词 iguopin(国聘) 种子；R038 补"contract 要求全量规范化时批处理所有 jd_complete 页面"流程点；Q134/R047 视结果再定。
 
