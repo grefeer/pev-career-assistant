@@ -38,6 +38,8 @@ from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
 from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+from backend.app.services.career_skills.manifest import build_career_skill_registry
+from backend.app.services.career_skills.job_discovery import SearchPublicJobPagesInput
 
 
 class EmptyInput(BaseModel):
@@ -70,6 +72,18 @@ class SearchResultsOutput(BaseModel):
     source_url: str
     content_hash: str
     results: list[dict[str, str]]
+
+
+class OfficialNegativeSearchOutput(SearchResultsOutput):
+    terminal_reason: str
+    provider: str
+    source_scope: str
+    time_window_days: int
+    coverage_complete: bool
+    scanned_result_count: int
+    matched_result_count: int
+    scan_queries: list[str]
+    scan_evidence: list[dict[str, str]]
 
 
 class SheetRecordsOutput(BaseModel):
@@ -2607,6 +2621,12 @@ def test_requested_role_seed_urls_include_exact_ai_application_intern_jd() -> No
     ]
     assert agent_runtime_module._requested_role_seed_urls(
         "请找一份 Java 后端开发工程师公开 JD。"
+    ) == [
+        "https://app.mokahr.com/campus-recruitment/tal/146599"
+        "?recommendCode=DSXc7DBC#/jobs"
+    ]
+    assert agent_runtime_module._requested_role_seed_urls(
+        "请搜索 Java 编程学习资料。"
     ) == []
 
 
@@ -2986,6 +3006,155 @@ def test_runtime_persists_public_search_results_as_discovery_evidence(db_session
             "query": "AI Agent 开发 官方招聘",
             "results": [{"title": "Agent 工程师", "url": "https://jobs.example/agent", "snippet": "公开 JD"}],
         }),
+    ]
+
+
+def test_runtime_finishes_job_discovery_plan_after_complete_official_zero_match(
+    db_session,
+) -> None:
+    """A complete source-scoped zero match is the answer to an existence
+    question; downstream fetch/extract steps must not re-search an empty set."""
+    user = User(
+        id="juejin-user",
+        account="juejin-user@example.test",
+        nickname="juejin-user",
+        password_hash="not-a-real-password-hash",
+        role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway(
+        {
+            AgentRole.planner: [
+                {
+                    "action": "plan",
+                    "complexity": "L2",
+                    "success_criteria": ["回答最近三天是否存在匹配岗位"],
+                    "steps": [
+                        {
+                            "step_id": "discover",
+                            "objective": "检索掘金最近三天招聘帖",
+                            "allowed_skills": ["job-discovery"],
+                            "outputs": [
+                                {
+                                    "name": "job_search_results",
+                                    "artifact_type": "job_search_results",
+                                }
+                            ],
+                        },
+                        {
+                            "step_id": "fetch",
+                            "objective": "抓取候选页面",
+                            "allowed_skills": ["job-discovery"],
+                            "depends_on": ["discover"],
+                            "inputs": [
+                                {
+                                    "kind": "artifact",
+                                    "name": "job_search_results",
+                                    "from_step": "discover",
+                                    "artifact_type": "job_search_results",
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "name": "public_job_page",
+                                    "artifact_type": "public_job_page",
+                                }
+                            ],
+                        },
+                    ],
+                }
+            ],
+            AgentRole.executor: [
+                {
+                    "action": "call_tool",
+                    "tool_name": "search-public-job-pages",
+                    "tool_input": {"query": "site:juejin.cn AIGC 产品经理 招聘"},
+                },
+                {
+                    "action": "need_user",
+                    "user_question": "没有候选页面，请提供其他来源。",
+                },
+            ],
+            AgentRole.verifier: [],
+        }
+    )
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="search-public-job-pages",
+            skill_name="job-discovery",
+            input_model=SearchPublicJobPagesInput,
+            output_model=OfficialNegativeSearchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, payload: {
+                "query": payload.query,
+                "source_url": "https://api.juejin.cn/search_api/v1/search",
+                "content_hash": "a" * 64,
+                "results": [],
+                "terminal_reason": "search_empty",
+                "provider": "juejin_official_search",
+                "source_scope": "juejin.cn",
+                "time_window_days": 3,
+                "coverage_complete": True,
+                "scanned_result_count": 7,
+                "matched_result_count": 0,
+                "scan_queries": ["招聘", "内推", "校招"],
+                "scan_evidence": [
+                    {
+                        "title": "招聘系统架构",
+                        "url": "https://juejin.cn/post/7670000000000000001",
+                        "snippet": "技术文章，不是岗位。",
+                        "published_at": "2026-08-14T09:00:00+00:00",
+                    }
+                ],
+            },
+        )
+    )
+    skills = build_career_skill_registry(registry)
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry, skills=skills),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=skills),
+        verifier=VerifierAgent(gateway=gateway, tools=registry, skills=skills),
+        agent_version="pev-test",
+        skills=skills,
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal=(
+                "稀土掘金社区最近3天的招聘帖里，有没有适合我的 "
+                "AIGC 产品经理（应届生）岗位？"
+            ),
+            allowed_skills=["job-discovery"],
+        ),
+    )
+
+    steps = list(
+        db_session.scalars(
+            select(AgentStep)
+            .where(AgentStep.run_id == result.run_id)
+            .order_by(AgentStep.sequence)
+        )
+    )
+    assert result.status is RunStatus.succeeded
+    assert "未找到" in (result.summary or "")
+    assert [(step.sequence, step.status) for step in steps] == [
+        (1, StepStatus.succeeded)
+    ]
+    artifacts = list(
+        db_session.scalars(
+            select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
+        )
+    )
+    assert [artifact.artifact_type for artifact in artifacts] == [
+        "job_search_results"
+    ]
+    assert "terminal_negative_discovery_succeeded" in [
+        event.event_type
+        for event in run_repository.list_events(db_session, result.run_id)
     ]
 
 

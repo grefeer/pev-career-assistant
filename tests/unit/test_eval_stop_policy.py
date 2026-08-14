@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests.question.eval_policy import (
+    audit_success_record,
     non_success_count,
     root_cause,
     should_stop,
@@ -58,3 +59,64 @@ def test_root_cause_prefers_actionable_error_over_budget_symptom() -> None:
     )
 
     assert root_cause(record) == "contract_or_policy_error"
+
+
+def test_success_audit_accepts_complete_official_negative_source_scan() -> None:
+    record = _record(
+        "R034",
+        "succeeded",
+        artifacts=[
+            {
+                "artifact_id": "artifact-1",
+                "artifact_type": "job_search_results",
+                "source_url": "https://api.juejin.cn/search_api/v1/search",
+                "content_hash": "a" * 64,
+                "provider": "juejin_official_search",
+                "source_scope": "juejin.cn",
+                "time_window_days": 3,
+                "coverage_complete": True,
+                "scanned_result_count": 7,
+                "matched_result_count": 0,
+                "terminal_reason": "search_empty",
+                "result_count": 0,
+            }
+        ],
+    )
+
+    assert audit_success_record(record) == {
+        "status": "passed",
+        "verified_negative_source_scans": 1,
+    }
+
+
+def test_success_audit_rejects_incomplete_or_generic_empty_search() -> None:
+    base = {
+        "artifact_id": "artifact-1",
+        "artifact_type": "job_search_results",
+        "source_url": "https://api.juejin.cn/search_api/v1/search",
+        "content_hash": "a" * 64,
+        "provider": "juejin_official_search",
+        "source_scope": "juejin.cn",
+        "time_window_days": 3,
+        "coverage_complete": False,
+        "scanned_result_count": 7,
+        "matched_result_count": 0,
+        "terminal_reason": "search_empty",
+        "result_count": 0,
+    }
+    assert audit_success_record(
+        _record("R034", "succeeded", artifacts=[base])
+    )["status"] != "passed"
+    assert audit_success_record(
+        _record(
+            "R034",
+            "succeeded",
+            artifacts=[
+                {
+                    **base,
+                    "provider": "public_web_search",
+                    "coverage_complete": True,
+                }
+            ],
+        )
+    )["status"] != "passed"

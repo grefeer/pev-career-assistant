@@ -92,6 +92,7 @@ _VERIFIED_ZERO_MATCH_MARKERS = (
 _DISCOVERY_EVIDENCE_ARTIFACT_TYPES = frozenset(
     {"public_job_page", "structured_job_details"}
 )
+_TERMINAL_NEGATIVE_DISCOVERY_CODE = "terminal_negative_discovery_complete"
 
 #: Per-candidate cap for the full JD text preserved alongside the bounded
 #: sections (``full_text``). Extraction outputs are already bounded by the
@@ -869,6 +870,30 @@ class AgentRuntime:
                         deadline=deadline,
                         replans=replans,
                     )
+                if outcome.error_code == _TERMINAL_NEGATIVE_DISCOVERY_CODE:
+                    tagged_outputs = self._tag_step_outputs(
+                        plan_step, list(step.output_artifact_refs_json or [])
+                    )
+                    step.output_artifact_refs_json = tagged_outputs
+                    final_summary = outcome.summary
+                    run_repository.finish_run(
+                        db,
+                        run,
+                        status=RunStatus.succeeded,
+                        final_summary=final_summary,
+                    )
+                    run_repository.append_event(
+                        db,
+                        run_id=run.id,
+                        event_type="run_succeeded",
+                        payload_json={
+                            "summary": final_summary,
+                            "reason": "terminal_negative_discovery_succeeded",
+                        },
+                    )
+                    return AgentRunResult(
+                        run.id, RunStatus.succeeded, final_summary
+                    )
                 if outcome.error_code == "replan_required":
                     replan_feedback = outcome.summary
                     replan_reason = outcome.replan_reason or ReplanReason.VERIFIER_REPLAN
@@ -1186,6 +1211,35 @@ class AgentRuntime:
                     "artifact_refs": [*prior_artifact_refs, *observed_artifact_refs],
                 }
             )
+            if self._is_complete_official_negative_discovery(
+                task, plan, plan_step, execution
+            ) and not self._step_has_blocked_evidence(
+                plan_step, execution.observations, execution.artifact_refs
+            ):
+                summary = self._official_negative_discovery_summary(
+                    task, execution
+                )
+                completed_execution = execution.model_copy(
+                    update={
+                        "status": "succeeded",
+                        "error_code": None,
+                        "summary": summary,
+                    }
+                )
+                self._rescue_step_succeeded(
+                    db,
+                    run_id,
+                    persisted_step,
+                    completed_execution,
+                    event_type="terminal_negative_discovery_succeeded",
+                    reason="complete_official_source_scan_zero_match",
+                )
+                return AgentRunResult(
+                    run_id,
+                    RunStatus.running,
+                    summary,
+                    _TERMINAL_NEGATIVE_DISCOVERY_CODE,
+                )
             if (
                 execution.status == "failed"
                 and auto_artifact_refs
@@ -2081,6 +2135,71 @@ class AgentRuntime:
             if isinstance(ref, dict)
         )
 
+    @staticmethod
+    def _is_complete_official_negative_discovery(
+        task: AgentTaskRequest,
+        plan: ExecutionPlan,
+        step: PlanStep,
+        execution: ExecutorResult,
+    ) -> bool:
+        """Close a pure discovery plan when an official scoped scan proves zero.
+
+        This is narrower than a generic ``search_empty``: every planned step
+        must belong only to job-discovery, the task must ask an existence
+        question, and the successful observation must pass the reviewed
+        source-specific semantic checker. Downstream fetch/extract steps have
+        no input after a verified empty set and are therefore intentionally
+        not executed.
+        """
+        if set(step.allowed_skills) != {"job-discovery"}:
+            return False
+        if not plan.steps or any(
+            set(candidate.allowed_skills) != {"job-discovery"}
+            for candidate in plan.steps
+        ):
+            return False
+        compact_goal = re.sub(r"\s+", "", task.goal).lower()
+        if not any(
+            marker in compact_goal for marker in _DISCOVERY_EXISTENCE_QUERY_MARKERS
+        ):
+            return False
+        return any(
+            observation.tool_name == "search-public-job-pages"
+            and observation.status == "succeeded"
+            and skill_observation_is_semantically_valid(
+                observation.tool_name, observation.output
+            )
+            for observation in execution.observations
+        )
+
+    @staticmethod
+    def _official_negative_discovery_summary(
+        task: AgentTaskRequest, execution: ExecutorResult
+    ) -> str:
+        output = next(
+            (
+                observation.output
+                for observation in execution.observations
+                if observation.tool_name == "search-public-job-pages"
+                and observation.status == "succeeded"
+                and skill_observation_is_semantically_valid(
+                    observation.tool_name, observation.output
+                )
+            ),
+            {},
+        )
+        recent_days = output.get("time_window_days") if isinstance(output, dict) else None
+        window_text = f"最近{recent_days}天" if isinstance(recent_days, int) else "指定时间窗"
+        source_name = (
+            "稀土掘金"
+            if isinstance(output, dict) and output.get("source_scope") == "juejin.cn"
+            else "指定公开来源"
+        )
+        return (
+            f"已完成{source_name}{window_text}官方公开搜索的完整分页核验；"
+            f"未找到满足用户硬约束的招聘帖。任务原始范围：{task.goal}"
+        )
+
     def _has_blocked_evidence(self, observations: list) -> bool:
         if self._skills is None:
             return legacy_has_blocked_evidence(observations)
@@ -2741,6 +2860,7 @@ class AgentRuntime:
                     "source_quality",
                     "output_name",
                     "semantic_valid",
+                    "completion_valid",
                 ):
                     value = item.get(optional)
                     if isinstance(value, str) and value:
@@ -2840,6 +2960,16 @@ class AgentRuntime:
         per-URL failures, and never invent or retry around access controls.
         """
         if "job-discovery" not in plan_step.allowed_skills:
+            return [], []
+        if any(
+            ref.get("artifact_type") == "job_search_results"
+            and ref.get("completion_valid") == "true"
+            for ref in artifact_refs
+        ):
+            # A complete official source scan with zero matches is already a
+            # final discovery proof. Re-running search cannot create a fetch
+            # candidate and only adds route/hash noise before the terminal
+            # negative rescue evaluates the original observation.
             return [], []
 
         # An explicitly named source or exact requested-role evidence page is

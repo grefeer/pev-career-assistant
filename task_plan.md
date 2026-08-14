@@ -660,3 +660,31 @@ C005、R007 仍依赖不稳定的搜索路由，两题均退回 `waiting_user`�
   next fresh full-set attempt.
 - [ ] After 24/24 passes, rerun final unit/static verification and inspect the
   exact changed/untouched file set before completing the goal.
+
+## Iteration 29 R034 official-source repair (2026-08-14)
+
+- [x] Diagnose iter27 R034: the Juejin web shell yielded no content, while
+  general search returned stale or unrelated posts and exhausted its route.
+- [x] Verify Juejin's current public search endpoint and its cursor contract;
+  the official API returns timestamped article IDs and supports a recent-week
+  source scan without login or anti-bot bypass.
+- [x] Add a source-specific, bounded official scan for tasks that explicitly
+  name Juejin and a recent window of at most seven days. The scan exhausts
+  `招聘` / `内推` / `校招`, filters exact timestamps, then applies the user's
+  role and graduate hard constraints.
+- [x] Extend the job-discovery contract only for a complete official negative
+  scan. Ordinary empty web searches and incomplete pagination still cannot
+  satisfy the deliverable gate.
+- [x] RED→GREEN tests cover pagination, time exclusion, role filtering, and
+  the strict negative-deliverable boundary; 229 related tests pass and Ruff
+  passes.
+- [x] Iter29 exposed a second terminal bug: the official zero-match artifacts
+  were persisted, but the executor's `needs_user` was followed by another
+  search/replan and ended in `route_already_consumed`.
+- [x] Add a pure-discovery terminal rescue: a complete official negative scan
+  now closes the current step and the whole existence-query plan; downstream
+  fetch/extract steps over an empty candidate set are intentionally not run.
+- [x] Extend the live success audit with the same strict official-negative
+  fields. Iter30 R034 succeeded and its audit passed.
+- [ ] Finish iter27 diagnostics and launch the next fresh all-24 process with
+  the latest code.

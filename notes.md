@@ -481,3 +481,45 @@ Manifest：`tests/question/error_sets/non_crawl_error_set_20260814/manifest.json
   resume-tailoring brief are both bound to
   `https://career.hebut.edu.cn/correcruit/content/id/79111.html`, confirming
   that exact raw-page target identity survived matching into tailoring.
+
+## Iteration 29 R034 official Juejin coverage
+
+- Iter27 R034 was not a genuine external anti-bot terminal. The web route
+  `https://juejin.cn/pins/new` was a JS shell, two search-result pages were
+  empty, and the remaining results were old or unrelated. The executor then
+  exhausted the bounded public-search route.
+- Juejin's current web bundle calls the anonymous official endpoint
+  `https://api.juejin.cn/search_api/v1/search`. A live probe confirmed cursor
+  pagination, official `ctime` timestamps, article IDs, titles, and snippets.
+- The new adapter runs only when the original task explicitly names Juejin and
+  states a 1–7 day window. It scans the official `招聘`, `内推`, and `校招`
+  result sets to exhaustion, deduplicates IDs, applies the exact rolling time
+  cutoff, and then checks explicit role/cohort constraints. It never upgrades
+  a generic search-engine miss into an exhaustive claim.
+- The current live product-tool probe inspected seven distinct official
+  records inside the rolling three-day window and found zero AIGC product
+  manager graduate-role posts. The output carries the source endpoint, scan
+  queries, timestamped evidence projection, coverage flag, counts, and a hash.
+- The discovery completion contract accepts this result only when provider,
+  source scope, time window, complete pagination, zero result count, terminal
+  reason, endpoint, and evidence hash all match the reviewed shape. The
+  persisted search artifact separately marks routing validity and final
+  completion validity, preventing ordinary URL lists or Bing-empty responses
+  from closing the task.
+- Iter29 persisted the official scan but still waited: the plan treated the
+  first step as URL routing and kept a fetch/extract suffix, while an empty
+  result set has no URL to route. Repeated searches then hit
+  `route_already_consumed`.
+- Runtime now recognizes the stronger terminal shape only for an existence
+  question whose entire plan is scoped to `job-discovery`. It marks the scan
+  step succeeded, finishes the run, and does not execute downstream steps that
+  require nonexistent candidates. A generic search miss, mixed-skill plan, or
+  imperative discovery task does not take this path.
+- The eval success audit independently requires a SHA-256-bound official
+  Juejin search artifact, complete pagination, explicit time window, zero
+  matched/result counts, and `search_empty`. This does not weaken the normal
+  requirement for a `jd_complete` public page on positive discovery results.
+- Iter30 R034 succeeded with `success_audit.status=passed`; its final summary
+  reports the official three-day scan and the honest absence of an AIGC
+  product-manager graduate-role post. Evidence:
+  `tests/question/eval_results/pev_waiting_internal_set_20260814_iter30_r034_terminal_live/R034.json`.

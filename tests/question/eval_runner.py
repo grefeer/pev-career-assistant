@@ -444,6 +444,47 @@ def run_question(
                     and isinstance(artifact.content_json.get("candidates"), list)
                     else None
                 ),
+                "provider": (
+                    artifact.content_json.get("provider")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "source_scope": (
+                    artifact.content_json.get("source_scope")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "time_window_days": (
+                    artifact.content_json.get("time_window_days")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "coverage_complete": (
+                    artifact.content_json.get("coverage_complete")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "scanned_result_count": (
+                    artifact.content_json.get("scanned_result_count")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "matched_result_count": (
+                    artifact.content_json.get("matched_result_count")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "terminal_reason": (
+                    artifact.content_json.get("terminal_reason")
+                    if isinstance(artifact.content_json, dict)
+                    else None
+                ),
+                "result_count": (
+                    len(artifact.content_json.get("results", []))
+                    if isinstance(artifact.content_json, dict)
+                    and isinstance(artifact.content_json.get("results"), list)
+                    else None
+                ),
                 "created_by": artifact.created_by.value,
             }
             for artifact in artifacts

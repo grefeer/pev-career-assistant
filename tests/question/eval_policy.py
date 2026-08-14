@@ -63,6 +63,7 @@ def audit_success_record(record: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(artifacts, list):
         return {"status": "inconclusive", "reason": "artifacts_missing"}
     valid_pages = 0
+    verified_negative_source_scans = 0
     forbidden: list[str] = []
     for artifact in artifacts:
         if not isinstance(artifact, dict):
@@ -71,6 +72,26 @@ def audit_success_record(record: dict[str, Any]) -> dict[str, Any]:
         if quality in {"list_only", "search_empty", "blocked", "empty"}:
             forbidden.append(str(quality))
         if artifact.get("artifact_type") != "public_job_page":
+            if (
+                artifact.get("artifact_type") == "job_search_results"
+                and artifact.get("provider") == "juejin_official_search"
+                and artifact.get("source_scope") == "juejin.cn"
+                and artifact.get("coverage_complete") is True
+                and isinstance(artifact.get("time_window_days"), int)
+                and artifact["time_window_days"] > 0
+                and isinstance(artifact.get("scanned_result_count"), int)
+                and artifact["scanned_result_count"] >= 0
+                and artifact.get("matched_result_count") == 0
+                and artifact.get("terminal_reason") == "search_empty"
+                and artifact.get("result_count") == 0
+                and isinstance(artifact.get("source_url"), str)
+                and artifact["source_url"].startswith(
+                    "https://api.juejin.cn/search_api/v1/search"
+                )
+                and isinstance(artifact.get("content_hash"), str)
+                and _SHA256_RE.fullmatch(artifact["content_hash"]) is not None
+            ):
+                verified_negative_source_scans += 1
             continue
         if (
             isinstance(artifact.get("artifact_id"), str)
@@ -86,6 +107,11 @@ def audit_success_record(record: dict[str, Any]) -> dict[str, Any]:
             valid_pages += 1
     if valid_pages:
         return {"status": "passed", "valid_public_job_pages": valid_pages}
+    if verified_negative_source_scans:
+        return {
+            "status": "passed",
+            "verified_negative_source_scans": verified_negative_source_scans,
+        }
     if forbidden:
         return {
             "status": "failed",
