@@ -422,6 +422,61 @@ def test_needs_user_conversion_is_once_per_run(db_session) -> None:
     ]
 
 
+class StubInvalidResponseExecutor:
+    """Executor stub returning the Deep Executor's unparseable-terminal hand-off."""
+
+    def run(self, **kwargs: Any) -> ExecutorResult:
+        return ExecutorResult(
+            status="needs_user",
+            user_question="模型未返回可解析的终态，请补充岗位正文或重试。",
+            error_code="deep_executor_invalid_response",
+        )
+
+
+def test_deep_executor_invalid_response_converts_to_bounded_replan(
+    db_session,
+) -> None:
+    """An unparseable terminal with an unmet contract replans once per run."""
+    user = _user("user-c8")
+    db_session.add(user)
+    db_session.commit()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [
+            _plan_decision(["job-matching"]),
+            _plan_decision(["job-matching"]),
+        ],
+        AgentRole.executor: [],
+        AgentRole.verifier: [],
+    })
+    registry = ToolRegistry()
+    _register_match_tool(registry)
+    runtime = AgentRuntime(
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=StubInvalidResponseExecutor(),
+        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        agent_version="pev-test",
+    )
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="匹配岗位",
+            allowed_skills=["job-matching"],
+            budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=2),
+        ),
+    )
+
+    # First invalid response converted to a replan; the repeated one (marker
+    # already present) stays a human hand-off.
+    assert result.status is RunStatus.waiting_user
+    assert result.summary == "模型未返回可解析的终态，请补充岗位正文或重试。"
+    assert _events(db_session, result.run_id).count("verification_replan") == 1
+    steps = _steps(db_session, result.run_id)
+    assert len(steps) == 2
+    assert {step.error_code for step in steps} == {"replan_required", "need_user"}
+
+
 def test_completion_gate_rejection_converts_to_bounded_replan(db_session) -> None:
     """An executor-declared success over an empty deliverable replans once."""
     user = _user("user-c7")

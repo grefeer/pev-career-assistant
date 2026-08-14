@@ -1344,6 +1344,34 @@ class AgentRuntime:
                         event_type="executor_rescue_succeeded",
                         reason="needs_user_deliverable_persisted",
                     )
+                if (
+                    execution.error_code == "deep_executor_invalid_response"
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
+                    and replans < task.budget.max_replans
+                    and not task.replan_state.conversion_used(
+                        ReplanReason.RETRY_CONTRACT_EXHAUSTED
+                    )
+                ):
+                    # The Deep Executor produced no parseable terminal and the
+                    # step's deliverable contract is still unmet. Convert to a
+                    # bounded REPLAN (once per run, guarded by the replan
+                    # budget and the shared retry-exhaustion marker) so the
+                    # planner can restructure the step instead of ending at a
+                    # human hand-off for a purely mechanical parse failure.
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=(
+                            "执行器未输出可解析的完成终态且交付契约未满足；"
+                            "请重组该步骤、缩小范围或更换交付路线。"
+                        ),
+                        summary=f"执行器终态不可解析 {_RETRY_REPLAN_MARKER}",
+                        output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.RETRY_CONTRACT_EXHAUSTED,
+                    )
                 return self._wait_for_user(
                     db,
                     run_id,
