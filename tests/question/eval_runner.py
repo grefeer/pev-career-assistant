@@ -128,6 +128,8 @@ IGUOPIN_SEARCH = {  # https://www.iguopin.com/job/list?keyword=<kw>, URL-encoded
     "ai": "https://www.iguopin.com/job/list?keyword=AI%E7%AE%97%E6%B3%95%E5%B7%A5%E7%A8%8B%E5%B8%88",  # AI算法工程师
     "pm": "https://www.iguopin.com/job/list?keyword=%E4%BA%A7%E5%93%81%E7%BB%8F%E7%90%86",  # 产品经理
     "llm": "https://www.iguopin.com/job/list?keyword=%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91",  # 大模型应用开发
+    "cmcc": "https://www.iguopin.com/job/list?keyword=%E4%B8%AD%E5%9B%BD%E7%A7%BB%E5%8A%A8",  # 中国移动
+    "cucc": "https://www.iguopin.com/job/list?keyword=%E4%B8%AD%E5%9B%BD%E8%81%94%E9%80%9A",  # 中国联通
 }
 
 # question id -> (urls, seed note)
@@ -155,7 +157,7 @@ SEED_URLS: dict[str, tuple[list[str], str]] = {
     "R018": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
     "R019": ([IGUOPIN_SEARCH["ai"]], "iguopin AI 算法搜索页 (render-verified job cards)"),
     "R020": ([IGUOPIN_SEARCH["pm"]], "iguopin 产品经理搜索页 (render-verified job cards)"),
-    "R021": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
+    "R021": ([IGUOPIN_SEARCH["java"], IGUOPIN_SEARCH["cmcc"], IGUOPIN_SEARCH["cucc"]], "iguopin Java 后端 + 中国移动/中国联通关键词搜索页 (render-verified job cards)"),
     "R022": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
     "R023": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "R024": ([LIEPIN_ROLE_URLS["java"], IGUOPIN_SEARCH["java"]], "liepin 后端 role landing + iguopin Java 搜索 fallback"),

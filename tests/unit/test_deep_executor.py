@@ -684,6 +684,7 @@ def test_executor_operating_procedure_requires_detail_page_expansion() -> None:
     assert "detail pages" in _EXECUTOR_OPERATING_PROCEDURE
     assert "target_role_mismatch" in _EXECUTOR_OPERATING_PROCEDURE
     assert "private_context" in _EXECUTOR_OPERATING_PROCEDURE
+    assert "ALL of them in batch extraction calls" in _EXECUTOR_OPERATING_PROCEDURE
 
 
 def test_filesystem_tools_cannot_modify_the_skill_package(tmp_path: Path) -> None:
