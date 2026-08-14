@@ -1,0 +1,233 @@
+{
+  "id": "full83_non_success_set_20260814",
+  "description": "从 full83_single_20260814_215826 全量 83 题单线程结果提取的 28 个非成功用例回归集（27 waiting_user + 1 failed），按终端契约四类：外部拦截 15、模型/验证器决策 7、预算耗尽 4、契约校验失败 2",
+  "source_question_dir": "tests/question/redesign",
+  "expected_count": 28,
+  "run_command": ".\\\\.venv\\\\Scripts\\\\python.exe -m tests.question.eval_runner --ids C002 C007 C008 C010 C011 C015 Q011 Q013 Q028 Q046 Q055 Q057 Q071 Q115 Q134 R013 R021 R024 R025 R027 R038 R040 R041 R042 R043 R045 R046 R047 --question-dir tests/question/redesign --out-dir tests/question/eval_results/full83_non_success_set_20260814_live",
+  "cases": [
+    {
+      "id": "C002",
+      "category": "external_blocked",
+      "source_terminal_reason": "adapter:empty_result",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "适配器空结果的解释性终态与候选来源切换"
+    },
+    {
+      "id": "C007",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "C008",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "C010",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "C011",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "C015",
+      "category": "external_blocked",
+      "source_terminal_reason": "adapter:empty_result",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "适配器空结果的解释性终态与候选来源切换"
+    },
+    {
+      "id": "Q011",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "Q013",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "Q028",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "Q046",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "Q055",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "Q057",
+      "category": "budget_exhausted",
+      "source_terminal_reason": "wall_clock_budget_exhausted",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "墙钟预算耗尽的可恢复暂停与分阶段推进"
+    },
+    {
+      "id": "Q071",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "Q115",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "Q134",
+      "category": "external_blocked",
+      "source_terminal_reason": "access_denied",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "访问拒绝后的安全替代路线"
+    },
+    {
+      "id": "R013",
+      "category": "budget_exhausted",
+      "source_terminal_reason": "replan_budget_exhausted",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "重规划预算耗尽前的规划压缩"
+    },
+    {
+      "id": "R021",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "R024",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "R025",
+      "category": "model_or_verifier_decision",
+      "source_terminal_reason": "need_user",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "不可解析模型终态的有界恢复与更可行动的提问"
+    },
+    {
+      "id": "R027",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "R038",
+      "category": "contract_or_policy_error",
+      "source_terminal_reason": "verification_failed",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "交付契约校验失败的证据补齐路径"
+    },
+    {
+      "id": "R040",
+      "category": "external_blocked",
+      "source_terminal_reason": "adapter:empty_result",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "适配器空结果的解释性终态与候选来源切换"
+    },
+    {
+      "id": "R041",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "R042",
+      "category": "budget_exhausted",
+      "source_terminal_reason": "wall_clock_budget_exhausted",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "墙钟预算耗尽的可恢复暂停与分阶段推进"
+    },
+    {
+      "id": "R043",
+      "category": "external_blocked",
+      "source_terminal_reason": "anti_bot_challenge",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "反爬/风控挑战页的安全降级与替代来源"
+    },
+    {
+      "id": "R045",
+      "category": "budget_exhausted",
+      "source_terminal_reason": "tool_budget_exhausted",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "工具调用预算的批量/合并降耗"
+    },
+    {
+      "id": "R046",
+      "category": "contract_or_policy_error",
+      "source_terminal_reason": "verification_failed",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": false,
+      "optimization_focus": "交付契约校验失败的证据补齐路径"
+    },
+    {
+      "id": "R047",
+      "category": "external_blocked",
+      "source_terminal_reason": "adapter:empty_result",
+      "source_result_root": "tests/question/eval_results/full83_single_20260814_215826",
+      "external_block_possible": true,
+      "optimization_focus": "适配器空结果的解释性终态与候选来源切换"
+    }
+  ]
+}
