@@ -288,6 +288,8 @@ class _DeepExecutionLedger:
             "tool_skill_forbidden",
             "unknown_tool",
             "invalid_tool_input",
+            "target_role_mismatch",
+            "target_source_mismatch",
         }:
             self.stable_failed_calls.append((name, payload))
         if observation.error_code in {

@@ -809,3 +809,22 @@ def test_ledger_snapshot_preserves_retry_state_and_deduplicates() -> None:
     assert snapshot["consecutive_stalls"] == 1
     assert snapshot["total_wasted_turns"] == 2
     assert snapshot["succeeded_calls"][0]["hash"] == "hash-from-retry"
+
+
+def test_ledger_records_target_mismatch_as_stable_failure() -> None:
+    ledger = _DeepExecutionLedger(candidate_urls=frozenset())
+    observation = ToolObservation(
+        tool_name="build-resume-tailoring-brief",
+        status="failed",
+        error_code="target_role_mismatch",
+    )
+    ledger.record("build-resume-tailoring-brief", {"target_jd": "jd-1"}, observation)
+
+    assert ledger.is_duplicate_stable_failure(
+        "build-resume-tailoring-brief", {"target_jd": "jd-1"}
+    )
+    # A different target payload is a new call, not a doomed repeat.
+    assert not ledger.is_duplicate_stable_failure(
+        "build-resume-tailoring-brief", {"target_jd": "jd-2"}
+    )
+    assert ledger.total_wasted_turns == 1

@@ -107,6 +107,8 @@ _STABLE_FAILURE_ERROR_CODES = frozenset(
         "unknown_tool",
         "invalid_tool_input",
         "route_already_consumed",
+        "target_role_mismatch",
+        "target_source_mismatch",
     }
 )
 

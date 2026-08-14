@@ -85,6 +85,9 @@ EXECUTOR_RUNTIME_RULES = (
     "observed_evidence_not_found 或 invalid_tool_input 后，不得原样重试。\n"
     "生成下游交付物前，先核对目标语义与候选 artifact 的标题/对象方向/地域等已验证字段；"
     "泛化对象、偶然页面标题或无关段落不能作为目标证据。\n"
+    "下游交付工具返回 target_role_mismatch / target_source_mismatch 时，说明所选目标对象 "
+    "与用户要求不符：从已有 artifact 中换一个语义匹配的目标重试；"
+    "连续两次同类失败后立即停止，用已有证据收尾或 need_user，不得继续消耗预算。\n"
 )
 
 

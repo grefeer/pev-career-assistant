@@ -74,7 +74,7 @@ DEFAULT_BUDGET = AgentBudget(
     max_agent_turns=36,
     max_tool_calls=32,
     max_replans=2,
-    max_wall_clock_seconds=300,
+    max_wall_clock_seconds=600,
 )
 
 # ---------------------------------------------------------------- seed bank
@@ -127,6 +127,7 @@ IGUOPIN_SEARCH = {  # https://www.iguopin.com/job/list?keyword=<kw>, URL-encoded
     "frontend": "https://www.iguopin.com/job/list?keyword=%E5%89%8D%E7%AB%AF%E5%BC%80%E5%8F%91%E5%B7%A5%E7%A8%8B%E5%B8%88",  # 前端开发工程师
     "ai": "https://www.iguopin.com/job/list?keyword=AI%E7%AE%97%E6%B3%95%E5%B7%A5%E7%A8%8B%E5%B8%88",  # AI算法工程师
     "pm": "https://www.iguopin.com/job/list?keyword=%E4%BA%A7%E5%93%81%E7%BB%8F%E7%90%86",  # 产品经理
+    "llm": "https://www.iguopin.com/job/list?keyword=%E5%A4%A7%E6%A8%A1%E5%9E%8B%E5%BA%94%E7%94%A8%E5%BC%80%E5%8F%91",  # 大模型应用开发
 }
 
 # question id -> (urls, seed note)
@@ -135,15 +136,15 @@ IGUOPIN_SEARCH = {  # https://www.iguopin.com/job/list?keyword=<kw>, URL-encoded
 # Chain links run under their own id "C###-L<n>"; link 1 carries the source
 # seeds, links 2+ inherit candidate_urls from the previous link's artifacts.
 SEED_URLS: dict[str, tuple[list[str], str]] = {
-    "Q011": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page (5523ch, real JDs)"),
-    "Q013": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin LLM-dev landing page (sgcc seeds removed)"),
+    "Q011": ([LIEPIN_ROLE_URLS["frontend"], IGUOPIN_SEARCH["frontend"]], "liepin 前端 role landing + iguopin 前端搜索 fallback"),
+    "Q013": ([LIEPIN_ROLE_URLS["llm-dev"], IGUOPIN_SEARCH["llm"]], "liepin LLM-dev landing + iguopin 大模型应用开发 fallback"),
     "Q017": ([*BAIDU_TALENT_URLS, CAMPUS_EVIDENCE[0]], "campus GRADUATE JDs + cofco campus post"),
     "Q028": (CAMPUS_EVIDENCE, "campus job pages (probe-verified)"),
     "Q034": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
     "Q040": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
     "Q045": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
-    "Q046": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
-    "Q055": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page (aggregator)"),
+    "Q046": ([LIEPIN_ROLE_URLS["java"], IGUOPIN_SEARCH["java"]], "liepin 后端 role landing + iguopin Java 搜索 fallback"),
+    "Q055": ([LIEPIN_ROLE_URLS["frontend"], IGUOPIN_SEARCH["frontend"]], "liepin 前端 role landing + iguopin 前端搜索 fallback"),
     "Q148": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
     # R001-R010 (台账时间窗) / R011-R014 (大厂 AIGC PM) / R041/R042 (台账):
     # no seeds -- smartsheet query is the primary path; official SPA sites
@@ -157,35 +158,35 @@ SEED_URLS: dict[str, tuple[list[str], str]] = {
     "R021": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
     "R022": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
     "R023": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
-    "R024": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
-    "R025": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
+    "R024": ([LIEPIN_ROLE_URLS["java"], IGUOPIN_SEARCH["java"]], "liepin 后端 role landing + iguopin Java 搜索 fallback"),
+    "R025": ([LIEPIN_ROLE_URLS["frontend"], IGUOPIN_SEARCH["frontend"]], "liepin 前端 role landing + iguopin 前端搜索 fallback"),
     "R026": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
-    "R027": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
+    "R027": ([LIEPIN_ROLE_URLS["java"], IGUOPIN_SEARCH["java"]], "liepin 后端 role landing + iguopin Java 搜索 fallback"),
     "R028": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
     "R029": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "R030": ([IGUOPIN_SEARCH["java"]], "iguopin Java 后端搜索页 (render-verified job cards)"),
     "R031": ([IGUOPIN_SEARCH["frontend"]], "iguopin 前端搜索页 (render-verified job cards)"),
-    "R040": (BAIDU_TALENT_URLS, "baidu talent role-matched JDs"),
-    "R043": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
+    "R040": ([*BAIDU_TALENT_URLS, IGUOPIN_SEARCH["ai"], *CAMPUS_EVIDENCE], "baidu talent + iguopin AI 算法 + campus fallbacks (baidu GRADUATE 页近期不稳定)"),
+    "R043": ([LIEPIN_ROLE_URLS["java"], IGUOPIN_SEARCH["java"]], "liepin 后端 role landing + iguopin Java 搜索 fallback"),
     "R044": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
-    "R045": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
-    "R046": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
-    "R047": (BAIDU_TALENT_URLS, "baidu talent role-matched JDs"),
+    "R045": ([LIEPIN_ROLE_URLS["aigc"], IGUOPIN_SEARCH["pm"]], "liepin 产品经理专区 + iguopin 产品经理 fallback"),
+    "R046": ([LIEPIN_ROLE_URLS["llm-dev"], IGUOPIN_SEARCH["llm"]], "liepin 大模型应用开发 landing + iguopin 大模型 fallback"),
+    "R047": ([*BAIDU_TALENT_URLS, IGUOPIN_SEARCH["ai"], *CAMPUS_EVIDENCE], "baidu talent + iguopin AI 算法 + campus fallbacks (baidu GRADUATE 页近期不稳定)"),
     # chains: link 1 source seeds; links 2/3 inherit artifacts (no seeds).
     "C001-L1": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
-    "C002-L1": (BAIDU_TALENT_URLS, "baidu talent role-matched JDs"),
+    "C002-L1": ([*BAIDU_TALENT_URLS, IGUOPIN_SEARCH["ai"], *CAMPUS_EVIDENCE], "baidu talent + iguopin AI 算法 + campus fallbacks"),
     "C003-L1": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "C004-L1": ([LIEPIN_ROLE_URLS["llm-dev"]], "liepin 大模型应用开发 role landing page"),
     "C006-L1": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "C007-L1": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "C008-L1": ([LIEPIN_ROLE_URLS["java"]], "liepin 后端 role landing page"),
     "C009-L1": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
-    "C010-L1": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
-    "C011-L1": ([LIEPIN_ROLE_URLS["frontend"]], "liepin 前端 role landing page"),
+    "C010-L1": ([LIEPIN_ROLE_URLS["frontend"], IGUOPIN_SEARCH["frontend"]], "liepin 前端 role landing + iguopin 前端搜索 fallback"),
+    "C011-L1": ([LIEPIN_ROLE_URLS["frontend"], IGUOPIN_SEARCH["frontend"]], "liepin 前端 role landing + iguopin 前端搜索 fallback"),
     "C012-L1": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
     "C013-L1": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
     "C014-L1": ([LIEPIN_ROLE_URLS["aigc"]], "liepin 产品经理专区 incl. AIGC 专场"),
-    "C015-L1": (BAIDU_TALENT_URLS, "baidu talent role-matched JDs"),
+    "C015-L1": ([*BAIDU_TALENT_URLS, IGUOPIN_SEARCH["ai"], *CAMPUS_EVIDENCE], "baidu talent + iguopin AI 算法 + campus fallbacks"),
     # C005-L1 (台账 3 天) / R032-R034 (juejin) / R035-R039 (官网): no seeds --
     # smartsheet first, or search/degrade under test.
 }
