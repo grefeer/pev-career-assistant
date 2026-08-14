@@ -490,6 +490,17 @@ class ExecutorAgent:
         self._tools = tools
         self._skills = skills
 
+    def invoke_registered_tool(
+        self, *, name: str, context: ToolContext, payload: dict[str, Any]
+    ) -> ToolObservation:
+        """Invoke one deterministic Executor tool for runtime normalization."""
+        return self._tools.invoke(
+            role=AgentRole.executor,
+            name=name,
+            context=context,
+            payload=payload,
+        )
+
     def _scoped_out_tool_names(self, allowed_skills: frozenset[str]) -> frozenset[str]:
         """Tool names this step's skill scope can never invoke.
 

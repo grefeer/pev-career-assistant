@@ -267,3 +267,46 @@
 
 ## Status
 当前在第一阶段：修改 runtime 的 completion evidence 路径。
+
+# 2026-08-13 final fixed-sample optimization
+
+## Goal
+固定 10 个样例至少 8 个成功；若公开来源持续被反爬或访问控制阻断，则所有剩余失败必须分类为外部阻断。
+
+## Completed
+- [x] 修复 trusted artifact completion gate 与部分批量失败门控。
+- [x] 优先展开公开详情链接，增加国聘匿名详情访问边界探测和河北工业大学公开分页扩展。
+- [x] 修复校园详情页标题、公司、职位类型、任职资格解析，避免导航页脚污染 JD。
+- [x] 增加 Planner 非法计划重试与带候选 URL 的严格安全兜底。
+- [x] 增加目标岗位角色一致性校验、匹配候选角色优先和 URL 指针规范化。
+- [x] 增加单步一次性的确定性 JD 提取与职业交付兜底，避免重复抓取耗尽预算。
+- [x] 保留重规划前的外部访问阻断分类。
+- [x] 最终复测完成：2/10 succeeded，另外 8/10 全部 external_blocked。
+
+## Verification
+- 最终全量证据：`tests/question/eval_results/deep_executor_nonchain_20260813_run34_final_all_current_live/`
+- Q034 外部分类复测：`tests/question/eval_results/deep_executor_nonchain_20260813_run35_q034_external_classification_live/`
+- 最终回归：331 passed；Ruff、compileall 通过。
+
+## Status
+**Complete** - 已达到用户的第二停止条件：未成功样例均为公开来源反爬、访问拒绝或站点外部访问阻断。
+
+# 2026-08-14 全量 83 题表现评估
+
+## Goal
+在不覆盖历史结果、不过度并发占用 live 资源的前提下，运行当前项目的 83 个顶层题目，统计 succeeded、waiting_user、failed、external_blocked 及成功审计结果，并给出当前表现判断。
+
+## Phases
+- [x] 读取评估脚本、题集清单和历史口径
+- [ ] 等待已有 prompt_iter_08 live 进程结束，确认资源空闲
+- [ ] 启动 83 题全量 live 评测并保存独立结果
+- [ ] 汇总顶层状态、根因、工具失败和成功审计
+- [ ] 运行必要的离线一致性检查并输出报告
+
+## Constraints
+- 不覆盖 `tests/question/eval_results/` 下已有结果目录。
+- 不绕过登录、验证码、反爬或安全页。
+- 83 题以 `tests/question/redesign/manifest.json` 中的顶层 Q/C/R 文档为准。
+
+## Status
+**Currently in Phase 2** - 已确认现有 `prompt_iter_08` 有 5/10 结果，等待剩余进程自然结束后启动全量评测。

@@ -80,6 +80,8 @@ def build_resume_tailoring_brief(
             raise ResumeTailoringError("target_evidence_incomplete")
         target_title = target.get("title") if isinstance(target.get("title"), str) else None
         job_text = f"{target_title or ''}\n{visible_text}".lower()
+        if not _target_matches_goal(context.metadata.get("task_goal"), job_text):
+            raise ResumeTailoringError("target_role_mismatch")
     else:
         raise ResumeTailoringError("target_evidence_incomplete")
     required_keywords = [
@@ -140,6 +142,23 @@ def _find_target(raw_evidence: object, artifact_id: str) -> dict[str, Any] | Non
         if isinstance(item, dict) and item.get("artifact_id") == artifact_id:
             return item
     return None
+
+
+def _target_matches_goal(goal: object, searchable: str) -> bool:
+    """Reject a model-selected JD that is clearly for another requested role."""
+    if not isinstance(goal, str) or not goal.strip():
+        return True
+    role_groups = (
+        (("产品经理", "产品类", "aigc"), ("产品经理", "aigc")),
+        (("大模型应用开发", "llm 应用", "llm应用"), ("大模型", "应用开发", "llm", "agent")),
+        (("前端开发",), ("前端", "frontend")),
+        (("java 后端", "java后端"), ("java", "后端")),
+    )
+    lowered_goal = goal.lower()
+    for markers, evidence_terms in role_groups:
+        if any(marker in lowered_goal for marker in markers):
+            return any(term in searchable for term in evidence_terms)
+    return True
 
 
 def _structured_target_evidence(

@@ -50,6 +50,10 @@ PLANNER_RUNTIME_RULES = (
     "不要重新生成一个语义相同但字段不同的计划来逃避当前状态。\n"
     "计划必须给后续执行和验证留下收尾预算；不要把可选探索步骤排在必需交付之后，"
     "也不要创建无法在当前工具预算内闭合的长链路。\n"
+    "下游 step 只能依赖上游已实际产生的 artifact port；如果上游没有可引用 artifact，就不要"
+    "假设它会在当前 step 自动出现，应在依赖边界处交接缺口。\n"
+    "把用户目标中的约束原样保留在 success criteria 和步骤输入中；不得把目标对象的领域、"
+    "地域、资历、资格或时间范围改写成更宽泛的近似条件来提高完成率。\n"
 )
 
 
@@ -76,6 +80,11 @@ EXECUTOR_RUNTIME_RULES = (
     "说不清，就停止 call_tool，使用已有证据完成或交接。\n"
     "当 remaining_agent_turns 或 remaining_tool_calls 接近上限时，不再启动新的来源发现、分页或"
     "宽泛查询；只做一次最短收尾动作，无法收尾就立即 need_user，绝不靠超预算等待模型响应。\n"
+    "调用需要 artifact_id 的下游工具前，逐字核对 prior_observations、observations 或 artifact"
+    "refs 中的真实 ID；禁止根据标题、URL、summary 或模型记忆猜 ID。出现 target_evidence_not_found、"
+    "observed_evidence_not_found 或 invalid_tool_input 后，不得原样重试。\n"
+    "生成下游交付物前，先核对目标语义与候选 artifact 的标题/对象方向/地域等已验证字段；"
+    "泛化对象、偶然页面标题或无关段落不能作为目标证据。\n"
 )
 
 
@@ -101,6 +110,10 @@ VERIFIER_RUNTIME_RULES = (
     "只因为 summary 不完整就 RETRY，也不得在没有新动作时重复 PASS/RETRY。\n"
     "如果剩余预算不足以完成一次新动作及其验证，不得 RETRY_EXECUTOR；保留已有 evidence，"
     "按可恢复 NEED_USER 输出缺失项。\n"
+    "若下游工具因缺失 artifact reference 失败，验证结论应指出上游端口缺口，不要要求 Executor"
+    "重复调用下游工具；只有重新取得真实上游 artifact 才允许继续。\n"
+    "验证匹配或交付物时，用户明确的约束是硬条件而非建议；任一关键约束未被证据满足时不得"
+    "PASS，也不得用相似标题、同公司或同领域结果替代。\n"
 )
 
 

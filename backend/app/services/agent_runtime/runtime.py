@@ -9,9 +9,10 @@ import re
 import time
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from backend.app.db.models import AgentRun, AgentStep
+from backend.app.db.models import AgentEvent, AgentRun, AgentStep
 from backend.app.domain.agent_runtime import (
     AgentRole,
     RunStatus,
@@ -71,6 +72,22 @@ _RETRY_REPLAN_MARKER = "<retry_replan>"
 #: page's visible text (itself capped at 32k), so this engages defensively
 #: only for unusually large pages.
 _STRUCTURED_FULL_TEXT_CHARS = 32_000
+
+
+def _is_external_runtime_code(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value in {
+        "anti_bot",
+        "anti_bot_challenge",
+        "captcha",
+        "login_required",
+        "access_denied",
+        "domain_temporarily_blocked",
+        "adapter:empty_result",
+        "adapter:adapter_invalid",
+        "adapter:adapter_error",
+    } or value.startswith("adapter:http_error:")
 
 
 class StepDependencyError(ValueError):
@@ -597,6 +614,7 @@ class AgentRuntime:
         prior_observations = []
         prior_artifact_refs: list[dict[str, str]] = []
         last_retry_progress_fingerprint: str | None = None
+        auto_extract_attempted = False
         while True:
             try:
                 execution = self._executor.run(
@@ -629,6 +647,46 @@ class AgentRuntime:
             observed_artifact_refs = self._persist_observed_evidence(
                 db, run_id, persisted_step, execution
             )
+            if auto_extract_attempted:
+                auto_observations, auto_artifact_refs = [], []
+            else:
+                auto_observations, auto_artifact_refs = self._auto_extract_jd_details(
+                    db=db,
+                    run_id=run_id,
+                    task=task,
+                    plan_step=plan_step,
+                    persisted_step=persisted_step,
+                    context=context,
+                    artifact_refs=[*prior_artifact_refs, *observed_artifact_refs],
+                    tool_budget=tool_budget,
+                )
+                if auto_observations or auto_artifact_refs:
+                    auto_extract_attempted = True
+            deliverable_observations, deliverable_refs = (
+                self._auto_build_role_deliverable(
+                    db=db,
+                    run_id=run_id,
+                    task=task,
+                    plan_step=plan_step,
+                    persisted_step=persisted_step,
+                    context=context,
+                    artifact_refs=[
+                        *prior_artifact_refs,
+                        *observed_artifact_refs,
+                        *auto_artifact_refs,
+                    ],
+                    tool_budget=tool_budget,
+                )
+            )
+            auto_observations.extend(deliverable_observations)
+            auto_artifact_refs.extend(deliverable_refs)
+            if auto_observations:
+                execution = execution.model_copy(
+                    update={
+                        "observations": [*execution.observations, *auto_observations],
+                    }
+                )
+            observed_artifact_refs.extend(auto_artifact_refs)
             # A verifier retry continues the same planned outcome. Keep prior
             # tool-backed observations for independent verification, but persist
             # only the new observation set from this Executor invocation.
@@ -657,10 +715,31 @@ class AgentRuntime:
                 )
             if execution.status == "needs_user":
                 if (
+                    any(
+                        observation.error_code == "target_role_mismatch"
+                        for observation in execution.observations
+                    )
+                    and replans < task.budget.max_replans
+                ):
+                    return self._request_replan(
+                        db,
+                        run_id,
+                        persisted_step,
+                        feedback=(
+                            "目标 JD 与用户请求的岗位角色不匹配；请先通过已处理候选 URL 或公开搜索"
+                            "发现角色匹配的 JD，再执行后续职业交付。"
+                        ),
+                        summary="目标岗位角色不匹配，已请求重新发现匹配证据。",
+                        output_artifact_refs=execution.artifact_refs,
+                        reason=ReplanReason.DEPENDENCY_UNAVAILABLE,
+                    )
+                if (
                     self._step_contract_met(
                         plan_step, execution.observations, execution.artifact_refs
                     )
-                    and not self._has_blocked_evidence(execution.observations)
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                 ):
                     # The executor asked the human even though the step's
                     # deliverable is already tool-backed (post-deliverable
@@ -710,7 +789,9 @@ class AgentRuntime:
                 and self._step_contract_met(
                     plan_step, execution.observations, execution.artifact_refs
                 )
-                and not self._has_blocked_evidence(execution.observations)
+                and not self._step_has_blocked_evidence(
+                    plan_step, execution.observations, execution.artifact_refs
+                )
             ):
                 return self._rescue_step_succeeded(
                     db,
@@ -775,7 +856,9 @@ class AgentRuntime:
                         self._step_contract_met(
                             plan_step, execution.observations, execution.artifact_refs
                         )
-                        and not self._has_blocked_evidence(execution.observations)
+                        and not self._step_has_blocked_evidence(
+                            plan_step, execution.observations, execution.artifact_refs
+                        )
                     ):
                         # The verifier transport degraded after the step's
                         # deliverable was already tool-backed (invalid
@@ -860,6 +943,11 @@ class AgentRuntime:
                         "请补充工具产出或人工确认后重试。",
                         output_artifact_refs=execution.artifact_refs,
                         terminal_contract=build_terminal_contract(
+                            error_code=(
+                                "domain_temporarily_blocked"
+                                if self._run_has_external_fetch_block(db, run_id)
+                                else "verification_failed"
+                            ),
                             observations=execution.observations,
                             source_role="runtime",
                             phase="verification",
@@ -922,7 +1010,9 @@ class AgentRuntime:
                     },
                 )
                 if (
-                    self._has_blocked_evidence(execution.observations)
+                    self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and not self._step_contract_met(
                         plan_step, execution.observations, execution.artifact_refs
                     )
@@ -1024,7 +1114,9 @@ class AgentRuntime:
                     self._step_contract_met(
                         plan_step, execution.observations, execution.artifact_refs
                     )
-                    and not self._has_blocked_evidence(execution.observations)
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and replans < task.budget.max_replans
                     and not task.replan_state.conversion_used(
                         ReplanReason.RETRY_CONTRACT_EXHAUSTED
@@ -1051,7 +1143,9 @@ class AgentRuntime:
                     self._step_contract_met(
                         plan_step, execution.observations, execution.artifact_refs
                     )
-                    and not self._has_blocked_evidence(execution.observations)
+                    and not self._step_has_blocked_evidence(
+                        plan_step, execution.observations, execution.artifact_refs
+                    )
                     and replans < task.budget.max_replans
                     and not task.replan_state.conversion_used(
                         ReplanReason.NEED_USER_CONTRACT
@@ -1248,6 +1342,37 @@ class AgentRuntime:
         if self._skills is None:
             return legacy_has_blocked_evidence(observations)
         return self._skills.has_blocked_evidence(observations)
+
+    def _step_has_blocked_evidence(
+        self,
+        step: PlanStep,
+        observations: list,
+        artifact_refs: list[dict[str, Any]],
+    ) -> bool:
+        if self._skills is None:
+            return legacy_has_blocked_evidence(observations)
+        return bool(
+            self._skills.completion_evidence_diagnostics(
+                step,
+                observations,
+                summary="contract-check",
+                artifact_refs=artifact_refs,
+            )["blocked"]
+        )
+
+    @staticmethod
+    def _run_has_external_fetch_block(db: Session, run_id: str) -> bool:
+        """Preserve an earlier source-access block across a bounded replan."""
+        events = db.scalars(
+            select(AgentEvent).where(AgentEvent.run_id == run_id)
+        )
+        for event in events:
+            payload = event.payload_json or {}
+            if isinstance(payload, dict) and _is_external_runtime_code(
+                payload.get("error_code")
+            ):
+                return True
+        return False
 
     def _completion_gate_rejected(
         self,
@@ -1490,6 +1615,7 @@ class AgentRuntime:
                 "confirmed_profile_facts": profile_facts
                 if isinstance(profile_facts, dict)
                 else {},
+                "task_goal": task.goal,
                 "resolved_step_inputs": task.context.get(
                     "resolved_step_inputs", {"context": {}, "artifacts": {}}
                 ),
@@ -1704,6 +1830,178 @@ class AgentRuntime:
                 },
             )
         return artifact_refs
+
+    def _auto_extract_jd_details(
+        self,
+        *,
+        db: Session,
+        run_id: str,
+        task: AgentTaskRequest,
+        plan_step: PlanStep,
+        persisted_step: AgentStep,
+        context: ToolContext,
+        artifact_refs: list[dict[str, Any]],
+        tool_budget: ToolCallBudget,
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        """Normalize captured JD pages before a model stall becomes a handoff."""
+        if "job-discovery" not in plan_step.allowed_skills:
+            return [], []
+        if any(ref.get("runtime_auto_extract") == "true" for ref in artifact_refs):
+            return [], []
+        page_ids = [
+            str(ref["artifact_id"])
+            for ref in artifact_refs
+            if ref.get("artifact_type") == "public_job_page"
+            and ref.get("quality") == "jd_complete"
+            and isinstance(ref.get("artifact_id"), str)
+        ]
+        if not page_ids:
+            return [], []
+        page_ids = list(dict.fromkeys(page_ids))
+        tool_context = self._tool_context(
+            user_id=context.user_id,
+            run_id=run_id,
+            task=task,
+            db=db,
+        )
+        observations: list[Any] = []
+        refs: list[dict[str, str]] = []
+        for offset in range(0, len(page_ids), 10):
+            if not tool_budget.try_consume():
+                break
+            observation = self._executor.invoke_registered_tool(
+                name="extract-observed-job-details-batch",
+                context=tool_context,
+                payload={"artifact_ids": page_ids[offset : offset + 10]},
+            )
+            observations.append(observation)
+            if observation.status != "succeeded":
+                continue
+            auto_execution = ExecutorResult(
+                status="succeeded",
+                observations=[observation],
+                summary="已对已抓取的公开 JD 页面执行确定性结构化提取。",
+            )
+            batch_refs = self._persist_observed_evidence(
+                db, run_id, persisted_step, auto_execution
+            )
+            for ref in batch_refs:
+                ref["runtime_auto_extract"] = "true"
+            refs.extend(batch_refs)
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type="runtime_auto_extracted_jd_details",
+            payload_json={
+                "step_id": plan_step.step_id,
+                "tool": "extract-observed-job-details-batch",
+                "page_count": len(page_ids),
+                "artifact_count": len(refs),
+            },
+        )
+        return observations, refs
+
+    def _auto_build_role_deliverable(
+        self,
+        *,
+        db: Session,
+        run_id: str,
+        task: AgentTaskRequest,
+        plan_step: PlanStep,
+        persisted_step: AgentStep,
+        context: ToolContext,
+        artifact_refs: list[dict[str, Any]],
+        tool_budget: ToolCallBudget,
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        """Finish a role-specific artifact from trusted candidates after a model stall."""
+        if "resume-tailoring" in plan_step.allowed_skills:
+            artifact_type = "resume_tailoring_brief"
+            tool_name = "build-resume-tailoring-brief"
+            keywords = self._goal_role_keywords(task.goal)
+        elif "career-planning" in plan_step.allowed_skills:
+            artifact_type = "career_preparation_plan"
+            tool_name = "build-preparation-plan"
+            keywords = self._goal_role_keywords(task.goal)
+        else:
+            return [], []
+        if any(ref.get("artifact_type") == artifact_type for ref in artifact_refs):
+            return [], []
+        candidates = _structured_job_candidates(db, run_id)
+        ranked: list[tuple[int, dict[str, Any]]] = []
+        for candidate in candidates:
+            source_quality = candidate.get("source_quality")
+            if source_quality in {"list_only", "js_shell", "empty"}:
+                continue
+            searchable = "\n".join(
+                str(candidate.get(key) or "")
+                for key in ("title", "company_name", "responsibilities", "requirements")
+            ).lower()
+            score = sum(1 for keyword in keywords if keyword.lower() in searchable)
+            if score:
+                ranked.append((score, candidate))
+        if not ranked or not tool_budget.try_consume():
+            return [], []
+        ranked.sort(
+            key=lambda item: (
+                -item[0],
+                str(item[1].get("title") or ""),
+                str(item[1].get("artifact_id") or ""),
+            )
+        )
+        selected = ranked[0][1]
+        artifact_id = selected.get("artifact_id")
+        if not isinstance(artifact_id, str) or not artifact_id:
+            return [], []
+        target_keywords = [
+            keyword
+            for keyword in keywords
+            if keyword.lower()
+            in "\n".join(
+                str(selected.get(key) or "")
+                for key in ("title", "responsibilities", "requirements")
+            ).lower()
+        ] or ["岗位"]
+        payload: dict[str, Any] = {
+            "target_artifact_id": artifact_id,
+        }
+        if tool_name == "build-resume-tailoring-brief":
+            payload["target_keywords"] = target_keywords
+        else:
+            payload["focus_keywords"] = target_keywords
+        observation = self._executor.invoke_registered_tool(
+            name=tool_name,
+            context=self._tool_context(
+                user_id=context.user_id,
+                run_id=run_id,
+                task=task,
+                db=db,
+            ),
+            payload=payload,
+        )
+        if observation.status != "succeeded":
+            return [observation], []
+        auto_execution = ExecutorResult(
+            status="succeeded",
+            observations=[observation],
+            summary="已基于目标角色匹配的公开 JD 生成职业交付物。",
+        )
+        refs = self._persist_observed_evidence(db, run_id, persisted_step, auto_execution)
+        for ref in refs:
+            ref["runtime_auto_deliverable"] = "true"
+        return [observation], refs
+
+    @staticmethod
+    def _goal_role_keywords(goal: str) -> list[str]:
+        lowered = goal.lower()
+        if "产品经理" in lowered or "aigc" in lowered:
+            return ["产品经理", "AIGC", "AI"]
+        if "大模型应用开发" in lowered or "llm 应用" in lowered or "llm应用" in lowered:
+            return ["大模型", "应用开发", "Agent", "AI"]
+        if "前端开发" in lowered:
+            return ["前端", "Frontend", "Vue"]
+        if "java 后端" in lowered or "java后端" in lowered:
+            return ["Java", "后端"]
+        return ["岗位"]
 
     @staticmethod
     def _record_failed_executor_observations(

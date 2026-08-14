@@ -25,6 +25,9 @@ from backend.app.services.agent_runtime.schemas import (
     ExecutionPlan,
     PlannerDecision,
     PlannerResult,
+    PlanStep,
+    StepInputRef,
+    StepOutputRef,
     ToolObservation,
 )
 from backend.app.services.agent_runtime.skill_definition import SkillRegistry
@@ -267,6 +270,13 @@ class PlannerAgent:
                             + "; ".join(details)[:500]
                         )
                         continue
+                    fallback = self._build_seeded_career_fallback(task)
+                    if fallback is not None:
+                        return PlannerResult(
+                            status="planned",
+                            plan=fallback,
+                            observations=observations,
+                        )
                     return PlannerResult(
                         status="needs_user",
                         observations=observations,
@@ -303,6 +313,13 @@ class PlannerAgent:
                                 + port_error[:500]
                             )
                             continue
+                        fallback = self._build_seeded_career_fallback(task)
+                        if fallback is not None:
+                            return PlannerResult(
+                                status="planned",
+                                plan=fallback,
+                                observations=observations,
+                            )
                         return PlannerResult(
                             status="needs_user",
                             observations=observations,
@@ -336,3 +353,147 @@ class PlannerAgent:
             observations=observations,
             user_question="Planner turn budget exhausted before a safe plan was formed.",
         )
+
+    def _build_seeded_career_fallback(
+        self, task: AgentTaskRequest
+    ) -> ExecutionPlan | None:
+        """Build a narrow deterministic plan when seeded career planning is malformed.
+
+        This is only enabled for the production career registry and explicit
+        candidate URLs.  It repairs model schema/dependency noise without
+        inventing a source or bypassing a site boundary; the Executor still
+        has to fetch and validate every public page.
+        """
+        if self._skills is None:
+            return None
+        candidate_urls = task.context.get("candidate_urls")
+        if not (
+            isinstance(candidate_urls, list)
+            and any(isinstance(url, str) and url.strip() for url in candidate_urls)
+        ):
+            return None
+        permitted = set(task.allowed_skills)
+        if "job-discovery" not in permitted:
+            return None
+
+        steps: list[PlanStep] = [
+            PlanStep(
+                step_id="discover_jobs",
+                objective="从候选公开 URL 抓取并规范化可追溯 JD 证据。",
+                allowed_skills=["job-discovery"],
+                success_criteria=["至少产出一个有效结构化 JD artifact"],
+                inputs=[
+                    StepInputRef(kind="context", name="candidate_urls")
+                ],
+                outputs=[
+                    StepOutputRef(
+                        name="structured_job_details",
+                        artifact_type="structured_job_details",
+                    )
+                ],
+            )
+        ]
+        previous_step = "discover_jobs"
+        previous_artifact = "structured_job_details"
+
+        goal = task.goal
+        needs_matching = (
+            "job-matching" in permitted
+            and any(marker in goal for marker in ("匹配", "筛选", "最适合", "最匹配"))
+        )
+        needs_tailoring = (
+            "resume-tailoring" in permitted
+            and any(marker in goal for marker in ("简历", "定制", "修改建议"))
+        )
+        needs_planning = (
+            "career-planning" in permitted
+            and any(marker in goal for marker in ("面试", "准备", "计划", "回答要点"))
+        )
+        if needs_matching:
+            steps.append(
+                PlanStep(
+                    step_id="match_jobs",
+                    objective="基于已确认简历事实对有效 JD 做透明匹配排序。",
+                    allowed_skills=["job-matching"],
+                    success_criteria=["产出带证据引用的岗位匹配报告"],
+                    depends_on=[previous_step],
+                    inputs=[
+                        StepInputRef(
+                            kind="artifact",
+                            name=previous_artifact,
+                            from_step=previous_step,
+                            artifact_type=previous_artifact,
+                        )
+                    ],
+                    outputs=[
+                        StepOutputRef(
+                            name="job_matching_report",
+                            artifact_type="job_matching_report",
+                        )
+                    ],
+                )
+            )
+            previous_step = "match_jobs"
+            previous_artifact = "job_matching_report"
+        if needs_tailoring:
+            steps.append(
+                PlanStep(
+                    step_id="tailor_resume",
+                    objective="针对最匹配岗位生成基于已确认事实的简历修改建议。",
+                    allowed_skills=["resume-tailoring"],
+                    success_criteria=["产出可审阅的简历定制 brief"],
+                    depends_on=[previous_step],
+                    inputs=[
+                        StepInputRef(
+                            kind="artifact",
+                            name=previous_artifact,
+                            from_step=previous_step,
+                            artifact_type=previous_artifact,
+                        )
+                    ],
+                    outputs=[
+                        StepOutputRef(
+                            name="resume_tailoring_brief",
+                            artifact_type="resume_tailoring_brief",
+                        )
+                    ],
+                )
+            )
+            previous_step = "tailor_resume"
+            previous_artifact = "resume_tailoring_brief"
+        if needs_planning:
+            steps.append(
+                PlanStep(
+                    step_id="prepare_interview",
+                    objective="基于有效 JD 生成岗位相关的面试准备计划。",
+                    allowed_skills=["career-planning"],
+                    success_criteria=["产出带岗位证据的准备计划"],
+                    depends_on=[previous_step],
+                    inputs=[
+                        StepInputRef(
+                            kind="artifact",
+                            name=previous_artifact,
+                            from_step=previous_step,
+                            artifact_type=previous_artifact,
+                        )
+                    ],
+                    outputs=[
+                        StepOutputRef(
+                            name="career_preparation_plan",
+                            artifact_type="career_preparation_plan",
+                        )
+                    ],
+                )
+            )
+        if len(steps) == 1:
+            return None
+        try:
+            return ExecutionPlan(
+                task=task,
+                created_by=AgentRole.planner,
+                complexity="L3" if len(steps) >= 3 else "L2",
+                success_criteria=["完成请求的职业辅助交付物"],
+                steps=steps,
+            )
+        except Exception:
+            return None

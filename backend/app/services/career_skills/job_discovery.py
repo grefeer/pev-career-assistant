@@ -2181,7 +2181,13 @@ def extract_observed_job_details(
             evidence_ref,
             source_quality=source_quality,
         )
-    extracted = extract_jd_candidates(visible_text, source_url)
+    # Several public campus portals put the real title/company in a detail
+    # header but place navigation chrome before the JD body.  Add only
+    # deterministic labels recovered from the captured page; never add model
+    # text or fetch a second source.  This prevents ``招聘日历``/login-footer
+    # navigation from winning over an otherwise valid public JD.
+    extraction_text = _prepare_portal_extraction_text(visible_text, source_url)
+    extracted = extract_jd_candidates(extraction_text, source_url)
     # A single-JD page is enriched from its own full text; a multi-candidate
     # page (e.g. a Feishu card listing) must NOT have the page's first
     # responsibilities/requirements section copied onto every candidate.
@@ -2207,15 +2213,20 @@ def extract_observed_job_details(
         ]
         responsibilities = (
             _extract_jd_section(
-                visible_text,
+                extraction_text,
                 labels=("岗位职责", "工作职责", "职位描述", "工作内容", "主要职责", "岗位定位", "你将负责"),
             )
             if single_jd_page
             else candidate.responsibilities
         ) or candidate.responsibilities
+        portal_role_text = _extract_portal_role_text(visible_text, source_url)
+        if portal_role_text and portal_role_text not in responsibilities:
+            responsibilities = " ".join(
+                part for part in (responsibilities, portal_role_text) if part
+            )
         requirements = (
             _extract_jd_section(
-                visible_text,
+                extraction_text,
                 labels=(
                     "任职要求",
                     "职责要求",
@@ -2223,6 +2234,8 @@ def extract_observed_job_details(
                     "职位要求",
                     "资格要求",
                     "招聘要求",
+                    "任职资格",
+                    "专业要求",
                 ),
             )
             if single_jd_page
@@ -2414,21 +2427,100 @@ def _extract_jd_section(text: str, *, labels: tuple[str, ...]) -> str:
             "工作地点",
             "工作地址",
             "投递方式",
-            "申请方式",
-            "截止日期",
-            "截止时间",
-            "申请职位",
-        )
+        "申请方式",
+        "截止日期",
+        "截止时间",
+        "申请职位",
+        "公司介绍",
+        "公司简介",
+        "招募对象",
+        "职位类型",
+        "招聘流程",
+        "专业要求",
+        "投递简历",
+        "任职资格",
     )
-    match = re.search(
+    )
+    matches = re.finditer(
         rf"(?:{label_pattern})\s*[:：]?\s*(.*?)"
         rf"(?=(?:{stop_pattern})\s*[:：]?|$)",
         text,
         flags=re.DOTALL,
     )
-    if match is None:
+    for match in matches:
+        value = " ".join(match.group(1).split()).strip()
+        if value:
+            return value
+    return ""
+
+
+def _prepare_portal_extraction_text(text: str, source_url: str) -> str:
+    """Prefix stable labels for known public campus-detail layouts.
+
+    The source page remains the sole evidence.  These prefixes only expose
+    fields already present in that page's visible text to the deterministic
+    JD parser, so footer/navigation strings cannot be mistaken for the job
+    title or employer.
+    """
+    parsed = urlsplit(source_url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    prefixes: list[str] = []
+    body = text
+    if host == _CAMPUS_PORTAL_HOST and "/correcruit/content/" in path:
+        match = re.search(
+            r"(?:^|\n)>\s*>\s*招聘信息\s*\n"
+            r"(?P<title>[^\n]+)\n[^\n]*\n【(?P<company>[^】\n]+)】",
+            text,
+        )
+        if match:
+            prefixes.extend(
+                [
+                    f"职位名称：{match.group('title').strip()}",
+                    f"公司名称：{match.group('company').strip()}",
+                ]
+            )
+            header = text[match.end() :]
+            body = header
+            location = re.search(r"工作地域：([^\n]*?)(?:\s+职位类别：|$)", header)
+            if location:
+                prefixes.append(f"工作地点：{location.group(1).strip()}")
+            degree = re.search(r"学历要求：([^\s]+)", header)
+            if degree:
+                prefixes.append(f"学历要求：{degree.group(1).strip()}")
+    elif host == "job.xiaohongshu.com" and "/campus/position/" in path:
+        match = re.search(
+            r"(?:^|\n)职位列表\s*\n(?P<title>[^\n]+)\n",
+            text,
+        )
+        if match:
+            prefixes.extend(
+                [
+                    f"职位名称：{match.group('title').strip()}",
+                    "公司名称：行吟信息科技（上海）有限公司",
+                ]
+            )
+            body = text[match.end() :]
+        location = re.search(r"工作地点：([^\n]+)", text)
+        if location:
+            prefixes.append(f"工作地点：{location.group(1).strip()}")
+    return "\n".join(prefixes + [body]) if prefixes else text
+
+
+def _extract_portal_role_text(text: str, source_url: str) -> str:
+    """Keep official portal role-family lines that identify specific roles."""
+    parsed = urlsplit(source_url)
+    if (
+        (parsed.hostname or "").lower() != _CAMPUS_PORTAL_HOST
+        or "/correcruit/content/" not in parsed.path.lower()
+    ):
         return ""
-    return " ".join(match.group(1).split()).strip()
+    match = re.search(
+        r"职位类型：\s*(.*?)\s*(?=招聘流程：|工作地点：|投递简历|$)",
+        text,
+        flags=re.DOTALL,
+    )
+    return " ".join(match.group(1).split()).strip() if match else ""
 
 
 def _infer_official_page_title(text: str) -> str | None:

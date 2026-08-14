@@ -296,8 +296,12 @@ class SkillRegistry:
         trusted_artifact_contract_met = self._trusted_artifact_contract_met(
             step, artifact_refs
         )
-        blocked = self.has_blocked_evidence(observations)
         contract_met = observation_contract_met or trusted_artifact_contract_met
+        # A bounded batch may contain both usable public pages and per-URL
+        # anti-bot/adapter failures.  Once a trusted deliverable exists, the
+        # failed URLs are partial coverage diagnostics, not a reason to discard
+        # the valid result.  A blocked-only observation still blocks the gate.
+        blocked = self.has_blocked_evidence(observations) and not contract_met
         reason_codes: list[str] = []
         if not summary_present:
             reason_codes.append("missing_summary")

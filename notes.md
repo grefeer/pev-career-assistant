@@ -92,3 +92,30 @@
 1. runtime 的 `needs_user` rescue 只使用 `step_contract_met(observations)`，未使用 `_persist_observed_evidence()` 返回的 trusted refs；这解释了“artifact 已存在但步骤失败”。
 2. 非验证步骤的 `_completion_gate_rejected()` 也只使用 observations，应该同时接收本次已持久化 refs。
 3. Q034 是否可修取决于公开 DOM 是否含 job-shaped detail links；若没有，保留 `list_only` 门禁和人工交接。
+
+# 2026-08-13 final fixed-sample audit
+
+## Final result
+
+- run34: Q017 and Q028 are `succeeded` with `success_audit=passed`.
+- run34 external blockers: Q011/Q013/Q040/Q045/Q046/Q055/Q057 = `anti_bot_challenge`.
+- Q034 was rerun in run35 after terminal classification repair and is `external_blocked/access_denied`; its public 国聘 detail boundary did not yield permitted anonymous JD evidence.
+- Final disposition: 2/10 succeeded; the remaining 8/10 are external source-access blockers, satisfying the requested fallback condition. No login, CAPTCHA, anti-bot, or private-page bypass was added.
+
+## Code changes in this pass
+
+- `runtime.py`: trusted artifact gate integration; partial batch failures no longer discard valid evidence; one-shot deterministic JD extraction; role-specific deliverable fallback; cross-replan external blocker preservation.
+- `planner_agent.py`: bounded invalid-plan retry and strict seeded-career fallback plan.
+- `skill_definition.py`: valid deliverable evidence can coexist with partial blocked URLs; blocked-only evidence still fails the gate.
+- `job_discovery.py` / `jd_extraction.py`: detail-link prioritization, bounded campus expansion, portal header/body extraction, role-family and `任职资格` parsing.
+- `job_matching.py`: goal-role-compatible candidates are preferred when present.
+- `career_planning.py` / `resume_tailoring.py`: deterministic target-role mismatch rejection.
+- `target_evidence.py`: normalized URL pointer resolution.
+- `executor_agent.py` / `deep_executor.py`: processed candidate URL tracking and safe alternative-route handling.
+
+## Verification
+
+- Final targeted test set: 331 passed.
+- Ruff: all changed runtime/career skill files passed.
+- compileall: agent runtime, career skills, and JD extraction modules passed.
+- Evidence directories are append-only historical artifacts; no prior run directory was overwritten or deleted.

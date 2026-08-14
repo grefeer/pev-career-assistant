@@ -75,7 +75,7 @@ def _find_raw_target(raw_evidence: object, target_id: str) -> dict[str, Any] | N
     for item in raw_evidence:
         if isinstance(item, dict) and (
             item.get("artifact_id") == target_id
-            or item.get("source_url") == target_id
+            or _normalized_url(item.get("source_url")) == _normalized_url(target_id)
             or f"observed:{item.get('content_hash')}" == target_id
         ):
             return item

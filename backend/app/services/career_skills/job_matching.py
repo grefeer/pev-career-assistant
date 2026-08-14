@@ -205,6 +205,21 @@ _COMPENSATION_RE = re.compile(
     r"(?:\s*(?:/\s*(?:月|年)|月薪|年薪))?"
 )
 _COMPANY_TYPE_LABELS = ("国企", "民营", "外企", "事业单位")
+_GOAL_ROLE_TERMS = (
+    "产品经理",
+    "项目经理",
+    "后端开发",
+    "前端开发",
+    "应用开发",
+    "算法工程师",
+    "开发工程师",
+    "工程师",
+    "大模型",
+    "AIGC",
+    "AI",
+    "Java",
+    "Python",
+)
 
 
 def match_observed_jobs(
@@ -219,16 +234,18 @@ def match_observed_jobs(
     with no structured extraction (single-JD pages, evidence-only evals).
     """
     candidates = context.metadata.get("structured_job_candidates", [])
+    goal_role_terms = _goal_role_terms(context.metadata.get("task_goal"))
     matches: list[ObservedJobMatch] = []
     if isinstance(candidates, list) and candidates:
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            match = _match_candidate(candidate, payload)
+            match = _match_candidate(candidate, payload, goal_role_terms=goal_role_terms)
             if match is not None:
                 matches.append(match)
     else:
-        matches = _match_raw_evidence(context, payload)
+        matches = _match_raw_evidence(context, payload, goal_role_terms=goal_role_terms)
+    matches = _prefer_goal_role_matches(matches, context.metadata.get("task_goal"))
     matches.sort(key=lambda match: (-match.score, match.title or "", match.artifact_id))
     selected_matches = matches[: payload.limit]
     unresolved = [
@@ -243,7 +260,10 @@ def match_observed_jobs(
 
 
 def _match_raw_evidence(
-    context: ToolContext, payload: MatchObservedJobsInput
+    context: ToolContext,
+    payload: MatchObservedJobsInput,
+    *,
+    goal_role_terms: list[str] | None = None,
 ) -> list[ObservedJobMatch]:
     """Score whole-page evidence items as jobs (fallback path)."""
     raw_evidence = context.metadata.get("observed_public_evidence", [])
@@ -276,13 +296,17 @@ def _match_raw_evidence(
                 searchable=searchable,
                 excerpt=visible_text,
                 payload=payload,
+                goal_role_terms=goal_role_terms,
             )
         )
     return matches
 
 
 def _match_candidate(
-    item: dict[str, Any], payload: MatchObservedJobsInput
+    item: dict[str, Any],
+    payload: MatchObservedJobsInput,
+    *,
+    goal_role_terms: list[str] | None = None,
 ) -> ObservedJobMatch | None:
     """Score one structured job candidate against the confirmed profile."""
     if item.get("source_quality") in {"list_only", "js_shell", "empty"}:
@@ -333,6 +357,7 @@ def _match_candidate(
         searchable=searchable,
         excerpt=excerpt,
         payload=payload,
+        goal_role_terms=goal_role_terms,
     )
 
 
@@ -346,6 +371,7 @@ def _score_job(
     searchable: str,
     excerpt: str,
     payload: MatchObservedJobsInput,
+    goal_role_terms: list[str] | None = None,
 ) -> ObservedJobMatch:
     """Score one job unit from its searchable text, exposing unverified criteria."""
     matched = [keyword for keyword in payload.profile_keywords if keyword in searchable]
@@ -361,7 +387,8 @@ def _score_job(
         compensation_text=compensation_text,
         observed_company_types=observed_company_types,
     )
-    score = min(100, len(matched) * 34)
+    role_hits = sum(1 for term in goal_role_terms or [] if term.lower() in searchable)
+    score = min(100, len(matched) * 34 + role_hits * 15)
     return ObservedJobMatch(
         artifact_id=artifact_id,
         candidate_id=candidate_id,
@@ -376,6 +403,42 @@ def _score_job(
         unverified_ranking_criteria=unverified,
         evidence_excerpt=excerpt[:500],
     )
+
+
+def _goal_role_terms(value: object) -> list[str]:
+    """Extract only explicit role tokens from the user goal for tie-breaking."""
+    if not isinstance(value, str):
+        return []
+    lowered = value.lower()
+    return [term for term in _GOAL_ROLE_TERMS if term.lower() in lowered]
+
+
+def _prefer_goal_role_matches(
+    matches: list[ObservedJobMatch], goal: object
+) -> list[ObservedJobMatch]:
+    """Keep role-compatible candidates when the captured set contains them."""
+    if not isinstance(goal, str):
+        return matches
+    lowered_goal = goal.lower()
+    if any(marker in lowered_goal for marker in ("产品经理", "aigc")):
+        terms = ("产品经理", "aigc")
+    elif any(marker in lowered_goal for marker in ("大模型应用开发", "llm 应用", "llm应用")):
+        terms = ("大模型", "应用开发", "llm", "agent")
+    elif "前端开发" in lowered_goal:
+        terms = ("前端", "frontend")
+    elif "java 后端" in lowered_goal or "java后端" in lowered_goal:
+        terms = ("java", "后端")
+    else:
+        return matches
+    compatible = [
+        match
+        for match in matches
+        if any(
+            term in f"{match.title or ''}\n{match.evidence_excerpt}".lower()
+            for term in terms
+        )
+    ]
+    return compatible or matches
 
 
 def _unverified_criteria(

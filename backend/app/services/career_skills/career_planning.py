@@ -106,6 +106,8 @@ def build_preparation_plan(
     if not isinstance(source_url, str) or not isinstance(visible_text, str):
         raise CareerPlanningError("target_evidence_incomplete")
     searchable = f"{target.get('title') or ''}\n{visible_text}".lower()
+    if not _target_matches_goal(context.metadata.get("task_goal"), searchable):
+        raise CareerPlanningError("target_role_mismatch")
     topic_pairs = [
         (keyword, keyword.lower())
         for keyword in payload.focus_keywords
@@ -206,6 +208,23 @@ def _find_target(raw_evidence: object, artifact_id: str) -> dict[str, Any] | Non
         if isinstance(item, dict) and item.get("artifact_id") == artifact_id:
             return item
     return None
+
+
+def _target_matches_goal(goal: object, searchable: str) -> bool:
+    """Reject a model-selected JD that is clearly for another requested role."""
+    if not isinstance(goal, str) or not goal.strip():
+        return True
+    role_groups = (
+        (("产品经理", "产品类", "aigc"), ("产品经理", "aigc")),
+        (("大模型应用开发", "llm 应用", "llm应用"), ("大模型", "应用开发", "llm", "agent")),
+        (("前端开发",), ("前端", "frontend")),
+        (("java 后端", "java后端"), ("java", "后端")),
+    )
+    lowered_goal = goal.lower()
+    for markers, evidence_terms in role_groups:
+        if any(marker in lowered_goal for marker in markers):
+            return any(term in searchable for term in evidence_terms)
+    return True
 
 
 def _resolve_due_date(target_date: date | None) -> tuple[date, str]:

@@ -26,7 +26,7 @@ _RESPONSIBILITIES_HEADERS: list[re.Pattern] = [
 ]
 
 _REQUIREMENTS_HEADERS: list[re.Pattern] = [
-    re.compile(r"(?:任职要求|岗位要求|职位要求|资格要求|招聘要求|应聘条件|基本要求|requirements|qualifications|what you.?ll need|required skills|basic requirements)", re.IGNORECASE),
+    re.compile(r"(?:任职要求|任职资格|岗位要求|职位要求|资格要求|招聘要求|应聘条件|基本要求|专业要求|requirements|qualifications|what you.?ll need|required skills|basic requirements)", re.IGNORECASE),
 ]
 
 _LOCATION_PATTERNS: list[re.Pattern] = [
@@ -320,7 +320,7 @@ def _extract_section(text: str, header_patterns: list[re.Pattern]) -> str:
             # Find the next line that looks like a heading
             next_header = re.search(
                 r"\n\s*(?:岗位职责|工作职责|职位描述|任职要求|岗位要求|"
-                r"职位要求|资格要求|工作地点|投递方式|截止日期|"
+                r"职位要求|资格要求|任职资格|专业要求|工作地点|投递方式|截止日期|"
                 r"公司介绍|公司简介|关于我们|responsibilities|"
                 r"requirements|qualifications|location|about us)\s*[:：]?\s*\n",
                 remainder,
