@@ -1,0 +1,90 @@
+{
+  "id": "non_crawl_error_set_20260814",
+  "description": "从 2026-08-14 live 轨迹中挑选的非反爬内部错误回归集",
+  "source_question_dir": "tests/question/redesign",
+  "expected_count": 10,
+  "anti_crawl_dependency": false,
+  "run_command": ".\\.venv\\Scripts\\python.exe -m tests.question.eval_runner --ids C001 Q055 C014 R008 R033 R025 R021 R003 R009 C011 --question-dir tests/question/redesign --out-dir tests/question/eval_results/non_crawl_error_set_20260814_live",
+  "cases": [
+    {
+      "id": "C001",
+      "category": "planner_executor_protocol",
+      "severity": "P0",
+      "source_result": "model_or_verifier_decision/need_user",
+      "selection_reason": "Planner 输出格式异常，未生成执行计划，工具证据为零；代表最早期协议断裂。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "Q055",
+      "category": "planner_executor_protocol",
+      "severity": "P0",
+      "source_result": "model_or_verifier_decision/need_user",
+      "selection_reason": "已有抓取证据，但 Executor 返回 deep_executor_invalid_response，无法生成可解析终态；覆盖晚期协议断裂。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "C014",
+      "category": "evidence_or_hard_constraint",
+      "severity": "P0",
+      "source_result": "model_or_verifier_decision/need_user",
+      "selection_reason": "已有岗位字段，但全部为资深岗且非 AIGC，验证了岗位族和应届硬约束不能只因有候选就 PASS。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R008",
+      "category": "evidence_or_hard_constraint",
+      "severity": "P0",
+      "source_result": "model_or_verifier_decision/need_user",
+      "selection_reason": "最近 3 天没有满足条件的台账记录，放宽到 30 天会违反用户时间窗；覆盖空结果与硬约束解释。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R033",
+      "category": "trusted_delivery_contract",
+      "severity": "P0",
+      "source_result": "contract_or_policy_error/verification_failed",
+      "selection_reason": "同时暴露 profile facts 未传递、旧帖污染、标题错位和 source_artifact_id 不在上游 refs 等多项链路契约问题。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R025",
+      "category": "trusted_delivery_contract",
+      "severity": "P0",
+      "source_result": "contract_or_policy_error/verification_failed",
+      "selection_reason": "简历定制针对烟台高级前端岗位，而用户要求广州/深圳、2 年经验；覆盖匹配到 tailoring 的目标岗位继承错误。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R021",
+      "category": "trusted_delivery_contract",
+      "severity": "P0",
+      "source_result": "contract_or_policy_error/verification_failed",
+      "selection_reason": "抽取仅产生 candidate_titles，没有完整 structured_job_details，且来源不符合国聘/官方渠道约束。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R003",
+      "category": "context_missing_replan_budget",
+      "severity": "P0",
+      "source_result": "budget_exhausted/replan_budget_exhausted",
+      "selection_reason": "复杂多步骤题同时缺少 role_keywords 和 recent_days，首步未执行工具便耗尽重规划预算。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "R009",
+      "category": "context_missing_replan_budget",
+      "severity": "P0",
+      "source_result": "budget_exhausted/replan_budget_exhausted",
+      "selection_reason": "公司定向题缺少 company_keywords，计划停在 query-career-sheet 前；覆盖公司实体约束未编译。",
+      "anti_crawl_dependency": false
+    },
+    {
+      "id": "C011",
+      "category": "duplicate_or_no_progress",
+      "severity": "P0",
+      "source_result": "no_progress_duplicate/no_progress_duplicate",
+      "selection_reason": "已有 6 个公开页面，但 Verifier 重试没有新增 artifact，代表完整的重复调用/无进展终止路径。",
+      "anti_crawl_dependency": false
+    }
+  ]
+}
