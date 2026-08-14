@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -220,6 +221,19 @@ _GOAL_ROLE_TERMS = (
     "Java",
     "Python",
 )
+_GOAL_LOCATION_TERMS = (
+    "北京", "上海", "广州", "深圳", "杭州", "南京", "苏州", "成都",
+    "武汉", "西安", "重庆", "天津", "长沙", "郑州", "济南", "青岛",
+    "合肥", "厦门", "大连", "东莞", "佛山",
+)
+_INVALID_TITLE_MARKERS = (
+    "如您应聘",
+    "温馨提示",
+    "平台内招聘方",
+    "举报",
+    "安全防范",
+    "查看全部",
+)
 
 
 def match_observed_jobs(
@@ -239,6 +253,18 @@ def match_observed_jobs(
     if isinstance(candidates, list) and candidates:
         for candidate in candidates:
             if not isinstance(candidate, dict):
+                continue
+            if not _is_primary_detail_candidate(candidate):
+                continue
+            if not _candidate_meets_goal_constraints(
+                candidate,
+                context.metadata.get("task_goal"),
+                context.metadata.get("confirmed_profile_facts"),
+            ):
+                continue
+            if not _source_allowed_for_goal(
+                candidate.get("source_url"), context.metadata.get("task_goal")
+            ):
                 continue
             match = _match_candidate(candidate, payload, goal_role_terms=goal_role_terms)
             if match is not None:
@@ -284,6 +310,8 @@ def _match_raw_evidence(
             isinstance(value, str) and value
             for value in (artifact_id, source_url, visible_text)
         ):
+            continue
+        if not _source_allowed_for_goal(source_url, context.metadata.get("task_goal")):
             continue
         title = item.get("title")
         normalized_title = title if isinstance(title, str) else None
@@ -361,6 +389,60 @@ def _match_candidate(
     )
 
 
+def _is_primary_detail_candidate(candidate: dict[str, Any]) -> bool:
+    """Ignore recommendation cards extracted from a full JD detail page."""
+    source_quality = candidate.get("source_quality")
+    candidate_id = candidate.get("candidate_id")
+    if source_quality != "jd_complete" or not isinstance(candidate_id, str):
+        return True
+    source_url = candidate.get("source_url")
+    page_source_url = candidate.get("page_source_url")
+    page_title = candidate.get("page_title")
+    page_text_prefix = candidate.get("page_text_prefix")
+    title = candidate.get("title")
+    if isinstance(page_title, str) and isinstance(title, str) and page_title.strip():
+        if title.strip().lower() not in page_title.lower():
+            return False
+    if (
+        isinstance(page_text_prefix, str)
+        and isinstance(title, str)
+        and page_text_prefix.strip()
+        and title.strip().lower() not in page_text_prefix.lower()
+    ):
+        return False
+    if (
+        isinstance(source_url, str)
+        and isinstance(page_source_url, str)
+        and source_url != page_source_url
+    ):
+        return False
+    return candidate_id.endswith(":candidate:0")
+
+
+def _source_allowed_for_goal(source_url: object, goal: object) -> bool:
+    """Enforce explicit source/channel constraints without inventing evidence."""
+    if not isinstance(source_url, str) or not source_url:
+        return False
+    if not isinstance(goal, str) or not goal.strip():
+        return True
+    goal_lower = goal.lower()
+    channel_required = any(
+        marker in goal_lower
+        for marker in ("国聘", "官网", "中国移动", "中国联通", "10086", "10010")
+    )
+    if not channel_required:
+        return True
+    host = (urlparse(source_url).hostname or "").lower().rstrip(".")
+    allowed_hosts = (
+        "iguopin.com",
+        "10086.cn",
+        "10010.com",
+        "chinaunicom.com",
+        "chinaunicom.cn",
+    )
+    return any(host == allowed or host.endswith("." + allowed) for allowed in allowed_hosts)
+
+
 def _score_job(
     *,
     artifact_id: str,
@@ -403,6 +485,85 @@ def _score_job(
         unverified_ranking_criteria=unverified,
         evidence_excerpt=excerpt[:500],
     )
+
+
+def _candidate_meets_goal_constraints(
+    candidate: dict[str, Any], goal: object, profile_facts: object = None
+) -> bool:
+    """Apply only explicit role/location/experience constraints from the goal.
+
+    Ranking criteria remain soft and are reported as unverified. These three
+    constraints are different: returning a clearly wrong role, city, or
+    minimum experience as the recommendation is a false positive, so the
+    candidate is excluded before scoring. Missing evidence remains eligible
+    and is surfaced through the normal unverified fields.
+    """
+    if not isinstance(goal, str) or not goal.strip():
+        return True
+    title = candidate.get("title")
+    title_text = title.strip() if isinstance(title, str) else ""
+    if title_text and any(marker in title_text for marker in _INVALID_TITLE_MARKERS):
+        return False
+    searchable = "\n".join(
+        str(candidate.get(key) or "")
+        for key in ("title", "company_name", "locations", "responsibilities", "requirements")
+    ).lower()
+    goal_lower = goal.lower()
+    if "产品经理" in goal_lower or "aigc" in goal_lower:
+        role_terms = ("产品经理", "aigc")
+    elif "大模型应用开发" in goal_lower or "llm 应用" in goal_lower or "llm应用" in goal_lower:
+        role_terms = ("大模型", "应用开发", "llm", "agent")
+    elif "前端开发" in goal_lower:
+        role_terms = ("前端", "frontend")
+    elif "java 后端" in goal_lower or "java后端" in goal_lower:
+        role_terms = ("java", "后端")
+    else:
+        role_terms = ()
+    profile_role_terms = _profile_role_terms(profile_facts)
+    if profile_role_terms:
+        role_terms = tuple(dict.fromkeys((*role_terms, *profile_role_terms)))
+    if role_terms and not any(term.lower() in searchable for term in role_terms):
+        return False
+
+    requested_locations = [term for term in _GOAL_LOCATION_TERMS if term in goal]
+    if requested_locations and not any(term.lower() in searchable for term in requested_locations):
+        return False
+
+    experience_match = re.search(r"(\d+)\s*年(?:经验|工作经验)", goal)
+    target_years = int(experience_match.group(1)) if experience_match else None
+    if target_years is None:
+        return True
+    ranges = [
+        (int(low), int(high))
+        for low, high in re.findall(r"(?<!\d)(\d+)\s*[-~至]\s*(\d+)\s*年", searchable)
+    ]
+    minimum_years = [low for low, _high in ranges]
+    minimum_years.extend(
+        int(value)
+        for value in re.findall(r"(?<!\d)(\d+)\s*年(?:及以上|以上)", searchable)
+    )
+    # Multiple explicit minimums in one captured JD are treated
+    # conservatively: a candidate is not eligible when any mandatory-looking
+    # minimum exceeds the user's stated experience.
+    return not minimum_years or max(minimum_years) <= target_years
+
+
+def _profile_role_terms(profile_facts: object) -> tuple[str, ...]:
+    """Extract only explicit role-family markers from confirmed profile facts."""
+    if not isinstance(profile_facts, dict):
+        return ()
+    text = "\n".join(
+        str(value) for key, value in profile_facts.items() if "name" in str(key).lower()
+    ).lower()
+    if "aigc" in text or "产品经理" in text:
+        return ("产品经理", "aigc")
+    if "大模型" in text or "llm" in text or "agent" in text:
+        return ("大模型", "应用开发", "llm", "agent")
+    if "前端" in text or "frontend" in text:
+        return ("前端", "frontend")
+    if "java" in text and "后端" in text:
+        return ("java", "后端")
+    return ()
 
 
 def _goal_role_terms(value: object) -> list[str]:

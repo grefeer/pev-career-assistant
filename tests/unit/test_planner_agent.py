@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
-from backend.app.services.agent_runtime.schemas import AgentTaskRequest
+from backend.app.services.agent_runtime.schemas import AgentTaskRequest, ExecutionPlan
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
@@ -139,6 +139,38 @@ def test_planner_can_sense_confirmed_profile_field_availability_without_fact_val
 
     assert gateway.states[0]["confirmed_profile_fact_fields"] == ["projects", "skills"]
     assert "秘密项目" not in str(gateway.states[0])
+
+
+def test_planner_trims_unrequested_trailing_resume_step() -> None:
+    task = AgentTaskRequest(
+        goal="请按匹配度排序这些前端开发工程师岗位",
+        allowed_skills=["job-discovery", "job-matching", "resume-tailoring"],
+    )
+    plan = ExecutionPlan.model_validate(
+        {
+            "task": task.model_dump(),
+            "created_by": "planner",
+            "complexity": "L3",
+            "success_criteria": ["完成岗位匹配"],
+            "steps": [
+                {
+                    "step_id": "match",
+                    "objective": "匹配岗位",
+                    "allowed_skills": ["job-matching"],
+                },
+                {
+                    "step_id": "tailor",
+                    "objective": "生成简历建议",
+                    "allowed_skills": ["resume-tailoring"],
+                    "depends_on": ["match"],
+                },
+            ],
+        }
+    )
+
+    trimmed = PlannerAgent._trim_unrequested_trailing_steps(task, plan)
+
+    assert [step.step_id for step in trimmed.steps] == ["match"]
 
 
 def test_planner_downgrades_invalid_execution_plan_to_recoverable_wait() -> None:

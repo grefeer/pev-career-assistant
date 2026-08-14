@@ -2188,6 +2188,23 @@ def extract_observed_job_details(
     # navigation from winning over an otherwise valid public JD.
     extraction_text = _prepare_portal_extraction_text(visible_text, source_url)
     extracted = extract_jd_candidates(extraction_text, source_url)
+    if source_quality == "jd_complete" and "/job/" in urlsplit(source_url).path:
+        # A full aggregator detail page can append a "猜你喜欢" card list to
+        # the same visible text. Keep only the candidate whose title is the
+        # page's own official heading; downstream matching must never rank a
+        # recommendation card as the requested JD.
+        official_title = _infer_official_page_title(visible_text)
+        if official_title:
+            official_matches = [
+                candidate
+                for candidate in extracted
+                if isinstance(candidate.title, str)
+                and candidate.title.strip().lower() in official_title.lower()
+            ]
+            if official_matches:
+                extracted = official_matches[:1]
+            elif extracted:
+                extracted = extracted[:1]
     # A single-JD page is enriched from its own full text; a multi-candidate
     # page (e.g. a Feishu card listing) must NOT have the page's first
     # responsibilities/requirements section copied onto every candidate.
@@ -2198,6 +2215,10 @@ def extract_observed_job_details(
         title = (
             inferred_title
             if candidate.title in {None, "申请职位"}
+            or (
+                inferred_title is not None
+                and not _is_plausible_job_title(candidate.title)
+            )
             else candidate.title
         )
         locations = candidate.locations or _infer_official_page_locations(
@@ -2530,11 +2551,36 @@ def _infer_official_page_title(text: str) -> str | None:
         candidate = line.strip()
         if (
             3 <= len(candidate) <= 100
-            and re.search(r"(?:工程师|开发|算法|研究员|实习生|架构师|科学家)", candidate)
+            and re.search(
+                r"(?:工程师|开发|算法|研究员|实习生|架构师|科学家|产品经理|项目经理)",
+                candidate,
+            )
             and "申请" not in candidate
         ):
             return candidate
     return None
+
+
+def _is_plausible_job_title(value: object) -> bool:
+    """Reject page chrome or numbered safety notes as a job title."""
+    if not isinstance(value, str):
+        return False
+    candidate = " ".join(value.split()).strip()
+    if not 2 <= len(candidate) <= 80:
+        return False
+    if re.match(r"^\d+[.、)]", candidate):
+        return False
+    return not any(
+        marker in candidate
+        for marker in (
+            "如您应聘",
+            "温馨提示",
+            "平台内招聘方",
+            "安全防范",
+            "举报",
+            "查看全部",
+        )
+    )
 
 
 def _infer_official_page_locations(text: str, title: str | None) -> list[str]:
@@ -2549,7 +2595,14 @@ def _infer_official_page_locations(text: str, title: str | None) -> list[str]:
     for line in lines[title_index + 1 :]:
         if re.search(r"(?:岗位职责|工作职责|职位描述)", line):
             break
-        if re.fullmatch(r"[\u4e00-\u9fff]{2,12}(?:市|省)?", line):
+        if (
+            re.fullmatch(
+                r"[\u4e00-\u9fff]{2,12}(?:市|省|区|县|新区)?"
+                r"(?:-[\u4e00-\u9fff]{1,12}(?:区|县|镇|街道)?)?",
+                line,
+            )
+            and line not in {"本科", "硕士", "博士", "大专", "学历不限"}
+        ):
             return [line]
     return []
 

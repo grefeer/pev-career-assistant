@@ -317,3 +317,86 @@ def test_match_accepts_full_extraction_limit_of_one_hundred() -> None:
     """The ranking limit must cover a full card-list extraction (100 per page)."""
     assert MatchObservedJobsInput(limit=100).limit == 100
     assert MatchObservedJobsInput(limit=101).limit == 100
+
+
+def test_match_respects_explicit_official_channel_constraints() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "task_goal": "中国移动、中国联通有没有适合我的 Java 后端开发工程师岗位？请通过国聘网/官网核实。",
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "liepin",
+                    "source_url": "https://www.liepin.com/job/1.shtml",
+                    "source_quality": "jd_complete",
+                    "title": "Java 后端开发工程师",
+                    "locations": ["北京"],
+                    "responsibilities": "Java 服务开发",
+                    "requirements": "",
+                },
+                {
+                    "artifact_id": "official",
+                    "source_url": "https://job.10086.cn/personal/job/detail.html?id=1",
+                    "source_quality": "jd_complete",
+                    "title": "Java 后端开发工程师",
+                    "locations": ["北京"],
+                    "responsibilities": "Java 服务开发",
+                    "requirements": "",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["Java", "后端"], preferred_locations=["北京"]),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["official"]
+
+
+def test_match_ignores_recommendation_cards_from_detail_page() -> None:
+    context = ToolContext(
+        user_id="user-a",
+        run_id="run-a",
+        metadata={
+            "confirmed_profile_facts": {
+                "basics.name": "AIGC 产品经理（应届生）",
+                "skills": ["AIGC 应用"],
+            },
+            "structured_job_candidates": [
+                {
+                    "artifact_id": "main",
+                    "candidate_id": "artifact:candidate:0",
+                    "source_quality": "jd_complete",
+                    "source_url": "https://jobs.example/detail/1",
+                    "page_source_url": "https://jobs.example/detail/1",
+                    "page_title": "数字化产品经理招聘",
+                    "title": "数字化产品经理",
+                    "locations": ["上海"],
+                    "responsibilities": "AIGC 应用产品设计",
+                    "requirements": "",
+                },
+                {
+                    "artifact_id": "recommended",
+                    "candidate_id": "artifact:candidate:1",
+                    "source_quality": "jd_complete",
+                    "source_url": "https://jobs.example/detail/2",
+                    "page_source_url": "https://jobs.example/detail/1",
+                    "page_title": "数字化产品经理招聘",
+                    "title": "Salesforce产品经理 – Customer Data",
+                    "locations": ["上海"],
+                    "responsibilities": "AIGC 应用产品设计",
+                    "requirements": "",
+                },
+            ],
+        },
+    )
+
+    result = match_observed_jobs(
+        context,
+        MatchObservedJobsInput(profile_keywords=["产品经理", "AIGC"]),
+    )
+
+    assert [match.artifact_id for match in result.matches] == ["main"]

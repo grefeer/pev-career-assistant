@@ -86,6 +86,7 @@ tests/manual/*
 
 # Skill runtime artifacts (deepagents conversation history + temp output)
 skill/conversation_history/
+**/conversation_history/
 skill/tmp/
 nul
 var/

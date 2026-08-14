@@ -129,6 +129,107 @@ def _task_input_value(task: AgentTaskRequest, name: str) -> Any:
     return _context_value(task.context, name)
 
 
+_DERIVED_ROLE_KEYWORDS = (
+    "大模型应用开发工程师",
+    "大模型应用开发",
+    "AIGC 产品经理",
+    "AI 产品经理",
+    "前端开发工程师",
+    "前端开发",
+    "Java 后端开发工程师",
+    "Java 后端",
+    "后端开发工程师",
+    "算法工程师",
+    "产品经理",
+    "应用开发",
+    "开发工程师",
+    "Java",
+    "Python",
+)
+_DERIVED_COMPANY_KEYWORDS = (
+    "中国移动",
+    "中国联通",
+    "中国电信",
+    "字节跳动",
+    "腾讯",
+    "阿里巴巴",
+    "百度",
+    "华为",
+    "小米",
+    "京东",
+    "美团",
+    "网易",
+    "用友",
+)
+_DERIVED_LOCATION_KEYWORDS = (
+    "北京",
+    "上海",
+    "广州",
+    "深圳",
+    "杭州",
+    "南京",
+    "苏州",
+    "成都",
+    "武汉",
+    "西安",
+    "重庆",
+    "天津",
+    "长沙",
+    "郑州",
+    "济南",
+    "青岛",
+    "合肥",
+    "厦门",
+    "大连",
+    "东莞",
+    "佛山",
+)
+
+
+def _compile_task_context(task: AgentTaskRequest) -> AgentTaskRequest:
+    """Fill only explicit, deterministic query fields absent from task context.
+
+    Planner outputs often reference the career-sheet query ports directly. A
+    missing port should not force a replan when the same value is plainly
+    stated in the user's goal. This compiler never invents a default time
+    window or preference: it derives a value only from an explicit phrase and
+    preserves all caller-provided keys unchanged.
+    """
+    context = dict(task.context)
+    goal = task.goal
+    lowered = goal.lower()
+    if "role_keywords" not in context:
+        role_keywords = [
+            term
+            for term in _DERIVED_ROLE_KEYWORDS
+            if term.lower() in lowered
+        ]
+        if role_keywords:
+            context["role_keywords"] = list(dict.fromkeys(role_keywords))[:5]
+    if "company_keywords" not in context:
+        company_keywords = [
+            term for term in _DERIVED_COMPANY_KEYWORDS if term.lower() in lowered
+        ]
+        if company_keywords:
+            context["company_keywords"] = list(dict.fromkeys(company_keywords))[:5]
+    if "location_keywords" not in context:
+        location_keywords = [term for term in _DERIVED_LOCATION_KEYWORDS if term in goal]
+        if location_keywords:
+            context["location_keywords"] = list(dict.fromkeys(location_keywords))[:5]
+    if "recent_days" not in context:
+        window_text = " ".join(
+            str(value)
+            for value in (goal, context.get("time_window_text"), context.get("time_window"))
+            if value is not None
+        )
+        match = re.search(r"(?:最近|近|过去|过去的)\s*(\d+)\s*(?:天|日)", window_text)
+        if match:
+            context["recent_days"] = int(match.group(1))
+    if context == task.context:
+        return task
+    return task.model_copy(update={"context": context})
+
+
 def _is_private_task_input(name: str) -> bool:
     """Identify input names that must never be copied into public model context."""
     return name == "confirmed_profile_facts" or name.startswith("private_context.")
@@ -175,6 +276,7 @@ class AgentRuntime:
         existing_run: AgentRun | None = None,
     ) -> AgentRunResult:
         """Run bounded PEV lifecycle; agents retain all semantic tool decisions."""
+        task = _compile_task_context(task)
         run = existing_run
         if run is None:
             run = run_repository.create_run(
@@ -258,8 +360,33 @@ class AgentRuntime:
                 )
             except AgentModelGatewayError as error:
                 if error.code == "invalid_model_response":
-                    return self._finish_planner_invalid_model(db, run.id, run)
-                return self._fail_run(db, run.id, error.code)
+                    fallback_builder = getattr(
+                        self._planner, "build_seeded_fallback", None
+                    )
+                    fallback = (
+                        fallback_builder(planning_task)
+                        if callable(fallback_builder)
+                        else None
+                    )
+                    if isinstance(fallback, ExecutionPlan):
+                        run_repository.append_event(
+                            db,
+                            run_id=run.id,
+                            event_type="planner_seeded_fallback",
+                            payload_json={
+                                "reason": "invalid_model_response",
+                                "step_count": len(fallback.steps),
+                            },
+                        )
+                        planner_result = PlannerResult(
+                            status="planned",
+                            plan=fallback,
+                            observations=[],
+                        )
+                    else:
+                        return self._finish_planner_invalid_model(db, run.id, run)
+                else:
+                    return self._fail_run(db, run.id, error.code)
             if planner_result.status != "planned" or planner_result.plan is None:
                 return self._finish_planner_non_plan(db, run.id, run, planner_result)
 
@@ -367,6 +494,13 @@ class AgentRuntime:
                     allowed_skills=plan_step.allowed_skills,
                 )
                 self._checkpoint(db)
+                if sequence == 1 and revision == 1:
+                    self._persist_seeded_public_evidence(
+                        db=db,
+                        run_id=run.id,
+                        step=step,
+                        task=planning_task,
+                    )
                 try:
                     if self._skills is not None:
                         port_error = self._skills.validate_step_ports(plan_step)
@@ -615,6 +749,13 @@ class AgentRuntime:
         prior_artifact_refs: list[dict[str, str]] = []
         last_retry_progress_fingerprint: str | None = None
         auto_extract_attempted = False
+        auto_discovery_attempted = False
+        seeded_artifact_refs = [
+            *self._step_seeded_artifact_refs(
+                db=db, run_id=run_id, step=persisted_step
+            ),
+            *self._resolved_step_artifact_refs(context),
+        ]
         while True:
             try:
                 execution = self._executor.run(
@@ -644,9 +785,30 @@ class AgentRuntime:
             self._record_failed_executor_observations(
                 db, run_id, persisted_step, execution
             )
-            observed_artifact_refs = self._persist_observed_evidence(
-                db, run_id, persisted_step, execution
-            )
+            observed_artifact_refs = [
+                *seeded_artifact_refs,
+                *self._persist_observed_evidence(
+                    db, run_id, persisted_step, execution
+                ),
+            ]
+            auto_discovery_observations: list[Any] = []
+            auto_discovery_refs: list[dict[str, str]] = []
+            if not auto_discovery_attempted:
+                auto_discovery_observations, auto_discovery_refs = (
+                    self._auto_recover_discovery_evidence(
+                        db=db,
+                        run_id=run_id,
+                        task=task,
+                        plan_step=plan_step,
+                        persisted_step=persisted_step,
+                        context=context,
+                        observations=execution.observations,
+                        artifact_refs=observed_artifact_refs,
+                        tool_budget=tool_budget,
+                    )
+                )
+                if auto_discovery_observations or auto_discovery_refs:
+                    auto_discovery_attempted = True
             if auto_extract_attempted:
                 auto_observations, auto_artifact_refs = [], []
             else:
@@ -662,6 +824,14 @@ class AgentRuntime:
                 )
                 if auto_observations or auto_artifact_refs:
                     auto_extract_attempted = True
+            auto_observations = [
+                *auto_discovery_observations,
+                *auto_observations,
+            ]
+            auto_artifact_refs = [
+                *auto_discovery_refs,
+                *auto_artifact_refs,
+            ]
             deliverable_observations, deliverable_refs = (
                 self._auto_build_role_deliverable(
                     db=db,
@@ -696,6 +866,28 @@ class AgentRuntime:
                     "artifact_refs": [*prior_artifact_refs, *observed_artifact_refs],
                 }
             )
+            if (
+                execution.status == "failed"
+                and auto_artifact_refs
+                and self._step_contract_met(
+                    plan_step, execution.observations, execution.artifact_refs
+                )
+                and not self._step_has_blocked_evidence(
+                    plan_step, execution.observations, execution.artifact_refs
+                )
+            ):
+                # A deterministic runtime recovery may finish the declared
+                # contract even when the model's terminal response exhausted
+                # its budget. Preserve the tool-backed deliverable and avoid
+                # discarding it as a model transport failure.
+                execution = execution.model_copy(
+                    update={
+                        "status": "succeeded",
+                        "error_code": None,
+                        "summary": execution.summary
+                        or "已由确定性工具恢复并完成步骤交付。",
+                    }
+                )
             if any(
                 observation.status == "failed"
                 and observation.error_code == "tool_skill_forbidden"
@@ -925,6 +1117,35 @@ class AgentRuntime:
                     else None
                 )
                 if diagnostics is not None and not diagnostics["gate_passed"]:
+                    durable_refs = self._step_seeded_artifact_refs(
+                        db=db, run_id=run_id, step=persisted_step
+                    )
+                    if durable_refs:
+                        merged_refs = list(
+                            {
+                                (ref.get("artifact_id"), ref.get("content_hash")): ref
+                                for ref in [*execution.artifact_refs, *durable_refs]
+                            }.values()
+                        )
+                        durable_diagnostics = self._skills.completion_evidence_diagnostics(
+                            plan_step,
+                            execution.observations,
+                            summary=execution.summary,
+                            artifact_refs=merged_refs,
+                        )
+                        if durable_diagnostics["gate_passed"]:
+                            execution = execution.model_copy(
+                                update={"artifact_refs": merged_refs}
+                            )
+                            return self._rescue_step_succeeded(
+                                db,
+                                run_id,
+                                persisted_step,
+                                execution,
+                                event_type="runtime_durable_contract_rescue",
+                                reason="persisted_evidence_contract_met",
+                                output_artifact_refs=merged_refs,
+                            )
                     run_repository.append_event(
                         db,
                         run_id=run_id,
@@ -1146,33 +1367,20 @@ class AgentRuntime:
                     and not self._step_has_blocked_evidence(
                         plan_step, execution.observations, execution.artifact_refs
                     )
-                    and replans < task.budget.max_replans
-                    and not task.replan_state.conversion_used(
-                        ReplanReason.NEED_USER_CONTRACT
-                    )
                 ):
-                    # R009/R018/R033/R013: the verifier asks the human even
-                    # though the step's deliverable is already tool-backed and
-                    # unblocked. The deterministic contract (the same evidence
-                    # the verifier would inspect) is satisfied, so the hand-off
-                    # is a request the agents already finished; a bounded replan
-                    # lets the planner restructure the step instead of dying at
-                    # step 1. Guarded by the replan budget and a once-per-run
-                    # marker: the run loop appends this summary to
-                    # verifier_feedback, so a second identical NEED_USER after
-                    # the replan keeps the human hand-off. Blocked evidence
-                    # (login/captcha/anti-bot/OCR-off) always keeps the human
-                    # hand-off.
-                    return self._request_replan(
+                    # A complete, unblocked Skill deliverable has no missing
+                    # evidence for a replan to repair. Preserve the human
+                    # feedback in the trace, but finish from the deterministic
+                    # contract. Access-blocked evidence never reaches this
+                    # branch.
+                    return self._rescue_step_succeeded(
                         db,
                         run_id,
                         persisted_step,
-                        feedback=verification.feedback,
-                        summary=(
-                            f"{verification.feedback} {_NEEDS_USER_REPLAN_MARKER}"
-                        ),
+                        execution,
+                        event_type="verifier_rescue_succeeded",
+                        reason="need_user_contract_met",
                         output_artifact_refs=execution.artifact_refs,
-                        reason=ReplanReason.NEED_USER_CONTRACT,
                     )
                 return self._wait_for_user(
                     db,
@@ -1263,6 +1471,23 @@ class AgentRuntime:
             ]
             if not matches and len(source) == 1 and input_ref.artifact_type is None:
                 matches = source
+            if (
+                input_ref.artifact_type == "job_search_results"
+                and "job-discovery" in plan_step.allowed_skills
+            ):
+                # A Planner may call the output of a discovery step
+                # ``job_search_results`` even after the Executor has already
+                # upgraded that source into public pages or structured JDs.
+                # Reuse only those same-run trusted discovery artifacts; do
+                # not widen arbitrary Skill or cross-domain ports.
+                compatible = [
+                    item
+                    for item in source
+                    if item.get("artifact_type")
+                    in {"public_job_page", "structured_job_details"}
+                ]
+                if compatible:
+                    matches = [*matches, *compatible]
             if not matches:
                 raise StepDependencyError(
                     f"step {plan_step.step_id} cannot resolve artifact '{input_ref.name}' "
@@ -1831,6 +2056,136 @@ class AgentRuntime:
             )
         return artifact_refs
 
+    @staticmethod
+    def _persist_seeded_public_evidence(
+        *,
+        db: Session,
+        run_id: str,
+        step: AgentStep,
+        task: AgentTaskRequest,
+    ) -> None:
+        """Hydrate trusted chain evidence into the current run's ledger.
+
+        Chained evaluations pass the previous run's immutable artifact
+        projection as ``observed_public_evidence``. Persisting that projection
+        before the first step keeps the current run's audit and downstream
+        tools consistent with the evidence already shown to the Executor.
+        Entries without a source URL, hash, or visible text are ignored.
+        """
+        raw_evidence = task.context.get("observed_public_evidence")
+        if not isinstance(raw_evidence, list):
+            return
+        seeded_count = 0
+        for item in raw_evidence:
+            if not isinstance(item, dict) or item.get("artifact_type") not in {
+                None,
+                "public_job_page",
+            }:
+                continue
+            source_url = item.get("source_url")
+            content_hash = item.get("content_hash")
+            visible_text = item.get("visible_text")
+            if not all(
+                isinstance(value, str) and value
+                for value in (source_url, content_hash, visible_text)
+            ):
+                continue
+            content_json = {
+                key: item[key]
+                for key in (
+                    "title",
+                    "visible_text",
+                    "effective_url",
+                    "redirect_chain",
+                    "http_status",
+                    "quality",
+                    "quality_signal",
+                )
+                if key in item
+            }
+            run_repository.create_evidence_artifact(
+                db,
+                run_id=run_id,
+                step_id=step.id,
+                source_url=source_url,
+                content_hash=content_hash,
+                content_json=content_json,
+            )
+            seeded_count += 1
+        if seeded_count:
+            run_repository.append_event(
+                db,
+                run_id=run_id,
+                event_type="inherited_public_evidence_hydrated",
+                payload_json={"sequence": step.sequence, "artifact_count": seeded_count},
+            )
+
+    @staticmethod
+    def _step_seeded_artifact_refs(
+        *, db: Session, run_id: str, step: AgentStep
+    ) -> list[dict[str, str]]:
+        """Project chain-hydrated page artifacts into the current step refs."""
+        refs: list[dict[str, str]] = []
+        for artifact in run_repository.list_evidence_artifacts(db, run_id):
+            if artifact.step_id != step.id or artifact.artifact_type != "public_job_page":
+                continue
+            quality = artifact.content_json.get("quality")
+            ref: dict[str, str] = {
+                "artifact_id": artifact.id,
+                "artifact_type": artifact.artifact_type,
+                "tool": "fetch-public-job-pages",
+                "source_url": artifact.source_url,
+                "content_hash": artifact.content_hash,
+            }
+            if isinstance(quality, str):
+                ref["quality"] = quality
+            refs.append(ref)
+        return refs
+
+    @staticmethod
+    def _resolved_step_artifact_refs(
+        context: ToolContext,
+    ) -> list[dict[str, str]]:
+        """Project trusted upstream step outputs into the current step refs.
+
+        ``_prepare_step_inputs`` resolves artifact ports from the current run's
+        previous steps and places that bounded projection in ToolContext. The
+        Executor must see those refs as usable evidence even when it chooses no
+        new fetch tool; otherwise a valid upstream JD is invisible to the
+        current step's deterministic completion gate.
+        """
+        resolved = context.metadata.get("resolved_step_inputs", {})
+        if not isinstance(resolved, dict):
+            return []
+        artifacts = resolved.get("artifacts", {})
+        if not isinstance(artifacts, dict):
+            return []
+        refs: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for source in artifacts.values():
+            if not isinstance(source, list):
+                continue
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                required = ("artifact_id", "artifact_type", "source_url", "content_hash")
+                if not all(isinstance(item.get(key), str) and item.get(key) for key in required):
+                    continue
+                key = (item["artifact_id"], item["content_hash"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                ref = {
+                    key: item[key]
+                    for key in ("artifact_id", "artifact_type", "source_url", "content_hash")
+                }
+                for optional in ("tool", "quality", "source_quality", "output_name"):
+                    value = item.get(optional)
+                    if isinstance(value, str) and value:
+                        ref[optional] = value
+                refs.append(ref)
+        return refs
+
     def _auto_extract_jd_details(
         self,
         *,
@@ -1901,6 +2256,315 @@ class AgentRuntime:
         )
         return observations, refs
 
+    def _auto_recover_discovery_evidence(
+        self,
+        *,
+        db: Session,
+        run_id: str,
+        task: AgentTaskRequest,
+        plan_step: PlanStep,
+        persisted_step: AgentStep,
+        context: ToolContext,
+        observations: list[Any],
+        artifact_refs: list[dict[str, Any]],
+        tool_budget: ToolCallBudget,
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        """Continue a source-bound discovery route after a model stall.
+
+        Two deterministic recovery cases are safe and common: a list-only
+        page needs the existing bounded detail expansion, and a successful
+        sheet/search result already contains public URLs that still need
+        fetching. Both paths use the registered public fetch tool, preserve
+        per-URL failures, and never invent or retry around access controls.
+        """
+        if "job-discovery" not in plan_step.allowed_skills:
+            return [], []
+
+        list_urls = list(
+            dict.fromkeys(
+                str(ref["source_url"])
+                for ref in artifact_refs
+                if ref.get("artifact_type") == "public_job_page"
+                and ref.get("quality") == "list_only"
+                and isinstance(ref.get("source_url"), str)
+                and str(ref["source_url"]).startswith(("http://", "https://"))
+                and not ref.get("runtime_auto_expand")
+            )
+        )
+        if list_urls:
+            expanded_observations, expanded_refs = self._auto_fetch_public_urls(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=context,
+                urls=list_urls[:3],
+                tool_budget=tool_budget,
+                event_type="runtime_auto_expanded_list_pages",
+                event_payload={"step_id": plan_step.step_id, "url_count": len(list_urls[:3])},
+            )
+            if any(ref.get("quality") == "jd_complete" for ref in expanded_refs):
+                return expanded_observations, expanded_refs
+            if self._contains_access_block(expanded_observations):
+                return expanded_observations, expanded_refs
+            supplied_urls = task.context.get("candidate_urls")
+            processed_urls = {
+                ref.get("source_url")
+                for ref in artifact_refs
+                if ref.get("artifact_type") == "public_job_page"
+                and isinstance(ref.get("source_url"), str)
+            }
+            if (
+                isinstance(supplied_urls, list)
+                and supplied_urls
+                and not {
+                    url for url in supplied_urls if isinstance(url, str)
+                }.issubset(processed_urls)
+            ):
+                # Preserve the Executor's source-boundary rule: public search
+                # is a fallback only after every supplied candidate has been
+                # processed or failed.
+                return expanded_observations, expanded_refs
+            search_observations, search_refs = self._auto_search_and_fetch(
+                db=db,
+                run_id=run_id,
+                persisted_step=persisted_step,
+                context=context,
+                tool_budget=tool_budget,
+                task_goal=context.metadata.get("task_goal"),
+                step_id=plan_step.step_id,
+            )
+            return (
+                [*expanded_observations, *search_observations],
+                [*expanded_refs, *search_refs],
+            )
+
+        has_complete_page = any(
+            isinstance(observation.output, dict)
+            and any(
+                isinstance(page, dict) and page.get("quality") == "jd_complete"
+                for page in (
+                    observation.output.get("pages")
+                    if isinstance(observation.output.get("pages"), list)
+                    else [observation.output]
+                )
+            )
+            for observation in observations
+        )
+        if has_complete_page:
+            return [], []
+        urls: list[str] = []
+        for observation in observations:
+            output = observation.output if isinstance(observation.output, dict) else {}
+            for collection_name in ("results", "records"):
+                collection = output.get(collection_name)
+                if not isinstance(collection, list):
+                    continue
+                for item in collection:
+                    if not isinstance(item, dict):
+                        continue
+                    candidates = [
+                        item.get("url"),
+                        item.get("source_url"),
+                        item.get("apply_url"),
+                        item.get("link"),
+                    ]
+                    prior = item.get("prior_metadata")
+                    if isinstance(prior, dict):
+                        candidates.append(prior.get("apply_url"))
+                    for value in candidates:
+                        if (
+                            isinstance(value, str)
+                            and value.startswith(("http://", "https://"))
+                            and value not in urls
+                        ):
+                            urls.append(value)
+                            break
+                    if len(urls) >= 10:
+                        break
+                if len(urls) >= 10:
+                    break
+            if len(urls) >= 10:
+                break
+        if not urls:
+            supplied_urls = task.context.get("candidate_urls")
+            if isinstance(supplied_urls, list):
+                processed_urls = {
+                    ref.get("source_url")
+                    for ref in artifact_refs
+                    if isinstance(ref.get("source_url"), str)
+                }
+                urls = list(
+                    dict.fromkeys(
+                        value
+                        for value in supplied_urls
+                        if isinstance(value, str)
+                        and value.startswith(("http://", "https://"))
+                        and value not in processed_urls
+                    )
+                )[:10]
+        if not urls:
+            return [], []
+        return self._auto_fetch_public_urls(
+            db=db,
+            run_id=run_id,
+            persisted_step=persisted_step,
+            context=context,
+            urls=urls,
+            tool_budget=tool_budget,
+            event_type="runtime_auto_fetched_search_results",
+            event_payload={"step_id": plan_step.step_id, "url_count": len(urls)},
+        )
+
+    def _auto_search_and_fetch(
+        self,
+        *,
+        db: Session,
+        run_id: str,
+        persisted_step: AgentStep,
+        context: ToolContext,
+        tool_budget: ToolCallBudget,
+        task_goal: object,
+        step_id: str,
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        """Use the already-authorized public-search fallback once per stall."""
+        if not isinstance(task_goal, str) or len(task_goal.strip()) < 2:
+            return [], []
+        if not tool_budget.try_consume():
+            return [], []
+        search_observation = self._executor.invoke_registered_tool(
+            name="search-public-job-pages",
+            context=ToolContext(
+                user_id=context.user_id,
+                run_id=run_id,
+                metadata=dict(context.metadata),
+            ),
+            payload={"query": task_goal[:380], "max_results": 5},
+        )
+        search_execution = ExecutorResult(
+            status="succeeded",
+            observations=[search_observation],
+            summary="已使用公开搜索回退核验岗位来源。",
+        )
+        search_refs = self._persist_observed_evidence(
+            db, run_id, persisted_step, search_execution
+        )
+        urls = self._search_result_urls([search_observation])
+        if search_observation.status != "succeeded" or not urls:
+            return [search_observation], search_refs
+        fetched_observations, fetched_refs = self._auto_fetch_public_urls(
+            db=db,
+            run_id=run_id,
+            persisted_step=persisted_step,
+            context=context,
+            urls=urls,
+            tool_budget=tool_budget,
+            event_type="runtime_auto_fetched_public_search_results",
+            event_payload={"step_id": step_id, "url_count": len(urls)},
+        )
+        return [search_observation, *fetched_observations], [*search_refs, *fetched_refs]
+
+    @staticmethod
+    def _search_result_urls(observations: list[Any]) -> list[str]:
+        urls: list[str] = []
+        for observation in observations:
+            output = observation.output if isinstance(observation.output, dict) else {}
+            for collection_name in ("results", "records"):
+                collection = output.get(collection_name)
+                if not isinstance(collection, list):
+                    continue
+                for item in collection:
+                    if not isinstance(item, dict):
+                        continue
+                    candidates = [
+                        item.get("url"),
+                        item.get("source_url"),
+                        item.get("apply_url"),
+                        item.get("link"),
+                    ]
+                    prior = item.get("prior_metadata")
+                    if isinstance(prior, dict):
+                        candidates.append(prior.get("apply_url"))
+                    value = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if isinstance(candidate, str)
+                            and candidate.startswith(("http://", "https://"))
+                        ),
+                        None,
+                    )
+                    if value and value not in urls:
+                        urls.append(value)
+                    if len(urls) >= 10:
+                        return urls
+        return urls
+
+    @staticmethod
+    def _contains_access_block(observations: list[Any]) -> bool:
+        blocked_codes = {
+            "anti_bot",
+            "anti_bot_challenge",
+            "captcha",
+            "login_required",
+            "access_denied",
+            "domain_temporarily_blocked",
+        }
+        for observation in observations:
+            if getattr(observation, "error_code", None) in blocked_codes:
+                return True
+            output = observation.output if isinstance(observation.output, dict) else {}
+            failures = output.get("failures")
+            if isinstance(failures, list) and any(
+                isinstance(item, dict) and item.get("error_code") in blocked_codes
+                for item in failures
+            ):
+                return True
+        return False
+
+    def _auto_fetch_public_urls(
+        self,
+        *,
+        db: Session,
+        run_id: str,
+        persisted_step: AgentStep,
+        context: ToolContext,
+        urls: list[str],
+        tool_budget: ToolCallBudget,
+        event_type: str,
+        event_payload: dict[str, Any],
+    ) -> tuple[list[Any], list[dict[str, str]]]:
+        if not urls or not tool_budget.try_consume():
+            return [], []
+        fetch_context = ToolContext(
+            user_id=context.user_id,
+            run_id=run_id,
+            metadata=dict(context.metadata),
+        )
+        observation = self._executor.invoke_registered_tool(
+            name="fetch-public-job-pages",
+            context=fetch_context,
+            payload={"urls": urls[:10]},
+        )
+        if observation.status != "succeeded":
+            return [observation], []
+        execution = ExecutorResult(
+            status="succeeded",
+            observations=[observation],
+            summary="已对工具返回的公开岗位链接执行确定性页面核验。",
+        )
+        refs = self._persist_observed_evidence(
+            db, run_id, persisted_step, execution
+        )
+        for ref in refs:
+            ref["runtime_auto_expand"] = "true"
+        run_repository.append_event(
+            db,
+            run_id=run_id,
+            event_type=event_type,
+            payload_json={**event_payload, "artifact_count": len(refs)},
+        )
+        return [observation], refs
+
     def _auto_build_role_deliverable(
         self,
         *,
@@ -1914,7 +2578,11 @@ class AgentRuntime:
         tool_budget: ToolCallBudget,
     ) -> tuple[list[Any], list[dict[str, str]]]:
         """Finish a role-specific artifact from trusted candidates after a model stall."""
-        if "resume-tailoring" in plan_step.allowed_skills:
+        if "job-matching" in plan_step.allowed_skills:
+            artifact_type = "job_matching_report"
+            tool_name = "match-observed-jobs"
+            keywords = self._goal_role_keywords(task.goal)
+        elif "resume-tailoring" in plan_step.allowed_skills:
             artifact_type = "resume_tailoring_brief"
             tool_name = "build-resume-tailoring-brief"
             keywords = self._goal_role_keywords(task.goal)
@@ -1927,11 +2595,38 @@ class AgentRuntime:
         if any(ref.get("artifact_type") == artifact_type for ref in artifact_refs):
             return [], []
         candidates = _structured_job_candidates(db, run_id)
+        usable_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("source_quality") not in {"list_only", "js_shell", "empty"}
+        ]
+        if tool_name == "match-observed-jobs":
+            # Matching consumes the full trusted candidate projection. Do not
+            # pre-filter it by title: the deterministic matcher owns role,
+            # location, and experience constraints and must explain exclusions.
+            if not usable_candidates:
+                # A chained matching step may inherit only public page refs
+                # (the prior step did not persist structured extraction). The
+                # matching tool has a bounded raw-page fallback, so one
+                # complete page is enough to invoke it without fabricating a
+                # structured candidate.
+                usable_candidates = [
+                    {"artifact_id": artifact.id}
+                    for artifact in run_repository.list_evidence_artifacts(db, run_id)
+                    if artifact.artifact_type == "public_job_page"
+                    and artifact.content_json.get("quality") == "jd_complete"
+                ]
+            if not usable_candidates or not tool_budget.try_consume():
+                return [], []
+            selected = usable_candidates[0]
+            target_keywords = keywords or ["岗位"]
+        else:
+            selected = None
         ranked: list[tuple[int, dict[str, Any]]] = []
-        for candidate in candidates:
+        for candidate in usable_candidates:
+            if tool_name == "match-observed-jobs":
+                break
             source_quality = candidate.get("source_quality")
-            if source_quality in {"list_only", "js_shell", "empty"}:
-                continue
             searchable = "\n".join(
                 str(candidate.get(key) or "")
                 for key in ("title", "company_name", "responsibilities", "requirements")
@@ -1939,34 +2634,120 @@ class AgentRuntime:
             score = sum(1 for keyword in keywords if keyword.lower() in searchable)
             if score:
                 ranked.append((score, candidate))
-        if not ranked or not tool_budget.try_consume():
+        if tool_name == "build-resume-tailoring-brief" and not ranked:
+            # A chain step may describe only "the selected job" and therefore
+            # contain no role keyword. Prefer a real, body-backed JD over a
+            # recommendation card so the tailoring tool receives resolvable
+            # target evidence even before the matching-report projection is
+            # available.
+            ranked = [
+                (1, candidate)
+                for candidate in usable_candidates
+                if (
+                    isinstance(candidate.get("title"), str)
+                    and (
+                        isinstance(candidate.get("responsibilities"), str)
+                        and candidate.get("responsibilities").strip()
+                        or isinstance(candidate.get("requirements"), str)
+                        and candidate.get("requirements").strip()
+                    )
+                )
+            ]
+        if tool_name != "match-observed-jobs" and (
+            not ranked or not tool_budget.try_consume()
+        ):
             return [], []
-        ranked.sort(
-            key=lambda item: (
-                -item[0],
-                str(item[1].get("title") or ""),
-                str(item[1].get("artifact_id") or ""),
+        tailoring_target_id: str | None = None
+        if tool_name != "match-observed-jobs":
+            ranked.sort(
+                key=lambda item: (
+                    -item[0],
+                    str(item[1].get("title") or ""),
+                    str(item[1].get("artifact_id") or ""),
+                )
             )
-        )
-        selected = ranked[0][1]
-        artifact_id = selected.get("artifact_id")
-        if not isinstance(artifact_id, str) or not artifact_id:
-            return [], []
-        target_keywords = [
-            keyword
-            for keyword in keywords
-            if keyword.lower()
-            in "\n".join(
-                str(selected.get(key) or "")
-                for key in ("title", "responsibilities", "requirements")
-            ).lower()
-        ] or ["岗位"]
-        payload: dict[str, Any] = {
-            "target_artifact_id": artifact_id,
-        }
+            selected = ranked[0][1]
+            artifact_id = selected.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                return [], []
+            target_keywords = [
+                keyword
+                for keyword in keywords
+                if keyword.lower()
+                in "\n".join(
+                    str(selected.get(key) or "")
+                    for key in ("title", "responsibilities", "requirements")
+                ).lower()
+            ] or ["岗位"]
+            if tool_name == "build-resume-tailoring-brief":
+                report_target_id = self._matching_report_target_artifact_id(
+                    db=db, run_id=run_id
+                )
+                if report_target_id:
+                    tailoring_target_id = report_target_id
+                    report_candidate = next(
+                        (
+                            candidate
+                            for candidate in usable_candidates
+                            if candidate.get("artifact_id") == report_target_id
+                        ),
+                        None,
+                    )
+                    if report_candidate is not None:
+                        selected = report_candidate
+                        artifact_id = report_target_id
+                        target_keywords = self._tailoring_keywords(
+                            task, report_candidate
+                        )
+                    else:
+                        report_facts = task.private_context.get(
+                            "confirmed_profile_facts", {}
+                        )
+                        if isinstance(report_facts, dict):
+                            for key, value in report_facts.items():
+                                if "name" in str(key).lower() and isinstance(value, str):
+                                    target_keywords = self._goal_role_keywords(value)
+                                    break
+        if tool_name == "match-observed-jobs":
+            profile_facts = task.private_context.get("confirmed_profile_facts", {})
+            profile_keywords = list(keywords)
+            if isinstance(profile_facts, dict):
+                skills = profile_facts.get("skills")
+                if isinstance(skills, list):
+                    profile_keywords.extend(
+                        skill for skill in skills if isinstance(skill, str)
+                    )
+                for key, value in profile_facts.items():
+                    if "name" in str(key).lower() and isinstance(value, str):
+                        profile_keywords.extend(self._goal_role_keywords(value))
+            profile_keywords.extend(
+                value
+                for value in (
+                    task.context.get("role_keywords", [])
+                    if isinstance(task.context.get("role_keywords", []), list)
+                    else []
+                )
+                if isinstance(value, str)
+            )
+            preferred_locations = task.context.get("location_keywords", [])
+            if not isinstance(preferred_locations, list):
+                preferred_locations = []
+            payload = {
+                "profile_keywords": list(dict.fromkeys(profile_keywords))[:30],
+                "preferred_locations": [
+                    value for value in preferred_locations if isinstance(value, str)
+                ][:20],
+                "ranking_criteria": ["skills", "location", "recency"],
+                "limit": 100,
+            }
+        else:
+            payload = {
+                "target_artifact_id": tailoring_target_id
+                or selected.get("artifact_id"),
+            }
         if tool_name == "build-resume-tailoring-brief":
             payload["target_keywords"] = target_keywords
-        else:
+        elif tool_name == "build-preparation-plan":
             payload["focus_keywords"] = target_keywords
         observation = self._executor.invoke_registered_tool(
             name=tool_name,
@@ -1989,6 +2770,73 @@ class AgentRuntime:
         for ref in refs:
             ref["runtime_auto_deliverable"] = "true"
         return [observation], refs
+
+    @staticmethod
+    def _matching_report_target_artifact_id(
+        *, db: Session, run_id: str
+    ) -> str | None:
+        """Resolve the top match to the exact artifact expected by tailoring."""
+        for artifact in run_repository.list_evidence_artifacts(db, run_id):
+            if artifact.artifact_type != "job_matching_report":
+                continue
+            matches = artifact.content_json.get("matches")
+            if not isinstance(matches, list) or not matches:
+                continue
+            top = matches[0]
+            if not isinstance(top, dict):
+                continue
+            candidate_ids = [
+                top.get("artifact_id"),
+                top.get("source_artifact_id"),
+            ]
+            source_url = top.get("source_url")
+            artifacts = run_repository.list_evidence_artifacts(db, run_id)
+            for candidate_id in candidate_ids:
+                if not isinstance(candidate_id, str):
+                    continue
+                if any(artifact.id == candidate_id for artifact in artifacts):
+                    return candidate_id
+            if isinstance(source_url, str) and source_url:
+                for artifact in artifacts:
+                    if artifact.source_url == source_url and artifact.artifact_type in {
+                        "public_job_page",
+                        "structured_job_details",
+                    }:
+                        return artifact.id
+        return None
+
+    @staticmethod
+    def _tailoring_keywords(
+        task: AgentTaskRequest, candidate: dict[str, Any]
+    ) -> list[str]:
+        keywords = AgentRuntime._goal_role_keywords(task.goal)
+        if keywords != ["岗位"]:
+            return keywords
+        text = " ".join(
+            str(candidate.get(key) or "")
+            for key in ("title", "responsibilities", "requirements")
+        )
+        inferred = [
+            marker
+            for marker in (
+                "产品经理",
+                "前端",
+                "Java",
+                "后端",
+                "大模型",
+                "AIGC",
+                "AI",
+                "Agent",
+                "RAG",
+            )
+            if marker.lower() in text.lower()
+        ]
+        facts = task.private_context.get("confirmed_profile_facts", {})
+        if isinstance(facts, dict) and isinstance(facts.get("skills"), list):
+            inferred.extend(
+                skill for skill in facts["skills"] if isinstance(skill, str)
+            )
+        return list(dict.fromkeys(inferred)) or ["岗位"]
 
     @staticmethod
     def _goal_role_keywords(goal: str) -> list[str]:
@@ -2455,13 +3303,26 @@ def _structured_job_candidates(db: Session, run_id: str) -> list[dict[str, Any]]
                     "source_artifact_id": _evidence_artifact_id(candidate),
                     "source_url": source_url,
                     "page_source_url": artifact.source_url,
+                    "page_title": artifact.content_json.get("title")
+                    if isinstance(artifact.content_json.get("title"), str)
+                    else None,
+                    "page_text_prefix": (
+                        artifact.content_json.get("visible_text", "")[:2000]
+                        if isinstance(artifact.content_json.get("visible_text"), str)
+                        else ""
+                    ),
                     "apply_url": (
                         candidate.get("apply_url")
                         if isinstance(candidate.get("apply_url"), str)
                         else None
                     ),
                     "content_hash": artifact.content_hash,
-                    "source_quality": quality_by_source.get(source_url),
+                    # The page that produced the candidate is authoritative:
+                    # a list page may point at a URL that was later fetched as
+                    # a detail page, but its card must not inherit the detail
+                    # page's quality and bypass the list-only gate.
+                    "source_quality": quality_by_source.get(artifact.source_url)
+                    or quality_by_source.get(source_url),
                     "title": title if isinstance(title, str) else None,
                     "locations": _string_list(candidate.get("locations")),
                     # Card-list extraction can land JD snippets in company_name

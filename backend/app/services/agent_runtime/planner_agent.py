@@ -328,6 +328,7 @@ class PlannerAgent:
                             ),
                             error_code="invalid_execution_plan",
                         )
+                plan = self._trim_unrequested_trailing_steps(task, plan)
                 return PlannerResult(
                     status="planned", plan=plan, observations=observations
                 )
@@ -485,8 +486,6 @@ class PlannerAgent:
                     ],
                 )
             )
-        if len(steps) == 1:
-            return None
         try:
             return ExecutionPlan(
                 task=task,
@@ -497,3 +496,48 @@ class PlannerAgent:
             )
         except Exception:
             return None
+
+    def build_seeded_fallback(self, task: AgentTaskRequest) -> ExecutionPlan | None:
+        """Expose the narrow URL-seeded fallback to the runtime harness.
+
+        The fallback is deliberately kept on the Planner so the runtime does
+        not duplicate plan-construction policy.  It is safe to use after a
+        malformed model response because it only consumes user- or
+        chain-provided URLs and still routes every fetch through the normal
+        public-evidence tools.
+        """
+        return self._build_seeded_career_fallback(task)
+
+    @staticmethod
+    def _trim_unrequested_trailing_steps(
+        task: AgentTaskRequest, plan: ExecutionPlan
+    ) -> ExecutionPlan:
+        """Drop trailing deliverables that the user's goal never requested.
+
+        A valid schema is not sufficient when a Planner appends a second
+        career deliverable (for example resume tailoring after a pure matching
+        question). Such a step has no target contract and commonly ends in a
+        false no-progress hand-off. Only trailing steps are removed, so this
+        repair never rewrites dependencies for an earlier requested step.
+        """
+        goal = task.goal.lower()
+        wants_tailoring = any(
+            marker in goal for marker in ("简历", "定制", "修改建议", "resume", "tailor")
+        )
+        wants_planning = any(
+            marker in goal
+            for marker in ("面试", "准备", "计划", "回答要点", "career preparation", "interview")
+        )
+        steps = list(plan.steps)
+        while steps:
+            skills = set(steps[-1].allowed_skills)
+            if "resume-tailoring" in skills and not wants_tailoring:
+                steps.pop()
+                continue
+            if "career-planning" in skills and not wants_planning:
+                steps.pop()
+                continue
+            break
+        if len(steps) == len(plan.steps):
+            return plan
+        return plan.model_copy(update={"steps": steps})

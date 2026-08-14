@@ -298,10 +298,10 @@
 
 ## Phases
 - [x] 读取评估脚本、题集清单和历史口径
-- [ ] 等待已有 prompt_iter_08 live 进程结束，确认资源空闲
-- [ ] 启动 83 题全量 live 评测并保存独立结果
-- [ ] 汇总顶层状态、根因、工具失败和成功审计
-- [ ] 运行必要的离线一致性检查并输出报告
+- [x] 等待已有 prompt_iter_08 live 进程结束，确认资源空闲
+- [x] 启动其余 73 题 live 评测并保存独立结果（2 workers，间隔 60 秒）
+- [x] 汇总顶层状态、根因、工具失败和成功审计
+- [x] 运行必要的离线一致性检查并输出报告
 
 ## Constraints
 - 不覆盖 `tests/question/eval_results/` 下已有结果目录。
@@ -309,4 +309,95 @@
 - 83 题以 `tests/question/redesign/manifest.json` 中的顶层 Q/C/R 文档为准。
 
 ## Status
-**Currently in Phase 2** - 已确认现有 `prompt_iter_08` 有 5/10 结果，等待剩余进程自然结束后启动全量评测。
+**Currently complete** - live 评测按用户要求停止；已完成落盘结果的 waiting_user 分类、工具轨迹分析和优化建议。
+
+## Errors Encountered
+- 首次启动目录 `tests/question/eval_results/all_73_20260814_2p_stagger60_live/` 的 worker 因错误传入不受支持的 `--evidence-mode live` 参数立即退出，完成数为 0；目录保留，未计入业务结果。已准备移除该参数后重试。
+
+## 2026-08-14 用户要求停止后的状态
+
+- [x] 按用户要求停止 `all_73_20260814_2p_stagger60_live_retry1` 的 2 个 worker；精确终止 4 个 Python 进程（每个 worker 含启动器与实际解释器），剩余 0 个。
+- [x] 汇总已落盘结果并按 root cause、terminal contract、tool error 聚类。
+- [x] 生成 `docs/83-question-waiting-user-analysis-2026-08-14.md`。
+- [ ] 未完成的 17 题不再继续执行，等待用户后续决定。
+
+## 当前评估结果
+
+- 固定 10 题：7 succeeded、3 waiting_user。
+- 其余 73 题：56/73 已完成，其中 12 succeeded、44 waiting_user；17 题未运行。
+- 合并已完成 66/83：19 succeeded、47 waiting_user、0 failed；19 个成功审计全部通过。
+- 47 个 waiting_user：external_blocked 12、model/executor protocol 7、证据/硬约束缺口 8、可信交付契约失败 12、上下文导致重规划耗尽 7、重复/无进展 1。
+
+## Status
+**Complete for the requested stopped-run analysis** - live worker 已停止；waiting_user 详细分类、题目清单、工具调用证据和优化优先级已写入报告。17 个未运行题目不纳入当前结论。
+
+# 2026-08-14 非反爬错误回归测试集
+
+## Goal
+从已观察的 waiting_user 中挑选最严重且可在不依赖反爬的情况下复现的 10 题，覆盖 Planner/Executor 协议、证据/硬约束、可信交付契约、上下文预算和无进展五类内部问题。
+
+## Selected set
+- [x] Planner/Executor 输出协议异常：C001、Q055（2）
+- [x] 证据或用户硬约束无法满足：C014、R008（2）
+- [x] 可信交付契约失败：R033、R025、R021（3）
+- [x] 上下文缺失导致重规划耗尽：R003、R009（2）
+- [x] 重复调用/无进展：C011（全部 1）
+- [x] 生成独立 manifest 和复测命令
+
+## Constraints
+- 原题仍从 `tests/question/redesign/` 读取，不复制或改写原始题目。
+- 结果写入新的 `tests/question/eval_results/non_crawl_error_set_20260814_live/` 目录。
+- 题集选择依据为已记录的错误轨迹；不把反爬、验证码或访问拒绝作为复现前提。
+
+## Status
+**Complete** - 测试集 manifest：`tests/question/error_sets/non_crawl_error_set_20260814/manifest.json`。
+
+# 2026-08-14 非反爬错误集持续优化
+
+## Goal
+根据 10 题真实失败轨迹修改当前 PEV runtime 和 career skills，循环验证，直到 10/10 通过成功审计。
+
+## Phases
+- [x] 读取分析报告、manifest 和当前代码入口
+- [x] 运行未修改代码的 10 题基线
+- [x] 修复上下文编译、协议解析、交付契约和无进展控制
+- [x] 运行定向单测、Ruff 和 compileall
+- [x] 循环运行 10 题 live 集合并继续修复
+- [x] 达到至少 8/10 成功审计；剩余外部访问阻断单独保留
+
+## Status
+**Complete** - 最新有效结果为 9/10 成功审计通过；R021 的国聘/官网来源受到访问阻断或 wall-clock 超时，未绕过安全边界。
+
+## Evidence directories
+
+- Baseline: `tests/question/eval_results/non_crawl_error_set_20260814_baseline_live/`
+- Iteration 1: `tests/question/eval_results/non_crawl_error_set_20260814_iter1_live/`
+- Iteration 2: `tests/question/eval_results/non_crawl_error_set_20260814_iter2_live/`
+- Iteration 3: `tests/question/eval_results/non_crawl_error_set_20260814_iter3_live/`
+- Final full run: `tests/question/eval_results/non_crawl_error_set_20260814_final_live/`
+- Latest C014 refresh: `tests/question/eval_results/non_crawl_error_set_202612_c014_live/`
+- Latest R025 refresh: `tests/question/eval_results/non_crawl_error_set_20260814_iter6_focus_live/`
+
+## Final per-ID disposition
+
+- Succeeded + success audit passed: `C001 Q055 C014 R003 R008 R009 R025 R033 C011` (9/10).
+- External source blocked: `R021` (official/Guopin access denial in earlier trace; final full run also hit wall-clock timeout).
+
+# 2026-08-14 83题全量四进程错峰回归
+
+## Goal
+使用 `tests/question/redesign/manifest.json` 的 83 个顶层题目，启动 4 个独立全量评测进程；相邻进程启动间隔 90 秒，结果分别写入独立 worker 目录。
+
+## Phases
+- [ ] 确认 83 题清单与无残留进程
+- [ ] 启动 4 个全量评测进程（错峰 90 秒）
+- [ ] 监控四个 worker 的进程与落盘数量
+- [ ] 汇总 succeeded / waiting_user / failed 及可审计结果
+
+## Constraints
+- 不覆盖历史 `tests/question/eval_results/` 结果目录。
+- 不绕过登录、验证码、反爬或安全页。
+- 每个 worker 都运行完整 83 题，而不是拆分题目；四轮用于独立重复回归。
+
+## Status
+**Currently in setup** - 已确认 manifest 为 83 题且无残留 `eval_runner` 进程，准备启动调度器。
