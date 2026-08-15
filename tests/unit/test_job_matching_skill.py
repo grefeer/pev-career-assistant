@@ -657,3 +657,25 @@ def test_match_emits_a_semantic_report_when_verified_candidates_do_not_qualify()
     assert skill_observation_is_semantically_valid(
         "match-observed-jobs", result.model_dump(mode="json")
     )
+
+
+def test_source_allowed_treats_generic_official_site_as_unconstrained() -> None:
+    from backend.app.services.career_skills.job_matching import (
+        _source_allowed_for_goal,
+    )
+
+    # "官网" in a school-site goal refers to the school's own site, not a
+    # carrier channel (Q028): host enforcement must not reject it.
+    assert _source_allowed_for_goal(
+        "https://career.hebut.edu.cn/correcruit/content/id/79139.html",
+        "最近3天学校就业指导中心官网/就业信息网适合我的AIGC 产品经理（应届生）岗位有哪些？",
+    )
+    # Carrier-named goals stay host-enforced.
+    assert not _source_allowed_for_goal(
+        "https://jobs.random-site.example/1",
+        "中国移动、中国联通有没有适合我的 Java 后端开发工程师岗位？请通过国聘网/官网核实。",
+    )
+    assert _source_allowed_for_goal(
+        "https://www.iguopin.com/job/detail/123",
+        "中国移动、中国联通有没有适合我的 Java 后端开发工程师岗位？请通过国聘网/官网核实。",
+    )

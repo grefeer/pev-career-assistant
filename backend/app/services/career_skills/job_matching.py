@@ -534,9 +534,14 @@ def _source_allowed_for_goal(
             and path.startswith("/jobs/view/")
         )
         return is_linkedin_public_job and "该职位来源于猎聘" in text
+    # Only explicitly named channels get host-enforced. The generic word
+    # "官网" is not a channel: for non-carrier goals it refers to the named
+    # company's/school's own official site (e.g. 学校就业指导中心官网),
+    # whose host cannot be enumerated here. Carrier goals still trigger via
+    # 中国移动/中国联通/10086/10010, and 国聘 via iguopin.com.
     channel_required = any(
         marker in goal_lower
-        for marker in ("国聘", "官网", "中国移动", "中国联通", "10086", "10010")
+        for marker in ("国聘", "中国移动", "中国联通", "10086", "10010")
     )
     if not channel_required:
         return True
