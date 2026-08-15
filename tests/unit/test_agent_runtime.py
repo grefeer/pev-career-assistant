@@ -2626,6 +2626,12 @@ def test_requested_role_seed_urls_include_exact_ai_application_intern_jd() -> No
         "?recommendCode=DSXc7DBC#/jobs"
     ]
     assert agent_runtime_module._requested_role_seed_urls(
+        "请先找到一份前端开发工程师的公开 JD 再给出面试准备计划。"
+    ) == [
+        "https://www.iguopin.com/job/list"
+        "?keyword=%E5%89%8D%E7%AB%AF%E5%BC%80%E5%8F%91%E5%B7%A5%E7%A8%8B%E5%B8%88"
+    ]
+    assert agent_runtime_module._requested_role_seed_urls(
         "请搜索 Java 编程学习资料。"
     ) == []
 
