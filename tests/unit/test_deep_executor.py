@@ -14,9 +14,11 @@ from backend.app.services.agent_runtime.deep_executor import (
     _EXECUTOR_OPERATING_PROCEDURE,
     _bounded_context_metadata,
     _bounded_deep_agent_messages,
+    _login_state_crawl_policy_blocks,
     _produces_persisted_artifact,
     _terminal_from_messages,
 )
+from backend.app.services.agent_runtime.skill_script_runner import SkillScriptRunner
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -685,6 +687,8 @@ def test_executor_operating_procedure_requires_detail_page_expansion() -> None:
     assert "target_role_mismatch" in _EXECUTOR_OPERATING_PROCEDURE
     assert "private_context" in _EXECUTOR_OPERATING_PROCEDURE
     assert "ALL of them in batch extraction calls" in _EXECUTOR_OPERATING_PROCEDURE
+    assert "Login-required sites" in _EXECUTOR_OPERATING_PROCEDURE
+    assert "logged-in profile" in _EXECUTOR_OPERATING_PROCEDURE
 
 
 def test_filesystem_tools_cannot_modify_the_skill_package(tmp_path: Path) -> None:
@@ -812,6 +816,138 @@ def test_ledger_snapshot_preserves_retry_state_and_deduplicates() -> None:
     assert snapshot["consecutive_stalls"] == 1
     assert snapshot["total_wasted_turns"] == 2
     assert snapshot["succeeded_calls"][0]["hash"] == "hash-from-retry"
+
+
+def test_login_state_crawl_policy_blocks_only_after_login_wall() -> None:
+    login_wall = ToolObservation(
+        tool_name="fetch-public-job-page",
+        status="failed",
+        error_code="login_required",
+    )
+    clean = ToolObservation(
+        tool_name="fetch-public-job-page",
+        status="succeeded",
+        output={"pages": []},
+    )
+
+    assert _login_state_crawl_policy_blocks("scripts/crawl.py", [login_wall])
+    assert _login_state_crawl_policy_blocks("scripts/login.py", [login_wall])
+    assert not _login_state_crawl_policy_blocks("scripts/crawl.py", [clean])
+    assert not _login_state_crawl_policy_blocks(
+        "scripts/check_login.py", [login_wall]
+    )
+    assert not _login_state_crawl_policy_blocks("scripts/crawl.py", [])
+    assert not _login_state_crawl_policy_blocks(None, [login_wall])
+
+
+def test_run_skill_script_policy_blocks_login_state_crawl_after_login_wall(
+    tmp_path: Path,
+) -> None:
+    """login.py/crawl.py are refused (no subprocess) once a login wall was seen."""
+    login_script = tmp_path / "scripts" / "login.py"
+    login_script.parent.mkdir(parents=True)
+    login_script.write_text(
+        "from pathlib import Path\nPath('login-ran.marker').write_text('x')\n",
+        encoding="utf-8",
+    )
+
+    agent = DeepExecutorAgent(
+        gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
+        tools=ToolRegistry(),
+        skills=None,
+        skill_root=tmp_path,
+    )
+    task = AgentTaskRequest(
+        goal="收集需要登录的岗位信息", allowed_skills=["job-discovery"]
+    )
+    step = PlanStep(
+        step_id="step-1",
+        objective="尝试收集岗位信息",
+        allowed_skills=["job-discovery"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["有证据"],
+        steps=[step],
+    )
+    context_holder = {"value": ToolContext(user_id="u", run_id="r")}
+    observations = [
+        ToolObservation(
+            tool_name="fetch-public-job-page",
+            status="failed",
+            error_code="login_required",
+        )
+    ]
+
+    wrapped = agent._build_tools(
+        task=task,
+        plan=plan,
+        step=step,
+        context_holder=context_holder,
+        allowed_skills=frozenset({"job-discovery"}),
+        observations=observations,
+        projected_observations=[],
+        ledger=_DeepExecutionLedger(candidate_urls=frozenset()),
+        tool_budget=None,
+        script_runner=SkillScriptRunner(tmp_path),
+    )
+    run_script = next(tool for tool in wrapped if tool.name == "run_skill_script")
+
+    result_text = run_script.invoke({"script_path": "scripts/login.py"})
+
+    assert "policy_login_required_no_crawl" in result_text
+    assert not (tmp_path / "login-ran.marker").exists()
+
+
+def test_run_skill_script_still_runs_scripts_without_login_wall(
+    tmp_path: Path,
+) -> None:
+    """Without a login wall the same script executes normally."""
+    script = tmp_path / "scripts" / "helper.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("print('helper-ok')\n", encoding="utf-8")
+
+    agent = DeepExecutorAgent(
+        gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
+        tools=ToolRegistry(),
+        skills=None,
+        skill_root=tmp_path,
+    )
+    task = AgentTaskRequest(
+        goal="收集公开岗位信息", allowed_skills=["job-discovery"]
+    )
+    step = PlanStep(
+        step_id="step-1",
+        objective="收集岗位信息",
+        allowed_skills=["job-discovery"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["有证据"],
+        steps=[step],
+    )
+
+    wrapped = agent._build_tools(
+        task=task,
+        plan=plan,
+        step=step,
+        context_holder={"value": ToolContext(user_id="u", run_id="r")},
+        allowed_skills=frozenset({"job-discovery"}),
+        observations=[],
+        projected_observations=[],
+        ledger=_DeepExecutionLedger(candidate_urls=frozenset()),
+        tool_budget=None,
+        script_runner=SkillScriptRunner(tmp_path),
+    )
+    run_script = next(tool for tool in wrapped if tool.name == "run_skill_script")
+
+    result_text = run_script.invoke({"script_path": "scripts/helper.py"})
+
+    assert "helper-ok" in result_text
 
 
 def test_ledger_records_target_mismatch_as_stable_failure() -> None:

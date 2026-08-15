@@ -160,6 +160,7 @@ pytestmark = pytest.mark.skipif(
 - [ ] JobPosting completion/review/decision writes check `review_version` (409 on conflict)
 - [ ] No code path grants `task:submit` scope
 - [ ] No auto-skip of login/captcha/anti-bot
+- [ ] Login-required sites are reported and never crawled via logged-in profiles: after a login wall is observed, `run_skill_script` policy-blocks `login.py`/`crawl.py` and the executor reports the situation instead
 - [ ] Public-page fetching follows redirects manually and re-validates each hop (`_fetch_validated` + `_assert_public_url`); no 302 to private/cloud-metadata addresses
 - [ ] API field whitelists in DTOs (never expose raw payloads or tokens)
 - [ ] Device actions validate task lease, not just device token

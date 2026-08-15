@@ -190,7 +190,12 @@ _EXECUTOR_OPERATING_PROCEDURE = (
     "9. When the step contract requires normalizing every captured "
     "page artifact, process ALL of them in batch extraction calls "
     "before emitting succeeded; partial normalization cannot close "
-    "the step.\n\n"
+    "the step.\n"
+    "10. Login-required sites: if the job content sits behind a login "
+    "wall (login_required, captcha, or anti-bot on a login-gated page), "
+    "do NOT run login.py or crawl.py and never crawl with a logged-in "
+    "profile. Report the site and reason to the user and stop; only "
+    "public, no-login sources may be crawled.\n\n"
     "When work is complete, output ONLY one final JSON object with "
     "status=succeeded, needs_user, or failed. succeeded requires a "
     "non-empty summary; needs_user requires a non-empty user_question; "
@@ -497,8 +502,31 @@ class _DeepExecutorToolFilterMiddleware(AgentMiddleware[Any, Any, Any]):
         return handler(request)
 
 
+#: Login-gated error codes: once any of these is observed, the
+#: no-login-crawl policy blocks login-state crawling (scripts/login.py,
+#: scripts/crawl.py) - the executor must report the situation instead.
+_LOGIN_GATED_ERROR_CODES = frozenset(
+    {"login_required", "captcha", "anti_bot_challenge"}
+)
+
+
+def _login_state_crawl_policy_blocks(
+    script_path: object, observations: list[ToolObservation]
+) -> bool:
+    """True when a login-state crawl script is requested after a login wall."""
+    if not isinstance(script_path, str):
+        return False
+    normalized = script_path.strip().replace("\\", "/").lower()
+    if normalized not in {"scripts/login.py", "scripts/crawl.py"}:
+        return False
+    return any(
+        observation.error_code in _LOGIN_GATED_ERROR_CODES
+        for observation in observations
+    )
+
+
 class DeepExecutorAgent:
-    """Run one PEV step through ``create_deep_agent``."""
+    """Run one PEV step through create_deep_agent."""
 
     def __init__(
         self,
@@ -1007,6 +1035,20 @@ class DeepExecutorAgent:
             duplicate_result = guard_call("run_skill_script", payload)
             if duplicate_result is not None:
                 return duplicate_result
+            if _login_state_crawl_policy_blocks(
+                payload.get("script_path"), observations
+            ):
+                policy_block = ToolObservation(
+                    tool_name="run_skill_script",
+                    status="failed",
+                    error_code="policy_login_required_no_crawl",
+                    error_message=(
+                        "目标站点需要登录才能获取内容；按运行策略不执行登录态抓取"
+                        "（login.py/crawl.py 仅限人工使用）。请上报站点与原因并停止。"
+                    ),
+                )
+                ledger.record("run_skill_script", payload, policy_block)
+                return append_observation(policy_block)
             parsed = RunSkillScriptInput.model_validate(payload)
             output = script_runner.run(parsed)
             observation = ToolObservation(
@@ -1031,9 +1073,10 @@ class DeepExecutorAgent:
                     "Run one Python helper under the active Skill directory. "
                     "Any .py file under the skill folder is allowed (scripts/, "
                     "anti_crawl/, output/ ...). Use a relative .py path; never "
-                    "use an absolute path or .. . Note: scripts/login.py is an "
-                    "interactive human login flow and may exceed the script "
-                    "timeout in an agent step."
+                    "use an absolute path or .. . Login-required sites must not "
+                    "be crawled with logged-in profiles: after a login wall is "
+                    "observed, scripts/login.py and scripts/crawl.py are "
+                    "policy-blocked - report the situation instead."
                 ),
                 args_schema=RunSkillScriptInput,
             )
