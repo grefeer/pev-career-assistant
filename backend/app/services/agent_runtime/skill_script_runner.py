@@ -28,6 +28,12 @@ _ALLOWED_SCRIPT_PATHS = frozenset(
         "scripts/write_candidates.py",
     }
 )
+#: Relative directory prefixes (POSIX) under the active Skill directory.
+#: Every .py file inside an allowed directory is runnable, subject to the
+#: same hard checks as the per-file allowlist (relative path, no "..",
+#: inside the skill dir, python suffix, sanitized environment, bounded
+#: arguments and timeout). "." means the whole active skill folder.
+_ALLOWED_SCRIPT_DIRS: tuple[str, ...] = (".",)
 _SAFE_ENVIRONMENT_KEYS = frozenset(
     {
         "LANG",
@@ -84,11 +90,26 @@ class RunSkillScriptOutput(BaseModel):
 
 
 class SkillScriptRunner:
-    """Execute only Python files below one provisioned Skill directory."""
+    """Execute Python files below one provisioned Skill directory.
 
-    def __init__(self, skill_dir: Path, *, python_executable: str | None = None) -> None:
+    A script is runnable when it matches the per-file allowlist or sits
+    under an allowed directory prefix (see _ALLOWED_SCRIPT_DIRS).
+    """
+
+    def __init__(
+        self,
+        skill_dir: Path,
+        *,
+        python_executable: str | None = None,
+        allowed_script_dirs: tuple[str, ...] | None = None,
+    ) -> None:
         self._skill_dir = skill_dir.resolve()
         self._python_executable = python_executable or sys.executable
+        self._allowed_script_dirs = (
+            tuple(allowed_script_dirs)
+            if allowed_script_dirs is not None
+            else _ALLOWED_SCRIPT_DIRS
+        )
 
     @property
     def skill_dir(self) -> Path:
@@ -101,9 +122,16 @@ class SkillScriptRunner:
         if relative_path.suffix.lower() != ".py":
             return self._failure(payload.script_path, "script_must_be_python")
         normalized_path = relative_path.as_posix().lower()
-        if normalized_path not in {
+        allowed_by_path = normalized_path in {
             path.lower() for path in _ALLOWED_SCRIPT_PATHS
-        }:
+        }
+        allowed_by_dir = any(
+            dir_path == "."
+            or normalized_path == dir_path.rstrip("/").lower()
+            or normalized_path.startswith(dir_path.rstrip("/").lower() + "/")
+            for dir_path in self._allowed_script_dirs
+        )
+        if not allowed_by_path and not allowed_by_dir:
             return self._failure(payload.script_path, "script_not_allowlisted")
 
         script = (self._skill_dir / relative_path).resolve()

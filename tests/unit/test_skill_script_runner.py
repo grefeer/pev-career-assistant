@@ -35,11 +35,41 @@ def test_runner_rejects_traversal_and_non_python_paths(tmp_path: Path) -> None:
 
     traversal = runner.run(RunSkillScriptInput(script_path="../outside.py"))
     non_python = runner.run(RunSkillScriptInput(script_path="SKILL.md"))
-    unallowlisted = runner.run(RunSkillScriptInput(script_path="scripts/unknown.py"))
+    missing_but_allowed = runner.run(
+        RunSkillScriptInput(script_path="scripts/unknown.py")
+    )
 
     assert traversal.error_code == "script_path_outside_skill"
     assert non_python.error_code == "script_must_be_python"
-    assert unallowlisted.error_code == "script_not_allowlisted"
+    assert missing_but_allowed.error_code == "script_not_found"
+
+
+def test_runner_executes_any_python_file_under_the_skill_dir(tmp_path: Path) -> None:
+    script = tmp_path / "anti_crawl" / "helper.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("print('anti-crawl-ok')\n", encoding="utf-8")
+
+    result = SkillScriptRunner(tmp_path).run(
+        RunSkillScriptInput(script_path="anti_crawl/helper.py")
+    )
+
+    assert result.status == "succeeded"
+    assert "anti-crawl-ok" in result.stdout
+
+
+def test_runner_honors_narrowed_allowed_script_dirs(tmp_path: Path) -> None:
+    allowed = tmp_path / "scripts" / "ok.py"
+    allowed.parent.mkdir(parents=True)
+    allowed.write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "tools").mkdir()
+
+    runner = SkillScriptRunner(tmp_path, allowed_script_dirs=("scripts",))
+
+    in_dir = runner.run(RunSkillScriptInput(script_path="scripts/ok.py"))
+    out_dir = runner.run(RunSkillScriptInput(script_path="tools/denied.py"))
+
+    assert in_dir.status == "succeeded"
+    assert out_dir.error_code == "script_not_allowlisted"
 
 
 def test_runner_times_out_and_redacts_secret_like_stderr(tmp_path: Path) -> None:

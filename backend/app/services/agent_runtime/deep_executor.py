@@ -1029,7 +1029,11 @@ class DeepExecutorAgent:
                 name="run_skill_script",
                 description=(
                     "Run one Python helper under the active Skill directory. "
-                    "Use a relative .py path; never use an absolute path or .. ."
+                    "Any .py file under the skill folder is allowed (scripts/, "
+                    "anti_crawl/, output/ ...). Use a relative .py path; never "
+                    "use an absolute path or .. . Note: scripts/login.py is an "
+                    "interactive human login flow and may exceed the script "
+                    "timeout in an agent step."
                 ),
                 args_schema=RunSkillScriptInput,
             )
