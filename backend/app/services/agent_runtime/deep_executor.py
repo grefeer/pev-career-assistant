@@ -175,10 +175,11 @@ _EXECUTOR_OPERATING_PROCEDURE = (
     "5. If public evidence is blocked, private, missing, or a safe "
     "next tool is unavailable, stop and emit needs_user instead of "
     "guessing or trying unrelated routes.\n"
-    "6. The filesystem is read-only and only read_file may be used "
-    "for an exceptional, known procedure lookup. Do not browse the "
-    "Skill tree, invent helper paths, or use scripts as a substitute "
-    "for a registered business tool.\n"
+    "6. The filesystem is read-only. You may read the active Skill's "
+    "SKILL.md and the reference files it names (the disclosed skill "
+    "list gives their paths; SKILL.md itself links its references). "
+    "Do not browse unrelated skill trees, invent helper paths, or use "
+    "scripts as a substitute for a registered business tool.\n"
     "7. A target_role_mismatch / target_source_mismatch failure means "
     "the selected target does not match the user's requested role or "
     "source: switch to a semantically matching candidate from the "
@@ -640,7 +641,7 @@ class DeepExecutorAgent:
             agent = self._build_agent(
                 model=model,
                 tools=wrapped_tools,
-                skill_dir=skill_dir,
+                skill_root=self._skill_root,
                 skill_name=skill_name,
                 turn_budget=turn_budget,
                 model_budget=model_budget,
@@ -1040,7 +1041,7 @@ class DeepExecutorAgent:
         *,
         model: Any,
         tools: list[Any],
-        skill_dir: Path,
+        skill_root: Path,
         skill_name: str,
         turn_budget: AgentTurnBudget | None,
         model_budget: ModelCallBudget | None,
@@ -1054,7 +1055,7 @@ class DeepExecutorAgent:
         from deepagents.middleware.filesystem import FilesystemPermission
         from langgraph.checkpoint.memory import InMemorySaver
 
-        backend = FilesystemBackend(root_dir=skill_dir, virtual_mode=True)
+        backend = FilesystemBackend(root_dir=skill_root, virtual_mode=True)
         permissions = [
             FilesystemPermission(
                 operations=["write"],
@@ -1064,10 +1065,11 @@ class DeepExecutorAgent:
             FilesystemPermission(
                 operations=["read"],
                 paths=[
-                    "/anti_crawl/store/profiles/**",
-                    "/.env",
-                    "/settings.json",
-                    "/.claude/logs/**",
+                    "/**/anti_crawl/store/profiles/**",
+                    "/**/conversation_history/**",
+                    "/**/.env",
+                    "/**/settings.json",
+                    "/**/.claude/logs/**",
                 ],
                 mode="deny",
             ),
@@ -1094,10 +1096,13 @@ class DeepExecutorAgent:
                 f"{tool_catalog}\n\n"
                 f"{_EXECUTOR_OPERATING_PROCEDURE}"
             ),
-            # Directly inject the scoped policy above. Progressive skill
-            # disclosure caused extra filesystem calls and consumed the old
-            # lifecycle turn budget before business work started.
-            skills=None,
+            # Progressive skill disclosure re-enabled (2026-08-15): the
+            # backend root is now the skill/ package tree and "/" discloses
+            # every package's SKILL.md (metadata first, full content on
+            # demand via read_file). The bounded scoped policy above stays
+            # as the baseline, so disclosure adds only what the model asks
+            # for; the budget middleware still caps internal model calls.
+            skills=["/"],
             backend=backend,
             permissions=permissions,
             middleware=[

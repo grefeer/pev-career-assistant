@@ -710,7 +710,7 @@ def test_filesystem_tools_cannot_modify_the_skill_package(tmp_path: Path) -> Non
     agent = DeepExecutorAgent._build_agent(
         model=model,
         tools=[],
-        skill_dir=tmp_path,
+        skill_root=tmp_path,
         skill_name="test",
         turn_budget=None,
         model_budget=None,
