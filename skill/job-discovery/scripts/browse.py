@@ -45,6 +45,7 @@ import hashlib
 import ipaddress
 import json
 import math
+import random
 import re
 import socket
 import sys
@@ -54,6 +55,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+# Polite randomized pacing: every human-visible sleep gets a gentle ±25% jitter
+# so repeated crawls don't look perfectly metronomic to site anti-bot heuristics.
+# Timeouts (goto / wait_for_load_state) keep fixed values; only sleeps are jittered.
+_POLITE_JITTER_PCT = 0.25
+_POLITE_MIN_WAIT_MS = 50
+_RNG = random.Random()
+
+
+def _jitter_ms(base_ms: int) -> int:
+    """Jitter a base wait by ±_POLITE_JITTER_PCT (floor _POLITE_MIN_WAIT_MS)."""
+    low = max(_POLITE_MIN_WAIT_MS, int(base_ms * (1 - _POLITE_JITTER_PCT)))
+    high = max(low, int(base_ms * (1 + _POLITE_JITTER_PCT)))
+    return _RNG.randint(low, high)
+
+
+def _polite_wait(page: Any, base_ms: int) -> None:
+    """Sleep a jittered version of base_ms (polite randomized pacing)."""
+    page.wait_for_timeout(_jitter_ms(base_ms))
 
 
 _PUBLIC_JOB_TITLE_KEYS = ("title", "name", "positionName", "jobTitle")
@@ -294,7 +314,7 @@ def _dismiss_consent(page: Any) -> bool:
                     if kw.lower() in btn_text:
                         return False
                 btn.click(timeout=3000)
-                page.wait_for_timeout(1000)
+                _polite_wait(page, 1000)
                 return True
         except Exception:
             continue
@@ -452,7 +472,7 @@ def _find_prev_page_button(page: Any) -> Any | None:
 def _scroll_to_load(page: Any, wait_ms: int = 2000, rounds: int = 3) -> None:
     for _ in range(rounds):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(wait_ms)
+        _polite_wait(page, wait_ms)
         try:
             page.wait_for_load_state(
                 "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
@@ -535,7 +555,7 @@ def browse_list_mode(page: Any, url: str, out_dir: Path, max_pages: int, wait_ms
         try:
             old_url = page.url
             next_btn.click(timeout=5000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=4000)
             except Exception:
@@ -686,7 +706,7 @@ def browse_click_mode(
             pass
         try:
             target.click(timeout=5000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -878,7 +898,7 @@ def _detect_pagination(page: Any, retries: int) -> dict[str, Any] | None:
             pass
         try:
             next_btn.click(timeout=5000)
-            page.wait_for_timeout(2000)
+            _polite_wait(page, 2000)
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
@@ -898,7 +918,7 @@ def _detect_pagination(page: Any, retries: int) -> dict[str, Any] | None:
     if prev is not None:
         try:
             prev.click(timeout=5000)
-            page.wait_for_timeout(1500)
+            _polite_wait(page, 1500)
         except Exception:
             try:
                 page.go_back(timeout=5000)
@@ -1045,7 +1065,7 @@ def _fetch_one(url: str, wait_ms: int) -> str:
     page = context.new_page()
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(wait_ms)
+        _polite_wait(page, wait_ms)
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
@@ -1157,7 +1177,7 @@ def browse_parallel_fetch_mode(
         public_job_collector.attach(page)
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
@@ -1311,7 +1331,7 @@ def browse_parallel_fetch_mode(
             page = context.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 _scroll_to_load(page, wait_ms)
                 for _ in range(3):
                     _dismiss_consent(page)
@@ -1367,7 +1387,7 @@ def browse_detail_mode(page: Any, url: str, out_dir: Path, wait_ms: int) -> dict
     _scroll_to_load(page, wait_ms)
     for _ in range(3):
         _dismiss_consent(page)
-    page.wait_for_timeout(wait_ms)
+    _polite_wait(page, wait_ms)
 
     text = _extract_body_text(page)
     short_hash, text_path, screenshot_path = _save_evidence(text, out_dir)
@@ -1498,19 +1518,19 @@ def _perform_search(page: Any, term: str, wait_ms: int) -> tuple[bool, str]:
     # Clear existing text and type the search term
     try:
         search_input.click(timeout=3000)
-        page.wait_for_timeout(300)
+        _polite_wait(page, 300)
         # Triple-click to select all existing text, then type
         search_input.click(timeout=3000, click_count=3)
-        page.wait_for_timeout(200)
+        _polite_wait(page, 200)
         search_input.fill(term)
-        page.wait_for_timeout(_SEARCH_TYPE_DELAY_MS)
+        _polite_wait(page, _SEARCH_TYPE_DELAY_MS)
     except Exception as exc:
         return False, f"Failed to type search term: {exc}"
 
     # Strategy 1: Press Enter
     try:
         search_input.press("Enter")
-        page.wait_for_timeout(wait_ms)
+        _polite_wait(page, wait_ms)
         try:
             page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
@@ -1530,7 +1550,7 @@ def _perform_search(page: Any, term: str, wait_ms: int) -> tuple[bool, str]:
     if search_btn is not None:
         try:
             search_btn.click(timeout=3000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -1545,7 +1565,7 @@ def _perform_search(page: Any, term: str, wait_ms: int) -> tuple[bool, str]:
             pass
 
     # Strategy 3: Assume real-time filtering (just typing is enough)
-    page.wait_for_timeout(wait_ms)
+    _polite_wait(page, wait_ms)
     visible_cards = _count_job_cards(page)
     return True, f"Real-time filter assumed — {visible_cards} visible cards"
 
@@ -1579,7 +1599,7 @@ def browse_search_mode(
     _scroll_to_load(page, wait_ms)
     for _ in range(3):
         _dismiss_consent(page)
-    page.wait_for_timeout(wait_ms)
+    _polite_wait(page, wait_ms)
 
     # Pre-search baseline: count and URL
     pre_count = _count_job_cards(page)
@@ -1618,7 +1638,7 @@ def browse_search_mode(
         if page.url != pre_url:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
@@ -1672,7 +1692,7 @@ def browse_search_mode(
             # Navigate back to unfiltered view first
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
@@ -1710,7 +1730,7 @@ def browse_search_mode(
         try:
             old_url = page.url
             next_btn.click(timeout=5000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state("networkidle", timeout=4000)
             except Exception:
@@ -1778,7 +1798,7 @@ def browse_search_interact_mode(
     _scroll_to_load(page, wait_ms)
     for _ in range(3):
         _dismiss_consent(page)
-    page.wait_for_timeout(wait_ms)
+    _polite_wait(page, wait_ms)
 
     pre_count = _count_job_cards(page)
     pre_url = page.url
@@ -1811,7 +1831,7 @@ def browse_search_interact_mode(
         if page.url != pre_url:
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
@@ -1853,7 +1873,7 @@ def browse_search_interact_mode(
         if fallback == "full":
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
@@ -1998,14 +2018,14 @@ def _expand_categories(page: Any, wait_ms: int) -> int:
                         continue
                     # Click to expand this category
                     el.click(timeout=3000)
-                    page.wait_for_timeout(wait_ms)
+                    _polite_wait(page, wait_ms)
                     clicked += 1
                 except Exception:
                     continue
         except Exception:
             continue
     if clicked > 0:
-        page.wait_for_timeout(wait_ms)
+        _polite_wait(page, wait_ms)
         try:
             page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
@@ -2186,14 +2206,14 @@ def _close_detail_panel(page: Any) -> None:
             btn = page.locator(sel).first
             if btn.is_visible():
                 btn.click(timeout=3000)
-                page.wait_for_timeout(1500)
+                _polite_wait(page, 1500)
                 return
         except Exception:
             continue
     # Fallback: press Escape
     try:
         page.keyboard.press("Escape")
-        page.wait_for_timeout(1000)
+        _polite_wait(page, 1000)
     except Exception:
         pass
 
@@ -2255,11 +2275,11 @@ def _interact_on_cards(
             break
         try:
             card.scroll_into_view_if_needed()
-            page.wait_for_timeout(500)
+            _polite_wait(page, 500)
             pre_text = _extract_body_text(page)
 
             card.click(timeout=3000)
-            page.wait_for_timeout(min(wait_ms, 2000))
+            _polite_wait(page, min(wait_ms, 2000))
             try:
                 page.wait_for_load_state(
                     "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
@@ -2275,7 +2295,7 @@ def _interact_on_cards(
                     f"\n=== {label_prefix} {i + 1} ({page.url}) ===\n{detail_text}"
                 )
                 page.go_back(wait_until="domcontentloaded", timeout=2500)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 current_url = page.url
                 clicked += 1
             elif len(post_text) > len(pre_text) + 50:
@@ -2284,7 +2304,7 @@ def _interact_on_cards(
                     f"\n=== {label_prefix} {i + 1} ===\n{detail_text}"
                 )
                 _close_detail_panel(page)
-                page.wait_for_timeout(1000)
+                _polite_wait(page, 1000)
                 clicked += 1
             else:
                 failed += 1
@@ -2294,7 +2314,7 @@ def _interact_on_cards(
             try:
                 if page.url != recover_url:
                     page.goto(recover_url, wait_until="domcontentloaded", timeout=15000)
-                    page.wait_for_timeout(wait_ms)
+                    _polite_wait(page, wait_ms)
                     current_url = page.url
             except Exception:
                 pass
@@ -2313,7 +2333,7 @@ def browse_interact_mode(
     _scroll_to_load(page, wait_ms)
     for _ in range(3):
         _dismiss_consent(page)
-    page.wait_for_timeout(wait_ms)
+    _polite_wait(page, wait_ms)
 
     # Expand category sections (Moka pattern: "X-STAR顶尖人才 共3个职位")
     cats_clicked = (
@@ -2337,7 +2357,7 @@ def browse_interact_mode(
             before_text = _extract_body_text(page)
             try:
                 next_btn.click(timeout=5000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state(
                         "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
@@ -2392,7 +2412,7 @@ def browse_interact_mode(
     if list_url:
         try:
             page.goto(list_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             _scroll_to_load(page, wait_ms)
             list_text = _extract_body_text(page)
             detail_urls = _detail_urls_from_current_page(page, list_url, max_cards)
@@ -2422,7 +2442,7 @@ def browse_interact_mode(
             before_text = _extract_body_text(page)
             try:
                 next_btn.click(timeout=5000)
-                page.wait_for_timeout(wait_ms)
+                _polite_wait(page, wait_ms)
                 try:
                     page.wait_for_load_state(
                         "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
@@ -2544,7 +2564,7 @@ def _fetch_detail_urls(
     for index, detail_url in enumerate(urls, start=1):
         try:
             page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(wait_ms)
+            _polite_wait(page, wait_ms)
             try:
                 page.wait_for_load_state(
                     "networkidle", timeout=_card_interaction_idle_timeout_ms(wait_ms)
@@ -2585,7 +2605,7 @@ def main() -> None:
     parser.add_argument("--max-cards", type=int, default=50,
                         help="Max job cards to click in interact/search-interact mode (default: 50)")
     parser.add_argument("--wait", type=int, default=3000,
-                        help="Wait time in ms after page load/scroll/click (default: 3000)")
+                        help="Base wait in ms after page load/scroll/click; each wait is jittered ±25% for polite pacing (default: 3000)")
     parser.add_argument("--ignore-cache", action="store_true",
                         help="[Deprecated] Use --cache-mode off instead. Skip cache check.")
     parser.add_argument("--cache-mode", choices=["use", "revalidate", "off"],
@@ -2720,7 +2740,7 @@ def main() -> None:
 
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(args.wait)
+                _polite_wait(page, args.wait)
                 try:
                     page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:

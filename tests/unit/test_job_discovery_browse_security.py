@@ -66,3 +66,28 @@ def test_cache_rejects_path_injection_hash(tmp_path: Path) -> None:
     )
 
     assert module._check_cache(tmp_path, "https://example.com", "use") is None
+
+
+def test_polite_wait_jitters_sleeps_within_plus_minus_25_percent() -> None:
+    """Every politeness sleep is randomized within ±25% of the base wait."""
+    module = _load_browse_module()
+
+    class _Page:
+        def __init__(self) -> None:
+            self.waited_ms: list[int] = []
+
+        def wait_for_timeout(self, ms: int) -> None:
+            self.waited_ms.append(ms)
+
+    page = _Page()
+    for _ in range(50):
+        module._polite_wait(page, 3000)
+
+    assert len(page.waited_ms) == 50
+    assert all(2250 <= ms <= 3750 for ms in page.waited_ms)
+    assert len(set(page.waited_ms)) > 1  # actually randomized, not a fixed value
+
+    # Small waits keep a polite floor instead of collapsing to zero.
+    page2 = _Page()
+    module._polite_wait(page2, 0)
+    assert page2.waited_ms == [50]
