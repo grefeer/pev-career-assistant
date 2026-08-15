@@ -93,6 +93,7 @@ var/
 settings.json
 .codex/
 tests/question/eval_results/
+skill_old/tmp/
 docs/study/
 plan/
 temp/
