@@ -689,6 +689,7 @@ def test_executor_operating_procedure_requires_detail_page_expansion() -> None:
     assert "ALL of them in batch extraction calls" in _EXECUTOR_OPERATING_PROCEDURE
     assert "Login-required sites" in _EXECUTOR_OPERATING_PROCEDURE
     assert "logged-in profile" in _EXECUTOR_OPERATING_PROCEDURE
+    assert "allow_login_state_crawl=true" in _EXECUTOR_OPERATING_PROCEDURE
 
 
 def test_filesystem_tools_cannot_modify_the_skill_package(tmp_path: Path) -> None:
@@ -838,6 +839,13 @@ def test_login_state_crawl_policy_blocks_only_after_login_wall() -> None:
     )
     assert not _login_state_crawl_policy_blocks("scripts/crawl.py", [])
     assert not _login_state_crawl_policy_blocks(None, [login_wall])
+    # An explicit task authorization disables the policy block.
+    assert not _login_state_crawl_policy_blocks(
+        "scripts/crawl.py", [login_wall], allow_login_state_crawl=True
+    )
+    assert not _login_state_crawl_policy_blocks(
+        "scripts/login.py", [login_wall], allow_login_state_crawl=True
+    )
 
 
 def test_run_skill_script_policy_blocks_login_state_crawl_after_login_wall(
@@ -899,6 +907,68 @@ def test_run_skill_script_policy_blocks_login_state_crawl_after_login_wall(
 
     assert "policy_login_required_no_crawl" in result_text
     assert not (tmp_path / "login-ran.marker").exists()
+
+
+def test_run_skill_script_allows_login_state_crawl_when_authorized(
+    tmp_path: Path,
+) -> None:
+    """allow_login_state_crawl=true unblocks login.py even after a login wall."""
+    login_script = tmp_path / "scripts" / "login.py"
+    login_script.parent.mkdir(parents=True)
+    login_script.write_text(
+        "from pathlib import Path\nPath('login-ran.marker').write_text('x')\n",
+        encoding="utf-8",
+    )
+
+    agent = DeepExecutorAgent(
+        gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
+        tools=ToolRegistry(),
+        skills=None,
+        skill_root=tmp_path,
+    )
+    task = AgentTaskRequest(
+        goal="收集需要登录的岗位信息",
+        allowed_skills=["job-discovery"],
+        context={"allow_login_state_crawl": True},
+    )
+    step = PlanStep(
+        step_id="step-1",
+        objective="尝试收集岗位信息",
+        allowed_skills=["job-discovery"],
+    )
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L2,
+        success_criteria=["有证据"],
+        steps=[step],
+    )
+    observations = [
+        ToolObservation(
+            tool_name="fetch-public-job-page",
+            status="failed",
+            error_code="login_required",
+        )
+    ]
+
+    wrapped = agent._build_tools(
+        task=task,
+        plan=plan,
+        step=step,
+        context_holder={"value": ToolContext(user_id="u", run_id="r")},
+        allowed_skills=frozenset({"job-discovery"}),
+        observations=observations,
+        projected_observations=[],
+        ledger=_DeepExecutionLedger(candidate_urls=frozenset()),
+        tool_budget=None,
+        script_runner=SkillScriptRunner(tmp_path),
+    )
+    run_script = next(tool for tool in wrapped if tool.name == "run_skill_script")
+
+    result_text = run_script.invoke({"script_path": "scripts/login.py"})
+
+    assert "policy_login_required_no_crawl" not in result_text
+    assert (tmp_path / "login-ran.marker").exists()
 
 
 def test_run_skill_script_still_runs_scripts_without_login_wall(

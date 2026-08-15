@@ -194,8 +194,10 @@ _EXECUTOR_OPERATING_PROCEDURE = (
     "10. Login-required sites: if the job content sits behind a login "
     "wall (login_required, captcha, or anti-bot on a login-gated page), "
     "do NOT run login.py or crawl.py and never crawl with a logged-in "
-    "profile. Report the site and reason to the user and stop; only "
-    "public, no-login sources may be crawled.\n\n"
+    "profile unless the task context explicitly sets "
+    "allow_login_state_crawl=true (default false). Report the site and "
+    "reason to the user and stop; only public, no-login sources may be "
+    "crawled.\n\n"
     "When work is complete, output ONLY one final JSON object with "
     "status=succeeded, needs_user, or failed. succeeded requires a "
     "non-empty summary; needs_user requires a non-empty user_question; "
@@ -511,9 +513,19 @@ _LOGIN_GATED_ERROR_CODES = frozenset(
 
 
 def _login_state_crawl_policy_blocks(
-    script_path: object, observations: list[ToolObservation]
+    script_path: object,
+    observations: list[ToolObservation],
+    *,
+    allow_login_state_crawl: bool = False,
 ) -> bool:
-    """True when a login-state crawl script is requested after a login wall."""
+    """True when a login-state crawl script is requested after a login wall.
+
+    The task may explicitly authorize login-state crawling by setting
+    allow_login_state_crawl=true in its context (default false); the policy
+    block then never fires for login.py/crawl.py.
+    """
+    if allow_login_state_crawl:
+        return False
     if not isinstance(script_path, str):
         return False
     normalized = script_path.strip().replace("\\", "/").lower()
@@ -1036,7 +1048,11 @@ class DeepExecutorAgent:
             if duplicate_result is not None:
                 return duplicate_result
             if _login_state_crawl_policy_blocks(
-                payload.get("script_path"), observations
+                payload.get("script_path"),
+                observations,
+                allow_login_state_crawl=(
+                    task.context.get("allow_login_state_crawl") is True
+                ),
             ):
                 policy_block = ToolObservation(
                     tool_name="run_skill_script",
@@ -1076,7 +1092,8 @@ class DeepExecutorAgent:
                     "use an absolute path or .. . Login-required sites must not "
                     "be crawled with logged-in profiles: after a login wall is "
                     "observed, scripts/login.py and scripts/crawl.py are "
-                    "policy-blocked - report the situation instead."
+                    "policy-blocked - report the situation instead - unless the "
+                    "task context sets allow_login_state_crawl=true."
                 ),
                 args_schema=RunSkillScriptInput,
             )
@@ -1267,6 +1284,9 @@ class DeepExecutorAgent:
                     "resolved_step_inputs": task.context.get("resolved_step_inputs", {}),
                     "verifier_feedback": verifier_feedback,
                     "replan_state": task.replan_state.model_dump(mode="json"),
+                    "allow_login_state_crawl": (
+                        task.context.get("allow_login_state_crawl") is True
+                    ),
                 },
                 "private_context": private_context,
                 "prior_observations": [
