@@ -893,6 +893,47 @@ def test_executor_hands_a_stalled_duplicate_loop_to_the_user() -> None:
     assert [obs.error_code for obs in result.observations] == [None, "duplicate_tool_call", "duplicate_tool_call"]
 
 
+def test_executor_relaxes_stall_cap_via_task_context() -> None:
+    """An auto-recovery attempt may raise the consecutive-stall cap (3 -> 5).
+
+    Uses the stable-failure dedup path (unknown_tool): repeats increment only
+    the consecutive-stall counter, never the total-waste counter, so the
+    raised stall cap is what trips.
+    """
+    registry = ToolRegistry()
+    gateway = ScriptedGateway([
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+        {"action": "call_tool", "tool_name": "fetch-missing", "tool_input": {"url": "https://jobs.example/1"}},
+    ])
+    task = AgentTaskRequest(
+        goal="抓取 JD", allowed_skills=["job-discovery"],
+        context={"max_consecutive_stalls": 5},
+    )
+    plan = ExecutionPlan(
+        task=task, created_by=AgentRole.planner, complexity=ComplexityLevel.L2,
+        success_criteria=["JD"],
+        steps=[PlanStep(step_id="discover", objective="抓取", allowed_skills=["job-discovery"])],
+    )
+
+    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+        task=task, plan=plan, step=plan.steps[0],
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+        tool_budget=ToolCallBudget(6),
+    )
+
+    # 1 stable failure + 4 recorded deduped re-issues; the 5th stall
+    # increment trips the raised cap (5) without recording another dup.
+    assert result.status == "needs_user"
+    assert [obs.error_code for obs in result.observations] == [
+        "unknown_tool", "duplicate_tool_call", "duplicate_tool_call",
+        "duplicate_tool_call", "duplicate_tool_call",
+    ]
+
+
 def test_executor_resets_stall_counter_on_real_progress() -> None:
     """A genuine tool execution clears prior duplicates, so no stall triggers."""
     invocations = {"a": 0, "b": 0}

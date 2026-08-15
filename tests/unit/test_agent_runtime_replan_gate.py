@@ -354,7 +354,8 @@ def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None
             goal="找岗位",
             allowed_skills=["job-discovery"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
@@ -401,7 +402,8 @@ def test_needs_user_conversion_is_once_per_run(db_session) -> None:
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
@@ -463,7 +465,10 @@ def test_deep_executor_invalid_response_converts_to_bounded_replan(
         task=AgentTaskRequest(
             goal="匹配岗位",
             allowed_skills=["job-matching"],
-            budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=2),
+            budget=AgentBudget(
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
+            ),
         ),
     )
 
@@ -540,7 +545,10 @@ def test_completion_gate_rejection_converts_to_bounded_replan(db_session) -> Non
         task=AgentTaskRequest(
             goal="匹配岗位",
             allowed_skills=["job-matching"],
-            budget=AgentBudget(max_agent_turns=8, max_tool_calls=8, max_replans=2),
+            budget=AgentBudget(
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
+            ),
         ),
     )
 
@@ -663,7 +671,8 @@ def test_needs_user_keeps_waiting_user_when_replan_budget_exhausted(db_session) 
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=0
+                max_agent_turns=8, max_tool_calls=8, max_replans=0,
+                max_auto_recoveries=0,
             ),
         ),
     )

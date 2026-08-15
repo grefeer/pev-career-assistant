@@ -75,6 +75,9 @@ DEFAULT_BUDGET = AgentBudget(
     max_tool_calls=32,
     max_replans=2,
     max_wall_clock_seconds=600,
+    # Verifier/model-decision pauses auto-resume up to 2 more times, each with
+    # a step-up budget and relaxed stall breaker (3 attempts total per run).
+    max_auto_recoveries=2,
 )
 
 # ---------------------------------------------------------------- seed bank

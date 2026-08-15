@@ -324,7 +324,8 @@ def test_retry_cap_with_contract_met_routes_to_bounded_replan(db_session) -> Non
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=16, max_tool_calls=8, max_replans=2
+                max_agent_turns=16, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
@@ -378,7 +379,8 @@ def test_retry_cap_conversion_is_once_per_run(db_session) -> None:
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=16, max_tool_calls=8, max_replans=2
+                max_agent_turns=16, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )

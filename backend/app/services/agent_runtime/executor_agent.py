@@ -77,6 +77,23 @@ _EXECUTOR_INSTRUCTION = (
 # evidence; after this cap the agent stops and hands control to the human.
 _MAX_CONSECUTIVE_STALLS = 3
 
+
+def _stall_limit(task: Any) -> int:
+    """Per-task stall-tolerance override, bounded at 2x base + 2.
+
+    An automatic recovery attempt may carry ``context.max_consecutive_stalls``
+    (4 on the first recovery, 5 on the second) so a verifier-confirmed retry
+    gets slightly more room before the no-progress breaker hands back to the
+    human. Unknown or out-of-range values fall back to the default cap.
+    """
+    raw = task.context.get("max_consecutive_stalls")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _MAX_CONSECUTIVE_STALLS
+    return max(1, min(2 * _MAX_CONSECUTIVE_STALLS + 2, value))
+
+
 # Per-step TOTAL wasted turns (NOT reset by interspersed success). Counts
 # duplicate_tool_call + candidate_urls_already_supplied + any turn whose
 # tool call did not append a new succeeded observation (catches alternating
@@ -1052,7 +1069,7 @@ class ExecutorAgent:
                 ):
                     consecutive_stalls += 1
                     total_wasted_turns += 1
-                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                    if consecutive_stalls >= _stall_limit(task):
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
@@ -1094,7 +1111,7 @@ class ExecutorAgent:
                     # keeps repeating the doomed call after the
                     # duplicate_tool_call guidance is genuinely stalled.
                     consecutive_stalls += 1
-                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                    if consecutive_stalls >= _stall_limit(task):
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
@@ -1134,7 +1151,7 @@ class ExecutorAgent:
                     # one genuinely new route remains executable.
                     consecutive_stalls += 1
                     total_wasted_turns += 1
-                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                    if consecutive_stalls >= _stall_limit(task):
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,
@@ -1191,7 +1208,7 @@ class ExecutorAgent:
                 ) in prior_succeeded_hashes:
                     consecutive_stalls += 1
                     total_wasted_turns += 1
-                    if consecutive_stalls >= _MAX_CONSECUTIVE_STALLS:
+                    if consecutive_stalls >= _stall_limit(task):
                         return ExecutorResult(
                             status="needs_user",
                             observations=observations,

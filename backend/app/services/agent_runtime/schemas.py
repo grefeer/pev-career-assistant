@@ -87,6 +87,12 @@ class AgentBudget(BaseModel):
     max_tool_calls: int = Field(default=24, ge=1, le=200)
     max_replans: int = Field(default=2, ge=0, le=10)
     max_wall_clock_seconds: int = Field(default=300, ge=10, le=3_600)
+    # Bounded automatic recovery rounds: when a run pauses as waiting_user for
+    # a verifier/model-decision reason (never a source-access block), the
+    # harness may resume the same run itself — with a step-up budget and a
+    # relaxed stall breaker — up to this many times before handing back to
+    # the human. 2 = first run + up to 2 automatic re-runs (3 attempts total).
+    max_auto_recoveries: int = Field(default=2, ge=0, le=5)
     # Physical model ceilings.  Turn count limits lifecycle decisions; these
     # limits bound provider requests and measured token consumption separately.
     max_model_requests: int = Field(default=128, ge=1, le=500)

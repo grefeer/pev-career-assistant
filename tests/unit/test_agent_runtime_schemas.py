@@ -44,6 +44,14 @@ def test_budget_rejects_a_zero_turn_agent_loop() -> None:
         AgentBudget(max_agent_turns=0, max_tool_calls=1, max_replans=0)
 
 
+def test_budget_bounds_automatic_recovery_rounds() -> None:
+    """Default allows 2 self-resumes (3 attempts total); the ceiling is 5."""
+    assert AgentBudget().max_auto_recoveries == 2
+    assert AgentBudget(max_auto_recoveries=0).max_auto_recoveries == 0
+    with pytest.raises(ValidationError):
+        AgentBudget(max_auto_recoveries=6)
+
+
 def test_execution_plan_cannot_grant_executor_an_unapproved_skill() -> None:
     """Planner output cannot expand the user/runtime-provided tool authority."""
     task = AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])

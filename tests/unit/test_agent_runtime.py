@@ -22,7 +22,11 @@ from backend.app.services.agent_runtime import runtime as agent_runtime_module
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
-from backend.app.services.agent_runtime.runtime import AgentRuntime, _skill_artifact_source_url
+from backend.app.services.agent_runtime.runtime import (
+    AgentRunResult,
+    AgentRuntime,
+    _skill_artifact_source_url,
+)
 from backend.app.services.agent_runtime.schemas import (
     AgentBudget,
     AgentTaskRequest,
@@ -3617,7 +3621,10 @@ def test_runtime_resume_after_verifier_wall_clock_recomputes_deadline_and_procee
     )
     task = AgentTaskRequest(
         goal="找岗位", allowed_skills=["job-discovery"],
-        budget=AgentBudget(max_agent_turns=6, max_tool_calls=6, max_replans=0),
+        budget=AgentBudget(
+            max_agent_turns=6, max_tool_calls=6, max_replans=0,
+            max_auto_recoveries=0,
+        ),
     )
 
     waiting = runtime.run(db_session, user_id=user.id, task=task)
@@ -3689,7 +3696,10 @@ def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_s
     )
     task = AgentTaskRequest(
         goal="找岗位", allowed_skills=["job-discovery"],
-        budget=AgentBudget(max_agent_turns=6, max_tool_calls=6, max_replans=0),
+        budget=AgentBudget(
+            max_agent_turns=6, max_tool_calls=6, max_replans=0,
+            max_auto_recoveries=0,
+        ),
     )
 
     waiting = runtime.run(db_session, user_id=user.id, task=task)
@@ -3726,4 +3736,246 @@ def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_s
     first_run_tool_remaining = gateway.states[AgentRole.executor][0]["remaining_tool_calls"]
     resume_tool_remaining = gateway.states[AgentRole.executor][2]["remaining_tool_calls"]
     assert resume_tool_remaining < first_run_tool_remaining
+
+
+class StaticDecisionGateway:
+    """Always returns the same per-role decision (no script popping)."""
+
+    def __init__(self, decisions: dict[AgentRole, dict[str, Any]]) -> None:
+        self.decisions = decisions
+        self.states: dict[AgentRole, list[dict[str, Any]]] = {role: [] for role in AgentRole}
+
+    @property
+    def last_usage(self) -> dict[str, Any]:
+        return {"model_name": "static-model", "input_tokens": 100, "output_tokens": 50}
+
+    def decide(
+        self,
+        *,
+        role: AgentRole,
+        instruction: str,
+        state: dict[str, Any],
+        response_model: type[BaseModel],
+    ) -> BaseModel:
+        assert instruction and state
+        self.states[role].append(state)
+        return response_model.model_validate(dict(self.decisions[role]))
+
+
+def _need_user_decisions() -> dict[AgentRole, dict[str, Any]]:
+    return {
+        AgentRole.planner: {
+            "action": "plan",
+            "complexity": "L3",
+            "success_criteria": ["有证据"],
+            "steps": [{
+                "step_id": "discover",
+                "objective": "提取公开 JD",
+                "allowed_skills": ["job-discovery"],
+                "requires_verification": True,
+            }],
+        },
+        AgentRole.executor: {"action": "complete", "summary": "已提取"},
+        AgentRole.verifier: {
+            "action": "decide",
+            "verification_decision": "NEED_USER",
+            "feedback": "请确认目标城市",
+        },
+    }
+
+
+def test_runtime_auto_recovers_verifier_need_user_up_to_budget_then_hands_off(
+    db_session,
+) -> None:
+    """A verifier NEED_USER pause self-resumes twice with step-up tolerance."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = StaticDecisionGateway(_need_user_decisions())
+    runtime = _runtime_for_gateway(gateway)
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找 AIGC 产品经理岗位",
+            allowed_skills=["job-discovery"],
+            budget=AgentBudget(
+                max_agent_turns=12,
+                max_tool_calls=24,
+                max_replans=2,
+                max_wall_clock_seconds=60,
+                max_auto_recoveries=2,
+            ),
+        ),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    events = run_repository.list_events(db_session, result.run_id)
+    auto_events = [e for e in events if e.event_type == "run_auto_recovered"]
+    assert [e.payload_json["attempt"] for e in auto_events] == [1, 2]
+    assert [e.payload_json["reason_code"] for e in auto_events] == ["need_user", "need_user"]
+    # Three planner passes: the initial run plus two automatic recoveries.
+    assert len(gateway.states[AgentRole.planner]) == 3
+    # Each recovery widened the stall breaker and carried its attempt counter.
+    assert gateway.states[AgentRole.planner][1]["context"]["max_consecutive_stalls"] == 4
+    assert gateway.states[AgentRole.planner][1]["context"]["auto_recovery_attempts"] == 1
+    assert gateway.states[AgentRole.planner][2]["context"]["max_consecutive_stalls"] == 5
+    assert gateway.states[AgentRole.planner][2]["context"]["auto_recovery_attempts"] == 2
+    assert "请确认目标城市" in gateway.states[AgentRole.planner][1]["context"]["auto_recovery_feedback"]
+
+
+def test_runtime_auto_recovery_never_resumes_a_blocked_source_pause(db_session) -> None:
+    """Login/captcha walls are policy hand-offs, not auto-recoverable pauses."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    run = run_repository.create_run(
+        db_session, user_id=user.id, goal="找岗位", allowed_skills=["job-discovery"],
+        context_summary={}, budget_json={}, agent_version="pev-test",
+    )
+    run_repository.append_event(
+        db_session,
+        run_id=run.id,
+        event_type="run_needs_user",
+        payload_json={
+            "contract_version": "terminal.v1",
+            "failure_class": "external_blocked",
+            "reason_code": "login_required",
+            "source_role": "verifier",
+            "phase": "verification",
+            "resumable": True,
+            "retry_allowed": False,
+            "replan_allowed": False,
+            "user_action": "provide_public_job_url_or_jd_text",
+            "evidence": {"contract_met": False, "blocked": True, "artifact_count": 0},
+        },
+    )
+    runtime = object.__new__(AgentRuntime)
+    task = AgentTaskRequest(
+        goal="找岗位", allowed_skills=["job-discovery"],
+        budget=AgentBudget(max_auto_recoveries=2),
+    )
+    paused = AgentRunResult(run.id, RunStatus.waiting_user, "站点需要登录", None)
+
+    out = runtime._auto_recover(db_session, user_id=user.id, task=task, result=paused)
+
+    assert out is paused
+    events = run_repository.list_events(db_session, run.id)
+    assert all(e.event_type != "run_auto_recovered" for e in events)
+
+
+def test_runtime_auto_recovery_disabled_when_budget_says_zero(db_session) -> None:
+    """max_auto_recoveries=0 keeps the single-run hand-off semantics."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = StaticDecisionGateway(_need_user_decisions())
+    runtime = _runtime_for_gateway(gateway)
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找 AIGC 产品经理岗位",
+            allowed_skills=["job-discovery"],
+            budget=AgentBudget(
+                max_agent_turns=12, max_tool_calls=24, max_replans=2,
+                max_wall_clock_seconds=60, max_auto_recoveries=0,
+            ),
+        ),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    assert len(gateway.states[AgentRole.planner]) == 1
+    events = run_repository.list_events(db_session, result.run_id)
+    assert all(e.event_type != "run_auto_recovered" for e in events)
+
+
+def test_runtime_auto_recovers_verification_failed_pause(db_session) -> None:
+    """Verifier FAIL (verification_failed) is a recoverable pause too."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    decisions = _need_user_decisions()
+    decisions[AgentRole.verifier] = {
+        "action": "decide",
+        "verification_decision": "FAIL",
+        "feedback": "证据不足",
+    }
+    gateway = StaticDecisionGateway(decisions)
+    runtime = _runtime_for_gateway(gateway)
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找 AIGC 产品经理岗位",
+            allowed_skills=["job-discovery"],
+            budget=AgentBudget(
+                max_agent_turns=12, max_tool_calls=24, max_replans=2,
+                max_wall_clock_seconds=60, max_auto_recoveries=2,
+            ),
+        ),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    events = run_repository.list_events(db_session, result.run_id)
+    auto_events = [e for e in events if e.event_type == "run_auto_recovered"]
+    assert [e.payload_json["reason_code"] for e in auto_events] == [
+        "verification_failed",
+        "verification_failed",
+    ]
+
+
+def test_upgraded_budget_scales_per_attempt_and_respects_caps() -> None:
+    """Auto-recovery budgets step up 1.5x then 2x, clamped at schema ceilings."""
+    base = AgentBudget(
+        max_agent_turns=12,
+        max_tool_calls=24,
+        max_replans=2,
+        max_wall_clock_seconds=600,
+        max_model_requests=128,
+        max_input_tokens=1_000_000,
+        max_output_tokens=200_000,
+        max_auto_recoveries=2,
+    )
+    first = AgentRuntime._upgraded_budget(base, 0)
+    assert first.max_agent_turns == 18
+    assert first.max_tool_calls == 36
+    assert first.max_replans == 3
+    assert first.max_wall_clock_seconds == 900
+    assert first.max_model_requests == 192
+    second = AgentRuntime._upgraded_budget(base, 1)
+    assert second.max_agent_turns == 24
+    assert second.max_tool_calls == 48
+    assert second.max_wall_clock_seconds == 1200
+    assert second.max_auto_recoveries == 2  # the recovery cap itself never grows
+
+    capped = AgentRuntime._upgraded_budget(
+        AgentBudget(
+            max_agent_turns=100,
+            max_tool_calls=200,
+            max_replans=10,
+            max_wall_clock_seconds=3_600,
+            max_model_requests=500,
+        ),
+        1,
+    )
+    assert capped.max_agent_turns == 100
+    assert capped.max_tool_calls == 200
+    assert capped.max_replans == 10
+    assert capped.max_wall_clock_seconds == 3_600
 

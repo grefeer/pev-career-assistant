@@ -31,11 +31,15 @@ from backend.app.services.agent_runtime.error_policy import (
     TerminalContract,
     build_terminal_contract,
 )
-from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.executor_agent import (
+    ExecutorAgent,
+    _MAX_CONSECUTIVE_STALLS,
+)
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.model_budget import ModelCallBudget
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.schemas import (
+    AgentBudget,
     AgentTaskRequest,
     ExecutionPlan,
     ExecutorResult,
@@ -71,6 +75,18 @@ _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
 #: summary to verifier_feedback, so a second identical exhaustion after the
 #: replan keeps the human hand-off instead of looping.
 _RETRY_REPLAN_MARKER = "<retry_replan>"
+
+#: Terminal reason codes a waiting_user pause may be auto-recovered from.
+#: Source-access blocks (login/captcha/anti-bot), repeated-plan oscillation
+#: guards, and hard budget failures never auto-recover: blocked evidence is a
+#: policy hand-off and the other two are provably futile or terminal.
+_AUTO_RECOVERY_ELIGIBLE_REASONS = frozenset({
+    "need_user",
+    "verification_failed",
+    "no_progress_duplicate",
+    "invalid_model_response",
+    "wall_clock_budget_exhausted",
+})
 
 # A discovery question can be answered conclusively by a verified zero-match
 # result. Keep this vocabulary deliberately narrow: the rescue below also
@@ -606,7 +622,132 @@ class AgentRuntime:
         task: AgentTaskRequest,
         existing_run: AgentRun | None = None,
     ) -> AgentRunResult:
-        """Run bounded PEV lifecycle; agents retain all semantic tool decisions."""
+        """Run bounded PEV lifecycle; agents retain all semantic tool decisions.
+
+        A run that pauses as ``waiting_user`` for a verifier/model-decision
+        reason (never a source-access block) is automatically resumed by the
+        harness itself, with a step-up budget and a relaxed stall breaker, up
+        to ``task.budget.max_auto_recoveries`` times before the human is asked.
+        """
+        result = self._run_once(
+            db, user_id=user_id, task=task, existing_run=existing_run
+        )
+        return self._auto_recover(db, user_id=user_id, task=task, result=result)
+
+    @staticmethod
+    def _last_needs_user_contract(db: Session, run_id: str) -> dict[str, Any] | None:
+        """The terminal contract of the most recent ``run_needs_user`` event."""
+        event = db.scalars(
+            select(AgentEvent)
+            .where(
+                AgentEvent.run_id == run_id,
+                AgentEvent.event_type == "run_needs_user",
+            )
+            .order_by(AgentEvent.sequence.desc())
+            .limit(1)
+        ).first()
+        if event is None:
+            return None
+        payload = event.payload_json or {}
+        return payload if payload.get("contract_version") == "terminal.v1" else None
+
+    @staticmethod
+    def _auto_recovery_eligible(contract: dict[str, Any]) -> bool:
+        """Auto-recovery is for model/verifier pauses, never blocked sources."""
+        if contract.get("resumable") is False:
+            return False
+        evidence = contract.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("blocked") is True:
+            return False
+        return contract.get("reason_code") in _AUTO_RECOVERY_ELIGIBLE_REASONS
+
+    @staticmethod
+    def _upgraded_budget(budget: AgentBudget, attempts_used: int) -> AgentBudget:
+        """Step-up budget per auto-recovery attempt (x1.5, then x2.0, capped)."""
+        factor = 1.0 + 0.5 * (attempts_used + 1)
+
+        def scale(value: int, cap: int) -> int:
+            return min(cap, max(1, int(value * factor)))
+
+        return AgentBudget(
+            max_agent_turns=scale(budget.max_agent_turns, 100),
+            max_tool_calls=scale(budget.max_tool_calls, 200),
+            max_replans=scale(budget.max_replans, 10),
+            max_wall_clock_seconds=scale(budget.max_wall_clock_seconds, 3_600),
+            max_model_requests=scale(budget.max_model_requests, 500),
+            max_input_tokens=scale(budget.max_input_tokens, 2_000_000),
+            max_output_tokens=scale(budget.max_output_tokens, 500_000),
+            max_auto_recoveries=budget.max_auto_recoveries,
+        )
+
+    def _auto_recover(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        task: AgentTaskRequest,
+        result: AgentRunResult,
+    ) -> AgentRunResult:
+        """Bounded self-resume of a recoverable waiting_user pause.
+
+        Each attempt carries a step-up budget (turn/tool/replan/model/wall
+        ceilings scale 1.5x then 2x) and a relaxed consecutive-stall breaker
+        (4 then 5), so a verifier-confirmed retry has room to finish instead
+        of re-tripping the same cap. Source-access blocks and oscillation
+        guards never auto-recover; the pause goes to the human unchanged.
+        """
+        if result.status is not RunStatus.waiting_user:
+            return result
+        raw_attempts = task.context.get("auto_recovery_attempts")
+        try:
+            attempts_used = int(raw_attempts)
+        except (TypeError, ValueError):
+            attempts_used = 0
+        attempts_used = max(0, attempts_used)
+        if attempts_used >= task.budget.max_auto_recoveries:
+            return result
+        run = db.get(AgentRun, result.run_id)
+        if run is None:  # defensive: foreign-key integrity normally prevents this.
+            return result
+        contract = self._last_needs_user_contract(db, run.id)
+        if contract is None or not self._auto_recovery_eligible(contract):
+            return result
+        feedback = (run.final_summary or "").strip()[:2000]
+        next_context = dict(task.context)
+        next_context["auto_recovery_attempts"] = attempts_used + 1
+        if feedback:
+            next_context["auto_recovery_feedback"] = feedback
+        next_context["max_consecutive_stalls"] = _MAX_CONSECUTIVE_STALLS + attempts_used + 1
+        upgraded_task = task.model_copy(
+            update={
+                "context": next_context,
+                "budget": self._upgraded_budget(task.budget, attempts_used),
+            }
+        )
+        run_repository.start_run(db, run)
+        run_repository.append_event(
+            db,
+            run_id=run.id,
+            event_type="run_auto_recovered",
+            payload_json={
+                "attempt": attempts_used + 1,
+                "reason_code": contract.get("reason_code"),
+                "feedback": feedback[:1000],
+            },
+        )
+        return self.run(
+            db, user_id=user_id, task=upgraded_task, existing_run=run
+        )
+
+    def _run_once(
+        self,
+        db: Session,
+        *,
+        user_id: str,
+        task: AgentTaskRequest,
+        existing_run: AgentRun | None = None,
+    ) -> AgentRunResult:
+        """One bounded PEV pass (plan -> execute -> verify loop)."""
         task = _compile_task_context(task)
         run = existing_run
         if run is None:
@@ -1956,6 +2097,12 @@ class AgentRuntime:
                     persisted_step,
                     verification.feedback,
                     output_artifact_refs=execution.artifact_refs,
+                    terminal_contract=build_terminal_contract(
+                        observations=execution.observations,
+                        source_role="verifier",
+                        phase="verification",
+                        artifact_count=len(execution.artifact_refs),
+                    ),
                 )
             if verification.decision is VerificationDecision.FAIL:
                 return self._wait_for_user(
