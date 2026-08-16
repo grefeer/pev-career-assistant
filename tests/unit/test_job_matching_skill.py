@@ -1,5 +1,7 @@
 """Behavior tests for evidence-bound PEV job matching."""
 
+from datetime import datetime, timezone
+
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.manifest import (
     skill_observation_is_semantically_valid,
@@ -605,7 +607,9 @@ def test_match_requires_authoritative_recent_timestamp_for_recent_goal() -> None
                     "responsibilities": "负责 AIGC 产品",
                     "requirements": "校招，应届生",
                     "recruitment_types": ["campus"],
-                    "updated_at": "2026-08-14",
+                    # Anchor to the real current date: a hardcoded date drifts
+                    # out of the "最近1天" window and breaks the assertion.
+                    "updated_at": datetime.now(timezone.utc).date().isoformat(),
                 },
             ],
         },

@@ -1042,7 +1042,14 @@ def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session
     )
     original_task = AgentTaskRequest(
         goal="find suitable roles", allowed_skills=["job-discovery"],
-        budget={"max_agent_turns": 3, "max_tool_calls": 3, "max_replans": 0},
+        # max_auto_recoveries=0: this test pins the single-pause + manual
+        # resume flow, so the harness must not self-resume the planner pause.
+        budget={
+            "max_agent_turns": 3,
+            "max_tool_calls": 3,
+            "max_replans": 0,
+            "max_auto_recoveries": 0,
+        },
     )
 
     waiting = runtime.run(db_session, user_id=user.id, task=original_task)
@@ -3826,6 +3833,93 @@ def test_runtime_auto_recovers_verifier_need_user_up_to_budget_then_hands_off(
     assert gateway.states[AgentRole.planner][2]["context"]["max_consecutive_stalls"] == 5
     assert gateway.states[AgentRole.planner][2]["context"]["auto_recovery_attempts"] == 2
     assert "请确认目标城市" in gateway.states[AgentRole.planner][1]["context"]["auto_recovery_feedback"]
+
+
+def test_runtime_auto_recovers_planner_phase_need_user(db_session) -> None:
+    """A planner-level need_user pause is found via planner_needs_user events."""
+    user = User(
+        id="user-a", account="user-a@example.test", nickname="user-a",
+        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
+    )
+    db_session.add(user)
+    db_session.commit()
+    gateway = StaticDecisionGateway({
+        AgentRole.planner: {"action": "need_user", "user_question": "请确认目标城市"},
+        AgentRole.executor: {"action": "complete", "summary": "未使用"},
+        AgentRole.verifier: {
+            "action": "decide", "verification_decision": "PASS", "feedback": ""
+        },
+    })
+    runtime = _runtime_for_gateway(gateway)
+
+    result = runtime.run(
+        db_session,
+        user_id=user.id,
+        task=AgentTaskRequest(
+            goal="找 AIGC 产品经理岗位",
+            allowed_skills=["job-discovery"],
+            budget=AgentBudget(
+                max_agent_turns=12,
+                max_tool_calls=24,
+                max_replans=2,
+                max_wall_clock_seconds=60,
+                max_auto_recoveries=2,
+            ),
+        ),
+    )
+
+    assert result.status is RunStatus.waiting_user
+    events = run_repository.list_events(db_session, result.run_id)
+    auto_events = [e for e in events if e.event_type == "run_auto_recovered"]
+    assert [e.payload_json["attempt"] for e in auto_events] == [1, 2]
+    assert [e.payload_json["reason_code"] for e in auto_events] == ["need_user", "need_user"]
+    # The planner was re-invoked once per attempt (3 total), never producing a plan.
+    assert len(gateway.states[AgentRole.planner]) == 3
+    assert gateway.states[AgentRole.planner][1]["context"]["max_consecutive_stalls"] == 4
+    assert gateway.states[AgentRole.planner][2]["context"]["auto_recovery_attempts"] == 2
+
+
+def test_auto_recovery_eligible_reason_set() -> None:
+    """Model-decision hand-off codes recover; blocks and hard failures never do."""
+    base: dict[str, Any] = {
+        "resumable": True,
+        "retry_allowed": False,
+        "replan_allowed": False,
+        "evidence": {"contract_met": False, "blocked": False, "artifact_count": 0},
+    }
+    recoverable = [
+        "need_user",
+        "verification_failed",
+        "no_progress_duplicate",
+        "invalid_model_response",
+        "wall_clock_budget_exhausted",
+        "route_already_consumed",
+        "candidate_urls_already_supplied",
+        "target_evidence_not_found",
+        "target_role_mismatch",
+        "target_source_mismatch",
+    ]
+    for reason in recoverable:
+        assert AgentRuntime._auto_recovery_eligible({**base, "reason_code": reason}) is True
+    terminal = [
+        "login_required",
+        "captcha",
+        "anti_bot_challenge",
+        "ocr_disabled",
+        "repeated_plan_fingerprint",
+        "tool_budget_exhausted",
+        "source_unavailable",
+        "search_empty",
+    ]
+    for reason in terminal:
+        assert AgentRuntime._auto_recovery_eligible({**base, "reason_code": reason}) is False
+    assert (
+        AgentRuntime._auto_recovery_eligible({**base, "reason_code": "need_user", "resumable": False})
+        is False
+    )
+    blocked = dict(base)
+    blocked["evidence"] = {"contract_met": False, "blocked": True, "artifact_count": 0}
+    assert AgentRuntime._auto_recovery_eligible({**blocked, "reason_code": "need_user"}) is False
 
 
 def test_runtime_auto_recovery_never_resumes_a_blocked_source_pause(db_session) -> None:

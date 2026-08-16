@@ -76,16 +76,32 @@ _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
 #: replan keeps the human hand-off instead of looping.
 _RETRY_REPLAN_MARKER = "<retry_replan>"
 
-#: Terminal reason codes a waiting_user pause may be auto-recovered from.
-#: Source-access blocks (login/captcha/anti-bot), repeated-plan oscillation
-#: guards, and hard budget failures never auto-recover: blocked evidence is a
-#: policy hand-off and the other two are provably futile or terminal.
+#: Terminal reason codes a waiting_user pause may be auto-recovered from:
+#: verifier/model-decision hand-offs plus the executor's own model-decision
+#: hand-offs (stalled route, supplied candidate set, missing/mismatched target
+#: evidence). Source-access blocks (login/captcha/anti-bot), repeated-plan
+#: oscillation guards, and hard budget failures never auto-recover: blocked
+#: evidence is a policy hand-off and the other two are provably futile or
+#: terminal.
 _AUTO_RECOVERY_ELIGIBLE_REASONS = frozenset({
     "need_user",
     "verification_failed",
     "no_progress_duplicate",
     "invalid_model_response",
     "wall_clock_budget_exhausted",
+    "route_already_consumed",
+    "candidate_urls_already_supplied",
+    "target_evidence_not_found",
+    "target_role_mismatch",
+    "target_source_mismatch",
+})
+
+#: Pause event types whose payload carries a terminal.v1 contract. The latest
+#: one decides auto-recovery eligibility, whichever agent produced the pause.
+_AUTO_RECOVERY_PAUSE_EVENT_TYPES = frozenset({
+    "run_needs_user",
+    "planner_needs_user",
+    "planner_budget_exhausted",
 })
 
 # A discovery question can be answered conclusively by a verified zero-match
@@ -636,12 +652,17 @@ class AgentRuntime:
 
     @staticmethod
     def _last_needs_user_contract(db: Session, run_id: str) -> dict[str, Any] | None:
-        """The terminal contract of the most recent ``run_needs_user`` event."""
+        """The terminal contract of the most recent needs-user pause event.
+
+        Covers executor/verifier pauses (``run_needs_user``) and planner-level
+        pauses (``planner_needs_user`` / ``planner_budget_exhausted``), so a
+        model-decision hand-off is auto-recoverable whichever agent produced it.
+        """
         event = db.scalars(
             select(AgentEvent)
             .where(
                 AgentEvent.run_id == run_id,
-                AgentEvent.event_type == "run_needs_user",
+                AgentEvent.event_type.in_(_AUTO_RECOVERY_PAUSE_EVENT_TYPES),
             )
             .order_by(AgentEvent.sequence.desc())
             .limit(1)
