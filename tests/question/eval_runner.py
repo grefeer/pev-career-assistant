@@ -377,6 +377,9 @@ def run_question(
         if decision.get("verification_decision"):
             verifier_decisions.append(decision["verification_decision"])
 
+    auto_recovery_count = sum(
+        1 for event in events if event.event_type == "run_auto_recovered"
+    )
     terminal_contract = None
     for event in reversed(events):
         payload = event.payload_json or {}
@@ -435,6 +438,7 @@ def run_question(
         "turns": turn_summaries,
         "verifier_decisions": verifier_decisions,
         "terminal_contract": terminal_contract,
+        "auto_recovery_count": auto_recovery_count,
         "artifacts": [
             {
                 "artifact_id": artifact.id,
@@ -602,6 +606,7 @@ def run_chain(db: Session, cid: str, doc: dict, *, budget: AgentBudget) -> dict:
         "wall_seconds": round(time.monotonic() - started, 1),
         "input_tokens": sum(r["input_tokens"] for r in records),
         "output_tokens": sum(r["output_tokens"] for r in records),
+        "auto_recovery_count": sum(r.get("auto_recovery_count", 0) for r in records),
     }
     record["failure_trace"] = failure_trace(last)
     record["root_cause"] = root_cause(last)
