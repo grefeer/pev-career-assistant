@@ -72,9 +72,17 @@ QUESTION_DIR = pathlib.Path(__file__).resolve().parent
 ALL_SKILLS = ["job-discovery", "job-matching", "resume-tailoring", "career-planning"]
 DEFAULT_BUDGET = AgentBudget(
     max_agent_turns=36,
-    max_tool_calls=32,
+    # 32 -> 64: R002/R013 逐公司扫描在一次 deep-executor 调用内烧穿 32 次
+    # 工具调用上限（tool_budget_exhausted）。
+    max_tool_calls=64,
     max_replans=2,
     max_wall_clock_seconds=600,
+    # 模型物理上限按实测耗尽轨迹上调（schema 默认 128 / 1_000_000）：
+    # Deep Executor 每次内部模型调用都按保守估算预占输入 token，Q017/Q028
+    # 在 ~7 turns 就烧穿 1M 输入预算（model_budget_exhausted）；请求上限
+    # 128 也会被内部调用环逼近。
+    max_model_requests=256,
+    max_input_tokens=2_000_000,
     # Verifier/model-decision pauses auto-resume up to 2 more times, each with
     # a step-up budget and relaxed stall breaker (3 attempts total per run).
     max_auto_recoveries=2,

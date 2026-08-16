@@ -603,7 +603,10 @@ class DeepExecutorAgent:
                 status="failed",
                 error_code="agent_turn_budget_exhausted",
             )
-        max_model_calls = min(12, max(4, task.budget.max_agent_turns))
+        # Per-invocation internal model-call cap, raised 12 -> 20: complex
+        # per-company sweeps (Q028) hit deep_executor_call_limit_exhausted on
+        # the first executor turn at 12.
+        max_model_calls = min(20, max(4, task.budget.max_agent_turns))
         model_call_counter = {"count": 0}
 
         from backend.app.services.agent_runtime.executor_agent import (
