@@ -101,3 +101,5 @@ Program/
 skill/job-discovery/anti_crawl/store/profiles/
 skill/job-discovery/anti_crawl/store/proxy.json
 skill/job-discovery/anti_crawl/store/state/
+executor/
+skill_old/
