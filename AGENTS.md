@@ -6,7 +6,7 @@ Multi-agent personal career assistant. Full-stack: FastAPI + Vue 3 + MySQL + Red
 
 > The previous LangGraph/Deep-Agents job-discovery pipeline (Supervisor / Web Navigation Agent / skill runtime / worker) has been retired and removed. Do not add code under those names; the current `job-discovery` is a career skill inside the PEV runtime.
 
-Business skill logic is owned by the skill packages (`skill/<name>/runtime/` as underscored Python modules, plus the hyphenated `skill/<name>/` SKILL.md/scripts/references). `backend/app/services/career_skills/` is the PEV tool host (`registry.py` / `manifest.py`) and import-compatibility aliases only; do not add new business rules there.
+Business skill logic is owned by the skill packages (`skill/<name>/runtime/` as underscored Python modules, plus the hyphenated `skill/<name>/` SKILL.md/scripts/references). `backend/app/services/career_skills/` is the PEV tool host (`registry.py` / `manifest.py`) and import-compatibility aliases only; do not add new business rules there. The current tool registry registers **13 tools** across the four skills (job-discovery 10, job-matching 1, resume-tailoring 1, career-planning 1) — see `backend/app/services/career_skills/registry.py` for the live list.
 
 ## How to Work in This Repo
 
@@ -146,6 +146,17 @@ pytestmark = pytest.mark.skipif(
     reason="set RUN_LIVE_PEV_E2E=1",
 )
 ```
+
+For end-to-end / round runs, use the 20-question eval harness in `tests/question/` (real DeepSeek + public fetch):
+
+```powershell
+# Single-question dry runs (per-question JSON under --out-dir):
+.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q001 Q002 --out-dir tests/question/eval_results/round_1
+
+# Full eval scripts used by the round merges live under scripts/ (run_full_83_staggered.ps1 etc.)
+```
+
+The eval harness produces per-question JSON + a round-level summary used by `merge_round.py` / `compare_rounds.py`; raw run logs live under `tests/question/eval_results/`.
 
 ### Opt-in Destructive MySQL Tests
 

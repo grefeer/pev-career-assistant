@@ -48,19 +48,23 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   │       └── rate_limit.py
 │   └── entrypoint.py            # Container entrypoint
 ├── skill/                       # Self-contained skill packages (PRESERVE — do not delete)
-│   └── job-discovery/scripts/   # browse/validate/deduplicate/state/ocr_image used by the skill
+│   └── <skill-name>/            # Hyphenated skill dir, e.g. job-discovery/
+│       ├── SKILL.md             # Skill contract (purpose, tools, safety)
+│       ├── scripts/             # Playwright / browse / validate / dedup / state scripts
+│       ├── references/          # Skill-local reference material
+│       └── runtime/             # Underscored Python module package (skill.<name>.runtime.*) — single source of truth for skill business logic
 ├── frontend/src/features/
 │   ├── agent-workspace/         # PEV natural-language task, evidence, artifacts, human recovery
 │   └── profile/                 # Profile workspace
 ├── executor/                    # Windows executor skeleton/simulator (assisted form filling)
 ├── docs/                        # Design specs, plans, runbooks, tech docs
 ├── tests/
-│   ├── unit/                    # Primary deterministic/unit suite (100% branch coverage)
-│   ├── integration/             # Integration + live smoke tests
+│   ├── unit/                    # Primary deterministic/unit suite (key-point coverage, see Coverage Policy)
+│   ├── integration/             # Integration + live smoke tests (gated: RUN_LIVE_PEV_E2E, ALLOW_DESTRUCTIVE_MYSQL_TESTS)
 │   ├── e2e/                     # E2E Playwright + fixture tests
 │   ├── question/                # 20-question PEV eval harness (eval_runner, merge/compare rounds)
 │   └── manual/                  # Standalone smoke/diagnostic scripts (excluded from pytest)
-├── alembic/versions/            # Database migrations (0001 -> 0023)
+├── alembic/versions/            # Database migrations (0001 -> 0024; head: 20260812_0024_retire_legacy_tables.py)
 ├── scripts/                     # Admin/dev scripts (create_admin, seed_strategies, fixtures, etc.)
 └── docker-compose.yml
 ```
@@ -85,7 +89,7 @@ docker compose -p platform-foundation up -d --build
 ### Testing
 
 ```powershell
-# All unit tests (100% branch coverage gate; count changes as the suite evolves)
+# All unit tests (key-point coverage; per-change targeted run, not the full 100% gate — see Coverage Policy)
 .\.venv\Scripts\python.exe -m pytest tests/unit/ -q
 
 # PEV + career-skills targeted regression
@@ -194,7 +198,7 @@ Key invariants enforced by the harness (not the agents):
 | `resume-tailoring` | Auditable resume edit ops | Each op cites a confirmed fact field + target JD; cannot fabricate |
 | `career-planning` | JD-driven interview/action plan | Only themes present in the target JD |
 
-Tool registry: [backend/app/services/career_skills/registry.py](backend/app/services/career_skills/registry.py). Eight tools are registered across the four skills; `search-public-job-pages` is executor-only.
+Tool registry: [backend/app/services/career_skills/registry.py](backend/app/services/career_skills/registry.py). **13 tools** are registered across the four skills (job-discovery 10, job-matching 1, resume-tailoring 1, career-planning 1); `search-public-job-pages` is executor-only.
 
 ## Executor Implementation
 
@@ -290,6 +294,18 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `002
 ## Coverage Policy
 
 `[tool.coverage.run]` in `pyproject.toml` measures **retained production packages** at 100% branch coverage (`fail_under = 100`). The PEV runtime, career skills, skill runtime packages, repositories, API, config, and `main` remain measured and must stay at 100%.
+
+**Active development gate (since 2026-08-09):** the user relaxed the 100% branch gate for day-to-day development — "现在不要求100%覆盖了，只要关键点覆盖就行，加快开发效率". `fail_under = 100` stays in `pyproject.toml` as an opt-in check, but per-change verification is now: targeted unit tests on the changed module + a fast smoke + a flip-matrix / error-code check on critical mechanisms. Security invariants remain non-negotiable and must keep full coverage:
+
+- `task:submit` scope never granted
+- No secrets in code, logs, error messages, or audit records
+- Blocked sources (login / captcha / anti-bot) always surface as `needs_manual_review`; no auto-bypass
+- Student API returns only `verified` jobs
+- `JobPosting` review writes use `review_version` optimistic locking
+- Device actions validate task lease, not just device token
+- Public-page redirect hops re-validate `_assert_public_url` (no jump to private / cloud-metadata addresses)
+
+Revisit this gate with the user before re-enabling `fail_under = 100` as a hard pre-merge check.
 
 ## Important Docs
 
