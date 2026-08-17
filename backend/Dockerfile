@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -m playwright install --with-deps chromium
 
 COPY backend ./backend
+COPY skill ./skill
 COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY data ./data

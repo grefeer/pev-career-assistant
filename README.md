@@ -22,7 +22,7 @@ flowchart LR
 - **Verifier**：独立检查计划验收条件、公开证据与事实边界；可要求重试、重规划、人工补充或失败降级。
 - **Harness**：只负责权限、Pydantic 契约、预算、持久化、审计和安全门，不替 Agent 选择业务动作。
 
-主运行时位于 `backend/app/services/agent_runtime/`，由普通 Python + Pydantic + 模型 SDK 实现；**LangGraph / Deep Agents 不是默认生产运行时**。
+主运行时位于 `backend/app/services/agent_runtime/`：Harness（计划、预算、验证路由、持久化）由普通 Python + Pydantic + 模型 SDK 实现；生产 Executor 使用 DeepAgents 工具调用循环（`deep_executor.py`）。业务 Skill 的确定性逻辑以 `skill/<name>/runtime/` 为唯一来源，`backend/app/services/career_skills/` 只保留工具注册宿主与兼容别名。
 
 ## 四个业务 Skill
 

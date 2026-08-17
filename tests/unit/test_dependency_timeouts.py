@@ -36,7 +36,6 @@ def _settings(**values: Any) -> Settings:
         "object_encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "database_url": "sqlite+pysqlite:///:memory:",
         "redis_url": "redis://localhost:6379/0",
-        "checkpoint_backend": "sqlite",
     }
     defaults.update(values)
     return Settings(**defaults)

@@ -20,10 +20,18 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from backend.app.domain.job_feedback import (
+from backend.app.domain.enums import (
+    ApplicationStatus,
+    CompanyResearchBlockReason,
+    CompanyResearchStatus,
+    DeduplicationStatus,
+    InterviewPrepKitStatus,
     JobFeedbackAction,
     JobFeedbackCategory,
     JobFeedbackStatus,
+    JobSourceLinkType,
+    SubmissionInputType,
+    SubmissionStatus,
 )
 
 from backend.app.domain.profiles import (
@@ -31,20 +39,6 @@ from backend.app.domain.profiles import (
     ResumeAssetStatus,
     ResumeImportStatus,
 )
-
-from backend.app.domain.job_submissions import (
-    DeduplicationStatus,
-    JobSourceLinkType,
-    SubmissionInputType,
-    SubmissionStatus,
-)
-
-from backend.app.domain.company_research import (
-    CompanyResearchBlockReason,
-    CompanyResearchStatus,
-)
-from backend.app.domain.interview_prep import InterviewPrepKitStatus
-from backend.app.domain.application_tracking import ApplicationStatus
 from backend.app.domain.agent_runtime import (
     AgentRole,
     ComplexityLevel,

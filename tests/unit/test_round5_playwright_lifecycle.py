@@ -12,7 +12,7 @@ def test_playwright_worker_command_isolated_from_parent_runtime() -> None:
         "https://jobs.example/detail", collect_links=True
     )
 
-    assert "backend.app.services.career_skills.playwright_worker" in command
+    assert "skill.job_discovery.runtime.playwright_worker" in command
     assert "--url" in command
     assert "https://jobs.example/detail" in command
     assert "--collect-links" in command

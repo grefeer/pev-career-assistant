@@ -1,1 +1,1 @@
-"""FastAPI backend for the LangGraph internship assistant."""
+"""FastAPI backend for the personal career assistant."""

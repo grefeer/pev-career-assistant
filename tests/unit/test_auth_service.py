@@ -31,7 +31,6 @@ def make_settings(**overrides: object) -> Settings:
         "object_encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "database_url": "sqlite+pysqlite:///:memory:",
         "redis_url": "redis://localhost:6379/15",
-        "checkpoint_backend": "sqlite",
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]

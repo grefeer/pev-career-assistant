@@ -59,7 +59,7 @@ def test_ocr_disabled_returns_needs_manual_review_without_network(monkeypatch) -
         raise AssertionError("slice must not run when OCR is disabled")
 
     monkeypatch.setattr(
-        "backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice.run_wechat_slice",
+        "skill.job_discovery.runtime.wechat_slice.run_wechat_slice",
         _boom,
     )
     result = fetch_wechat_article(
@@ -81,7 +81,7 @@ def test_ocr_success_carries_page_evidence(monkeypatch) -> None:
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     fake = _fake_slice(visible_text=text, content_hash=digest)
     monkeypatch.setattr(
-        "backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice.run_wechat_slice",
+        "skill.job_discovery.runtime.wechat_slice.run_wechat_slice",
         lambda *args, **kwargs: fake,
     )
 
@@ -111,7 +111,7 @@ def test_ocr_non_success_statuses_pass_through_without_evidence(monkeypatch) -> 
     ):
         fake = _fake_slice(status=status, reason=reason)
         monkeypatch.setattr(
-            "backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice.run_wechat_slice",
+            "skill.job_discovery.runtime.wechat_slice.run_wechat_slice",
             partial(lambda f, *args, **kwargs: f, fake),
         )
         result = fetch_wechat_article(
@@ -135,7 +135,7 @@ def test_ocr_disabled_uses_default_out_dir_only_when_enabled(monkeypatch) -> Non
         return fake
 
     monkeypatch.setattr(
-        "backend.app.services.deepagents_runtime.tools.skill_graphs.wechat_slice.run_wechat_slice",
+        "skill.job_discovery.runtime.wechat_slice.run_wechat_slice",
         _capture,
     )
     result = fetch_wechat_article(

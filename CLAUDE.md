@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A multi-agent personal career assistant. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (plain Python + Pydantic + langchain-openai, *not* LangGraph/Deep Agents) that drives four career skills: job discovery, job matching, resume tailoring, and career planning. Supporting capabilities include a WP2 manual-import → admin review → verified student job-center flow, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for human-reviewed form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
+A multi-agent personal career assistant. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (plain Python + Pydantic + langchain-openai). The harness (planning, budgets, verification routing, persistence) is self-built; the production Executor uses a DeepAgents tool-calling loop (`agent_runtime/deep_executor.py`) inside that self-built harness. It drives four career skills: job discovery, job matching, resume tailoring, and career planning. Supporting capabilities include a WP2 manual-import → admin review → verified student job-center flow, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for human-reviewed form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
 
 > The previous LangGraph/Deep-Agents job-discovery pipeline (Supervisor / Web Navigation Agent / Strategy Router / skill runtime / worker) has been retired and removed. `docs/job-discovery-legacy-architecture-summary.md` archives that design. The current `job-discovery` is a career skill inside the PEV runtime, not a standalone Tencent→Smartsheet pipeline.
 
@@ -148,12 +148,6 @@ These are code-level restrictions, NOT conventions:
 3. **Student API only returns `verified` jobs**: Filter at SQL level. Other statuses must never leak.
 4. **Never write secrets to repo/logs/argv**: Passwords, tokens, API keys, raw payloads - all rejected.
 5. **Never use Redis as authority**: MySQL is the single source of truth for business state.
-   - **Exception (deepagents_runtime only, spec 2026-08-07):** agent
-     execution checkpoints (LangGraph threads) may live in Redis (AOF
-     persistence); completed run records and evidence artifacts are always
-     flushed to MySQL at run completion (`flush_run`, idempotent + retry).
-     This exception covers only short-lived execution state — MySQL stays
-     authoritative for business state.
 6. **Never trust device token alone**: Task actions require task lease with scope validation.
 7. **Job review requires version check**: JobPosting completion/review/decision writes validate `review_version` (optimistic locking). Concurrent edits get 409.
 
@@ -161,7 +155,7 @@ These are code-level restrictions, NOT conventions:
 
 - All settings live in `backend/app/config.py` -> `Settings` (pydantic-settings).
 - `agent_harness_enabled` gates the PEV runtime; a missing model key logs a warning and the API safely returns `agent_harness_unavailable` / `agent_harness_disabled` rather than crashing.
-- Rejects: demo keys, template credentials, SQLite `database_url`/`checkpoint_backend` in production (enforced in `validate_production_settings`).
+- Rejects: demo keys, template credentials, and SQLite `database_url` in production (enforced in `validate_production_settings`).
 - `OBJECT_ENCRYPTION_KEY` must be Base64-encoded 32 bytes.
 - `.env` file at project root for local overrides; never committed.
 
@@ -202,21 +196,20 @@ Key invariants enforced by the harness (not the agents):
 
 Tool registry: [backend/app/services/career_skills/registry.py](backend/app/services/career_skills/registry.py). Eight tools are registered across the four skills; `search-public-job-pages` is executor-only.
 
-## DeepAgents Runtime (parallel build, eval pending)
+## Executor Implementation
 
-> Design: [docs/superpowers/specs/2026-08-07-deepagents-runtime-design.md](docs/superpowers/specs/2026-08-07-deepagents-runtime-design.md)
+The self-built `agent_runtime` owns the PEV lifecycle (planning, budgets,
+verification routing, persistence).  The production Executor path
+(`agent_runtime/executor_agent.py`) delegates to `agent_runtime/deep_executor.py`,
+a DeepAgents tool-calling loop.  The experimental `deepagents_runtime`
+package was removed: the self-built harness + one DeepAgents-based Executor is
+the single production path.
 
-A second PEV runtime built on langchain deepagents (`backend/app/services/deepagents_runtime/`),
-built in parallel with the self-built `agent_runtime` and not yet replacing
-it.  Three deep agents (Planner / Executor / Verifier) are driven by an
-external LangGraph harness graph that enforces the same invariants
-(budgets, one-skill-per-step, evidence binding, stall-breaker, recoverable
-`waiting_user`).  Tools: career_skills registry tools wrapped generically as
-`@tool` (adapters.py), and the job-discovery SKILL.md workflow encoded as a
-LangGraph subgraph wrapped as `run-job-discovery-workflow`.  Execution state
-checkpoints to Redis (AOF); completed runs flush to MySQL
-(`deepagents_runs` / `deepagents_artifacts`).  Comparative eval:
-`python -m backend.app.services.deepagents_runtime.eval.compare_runner --ids Q001 Q002 --out-dir tests/question/eval_results/deepagents_round_1`
+Skill business logic lives under `skill/<name>/runtime/` (Python packages
+with underscored module paths, e.g. `skill.job_discovery.runtime`) and is the
+source of truth for the PEV tools.  `backend/app/services/career_skills/`
+keeps `registry.py` / `manifest.py` (the PEV tool host) plus thin aliases to
+the skill runtime modules for backward-compatible imports.
 
 ## State Machines
 
@@ -289,14 +282,14 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `002
 - `0017`–`0019`: Agent runtime runs, artifacts, artifact-type dedup
 - `0020`: Agent turn-context manifest
 - `0021`: Profile active version
-- `0022`: DeepAgents runtime runs + artifacts (deepagents_runs / deepagents_artifacts)
+- `0022`: DeepAgents runtime runs + artifacts (tables retained for database continuity; the experimental runtime package was removed)
 - `0023`: SeenJob cross-run dedup ledger (job-discovery dedup, TTL-pruned)
 - `0024`: Retire 14 legacy tables (job-discovery / site-adapter / personalized-discovery / analysis-session schemas)
-- Hotfixes: `7b757ef17d3f` (MatchReport CHECK constraint), `7e8f22313271` (job-discovery tables), `ffc4f5917966` (strategy/trajectory tables)
+- Hotfixes (renamed to timestamp convention): `20260718_0008a` (MatchReport CHECK constraint), `20260718_0011a` (job-discovery tables), `20260718_0011b` (strategy/trajectory tables)
 
 ## Coverage Policy
 
-`[tool.coverage.run]` in `pyproject.toml` measures **retained production packages** at 100% branch coverage (`fail_under = 100`). A set of `domain/*` modules are omitted because they are pre-PEV paths retained for `db/models.py` enum imports pending proper retirement; they do not enter the coverage gate. The PEV runtime, career skills, repositories, API, config, and `main` remain measured and must stay at 100%.
+`[tool.coverage.run]` in `pyproject.toml` measures **retained production packages** at 100% branch coverage (`fail_under = 100`). The PEV runtime, career skills, skill runtime packages, repositories, API, config, and `main` remain measured and must stay at 100%.
 
 ## Important Docs
 
@@ -304,7 +297,6 @@ Alembic migrations numbered `YYYYMMDD_NNNN_description.py`. Current head is `002
 |----------|---------|
 | [PEV Architecture](docs/pev-agent-architecture.zh-CN.md) | Current 3-agent PEV runtime: structure, sequence diagrams, modules, constraints |
 | [PEV Design Spec](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md) | Adaptive PEV design, agent definitions, security boundaries, acceptance |
-| [DeepAgents Runtime Design](docs/superpowers/specs/2026-08-07-deepagents-runtime-design.md) | deepagents-based parallel PEV runtime: harness graph, tool layer, Redis checkpoint + MySQL sink |
 | [WP1 Tech Doc](docs/WP1-平台基础与权威数据-技术文档.md) | Platform foundation (auth, state machine, encryption, layers) |
 | [WP2 Tech Doc](docs/WP2-真实职位同步与核验-技术文档.md) | Job sync, review pipeline, student submissions |
 | [Job Discovery (legacy summary)](docs/job-discovery-legacy-architecture-summary.md) | Retired Supervisor/Web-Nav/Strategy-Router/skill-runtime architecture archive |

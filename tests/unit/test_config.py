@@ -13,7 +13,6 @@ def _production_base(**overrides):
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url="mysql+pymysql://root@mysql/db",
         redis_url="redis://redis/0",
-        checkpoint_backend="redis",
         rate_limit_hmac_secret="rate-limit-secret-with-at-least-32-chars",
         trusted_proxy_cidrs="172.16.0.0/12",
         object_store_access_key="safe-production-object-key",
@@ -31,7 +30,6 @@ def test_production_rejects_default_secrets() -> None:
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://app:app@mysql:3306/career_assistant",
             redis_url="redis://redis:6379/0",
-            checkpoint_backend="redis",
         )
 
 
@@ -43,7 +41,6 @@ def test_production_rejects_env_example_auth_secret() -> None:
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://app:app@mysql:3306/career_assistant",
             redis_url="redis://redis:6379/0",
-            checkpoint_backend="redis",
         )
 
 
@@ -54,7 +51,6 @@ def test_test_environment_accepts_sqlite_and_memory_dependencies() -> None:
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url="sqlite+pysqlite:///:memory:",
         redis_url="redis://localhost:6379/15",
-        checkpoint_backend="sqlite",
     )
     assert settings.is_production is False
     assert settings.jwt_audience == "career-assistant-web"
@@ -67,7 +63,6 @@ def test_production_rejects_object_credential_templates(value: str) -> None:
             app_env="production", app_auth_secret="x" * 32,
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://root@mysql/db", redis_url="redis://redis/0",
-            checkpoint_backend="redis",
             rate_limit_hmac_secret="rate-limit-secret-with-at-least-32-chars",
             trusted_proxy_cidrs="172.16.0.0/12",
             object_store_access_key=value,
@@ -83,7 +78,6 @@ def test_production_requires_rate_limit_hmac_secret() -> None:
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://root@mysql/db",
             redis_url="redis://redis/0",
-            checkpoint_backend="redis",
             trusted_proxy_cidrs="172.16.0.0/12",
             object_store_access_key="safe-production-object-key",
             object_store_secret_key="safe-production-object-secret",
@@ -98,7 +92,6 @@ def test_production_rejects_trust_all_proxy_cidr() -> None:
             object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             database_url="mysql+pymysql://root@mysql/db",
             redis_url="redis://redis/0",
-            checkpoint_backend="redis",
             rate_limit_hmac_secret="rate-limit-secret-with-at-least-32-chars",
             trusted_proxy_cidrs="0.0.0.0/0",
             object_store_access_key="safe-production-object-key",
@@ -123,7 +116,6 @@ def test_settings_override_uses_test_defaults_and_applies_values() -> None:
 
     assert settings.app_env == "test"
     assert settings.database_url == "sqlite+pysqlite:///:memory:"
-    assert settings.checkpoint_backend == "sqlite"
     assert settings.jwt_audience == "test-client"
 
 
@@ -158,12 +150,6 @@ def test_object_encryption_key_rejects_wrong_byte_length() -> None:
     """Valid base64 that does not decode to 32 bytes is rejected."""
     with pytest.raises(ValidationError, match="OBJECT_ENCRYPTION_KEY"):
         settings_override(object_encryption_key="AAAA")  # decodes to 3 bytes
-
-
-def test_production_requires_redis_checkpoint_backend() -> None:
-    """Production must not run on the sqlite checkpoint backend."""
-    with pytest.raises(ValidationError, match="CHECKPOINT_BACKEND"):
-        Settings(**_production_base(checkpoint_backend="sqlite"))
 
 
 def test_production_rejects_sqlite_database_url() -> None:

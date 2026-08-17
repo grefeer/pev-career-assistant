@@ -6,6 +6,8 @@ Multi-agent personal career assistant. Full-stack: FastAPI + Vue 3 + MySQL + Red
 
 > The previous LangGraph/Deep-Agents job-discovery pipeline (Supervisor / Web Navigation Agent / skill runtime / worker) has been retired and removed. Do not add code under those names; the current `job-discovery` is a career skill inside the PEV runtime.
 
+Business skill logic is owned by the skill packages (`skill/<name>/runtime/` as underscored Python modules, plus the hyphenated `skill/<name>/` SKILL.md/scripts/references). `backend/app/services/career_skills/` is the PEV tool host (`registry.py` / `manifest.py`) and import-compatibility aliases only; do not add new business rules there.
+
 ## How to Work in This Repo
 
 ### Before Any Code Change

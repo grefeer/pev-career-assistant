@@ -1,2 +1,6 @@
-"""The four business Skills selectable by the adaptive PEV Executor."""
+"""PEV career-skill tool host.
+
+Business logic lives under ``skill/<name>/runtime/``; this package keeps the
+ToolRegistry/manifest host and import-compatibility aliases.
+"""
 

@@ -47,7 +47,6 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url="sqlite+pysqlite:///:memory:",
         redis_url="redis://localhost:6379/15",
-        checkpoint_backend="sqlite",
     )
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",

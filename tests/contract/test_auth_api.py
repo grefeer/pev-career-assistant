@@ -32,7 +32,6 @@ def settings() -> Settings:
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url="sqlite+pysqlite:///:memory:",
         redis_url="redis://localhost:6379/15",
-        checkpoint_backend="sqlite",
     )
 
 
@@ -174,7 +173,6 @@ def test_factory_settings_are_used_for_issuing_and_decoding_tokens() -> None:
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url="sqlite+pysqlite:///:memory:",
         redis_url="redis://localhost:6379/15",
-        checkpoint_backend="sqlite",
     )
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -318,7 +316,6 @@ def test_app_factory_business_database_uses_factory_settings(tmp_path) -> None:
         object_encryption_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         database_url=url,
         redis_url="redis://localhost/15",
-        checkpoint_backend="sqlite",
     )
 
     class Blob:

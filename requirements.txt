@@ -1,6 +1,12 @@
 fastapi>=0.115,<1
+# The production Executor (deep_executor.py) runs on DeepAgents, which pulls
+# in langchain + langgraph. langgraph-checkpoint-redis is intentionally NOT
+# declared: its only consumer (the deepagents_runtime experiment) was removed.
+deepagents>=0.6.12,<1
+langchain>=1.3,<2
 langchain-core>=1.2,<2
 langchain-openai>=1.1,<2
+langgraph>=1.2,<2
 pydantic>=2.10,<3
 python-dotenv>=1.2,<2
 python-multipart>=0.0,<1

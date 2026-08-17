@@ -1,9 +1,8 @@
 # Agent Runtime 完整调用链（时序图）
 
-> 本文用 Mermaid 时序图绘制 `backend/app/services/agent_runtime/`（**无 deepagents 的自研 PEV 运行时**）的完整调用链：API 请求 → Service → Runtime → 三个 Agent → 工具 → MySQL / SSE。
+> 本文用 Mermaid 时序图绘制 `backend/app/services/agent_runtime/`（**自研 PEV Harness + DeepAgents Executor**）的完整调用链：API 请求 → Service → Runtime → 三个 Agent → 工具 → MySQL / SSE。
 >
 > - 架构总述见 [pev-agent-architecture.zh-CN.md](pev-agent-architecture.zh-CN.md)
-> - deepagents 版对照实现见 `backend/app/services/deepagents_runtime/`
 > - 所有行号以 `master` 当前代码为准
 
 ## 0. 总体结构

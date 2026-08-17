@@ -84,7 +84,6 @@ def settings_override(**values: Any) -> Settings:
         "object_encryption_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "database_url": "sqlite+pysqlite:///:memory:",
         "redis_url": "redis://localhost:6379/15",
-        "checkpoint_backend": "sqlite",
         # Pin PEV budgets to schema defaults so route/service assertions stay
         # deterministic even when a prior test imported ``main`` and polluted
         # ``os.environ`` with a developer's loosened ``.env`` values.
