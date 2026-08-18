@@ -1,6 +1,6 @@
 # Personal Career Agent
 
-面向 AI 应用开发与 Agent 平台工程求职的证据优先个人求职助手。它不是职位运营后台，也不是一个把 LLM 节点串起来的演示：每次任务由三个独立 Agent 在受限预算内完成感知、决策、工具调用、观察和调整。
+面向 AI 应用开发与 Agent 平台工程求职的证据优先个人求职助手。它不是职位运营后台，也不是一个把 LLM 节点串起来的演示：每次任务由两个 LLM Agent（Planner / Executor）在确定性 harness 的约束下完成感知、决策、工具调用、观察和调整——按业界共识 **agent = LLM + harness**：LLM 负责"想"，循环、预算、权限、判定等一切脚手架由 harness 负责。
 
 ## 当前默认架构
 
@@ -9,31 +9,31 @@ flowchart LR
     U["用户目标 / 已确认简历事实"] --> P["Planner Agent"]
     P --> PL["可验证计划"]
     PL --> E["Executor Agent"]
-    E <--> S["4 个业务 Skill"]
-    E --> V{"复杂度或风险需要验证?"}
-    V -->|"是"| Q["Verifier Agent"]
-    Q -->|"PASS / RETRY / REPLAN / NEED_USER / FAIL"| P
-    V -->|"否"| A["工件、证据与行动建议"]
-    Q --> A
+    E <--> S["3 个业务 Skill"]
+    E --> G{"CompletionGate（确定性，替代 LLM Verifier）"}
+    G -->|"PASS"| A["工件、证据与行动建议"]
+    G -->|"RETRY_EXECUTOR"| E
+    G -->|"NEED_USER"| W["waiting_user 人工补充"]
+    G -->|"FAIL"| F["failed"]
+    W --> P
 ```
 
 - **Planner**：围绕目标自主读取最小上下文、制定或重规划计划；不直接执行业务 Skill。
 - **Executor**：自主选择已授权 Skill、观察工具结果、调整方法或请求人工补充。
-- **Verifier**：独立检查计划验收条件、公开证据与事实边界；可要求重试、重规划、人工补充或失败降级。
-- **Harness**：只负责权限、Pydantic 契约、预算、持久化、审计和安全门，不替 Agent 选择业务动作。
+- **CompletionGate**（确定性，替代原 LLM Verifier）：只按 Skill 声明的完成合同 + 预算状态输出 PASS / RETRY_EXECUTOR / NEED_USER / FAIL——**不调用模型**，省成本且可重现。
+- **Harness**（即业界"agent = LLM + harness"中的 harness）：只负责控制流、权限、Pydantic 契约、预算、持久化、审计和安全门，不替 Agent 选择业务动作。
 
 主运行时位于 `backend/app/services/agent_runtime/`：Harness（计划、预算、验证路由、持久化）由普通 Python + Pydantic + 模型 SDK 实现；生产 Executor 使用 DeepAgents 工具调用循环（`deep_executor.py`），其余 Agent 由自建 PEV 状态机驱动。业务 Skill 的确定性逻辑以 `skill/<name>/runtime/` 为唯一来源，`backend/app/services/career_skills/` 只保留工具注册宿主与兼容别名。
 
 `executor/` 是 Windows 端的执行器骨架与模拟器，用于人工审核的表单填写辅助：系统**不会**自动提交任何求职申请，所有 `READY_FOR_REVIEW` 之后的提交动作必须由用户完成。
 
-## 四个业务 Skill
+## 三个业务 Skill
 
 | Skill | 产出 | 事实与安全边界 |
 | --- | --- | --- |
 | `job-discovery` | 公开招聘页面证据、结构化 JD | 仅抓取公开 HTTP(S) 页面；逐跳重新校验重定向目标，拒绝内网/云元数据地址、登录、验证码和反爬绕过。 |
 | `job-matching` | 带来源的岗位匹配排序 | 只对本 Run 已捕获的 JD 与已确认事实比较。 |
 | `resume-tailoring` | 可审核简历修改操作 | 每项操作引用已确认事实字段和目标 JD；缺失能力只能提示补证，不能虚构。 |
-| `career-planning` | JD 主题驱动的面试/行动计划 | 只围绕目标 JD 中存在的主题产生准备动作。 |
 
 系统不会自动提交求职申请，也不把用户未确认的经历写入简历。
 
@@ -62,7 +62,7 @@ flowchart LR
 ## 关键运行时保证
 
 - MySQL 保存 Run、Plan、Step、Turn、Event 和不可变 Artifact；Redis 不作为不可恢复业务状态。
-- 每个 Run 使用跨 Planner、Executor、Verifier 共享的模型调用与工具调用预算；崩溃恢复时按已持久化计划数恢复重规划预算（而非归零），已消耗预算不会因重启重复可用。
+- 每个 Run 使用跨 Planner、Executor 共享的模型调用与工具调用预算（原 LLM Verifier 已由确定性 CompletionGate 替代，不消耗模型预算）；崩溃恢复时按已持久化计划数恢复重规划预算（而非归零），已消耗预算不会因重启重复可用。
 - 模型输出格式异常（`invalid_model_response`）或核验对同一步骤反复重试超限时，Run 安全降级为可恢复的 `waiting_user` 并给出人工可读说明；连续无进展的工具调用也会停下询问用户——不崩溃、不静默失败。
 - 每次工具结果和 Agent 决策仅保存安全摘要，不保存推理过程、密钥或私有上下文；事件载荷按字节上限持久化，超限替换为有界存根。
 - 所有 Run、事件和工件都按用户所有权访问控制。
@@ -101,7 +101,7 @@ docker compose -p platform-foundation up -d --build
 
 ```powershell
 # PEV、四 Skill 和 API 的定向回归
-.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_planner_agent.py tests/unit/test_executor_agent.py tests/unit/test_verifier_agent.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q
+.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_planner_agent.py tests/unit/test_executor_agent.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q
 
 # 前端
 npm.cmd --prefix frontend run test
@@ -121,14 +121,14 @@ $env:RUN_LIVE_PEV_E2E='1'
 
 > 自 2026-08-09 起，单次提交不再强制 100% 分支覆盖（关键点覆盖 + 安全不变量测试即可），但 `pyproject.toml` 中的 `fail_under = 100` 仍保留，可作为可选检查重新启用。完整覆盖策略与豁免列表见 [CLAUDE.md](CLAUDE.md#coverage-policy)。
 
-完整架构要求、Agent 定义、安全边界和验收标准见 [自适应三 Agent PEV 设计](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md)；结构图与时序图见 [PEV 架构文档](docs/pev-agent-architecture.zh-CN.md)。
+完整架构要求、Agent 定义、安全边界和验收标准见 [自适应 PEV 设计](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md)；结构图与时序图见 [PEV 架构文档](docs/pev-agent-architecture.zh-CN.md)。面向面试的逐文件代码讲解（含"agent = LLM + harness"术语对齐）见 [docs/study/v4](docs/study/v4/00-教学总览与参考.md)。
 
 ## 项目结构
 
 ```text
 backend/app/services/
-  agent_runtime/        # PEV Harness、三个 Agent、模型/工具/预算边界（生产 Executor = deep_executor.py）
-  career_skills/        # 13 个工具注册 + 4 个业务 Skill 入口
+  agent_runtime/        # PEV 运行级 Harness + 两个 LLM Agent + 确定性 CompletionGate、模型/工具/预算边界（生产 Executor = deep_executor.py）
+  career_skills/        # 12 个工具注册 + 3 个业务 Skill 入口
 skill/<skill-name>/     # Skill 包（hyphenated），含 SKILL.md / scripts / references / runtime
 frontend/src/features/
   agent-workspace/      # 自然语言任务、证据、工件与人工恢复（AgentWorkspace.vue）

@@ -2,7 +2,7 @@
 
 ## Project Context
 
-Multi-agent personal career assistant. Full-stack: FastAPI + Vue 3 + MySQL + Redis + MinIO + Docker Compose. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (`backend/app/services/agent_runtime/`) driving three career skills (`backend/app/services/career_skills/`). A Windows executor skeleton/simulator (`executor/`) supports human-reviewed form filling. See `CLAUDE.md` for the architecture and workflow map and `docs/pev-agent-architecture.zh-CN.md` for sequence diagrams.
+Multi-agent personal career assistant. Full-stack: FastAPI + Vue 3 + MySQL + Redis + MinIO + Docker Compose. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (`backend/app/services/agent_runtime/`) driving three career skills (`backend/app/services/career_skills/`). The LLM Verifier role is retired: verification is the deterministic `completion_gate.py` (the "PEV" name is kept for historical continuity). Industry framing: **agent = LLM + harness** — Planner and Executor are the two LLM agents (each an LLM wrapped in its own loop); `runtime.py` is the run-level harness; the CompletionGate is a deterministic harness component. A Windows executor skeleton/simulator (`executor/`) supports human-reviewed form filling. See `CLAUDE.md` for the architecture and workflow map and `docs/pev-agent-architecture.zh-CN.md` for sequence diagrams.
 
 > The previous LangGraph/Deep-Agents job-discovery pipeline (Supervisor / Web Navigation Agent / skill runtime / worker) has been retired and removed. Do not add code under those names; the current `job-discovery` is a career skill inside the PEV runtime.
 
@@ -63,12 +63,12 @@ Tools are deterministic Python functions registered in the `ToolRegistry`. Each 
 
 1. Implement the deterministic logic (a pure function or a small service call) — keep it side-effect-free aside from explicit persistence.
 2. Define `InputModel` / `OutputModel` Pydantic schemas (`extra="forbid"`).
-3. Register a `ToolDefinition` in `backend/app/services/career_skills/registry.py` under the right `skill_name` and `allowed_roles` (executor, verifier, or both).
+3. Register a `ToolDefinition` in `backend/app/services/career_skills/registry.py` under the right `skill_name` and `allowed_roles`. Currently every tool is `executor`-only; the legacy `verifier` role is not used because verification is the deterministic CompletionGate, not an agent.
 4. If the skill is new, add a manifest entry in `career_skills/manifest.py` (`requires_evidence`, `supports_user_data`).
 5. Add unit coverage: tool determinism in `tests/unit/` plus the skill-level test (`test_*pev_skill.py` / `test_job_matching_skill.py`).
 6. Run: `.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q`
 
-Remember: `ToolRegistry.invoke` converts any handler exception into a `ToolObservation(status="failed", error_code=...)`; never raise across the agent boundary. Tools without a `skill_name` are excluded from scoped (per-step) catalogs - register every Executor/Verifier tool under a skill so it's reachable, or it will be invisible to the Executor.
+Remember: `ToolRegistry.invoke` converts any handler exception into a `ToolObservation(status="failed", error_code=...)`; never raise across the agent boundary. Tools without a `skill_name` are excluded from scoped (per-step) catalogs - register every Executor tool under a skill so it's reachable, or it will be invisible to the Executor.
 
 ### Adding a New API Endpoint
 
@@ -98,13 +98,16 @@ task = AgentTaskRequest(
 # in a background task. Stream progress via GET /agent-runs/{id}/events/stream (SSE).
 
 # Adding a new agent behavior:
-# - Planner/Executor/Verifier each have a system-prompt constant and a decide() loop.
+# - Planner/Executor are the two LLM agents, each with a system-prompt constant and a decide() loop;
+#   the CompletionGate (completion_gate.py) is deterministic — do NOT wrap it in an LLM.
+# - Terminology: agent = LLM + harness. Each agent = LLM + its own loop/guardrails; runtime.py is
+#   the run-level harness; skills/tools live on the harness side (see docs/study/v4 for the walkthrough).
 # - The harness (runtime.py) enforces budgets, state transitions, persistence, and
 #   verification routing; do NOT add control flow to the agents that the harness owns.
 # - New tool = see "Adding a New Tool to a Career Skill" above.
 ```
 
-Key files: `runtime.py` (orchestrator), `planner_agent.py` / `executor_agent.py` / `verifier_agent.py`, `observation_projection.py` (shared bounded decision-state projection), `model_gateway.py` (DeepSeek, schema-first + local JSON retry), `tool_registry.py`, `schemas.py`, `service.py` (user-scoped business service).
+Key files: `runtime.py` (run-level harness / orchestrator), `planner_agent.py` / `executor_agent.py` (delegates to `executor/deep_executor.py`) / `completion_gate.py` (deterministic, replaces the retired LLM Verifier), `observation_projection.py` (shared bounded decision-state projection), `model_gateway.py` (DeepSeek, schema-first + local JSON retry), `tool_registry.py`, `schemas.py`, `service.py` (user-scoped business service).
 
 ### Model Gateway Notes
 
@@ -191,7 +194,7 @@ The eval harness produces per-question JSON + a round-level summary used by `mer
 
 5. **Opt-in test gates**: Tests requiring external services use exact env-var names (`RUN_LIVE_PEV_E2E`, `ALLOW_DESTRUCTIVE_MYSQL_TESTS`). Don't rename them.
 
-6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `tool_budget_exhausted`, etc.); agents cannot exceed them. A verifier that keeps returning `RETRY_EXECUTOR` past the retry cap is a stuck loop, not a failure: the harness routes the step to `waiting_user` with the verifier feedback as the question (human-in-the-loop recovery), instead of failing the run. `recover()`/`resume()` resume the replan count from the persisted plan count (`max(0, revision - 1)`), so a crashed run can't re-spend budget already used on replanning. **Bounded automatic recovery**: a run that pauses as `waiting_user` for a verifier/model-decision reason (`need_user`, `verification_failed`, `no_progress_duplicate`, `invalid_model_response`, `wall_clock_budget_exhausted`, or the executor's model-decision hand-offs `route_already_consumed` / `candidate_urls_already_supplied` / `target_evidence_not_found` / `target_role_mismatch` / `target_source_mismatch`; the pause contract is read from the latest `run_needs_user` / `planner_needs_user` / `planner_budget_exhausted` event) auto-resumes itself up to `AgentBudget.max_auto_recoveries` times (default 1 = 2 attempts total). Each attempt carries a step-up budget (ceilings scale 1.5x then 2x, clamped at schema maxima) and a relaxed consecutive-stall breaker (4 then 5, via `context.max_consecutive_stalls`). Source-access blocks (login/captcha/anti-bot) and repeated-plan oscillation guards never auto-recover — they stay human hand-offs.
+6. **Budgets are hard ceilings**: `AgentBudget` / `ToolCallBudget` / `AgentTurnBudget` are enforced by the harness. Exhausting them fails the run with a stable error code (`replan_budget_exhausted`, `tool_budget_exhausted`, etc.); agents cannot exceed them. A completion gate that keeps returning `RETRY_EXECUTOR` past the retry cap is a stuck loop, not a failure: the harness routes the step to `waiting_user` with the gate feedback as the question (human-in-the-loop recovery), instead of failing the run. `recover()`/`resume()` resume the replan count from the persisted plan count (`max(0, revision - 1)`), so a crashed run can't re-spend budget already used on replanning. **Bounded automatic recovery**: a run that pauses as `waiting_user` for a verifier/model-decision reason (`need_user`, `verification_failed`, `no_progress_duplicate`, `invalid_model_response`, `wall_clock_budget_exhausted`, or the executor's model-decision hand-offs `route_already_consumed` / `candidate_urls_already_supplied` / `target_evidence_not_found` / `target_role_mismatch` / `target_source_mismatch`; the pause contract is read from the latest `run_needs_user` / `planner_needs_user` / `planner_budget_exhausted` event) auto-resumes itself up to `AgentBudget.max_auto_recoveries` times (default 1 = 2 attempts total). Each attempt carries a step-up budget (ceilings scale 1.5x then 2x, clamped at schema maxima) and a relaxed consecutive-stall breaker (4 then 5, via `context.max_consecutive_stalls`). Source-access blocks (login/captcha/anti-bot) and repeated-plan oscillation guards never auto-recover — they stay human hand-offs.
 
 7. **Frontend dirty state**: Admin/profile forms track dirty state. Navigating away shows a confirmation dialog. Don't disable this.
 

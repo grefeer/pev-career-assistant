@@ -37,7 +37,7 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   │   │   └── agent_runtime.py # PEV lifecycle contracts (roles, states, transitions)
 │   │   ├── repositories/        # Data access layer (SQL only, no business logic)
 │   │   └── services/
-│   │       ├── agent_runtime/   # ★ PEV harness: runtime, 3 agents, gateway, tools, budgets
+│   │       ├── agent_runtime/   # ★ PEV harness: runtime + 2 LLM agents (Planner/Executor) + deterministic CompletionGate, gateway, tools, budgets
 │   │       ├── career_skills/   # ★ 3 career skills + tool registry + manifest
 │   │       ├── job_discovery/   # Retained JD extraction helpers (schemas, tools/jd_extraction)
 │   │       ├── common/          # Shared service helpers
@@ -93,7 +93,7 @@ docker compose -p platform-foundation up -d --build
 .\.venv\Scripts\python.exe -m pytest tests/unit/ -q
 
 # PEV + career-skills targeted regression
-.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_planner_agent.py tests/unit/test_executor_agent.py tests/unit/test_verifier_agent.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q
+.\.venv\Scripts\python.exe -m pytest tests/unit/test_agent_runtime*.py tests/unit/test_planner_agent.py tests/unit/test_executor_agent.py tests/unit/test_*pev_skill.py tests/unit/test_job_matching_skill.py -q
 
 # Lint
 .\.venv\Scripts\python.exe -m ruff check backend tests scripts
@@ -138,8 +138,11 @@ Health-check SQL is an intentional infrastructure probe rather than business dat
 
 ### Agent vs Tool vs Skill
 
-- **Agent**: LLM-in-the-loop, autonomous tool selection, plan-verify-replan. The current runtime has three: **Planner**, **Executor**, **Verifier** (see `backend/app/services/agent_runtime/`).
-- **Tool**: Agent-callable deterministic Python function with fixed input/output, registered in `ToolRegistry` with role + skill scoping. Examples: `fetch-public-job-pages`, `extract-observed-job-details-batch`, `match-observed-jobs`, `build-resume-tailoring-brief`.
+Industry framing: **agent = LLM + harness** — an LLM alone is not an agent; the harness (loop, tools, budgets, guardrails, state) is what turns it into one.
+
+- **Agent**: LLM-in-the-loop with autonomous tool selection and plan/verify/replan behavior. The current runtime has **two LLM agents**: **Planner** and **Executor**, each an LLM wrapped in its own decision loop/guardrails (see `backend/app/services/agent_runtime/`). The retired LLM **Verifier** role is replaced by the deterministic **CompletionGate** (`completion_gate.py`) — verification is harness code, not a model call.
+- **Harness**: the deterministic scaffolding that turns an LLM into an agent — control flow, budgets, permissions/tool grants, persistence, event routing, and the CompletionGate. Two levels: per-role harness (Planner's loop + retries/fallbacks; Executor's middleware + ledger) and the run-level harness (`runtime.py`).
+- **Tool**: Agent-callable deterministic Python function with fixed input/output, registered in `ToolRegistry` with role + skill scoping. Examples: `fetch-public-job-pages`, `extract-observed-job-details-batch`, `match-observed-jobs`, `build-resume-tailoring-brief`. Tools are part of the harness side: the harness grants them to an agent.
 - **Skill**: A coherent tool bundle exposed to the PEV runtime via `career_skills/registry.py` + `manifest.py`. Three skills: `job-discovery`, `job-matching`, `resume-tailoring`. Each `PlanStep` allows exactly ONE skill; the Executor only sees that skill's tools.
 - **Catalog ↔ invoke consistency**: a scoped `tool_catalog` (one skill per step) omits tools with no `skill_name`, matching `invoke`'s `tool_skill_forbidden` rejection - the Executor is never advertised a tool it cannot call.
 
@@ -310,7 +313,8 @@ Revisit this gate with the user before re-enabling `fail_under = 100` as a hard 
 
 | Document | Content |
 |----------|---------|
-| [PEV Architecture](docs/pev-agent-architecture.zh-CN.md) | Current 3-agent PEV runtime: structure, sequence diagrams, modules, constraints |
+| [PEV Architecture](docs/pev-agent-architecture.zh-CN.md) | Current 2-agent (Planner/Executor) + deterministic CompletionGate PEV runtime: structure, sequence diagrams, modules, constraints |
+| [Study Walkthrough v4](docs/study/v4/00-教学总览与参考.md) | Per-file interview-oriented code walkthrough of the 6 core py files + job-discovery skill; includes the "agent = LLM + harness" terminology mapping |
 | [PEV Design Spec](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md) | Adaptive PEV design, agent definitions, security boundaries, acceptance |
 | [WP1 Tech Doc](docs/WP1-平台基础与权威数据-技术文档.md) | Platform foundation (auth, state machine, encryption, layers) |
 | [WP2 Tech Doc](docs/WP2-真实职位同步与核验-技术文档.md) | Job sync, review pipeline, student submissions |
