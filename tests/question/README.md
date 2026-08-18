@@ -53,6 +53,11 @@
 # 重新采样 20 题评测子集（均衡抽样，写入 sample_20.json）
 .\.venv\Scripts\python.exe tests\question\select_sample.py
 
+# 全量回归：83 题 full83 轮次（真实 DeepSeek + 公开抓取；round 题集 = redesign/manifest.json 的 83 个 id）
+#   单进程：        .\scripts\launch_full83_gate_eval.ps1 -RunName gate83_round_<N>
+#   4 进程错峰：    .\scripts\run_full_83_staggered.ps1 -WorkerCount 4 -StaggerSeconds 90 -RunName full83_round_<N>
+#   轮次对比：      .\.venv\Scripts\python.exe -m tests.question.compare_full83 <baseline_dir> <new_dir> --out <report>.md
+
 # 逐个将 question 作为 AgentRun 的 goal 提交（profile 按 meta.profile 提供），
 # 按 meta.skills 校验 Run 计划覆盖、meta.time_window 校验证据时效、meta.site_types 校验信息源。
 ```

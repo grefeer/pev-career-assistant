@@ -150,16 +150,21 @@ pytestmark = pytest.mark.skipif(
 )
 ```
 
-For end-to-end / round runs, use the 20-question eval harness in `tests/question/` (real DeepSeek + public fetch):
+For end-to-end / round runs, use the **83-question** full83 eval harness in `tests/question/` (real DeepSeek + public fetch). The round question set lives under `tests/question/redesign/` (manifest.json = 83 ids; the generator bank under `tests/question/` holds 150 questions):
 
 ```powershell
 # Single-question dry runs (per-question JSON under --out-dir):
-.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q001 Q002 --out-dir tests/question/eval_results/round_1
+.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q011 --question-dir tests/question/redesign --out-dir tests/question/eval_results/round_1
 
-# Full eval scripts used by the round merges live under scripts/ (run_full_83_staggered.ps1 etc.)
+# Full 83-question run launchers (used by the round merges; live under scripts/):
+#   single process:      .\scripts\launch_full83_gate_eval.ps1 -RunName gate83_round_<N>
+#   4-process staggered: .\scripts\run_full_83_staggered.ps1 -WorkerCount 4 -StaggerSeconds 90 -RunName full83_round_<N>
+
+# Round comparison (baseline vs new result dir):
+.\.venv\Scripts\python.exe -m tests.question.compare_full83 tests/question/eval_results/<baseline> tests/question/eval_results/<new> --out tests/question/eval_results/compare_<N>.md
 ```
 
-The eval harness produces per-question JSON + a round-level summary used by `merge_round.py` / `compare_rounds.py`; raw run logs live under `tests/question/eval_results/`.
+The eval harness produces per-question JSON + a round-level summary used by `merge_round.py` / `compare_rounds.py` (full83 rounds use `compare_full83.py`); raw run logs live under `tests/question/eval_results/`.
 
 ### Opt-in Destructive MySQL Tests
 

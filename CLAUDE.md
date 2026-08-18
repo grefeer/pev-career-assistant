@@ -62,7 +62,7 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   ├── unit/                    # Primary deterministic/unit suite (key-point coverage, see Coverage Policy)
 │   ├── integration/             # Integration + live smoke tests (gated: RUN_LIVE_PEV_E2E, ALLOW_DESTRUCTIVE_MYSQL_TESTS)
 │   ├── e2e/                     # E2E Playwright + fixture tests
-│   ├── question/                # 20-question PEV eval harness (eval_runner, merge/compare rounds)
+│   ├── question/                # 83-question full83 PEV eval harness (eval_runner, compare_full83/merge/compare rounds)
 │   └── manual/                  # Standalone smoke/diagnostic scripts (excluded from pytest)
 ├── alembic/versions/            # Database migrations (0001 -> 0024; head: 20260812_0024_retire_legacy_tables.py)
 ├── scripts/                     # Admin/dev scripts (create_admin, seed_strategies, fixtures, etc.)
@@ -110,8 +110,11 @@ Invoke-RestMethod http://127.0.0.1:18000/api/health/ready
 # Live PEV end-to-end (requires env vars + LLM; resume PDF read in-memory only)
 $env:RUN_LIVE_PEV_E2E='1'; .\.venv\Scripts\python.exe -m pytest tests/integration/test_pev_live_end_to_end.py -v
 
-# 20-question eval loop (real DeepSeek + public fetch; per-question JSON under --out-dir)
-.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q001 Q002 --out-dir tests/question/eval_results/round_1
+# Full 83-question eval loop (real DeepSeek + public fetch; round set: tests/question/redesign, manifest.json = 83 ids)
+#   single-process launcher: .\scripts\launch_full83_gate_eval.ps1 -RunName gate83_round_<N>
+#   4-process staggered launcher: .\scripts\run_full_83_staggered.ps1 -WorkerCount 4 -StaggerSeconds 90 -RunName full83_round_<N>
+# Single-question dry run (per-question JSON under --out-dir):
+.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q011 --question-dir tests/question/redesign --out-dir tests/question/eval_results/round_1
 ```
 
 ### Database

@@ -115,8 +115,18 @@ Invoke-RestMethod http://127.0.0.1:18000/api/health/ready
 $env:RUN_LIVE_PEV_E2E='1'
 .\.venv\Scripts\python.exe -m pytest tests/integration/test_pev_live_end_to_end.py -v
 
-# 20 题 PEV 评估（真实 DeepSeek + 公开抓取；每题 JSON 输出到 --out-dir）
-.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q001 Q002 --out-dir tests/question/eval_results/round_1
+# 83 题全量 PEV 评估（真实 DeepSeek + 公开抓取；回归题集 = tests/question/redesign，manifest.json 共 83 题）
+# 单进程启动（结果写入 tests/question/eval_results/<RunName>/）：
+.\scripts\launch_full83_gate_eval.ps1 -RunName gate83_round_<N>
+
+# 4 进程错峰启动（更快，推荐全量回归用）：
+.\scripts\run_full_83_staggered.ps1 -WorkerCount 4 -StaggerSeconds 90 -RunName full83_round_<N>
+
+# 单题调试（每题 JSON 输出到 --out-dir）：
+.\.venv\Scripts\python.exe -m tests.question.eval_runner --ids Q011 --question-dir tests/question/redesign --out-dir tests/question/eval_results/debug
+
+# 轮次对比（baseline vs new 结果目录）：
+.\.venv\Scripts\python.exe -m tests.question.compare_full83 tests/question/eval_results/<baseline> tests/question/eval_results/<new> --out tests/question/eval_results/compare_<N>.md
 ```
 
 > 自 2026-08-09 起，单次提交不再强制 100% 分支覆盖（关键点覆盖 + 安全不变量测试即可），但 `pyproject.toml` 中的 `fail_under = 100` 仍保留，可作为可选检查重新启用。完整覆盖策略与豁免列表见 [CLAUDE.md](CLAUDE.md#coverage-policy)。
