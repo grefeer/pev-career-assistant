@@ -23,7 +23,6 @@ from backend.app.services.agent_runtime.schemas import (
     ReplanReason,
     StepInputRef,
     StepOutputRef,
-    VerifierDecision,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.career_skills.target_evidence import resolve_target_evidence
@@ -88,7 +87,7 @@ def test_target_evidence_resolves_equivalent_public_jd_urls() -> None:
 
 
 def test_role_decisions_publish_real_discriminators() -> None:
-    for model in (PlannerDecision, ExecutorDecision, VerifierDecision):
+    for model in (PlannerDecision, ExecutorDecision):
         schema = model.model_json_schema()
         assert schema["discriminator"]["propertyName"] == "action"
         assert len(schema["oneOf"]) >= 2

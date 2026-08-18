@@ -55,7 +55,7 @@ async function handleAuth() {
       <p class="eyebrow">Personal Career Agent</p>
       <h1>以公开证据和已确认简历事实驱动你的求职决策。</h1>
       <p class="subtitle">
-        Planner、Executor、Verifier 三个 Agent 在预算和事实边界内协作，帮助你找到岗位、修改简历并制定准备计划。
+        Planner 与 Executor 两个 Agent 在预算和事实边界内协作，配合确定性完成门禁，帮助你找到岗位、匹配岗位并修改简历。
       </p>
       <div class="hero-grid">
         <div class="metric-card">

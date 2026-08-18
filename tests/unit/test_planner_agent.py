@@ -339,8 +339,8 @@ def test_planner_downgrades_invalid_execution_plan_to_recoverable_wait() -> None
     assert result.status == "needs_user"
     assert result.error_code == "invalid_execution_plan"
     assert result.user_question
-    assert len(gateway.states) == 4
-    assert "ExecutionPlan 校验失败" in gateway.states[3]["runtime_feedback"]
+    assert len(gateway.states) == 3
+    assert "ExecutionPlan 校验失败" in gateway.states[2]["runtime_feedback"]
 
 
 def test_planner_normalizes_known_model_artifact_port_alias() -> None:
@@ -392,7 +392,6 @@ def test_seeded_career_fallback_does_not_treat_generic_suitable_word_as_matching
             SkillDefinition(name="job-discovery"),
             SkillDefinition(name="job-matching"),
             SkillDefinition(name="resume-tailoring"),
-            SkillDefinition(name="career-planning"),
         ]
     )
     task = AgentTaskRequest(
@@ -401,7 +400,6 @@ def test_seeded_career_fallback_does_not_treat_generic_suitable_word_as_matching
             "job-discovery",
             "job-matching",
             "resume-tailoring",
-            "career-planning",
         ],
     )
 
@@ -411,3 +409,95 @@ def test_seeded_career_fallback_does_not_treat_generic_suitable_word_as_matching
 
     assert plan is not None
     assert [step.allowed_skills for step in plan.steps] == [["job-discovery"]]
+
+
+def test_planner_degrades_when_trim_leaves_guard_violating_plan() -> None:
+    """Trimming the only deliverable of a collected-goal plan must not crash.
+
+    A goal over already-collected jobs (marker + candidate_urls) requires a
+    deliverable step beyond job-discovery.  When the model appends an
+    unrequested matching step and the trim removes it, the final plan no
+    longer satisfies the guard; the planner must degrade to needs_user
+    instead of letting the ValidationError escape the runtime (eval crash:
+    C007 chain link 2, auto-recovery re-run).
+    """
+    gateway = ScriptedGateway(
+        [
+            {
+                "action": "plan",
+                "complexity": "L3",
+                "success_criteria": ["完成"],
+                "steps": [
+                    {
+                        "step_id": "discover",
+                        "objective": "从候选 URL 抓取并结构化岗位证据",
+                        "allowed_skills": ["job-discovery"],
+                        "outputs": [
+                            {
+                                "name": "structured_job_details",
+                                "artifact_type": "structured_job_details",
+                            }
+                        ],
+                    },
+                    {
+                        "step_id": "match",
+                        "objective": "生成岗位匹配报告",
+                        "allowed_skills": ["job-matching"],
+                        "depends_on": ["discover"],
+                    },
+                ],
+            }
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="针对上一环节收集的岗位，给我一份面试准备计划。",
+        allowed_skills=[
+            "job-discovery",
+            "job-matching",
+            "resume-tailoring",
+        ],
+        context={"candidate_urls": ["https://jobs.example.com/java-1"]},
+    )
+
+    result = PlannerAgent(
+        gateway=gateway, tools=ToolRegistry()
+    ).run(
+        task=task,
+        context=ToolContext(user_id="user-a", run_id="run-a"),
+    )
+
+    assert result.status == "needs_user"
+    assert result.error_code == "invalid_execution_plan"
+
+
+def test_planner_seeded_fallback_degrades_for_removed_skill_goal() -> None:
+    """A career-planning-only collected goal falls back to needs_user, never raises.
+
+    The seeded fallback cannot append a matching/tailoring step for a
+    interview-prep goal and the guard rejects the discovery-only plan, so the
+    planner hands the run to the user instead of crashing.
+    """
+    skills = SkillRegistry(
+        [
+            SkillDefinition(name="job-discovery"),
+            SkillDefinition(name="job-matching"),
+            SkillDefinition(name="resume-tailoring"),
+        ]
+    )
+    task = AgentTaskRequest(
+        goal="针对上一环节收集的岗位，给我一份面试准备计划。",
+        allowed_skills=[
+            "job-discovery",
+            "job-matching",
+            "resume-tailoring",
+        ],
+        context={"candidate_urls": ["https://jobs.example.com/java-1"]},
+    )
+    planner = PlannerAgent(
+        gateway=ScriptedGateway([]), tools=ToolRegistry(), skills=skills
+    )
+
+    plan = planner._build_seeded_career_fallback(task)
+
+    assert plan is None
+

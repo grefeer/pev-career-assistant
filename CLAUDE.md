@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A multi-agent personal career assistant. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (plain Python + Pydantic + langchain-openai). The harness (planning, budgets, verification routing, persistence) is self-built; the production Executor uses a DeepAgents tool-calling loop (`agent_runtime/deep_executor.py`) inside that self-built harness. It drives four career skills: job discovery, job matching, resume tailoring, and career planning. Supporting capabilities include a WP2 manual-import → admin review → verified student job-center flow, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for human-reviewed form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
+A multi-agent personal career assistant. The default runtime is a self-built **adaptive Planner–Executor–Verifier (PEV) agent runtime** (plain Python + Pydantic + langchain-openai). The harness (planning, budgets, verification routing, persistence) is self-built; the production Executor uses a DeepAgents tool-calling loop (`agent_runtime/executor/deep_executor.py`) inside that self-built harness. It drives three career skills: job discovery, job matching, and resume tailoring. Supporting capabilities include a WP2 manual-import → admin review → verified student job-center flow, structured talent profiles with evidence-based matching, and a Windows executor skeleton/simulator for human-reviewed form filling. Real-site GUI adapters and production deployment remain incomplete; final submission is always human-controlled.
 
 > The previous LangGraph/Deep-Agents job-discovery pipeline (Supervisor / Web Navigation Agent / Strategy Router / skill runtime / worker) has been retired and removed. `docs/job-discovery-legacy-architecture-summary.md` archives that design. The current `job-discovery` is a career skill inside the PEV runtime, not a standalone Tencent→Smartsheet pipeline.
 
@@ -38,7 +38,7 @@ A multi-agent personal career assistant. The default runtime is a self-built **a
 │   │   ├── repositories/        # Data access layer (SQL only, no business logic)
 │   │   └── services/
 │   │       ├── agent_runtime/   # ★ PEV harness: runtime, 3 agents, gateway, tools, budgets
-│   │       ├── career_skills/   # ★ 4 career skills + tool registry + manifest
+│   │       ├── career_skills/   # ★ 3 career skills + tool registry + manifest
 │   │       ├── job_discovery/   # Retained JD extraction helpers (schemas, tools/jd_extraction)
 │   │       ├── common/          # Shared service helpers
 │   │       ├── auth.py          # Registration, login, JWT, Argon2
@@ -139,8 +139,8 @@ Health-check SQL is an intentional infrastructure probe rather than business dat
 ### Agent vs Tool vs Skill
 
 - **Agent**: LLM-in-the-loop, autonomous tool selection, plan-verify-replan. The current runtime has three: **Planner**, **Executor**, **Verifier** (see `backend/app/services/agent_runtime/`).
-- **Tool**: Agent-callable deterministic Python function with fixed input/output, registered in `ToolRegistry` with role + skill scoping. Examples: `fetch-public-job-pages`, `extract-observed-job-details-batch`, `match-observed-jobs`, `build-resume-tailoring-brief`, `build-preparation-plan`.
-- **Skill**: A coherent tool bundle exposed to the PEV runtime via `career_skills/registry.py` + `manifest.py`. Four skills: `job-discovery`, `job-matching`, `resume-tailoring`, `career-planning`. Each `PlanStep` allows exactly ONE skill; the Executor only sees that skill's tools.
+- **Tool**: Agent-callable deterministic Python function with fixed input/output, registered in `ToolRegistry` with role + skill scoping. Examples: `fetch-public-job-pages`, `extract-observed-job-details-batch`, `match-observed-jobs`, `build-resume-tailoring-brief`.
+- **Skill**: A coherent tool bundle exposed to the PEV runtime via `career_skills/registry.py` + `manifest.py`. Three skills: `job-discovery`, `job-matching`, `resume-tailoring`. Each `PlanStep` allows exactly ONE skill; the Executor only sees that skill's tools.
 - **Catalog ↔ invoke consistency**: a scoped `tool_catalog` (one skill per step) omits tools with no `skill_name`, matching `invoke`'s `tool_skill_forbidden` rejection - the Executor is never advertised a tool it cannot call.
 
 ### Security Hard Gates
@@ -167,13 +167,13 @@ These are code-level restrictions, NOT conventions:
 
 > Full architecture, sequence diagrams, and module map: [docs/pev-agent-architecture.zh-CN.md](docs/pev-agent-architecture.zh-CN.md). Design spec: [docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md](docs/superpowers/specs/2026-08-01-personal-career-agent-adaptive-pev-design.md).
 
-Three autonomous LLM agents collaborate around a deterministic lifecycle harness:
+Two autonomous LLM agents collaborate around a deterministic lifecycle harness and a deterministic completion gate:
 
 | Role | Responsibility |
 |------|----------------|
 | **Planner** | Reads goal + confirmed profile facts + observed evidence; produces an `ExecutionPlan` with one skill per step |
 | **Executor** | Perceives-decides-acts-observes within a single step's skill scope; calls tools to gather evidence |
-| **Verifier** | Independently checks evidence and artifacts (never trusts executor claims); routes PASS / RETRY_EXECUTOR / REPLAN / NEED_USER / FAIL |
+| **CompletionGate** (deterministic) | Derives PASS / RETRY_EXECUTOR / NEED_USER / FAIL from the Skill registry completion contract plus budget state (replaces the retired LLM Verifier) |
 
 Key invariants enforced by the harness (not the agents):
 
@@ -182,29 +182,28 @@ Key invariants enforced by the harness (not the agents):
 - **Budgets**: `AgentBudget` (turns / tool_calls / replans / wall-clock), `ToolCallBudget`, `AgentTurnBudget` are hard ceilings enforced by the harness. `build_adaptive_agent_budget` scales turns by skill count.
 - **Tool exceptions never leak**: `ToolRegistry.invoke` converts any failure into a `ToolObservation(status=failed, error_code=...)`.
 - **Duplicate-call dedup + stall breaker**: a consecutive identical tool call after a success returns `duplicate_tool_call` without consuming budget (prevents executor thrash); after 3 consecutive no-progress decisions (deduped re-calls or a blocked public search) the Executor hands the step to the human (`needs_user`) instead of burning turns on a stuck loop.
-- **Safe degradation to `waiting_user`**: an `invalid_model_response` from any agent, a Verifier `RETRY_EXECUTOR` past `max_replans`, or wall-clock budget exhaustion (`wall_clock_budget_exhausted`) at any of the three agent boundaries, ends the run as recoverable `waiting_user` with a human-readable question (never a crash or hard failure); `resume()`/`recover()` continue in the remaining budget. Wall-clock exhaustion is a transport/resource pause (the clock window refreshes on resume), not a business failure; turn/tool budgets remain the latency-independent work authority and are NOT reset on resume (only the clock window refreshes).
-- **Bounded automatic recovery (auto-resume)**: a `waiting_user` pause whose terminal contract is a verifier/model decision (`need_user`, `verification_failed`, `no_progress_duplicate`, `invalid_model_response`, `wall_clock_budget_exhausted`, or the executor hand-off codes `route_already_consumed` / `candidate_urls_already_supplied` / `target_evidence_not_found` / `target_role_mismatch` / `target_source_mismatch`; the contract is read from the latest `run_needs_user` / `planner_needs_user` / `planner_budget_exhausted` event) is resumed by the harness itself up to `AgentBudget.max_auto_recoveries` times (default 2 = 3 attempts total, schema cap 5). Each attempt steps the `AgentBudget` ceilings up (1.5x then 2x, clamped at schema maxima) and relaxes the consecutive-stall breaker via `context.max_consecutive_stalls` (4 then 5). Source-access blocks (login/captcha/anti-bot) and repeated-plan oscillation guards never auto-recover — they remain human hand-offs.
+- **Safe degradation to `waiting_user`**: an `invalid_model_response` from an agent, a gate `RETRY_EXECUTOR` loop past `max_replans`, or wall-clock budget exhaustion (`wall_clock_budget_exhausted`) at an agent boundary, ends the run as recoverable `waiting_user` with a human-readable question (never a crash or hard failure); `resume()`/`recover()` continue in the remaining budget. Wall-clock exhaustion is a transport/resource pause (the clock window refreshes on resume), not a business failure; turn/tool budgets remain the latency-independent work authority and are NOT reset on resume (only the clock window refreshes).
+- **Bounded automatic recovery (auto-resume)**: a `waiting_user` pause whose terminal contract is a verifier/model decision (`need_user`, `verification_failed`, `no_progress_duplicate`, `invalid_model_response`, `wall_clock_budget_exhausted`, or the executor hand-off codes `route_already_consumed` / `candidate_urls_already_supplied` / `target_evidence_not_found` / `target_role_mismatch` / `target_source_mismatch`; the contract is read from the latest `run_needs_user` / `planner_needs_user` / `planner_budget_exhausted` event) is resumed by the harness itself up to `AgentBudget.max_auto_recoveries` times (default 1 = 2 attempts total, schema cap 5). Each attempt steps the `AgentBudget` ceilings up (1.5x then 2x, clamped at schema maxima) and relaxes the consecutive-stall breaker via `context.max_consecutive_stalls` (4 then 5). Source-access blocks (login/captcha/anti-bot) and repeated-plan oscillation guards never auto-recover — they remain human hand-offs.
 - **MySQL authority**: Run/Plan/Step/Turn/Event/Artifact persist to MySQL; SSE polls MySQL every 1s; Redis is non-authoritative.
 - **Replan budget survives recovery**: `recover()`/`resume()` resume `replans` from the persisted plan count (`max(0, revision - 1)`), so a crashed run cannot re-spend budget already consumed on replanning.
 - **Incremental decision-state projection**: each agent appends a bounded projection of a tool observation once per call (visible_text excerpted to 1,200 chars; pages/details capped at 10) and reuses the accumulated list per turn, so decision context grows O(turns) not O(turns²) (shared logic in `observation_projection.py`).
 - **Bounded event payloads**: `append_event` caps serialized payload size at `agent_harness_max_event_payload_bytes` (wired in the lifespan); an oversize payload is replaced with a `{"_payload_truncated": True, "original_bytes": ...}` stub so a runaway observation can't grow the event table / SSE stream.
 
-### Four Career Skills
+### Three Career Skills
 
 | Skill | Produces | Boundary |
 |-------|----------|----------|
 | `job-discovery` | Public job-page evidence, structured JDs | Public HTTP(S) pages only; rejects intranet/login/captcha/anti-bot bypass |
 | `job-matching` | Sourced job-match ranking | Compares only JDs already captured in the same Run |
 | `resume-tailoring` | Auditable resume edit ops | Each op cites a confirmed fact field + target JD; cannot fabricate |
-| `career-planning` | JD-driven interview/action plan | Only themes present in the target JD |
 
-Tool registry: [backend/app/services/career_skills/registry.py](backend/app/services/career_skills/registry.py). **13 tools** are registered across the four skills (job-discovery 10, job-matching 1, resume-tailoring 1, career-planning 1); `search-public-job-pages` is executor-only.
+Tool registry: [backend/app/services/career_skills/registry.py](backend/app/services/career_skills/registry.py). **12 tools** are registered across the three skills (job-discovery 10, job-matching 1, resume-tailoring 1); `search-public-job-pages` is executor-only.
 
 ## Executor Implementation
 
 The self-built `agent_runtime` owns the PEV lifecycle (planning, budgets,
 verification routing, persistence).  The production Executor path
-(`agent_runtime/executor_agent.py`) delegates to `agent_runtime/deep_executor.py`,
+(`agent_runtime/executor_agent.py`) delegates to `agent_runtime/executor/deep_executor.py`,
 a DeepAgents tool-calling loop.  The experimental `deepagents_runtime`
 package was removed: the self-built harness + one DeepAgents-based Executor is
 the single production path.

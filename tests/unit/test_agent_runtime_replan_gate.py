@@ -19,7 +19,6 @@ Round-3 behaviors:
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from pydantic import BaseModel
@@ -31,7 +30,6 @@ from backend.app.domain.agent_runtime import (
     ComplexityLevel,
     RunStatus,
     StepStatus,
-    VerificationDecision,
 )
 from backend.app.repositories import agent_runtime as run_repository
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
@@ -43,13 +41,22 @@ from backend.app.services.agent_runtime.schemas import (
     ExecutionPlan,
     ExecutorResult,
     PlanStep,
-    ToolObservation,
+)
+from backend.app.services.agent_runtime.skill_definition import (
+    CompletionContract,
+    SkillDefinition,
+    SkillRegistry,
 )
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
-from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+from backend.app.services.career_skills.manifest import (
+    build_career_skill_registry,
+    skill_observation_is_semantically_valid,
+)
+from backend.app.services.career_skills.registry import build_career_tool_registry
+from tests.unit.deepagents_testkit import scripted_executor_model
 
 _NEEDS_USER_REPLAN_MARKER = "<needs_user_replan>"
 
@@ -97,6 +104,17 @@ class RoleScriptedGateway:
             "input_tokens": 100,
             "output_tokens": 50,
         }
+        # Stage 1.2: the executor runs on the production Deep path, so the
+        # scripted executor decisions are exposed through a chat model for the
+        # Deep loop instead of the removed legacy decide() seam. Tests that
+        # never drive the executor (verifier-only or stub-executor flows)
+        # leave _model None, which the Deep executor reports as unavailable.
+        executor_script = scripts.get(AgentRole.executor) or []
+        self._model = (
+            scripted_executor_model(list(executor_script))
+            if executor_script
+            else None
+        )
 
     def decide(
         self,
@@ -153,10 +171,33 @@ def _register_match_tool(registry: ToolRegistry) -> None:
                         "artifact_id": "observed:a",
                         "source_url": "https://jobs.example/a",
                         "score": 80,
+                        "evidence_excerpt": "匹配证据文本",
                     }
                 ],
             },
         )
+    )
+
+
+def _match_contract_skills() -> SkillRegistry:
+    """Strict job-matching contract with OPTIONAL verification.
+
+    The completion-gate-rejection test drives the no-verification path
+    (L2 plan, requires_verification=False); the production registry marks
+    job-matching REQUIRED, which would force the verifier instead.
+    """
+    return SkillRegistry(
+        [
+            SkillDefinition(
+                name="job-matching",
+                completion_contract=CompletionContract(
+                    deliverable_tools=frozenset({"match-observed-jobs"}),
+                    semantic_check=lambda observation: skill_observation_is_semantically_valid(
+                        observation.tool_name, observation.output
+                    ),
+                ),
+            )
+        ]
     )
 
 
@@ -205,12 +246,18 @@ def _plan_decision(allowed_skills: list[str]) -> dict[str, Any]:
     }
 
 
-def _runtime_for_gateway(gateway: object, registry: ToolRegistry) -> AgentRuntime:
+def _runtime_for_gateway(
+    gateway: object,
+    registry: ToolRegistry,
+    *,
+    skills: SkillRegistry | None = None,
+) -> AgentRuntime:
     return AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=skills or build_career_skill_registry(registry),
     )
 
 
@@ -239,57 +286,39 @@ def test_needs_user_with_contract_met_converts_to_bounded_replan(db_session) -> 
     db_session.add(user)
     db_session.commit()
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
         ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工确认匹配结果"},
-            {"action": "decide", "verification_decision": "PASS"},
-        ],
+        AgentRole.verifier: [],
     })
     registry = ToolRegistry()
     _register_match_tool(registry)
 
-    result = _runtime_for_gateway(gateway, registry).run(
+    result = _runtime_for_gateway(gateway, registry, skills=build_career_skill_registry(build_career_tool_registry())).run(
         db_session,
         user_id=user.id,
         task=AgentTaskRequest(
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
+    # A tool-backed, semantically valid deliverable makes the deterministic
+    # gate PASS on the first pass; no replan and no verifier turn happen.
     assert result.status is RunStatus.succeeded
     assert result.summary == "匹配完成"
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
+    assert _events(db_session, result.run_id).count("plan_created") == 1
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
+    assert _events(db_session, result.run_id).count("verification_passed") == 1
     steps = _steps(db_session, result.run_id)
-    assert len(steps) == 2
-    assert {step.error_code for step in steps} == {"replan_required", None}
-    skipped = [step for step in steps if step.error_code == "replan_required"]
-    assert skipped[0].status is StepStatus.skipped
-    # The run loop appended the converted outcome (marker included) to
-    # verifier_feedback, which the replanned Planner sees.
-    planner_context = gateway.states[AgentRole.planner][1]["context"]
-    assert planner_context["verifier_feedback"] == [
-        f"请人工确认匹配结果 {_NEEDS_USER_REPLAN_MARKER}"
-    ]
-    # The Verifier receives the projected observations (never the anchor
-    # contract booleans — the anchor feature was removed as a water source).
-    verifier_state = gateway.states[AgentRole.verifier][0]
-    assert "step_contract_met" not in verifier_state
-    assert "has_blocked_evidence" not in verifier_state
-    assert "succeeded_deliverable_tool_names" not in verifier_state
-    assert "execution" in verifier_state
+    assert len(steps) == 1
+    assert steps[0].error_code is None
 
 
 def test_needs_user_keeps_waiting_user_when_blocked_evidence_present(db_session) -> None:
@@ -300,13 +329,10 @@ def test_needs_user_keeps_waiting_user_when_blocked_evidence_present(db_session)
     gateway = RoleScriptedGateway({
         AgentRole.planner: [_plan_decision(["job-discovery"])],
         AgentRole.executor: [
-            {"action": "call_tool", "tool_name": "fetch-public-job-pages", "tool_input": {"urls": ["https://jobs.example/1"]}},
             {"action": "call_tool", "tool_name": "fetch-wechat-article", "tool_input": {"url": "https://mp.weixin.qq.com/s/x"}},
             {"action": "complete", "summary": "已收集部分页面"},
         ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工确认微信来源"},
-        ],
+        AgentRole.verifier: [],
     })
     registry = ToolRegistry()
     _register_discovery_tools(registry, wechat_handler=_blocked_wechat_handler)
@@ -318,20 +344,20 @@ def test_needs_user_keeps_waiting_user_when_blocked_evidence_present(db_session)
             goal="找岗位",
             allowed_skills=["job-discovery"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
+    # Blocked-only evidence (no deliverable) makes the gate pause with
+    # NEED_USER; the human keeps the hand-off and no replan is spent.
     assert result.status is RunStatus.waiting_user
-    assert result.summary == "请人工确认微信来源"
+    assert "访问限制阻断" in (result.summary or "")
     steps = _steps(db_session, result.run_id)
     assert steps[0].error_code == "need_user"
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
-    verifier_state = gateway.states[AgentRole.verifier][0]
-    assert "step_contract_met" not in verifier_state
-    assert "has_blocked_evidence" not in verifier_state
 
 
 def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None:
@@ -341,9 +367,10 @@ def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None
     db_session.commit()
     gateway = RoleScriptedGateway({
         AgentRole.planner: [_plan_decision(["job-discovery"])],
-        AgentRole.executor: [{"action": "complete", "summary": "无证据完成"}],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请提供岗位链接"},
+        AgentRole.executor: [
+            {"action": "complete", "summary": "无证据完成"},
+            {"action": "complete", "summary": "无证据完成"},
+            {"action": "complete", "summary": "无证据完成"},
         ],
     })
 
@@ -360,40 +387,44 @@ def test_needs_user_keeps_waiting_user_when_contract_not_met(db_session) -> None
         ),
     )
 
+    # No tool evidence at all: the deterministic gate RETRYs and the repeated
+    # no-progress fingerprint hands the step to the human without a replan.
     assert result.status is RunStatus.waiting_user
-    assert result.summary == "请提供岗位链接"
+    assert "未满足确定性交付契约" in (result.summary or "")
     steps = _steps(db_session, result.run_id)
-    assert steps[0].error_code == "need_user"
+    assert steps[0].error_code == "no_progress_duplicate"
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
-    verifier_state = gateway.states[AgentRole.verifier][0]
-    assert "step_contract_met" not in verifier_state
-    assert "has_blocked_evidence" not in verifier_state
 
 
-def test_needs_user_conversion_is_once_per_run(db_session) -> None:
-    """The marker makes the conversion fire once; a repeat NEED_USER waits."""
+def test_gate_retry_loop_hands_off_on_empty_report(db_session) -> None:
+    """A gate RETRY over an unchanged fingerprint hands the step to the human."""
     user = _user("user-c4")
     db_session.add(user)
     db_session.commit()
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工确认匹配结果"},
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工再次确认匹配结果"},
+            {"action": "complete", "summary": "匹配完成"},
         ],
     })
     registry = ToolRegistry()
-    _register_match_tool(registry)
+    registry.register(
+        ToolDefinition(
+            name="match-observed-jobs",
+            skill_name="job-matching",
+            input_model=EmptyInput,
+            output_model=MatchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://jobs.example/a",
+                "matches": [],
+            },
+        )
+    )
 
     result = _runtime_for_gateway(gateway, registry).run(
         db_session,
@@ -408,20 +439,16 @@ def test_needs_user_conversion_is_once_per_run(db_session) -> None:
         ),
     )
 
-    # First NEED_USER converted to a replan; the second identical one (marker
-    # already present in verifier_feedback) stays a human hand-off even though
-    # the replan budget would still allow another conversion.
+    # The empty match report cannot satisfy the semantic contract: the gate
+    # RETRYs, the second retry repeats the same evidence fingerprint, and the
+    # runtime hands the step to the human without spending a replan.
     assert result.status is RunStatus.waiting_user
-    assert result.summary == "请人工再次确认匹配结果"
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
-    assert _events(db_session, result.run_id).count("plan_created") == 2
+    assert "未满足确定性交付契约" in (result.summary or "")
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
+    assert _events(db_session, result.run_id).count("plan_created") == 1
     steps = _steps(db_session, result.run_id)
-    assert len(steps) == 2
-    assert {step.error_code for step in steps} == {"replan_required", "need_user"}
-    planner_context = gateway.states[AgentRole.planner][1]["context"]
-    assert planner_context["verifier_feedback"] == [
-        f"请人工确认匹配结果 {_NEEDS_USER_REPLAN_MARKER}"
-    ]
+    assert len(steps) == 1
+    assert steps[0].error_code == "no_progress_duplicate"
 
 
 class StubInvalidResponseExecutor:
@@ -455,8 +482,9 @@ def test_deep_executor_invalid_response_converts_to_bounded_replan(
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
         executor=StubInvalidResponseExecutor(),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -539,7 +567,7 @@ def test_completion_gate_rejection_converts_to_bounded_replan(db_session) -> Non
         )
     )
 
-    result = _runtime_for_gateway(gateway, registry).run(
+    result = _runtime_for_gateway(gateway, registry, skills=_match_contract_skills()).run(
         db_session,
         user_id=user.id,
         task=AgentTaskRequest(
@@ -619,13 +647,24 @@ def test_needs_user_conversion_tolerates_non_list_verifier_feedback(db_session) 
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工确认匹配结果"},
+            {"action": "complete", "summary": "匹配完成"},
+            {"action": "complete", "summary": "匹配完成"},
         ],
     })
     registry = ToolRegistry()
-    _register_match_tool(registry)
+    registry.register(
+        ToolDefinition(
+            name="match-observed-jobs",
+            skill_name="job-matching",
+            input_model=EmptyInput,
+            output_model=MatchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://jobs.example/a",
+                "matches": [],
+            },
+        )
+    )
 
     result = _runtime_for_gateway(gateway, registry)._run_step(
         db=db_session,
@@ -641,9 +680,10 @@ def test_needs_user_conversion_tolerates_non_list_verifier_feedback(db_session) 
         replans=0,
     )
 
-    assert result.error_code == "replan_required"
-    assert step.status is StepStatus.skipped
-    assert result.summary.endswith(_NEEDS_USER_REPLAN_MARKER)
+    # A malformed (non-list) verifier_feedback context cannot crash the gate
+    # retry loop; the repeated no-progress fingerprint hands the step off.
+    assert result.error_code == "no_progress_duplicate"
+    assert step.status is StepStatus.failed
 
 
 def test_needs_user_keeps_waiting_user_when_replan_budget_exhausted(db_session) -> None:
@@ -656,13 +696,24 @@ def test_needs_user_keeps_waiting_user_when_replan_budget_exhausted(db_session) 
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "请人工确认匹配结果"},
+            {"action": "complete", "summary": "匹配完成"},
+            {"action": "complete", "summary": "匹配完成"},
         ],
     })
     registry = ToolRegistry()
-    _register_match_tool(registry)
+    registry.register(
+        ToolDefinition(
+            name="match-observed-jobs",
+            skill_name="job-matching",
+            input_model=EmptyInput,
+            output_model=MatchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://jobs.example/a",
+                "matches": [],
+            },
+        )
+    )
 
     result = _runtime_for_gateway(gateway, registry).run(
         db_session,
@@ -677,8 +728,10 @@ def test_needs_user_keeps_waiting_user_when_replan_budget_exhausted(db_session) 
         ),
     )
 
+    # With no replan budget the gate RETRY cannot convert; the repeated
+    # no-progress fingerprint keeps the human hand-off.
     assert result.status is RunStatus.waiting_user
-    assert result.summary == "请人工确认匹配结果"
+    assert "未满足确定性交付契约" in (result.summary or "")
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
 
@@ -688,29 +741,35 @@ def test_needs_user_keeps_waiting_user_when_replan_budget_exhausted(db_session) 
 # ---------------------------------------------------------------------------
 
 
-def test_retry_with_forbidden_tool_routes_to_replan(db_session) -> None:
-    """R013: RETRY over tool_skill_forbidden replans instead of re-invoking."""
+def test_out_of_scope_tool_call_never_reaches_the_registry(db_session) -> None:
+    """The Deep catalog is skill-scoped: a job-discovery tool is structurally
+    invisible inside a job-matching step, so no forbidden observation is ever
+    produced (the legacy R013 replan seam is unreachable)."""
     user = _user("user-c6")
     db_session.add(user)
     db_session.commit()
+    fetch_calls = {"count": 0}
+
+    def counting_fetch(_context, _payload):
+        fetch_calls["count"] += 1
+        return {"pages": []}
+
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "fetch-public-job-pages", "tool_input": {"urls": ["https://jobs.example/1"]}},
             {"action": "complete", "summary": "信息不完整"},
             {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "PASS"},
+            {"action": "complete", "summary": "匹配完成"},
         ],
     })
     registry = ToolRegistry()
     _register_match_tool(registry)
-    _register_discovery_tools(registry)
+    registry.register(ToolDefinition(
+        name="fetch-public-job-pages", skill_name="job-discovery", input_model=FetchPagesInput,
+        output_model=FetchPagesOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=counting_fetch,
+    ))
 
     result = _runtime_for_gateway(gateway, registry).run(
         db_session,
@@ -719,50 +778,33 @@ def test_retry_with_forbidden_tool_routes_to_replan(db_session) -> None:
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
-    assert result.status is RunStatus.succeeded
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
-    steps = _steps(db_session, result.run_id)
-    skipped = [step for step in steps if step.error_code == "replan_required"]
-    assert len(skipped) == 1
-    assert skipped[0].status is StepStatus.skipped
-    # The executor was NOT re-invoked within the same step: two decisions in
-    # the first invocation + one in the replanned step, never a third.
-    assert len(gateway.states[AgentRole.executor]) == 3
-    verifier_state = gateway.states[AgentRole.verifier][0]
-    assert "step_contract_met" not in verifier_state
-    assert "succeeded_deliverable_tool_names" not in verifier_state
-    # The scope violation is detected before verifier invocation, so the
-    # runtime supplies a deterministic replan reason rather than repeating
-    # the verifier feedback after an impossible call.
-    assert gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"] == [
-        "步骤 Skill 范围冲突，已停止重复工具调用并请求重规划。"
-    ]
+    assert result.status is RunStatus.waiting_user
+    assert _events(db_session, result.run_id).count("plan_created") == 1
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
+    # The scoped-out fetch was never invoked and produced no observation.
+    assert fetch_calls["count"] == 0
 
 
-def test_retry_with_unknown_tool_routes_to_replan(db_session) -> None:
-    """RETRY over an unknown_tool observation is equally unsatisfiable."""
+def test_unregistered_tool_call_never_reaches_the_registry(db_session) -> None:
+    """An unregistered tool name cannot produce an unknown_tool observation on
+    the Deep path: the wrapped catalog only exposes registered tools, so the
+    run continues with the model's own recovery decision."""
     user = _user("user-c7")
     db_session.add(user)
     db_session.commit()
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "no-such-tool", "tool_input": {}},
             {"action": "complete", "summary": "信息不完整"},
             {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "PASS"},
+            {"action": "complete", "summary": "匹配完成"},
         ],
     })
     registry = ToolRegistry()
@@ -775,22 +817,15 @@ def test_retry_with_unknown_tool_routes_to_replan(db_session) -> None:
             goal="匹配岗位",
             allowed_skills=["job-matching"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
-    assert result.status is RunStatus.succeeded
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("verification_replan") == 1
-    skipped = [
-        step
-        for step in _steps(db_session, result.run_id)
-        if step.error_code == "replan_required"
-    ]
-    assert len(skipped) == 1
-    assert skipped[0].status is StepStatus.skipped
-    assert len(gateway.states[AgentRole.executor]) == 3
+    assert result.status is RunStatus.waiting_user
+    assert _events(db_session, result.run_id).count("plan_created") == 1
+    assert _events(db_session, result.run_id).count("verification_replan") == 0
 
 
 def test_retry_keeps_normal_reinvocation_without_forbidden_observation(db_session) -> None:
@@ -828,172 +863,7 @@ def test_retry_keeps_normal_reinvocation_without_forbidden_observation(db_sessio
     assert result.status is RunStatus.succeeded
     assert _events(db_session, result.run_id).count("plan_created") == 1
     assert _events(db_session, result.run_id).count("verification_replan") == 0
-    assert len(gateway.states[AgentRole.executor]) == 3
-    assert gateway.states[AgentRole.executor][2]["verifier_feedback"] == [
-        "补充来源标注。"
-    ]
 
 
-# ---------------------------------------------------------------------------
 # Item 3 + 4 - Verifier execution-state projection and contract anchors
 # ---------------------------------------------------------------------------
-
-
-class VerifierScriptedGateway:
-    """Deterministic model boundary double for direct VerifierAgent tests."""
-
-    def __init__(self, responses: list[dict[str, Any]]) -> None:
-        self.responses = responses
-        self.states: list[dict[str, Any]] = []
-
-    def decide(
-        self,
-        *,
-        role: AgentRole,
-        instruction: str,
-        state: dict[str, Any],
-        response_model: type[BaseModel],
-    ) -> BaseModel:
-        assert role is AgentRole.verifier
-        self.states.append(state)
-        return response_model.model_validate(self.responses.pop(0))
-
-
-def _verifier_task() -> AgentTaskRequest:
-    return AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"])
-
-
-def _verifier_plan(task: AgentTaskRequest) -> ExecutionPlan:
-    return ExecutionPlan(
-        task=task,
-        created_by=AgentRole.planner,
-        complexity=ComplexityLevel.L3,
-        success_criteria=["完整 JD"],
-        steps=[
-            PlanStep(
-                step_id="discover",
-                objective="提取岗位",
-                allowed_skills=["job-discovery"],
-                requires_verification=True,
-            )
-        ],
-    )
-
-
-def test_verifier_execution_state_projection_is_bounded(db_session) -> None:
-    """The Verifier never sees raw full-width Executor observations."""
-    gateway = VerifierScriptedGateway(
-        [{"action": "decide", "verification_decision": "PASS"}]
-    )
-    raw_text = "RAW_PAGE_BODY_" * 1000  # 14,000 chars, well over the excerpt
-    observations = [
-        ToolObservation(
-            tool_name="fetch-public-job-pages",
-            status="succeeded",
-            output={
-                "source_url": f"https://jobs.example/{index}",
-                "content_hash": "b" * 64,
-                "visible_text": raw_text,
-            },
-        )
-        for index in range(50)
-    ]
-    # A batch observation with more pages than the projection cap.
-    observations.append(
-        ToolObservation(
-            tool_name="fetch-public-job-pages",
-            status="succeeded",
-            output={
-                "source_url": "https://jobs.example/batch",
-                "content_hash": "c" * 64,
-                "pages": [
-                    {
-                        "source_url": f"https://jobs.example/p{page}",
-                        "content_hash": "d" * 64,
-                        "visible_text": raw_text,
-                    }
-                    for page in range(20)
-                ],
-            },
-        )
-    )
-    execution = ExecutorResult(
-        status="succeeded", summary="完成", observations=observations
-    )
-    task = _verifier_task()
-    plan = _verifier_plan(task)
-
-    result = VerifierAgent(gateway=gateway, tools=ToolRegistry()).run(
-        task=task,
-        plan=plan,
-        step=plan.steps[0],
-        execution=execution,
-        context=ToolContext(user_id="user-a", run_id="run-a"),
-    )
-
-    assert result.decision is VerificationDecision.PASS
-    state = gateway.states[0]
-    projected = state["execution"]["observations"]
-    assert isinstance(projected, list)
-    # The 48,000-char list budget held: older observations collapsed to
-    # identifier-only summary lines, only the newest stay full.
-    assert len(json.dumps(state["execution"], ensure_ascii=False)) <= 48_000
-    assert len(projected) == len(observations)
-    # The full-width raw page body never reaches the model in one piece.
-    assert raw_text not in json.dumps(state, ensure_ascii=False)
-    # Summarized lines carry identity only - never output/visible_text/pages.
-    assert all("output" not in entry for entry in projected[:-5])
-    assert all(entry["tool_name"] == "fetch-public-job-pages" for entry in projected)
-    # The newest observations stay full but per-observation bounded.
-    recent = projected[-5:]
-    assert all(
-        isinstance(entry["output"], dict)
-        and len(entry["output"]["visible_text"]) <= 1_200
-        for entry in recent[:-1]
-    )
-    assert len(recent[-1]["output"]["pages"]) == 10  # capped, not 20
-    # The Verifier state carries no contract anchors (feature removed); only
-    # the projected execution observations and tool history remain.
-    assert "step_contract_met" not in state
-    assert "has_blocked_evidence" not in state
-    assert "succeeded_deliverable_tool_names" not in state
-    assert all(
-        call["tool_name"] == "fetch-public-job-pages"
-        for call in state["execution_tool_calls"]
-    )
-
-
-def test_verifier_projection_excludes_verifier_own_observation_dump(db_session) -> None:
-    """The verifier's own tool calls stay separate from the projected execution."""
-    gateway = VerifierScriptedGateway(
-        [{"action": "decide", "verification_decision": "PASS"}]
-    )
-    execution = ToolObservation(
-        tool_name="fetch-public-job-pages",
-        status="failed",
-        error_code="public_fetch_failed",
-    )
-    executor_result = ExecutorResult(
-        status="succeeded",
-        summary="完成",
-        observations=[execution],
-    )
-    task = _verifier_task()
-    plan = _verifier_plan(task)
-
-    result = VerifierAgent(gateway=gateway, tools=ToolRegistry()).run(
-        task=task,
-        plan=plan,
-        step=plan.steps[0],
-        execution=executor_result,
-        context=ToolContext(user_id="user-a", run_id="run-a"),
-    )
-
-    assert result.decision is VerificationDecision.PASS
-    state = gateway.states[0]
-    assert state["my_tool_calls"] == []
-    assert state["execution"]["observations"][0]["status"] == "failed"
-    assert state["execution"]["observations"][0]["error_code"] == (
-        "public_fetch_failed"
-    )
-    assert "step_contract_met" not in state

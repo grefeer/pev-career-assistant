@@ -16,8 +16,6 @@ from backend.app.services.agent_runtime.schemas import (
     PlannerDecision,
     PlannerResult,
     ToolObservation,
-    VerifierDecision,
-    VerifierResult,
 )
 
 
@@ -45,8 +43,8 @@ def test_budget_rejects_a_zero_turn_agent_loop() -> None:
 
 
 def test_budget_bounds_automatic_recovery_rounds() -> None:
-    """Default allows 2 self-resumes (3 attempts total); the ceiling is 5."""
-    assert AgentBudget().max_auto_recoveries == 2
+    """Default allows 1 self-resume (2 attempts total); the ceiling is 5."""
+    assert AgentBudget().max_auto_recoveries == 1
     assert AgentBudget(max_auto_recoveries=0).max_auto_recoveries == 0
     with pytest.raises(ValidationError):
         AgentBudget(max_auto_recoveries=6)
@@ -251,11 +249,6 @@ def test_agent_decision_and_result_contracts_reject_missing_handoff_data() -> No
         (ExecutorResult, {"status": "succeeded"}),
         (ExecutorResult, {"status": "needs_user"}),
         (ExecutorResult, {"status": "other"}),
-        (VerifierDecision, {"action": "call_tool"}),
-        (VerifierDecision, {"action": "decide"}),
-        (VerifierDecision, {"action": "decide", "verification_decision": "REPLAN"}),
-        (VerifierDecision, {"action": "other"}),
-        (VerifierResult, {"decision": "REPLAN"}),
     ]
     for model, payload in invalid_models:
         with pytest.raises(ValidationError):

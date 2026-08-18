@@ -8,7 +8,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
-from backend.app.services.agent_runtime.deep_executor import (
+from backend.app.services.agent_runtime.executor.deep_executor import (
     DeepExecutorAgent,
     _DeepExecutionLedger,
     _EXECUTOR_OPERATING_PROCEDURE,
@@ -138,7 +138,7 @@ def test_deep_executor_bridges_business_tool_and_structured_terminal_state() -> 
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=_registry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -203,7 +203,7 @@ def test_deep_executor_reserves_last_tool_call_from_repeated_public_search() -> 
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=registry,
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -355,7 +355,7 @@ def test_deep_executor_finishes_recent_company_routing_before_next_model_call() 
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=registry,
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -394,7 +394,7 @@ def test_deep_executor_consumes_one_pev_turn_for_multiple_internal_calls() -> No
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=_registry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -416,7 +416,7 @@ def test_deep_executor_hides_generic_execute_and_subagent_tools() -> None:
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=_registry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -484,7 +484,7 @@ def test_deep_executor_requires_one_skill_per_pev_step() -> None:
     result = DeepExecutorAgent(
         gateway=Gateway(RecordingModel(['{"status":"succeeded"}'])),
         tools=ToolRegistry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -504,7 +504,7 @@ def test_invalid_structured_terminal_is_a_recoverable_executor_failure() -> None
     result = DeepExecutorAgent(
         gateway=Gateway(model),
         tools=ToolRegistry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=Path("skill"),
     ).run(
         task=task,
@@ -862,7 +862,7 @@ def test_run_skill_script_policy_blocks_login_state_crawl_after_login_wall(
     agent = DeepExecutorAgent(
         gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
         tools=ToolRegistry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=tmp_path,
     )
     task = AgentTaskRequest(
@@ -923,7 +923,7 @@ def test_run_skill_script_allows_login_state_crawl_when_authorized(
     agent = DeepExecutorAgent(
         gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
         tools=ToolRegistry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=tmp_path,
     )
     task = AgentTaskRequest(
@@ -982,7 +982,7 @@ def test_run_skill_script_still_runs_scripts_without_login_wall(
     agent = DeepExecutorAgent(
         gateway=None,  # type: ignore[arg-type]  # tools are invoked directly
         tools=ToolRegistry(),
-        skills=None,
+        skills=SkillRegistry(),
         skill_root=tmp_path,
     )
     task = AgentTaskRequest(

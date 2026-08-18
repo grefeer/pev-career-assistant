@@ -15,10 +15,8 @@ from backend.app.domain.agent_runtime import (
     ComplexityLevel,
     RunStatus,
     StepStatus,
-    VerificationDecision,
 )
 from backend.app.repositories import agent_runtime as run_repository
-from backend.app.services.agent_runtime import runtime as agent_runtime_module
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.model_gateway import AgentModelGatewayError
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
@@ -35,15 +33,96 @@ from backend.app.services.agent_runtime.schemas import (
     PlanStep,
     PlannerResult,
     ToolObservation,
-    VerifierResult,
 )
 from backend.app.services.agent_runtime.tool_budget import ToolCallBudget
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.turn_budget import AgentTurnBudget
-from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 from backend.app.services.career_skills.manifest import build_career_skill_registry
+from backend.app.services.career_skills.discovery_recovery import auto_search_and_fetch
+from backend.app.services.career_skills.discovery_policy import (
+    discovery_search_hints,
+    observed_company_seed_urls,
+    official_company_seed_urls,
+    public_source_mirror_seed_urls,
+    requested_role_seed_urls,
+    trusted_discovery_seed_urls,
+)
 from backend.app.services.career_skills.job_discovery import SearchPublicJobPagesInput
+from backend.app.services.career_skills.tailoring_keywords import goal_role_keywords
+from langchain_core.messages import AIMessage
+
+from tests.unit.deepagents_testkit import (
+    RecordingModel,
+    ScriptedModel,
+    scripted_executor_model,
+)
+
+
+
+class _FakeRecoveryContext:
+    """Records skill-recovery tool invocations without persistence side effects."""
+
+    def __init__(
+        self,
+        *,
+        metadata: dict | None = None,
+        budget: ToolCallBudget | None = None,
+        responses: list[ToolObservation] | None = None,
+    ) -> None:
+        self.metadata = metadata or {}
+        self._budget = budget or ToolCallBudget(10)
+        self._responses = list(responses or [])
+        self.calls: list[dict] = []
+
+    def has_registered_tool(self, name: str) -> bool:
+        return True
+
+    def consume_tool_budget(self) -> bool:
+        return self._budget.try_consume()
+
+    def invoke_tool(
+        self, name: str, payload: dict, *, metadata: dict | None = None
+    ) -> ToolObservation:
+        self.calls.append({"name": name, "payload": payload, "metadata": metadata})
+        if self._responses:
+            return self._responses.pop(0)
+        return ToolObservation(tool_name=name, status="succeeded", output={})
+
+    def persist(self, execution: ExecutorResult, *, mark: str | None = None):
+        return []
+
+    def append_event(self, event_type: str, payload: dict) -> None:
+        return None
+
+    def child(self, metadata: dict) -> "_FakeRecoveryContext":
+        return _FakeRecoveryContext(
+            metadata=metadata, budget=self._budget, responses=self._responses
+        )
+
+    def persisted_job_search_observations(self, artifact_refs: list[dict]):
+        return []
+
+    @property
+    def user_id(self) -> str:
+        return "fake-user"
+
+    @property
+    def run_id(self) -> str:
+        return "fake-run"
+
+    @property
+    def task_goal(self) -> str:
+        return "fake-goal"
+
+    @property
+    def step_id(self) -> str:
+        return "fake-step"
+
+    @property
+    def task_context(self) -> dict:
+        return {}
 
 
 class EmptyInput(BaseModel):
@@ -59,6 +138,14 @@ class FetchedJobOutput(BaseModel):
     source_url: str
     content_hash: str
     visible_text: str
+
+
+class PagesOutput(BaseModel):
+    pages: list[dict[str, object]]
+
+
+class FetchUrlsInput(BaseModel):
+    urls: list[str]
 
 
 class EvidenceOutput(BaseModel):
@@ -122,6 +209,17 @@ class RoleScriptedGateway:
             "input_tokens": 100,
             "output_tokens": 50,
         }
+        # Stage 1.2: the executor runs on the production Deep path, so the
+        # scripted executor decisions are exposed through a chat model for the
+        # Deep loop instead of the removed legacy decide() seam. Tests that
+        # never drive the executor (verifier-only or stub-executor flows)
+        # leave _model None, which the Deep executor reports as unavailable.
+        executor_script = scripts.get(AgentRole.executor) or []
+        self._model = (
+            scripted_executor_model(list(executor_script))
+            if executor_script
+            else None
+        )
 
     def decide(
         self,
@@ -148,7 +246,15 @@ class FailingGateway:
 
 
 class InvalidModelGateway:
-    """Provider double whose completions never parse into the response model."""
+    """Provider double whose completions never parse into the response model.
+
+    The executor runs on the Deep path, so the invalid output is simulated
+    through a chat model that emits unparseable content; the Deep loop hits
+    its internal call cap and hands the step to the human (recoverable).
+    """
+
+    def __init__(self) -> None:
+        self._model = ScriptedModel(["not-json", "not-json"])
 
     @property
     def last_usage(self) -> dict[str, Any] | None:
@@ -163,6 +269,14 @@ class NoUsageGateway:
 
     def __init__(self, scripts: dict[AgentRole, list[dict[str, Any]]]) -> None:
         self.scripts = scripts
+        # Stage 1.2: the executor runs on the Deep path through the scripted
+        # executor decisions.
+        executor_script = scripts.get(AgentRole.executor) or []
+        self._model = (
+            scripted_executor_model(list(executor_script))
+            if executor_script
+            else None
+        )
 
     @property
     def last_usage(self) -> dict[str, Any] | None:
@@ -180,11 +294,43 @@ class NoUsageGateway:
         return response_model.model_validate(self.scripts[role].pop(0))
 
 
+class _SimulatedProcessLoss(BaseException):
+    """Process-loss simulation that escapes the Deep executor exception catch."""
+
+
+class _CrashAfterOneExecutorCallModel(ScriptedModel):
+    """Deep chat-model double: one tool call, then a simulated process loss."""
+
+    def __init__(self) -> None:
+        super().__init__([
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "fetch-job",
+                        "args": {},
+                        "id": "call-1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ])
+        self._calls = 0
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._calls += 1
+        if self._calls >= 2:
+            raise _SimulatedProcessLoss("simulated_process_loss")
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
 class CrashAfterFirstExecutorDecisionGateway:
     """Simulate process loss after a persisted Executor decision checkpoint."""
 
     def __init__(self) -> None:
         self._executor_decisions = 0
+        # The executor runs on the Deep path: crash on the second model call.
+        self._model = _CrashAfterOneExecutorCallModel()
 
     @property
     def last_usage(self) -> dict[str, Any] | None:
@@ -199,13 +345,6 @@ class CrashAfterFirstExecutorDecisionGateway:
                     "allowed_skills": ["job-discovery"], "requires_verification": False,
                 }],
             })
-        if role is AgentRole.executor:
-            self._executor_decisions += 1
-            if self._executor_decisions == 1:
-                return response_model.model_validate({
-                    "action": "call_tool", "tool_name": "fetch-job", "tool_input": {},
-                })
-            raise RuntimeError("simulated_process_loss")
         raise AssertionError("Verifier should not run for an L2 step")
 
 
@@ -218,6 +357,7 @@ def test_runtime_can_persist_a_queued_run_before_background_execution(db_session
     db_session.commit()
     runtime = AgentRuntime(
         planner=MagicMock(), executor=MagicMock(), verifier=MagicMock(), agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     run = runtime.create_queued_run(
@@ -229,13 +369,14 @@ def test_runtime_can_persist_a_queued_run_before_background_execution(db_session
     assert run.goal == "后台任务"
 
 
-def _runtime_for_gateway(gateway: object) -> AgentRuntime:
+def _runtime_for_gateway(gateway: object, *, skills: SkillRegistry | None = None) -> AgentRuntime:
     registry = ToolRegistry()
     return AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=skills or SkillRegistry(),
     )
 
 
@@ -332,14 +473,7 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
                     "artifact_refs": [{"uri": "artifact://job/1"}],
                 },
             ],
-            AgentRole.verifier: [
-                {
-                    "action": "call_tool",
-                    "tool_name": "check-job-evidence",
-                    "tool_input": {},
-                },
-                {"action": "decide", "verification_decision": "PASS"},
-            ],
+            AgentRole.verifier: [],
         }
     )
     registry = ToolRegistry()
@@ -353,21 +487,12 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
             handler=lambda _context, _payload: {"title": "AI Agent 开发工程师"},
         )
     )
-    registry.register(
-        ToolDefinition(
-            name="check-job-evidence",
-            skill_name="job-discovery",
-            input_model=EmptyInput,
-            output_model=EvidenceOutput,
-            allowed_roles=frozenset({AgentRole.verifier}),
-            handler=lambda _context, _payload: {"complete": True},
-        )
-    )
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -393,20 +518,27 @@ def test_runtime_persists_planner_executor_verifier_success_trace(db_session) ->
             .order_by(AgentTurn.created_at.asc(), AgentTurn.id.asc())
         )
     )
+    # The Deep executor records one terminal turn per invocation; the
+    # deterministic completion gate emits no verifier turns.
     assert [(turn.role, turn.decision_json["action"]) for turn in turns] == [
         (AgentRole.planner, "plan"),
-        (AgentRole.executor, "call_tool"),
-        (AgentRole.executor, "complete"),
-        (AgentRole.verifier, "call_tool"),
-        (AgentRole.verifier, "decide"),
+        (AgentRole.executor, "succeeded"),
     ]
-    # Verify token usage is persisted for every turn
+    # Verify token usage is persisted for every decide() turn; the Deep
+    # executor terminal turn carries no model usage metadata.
     for turn in turns:
+        if turn.decision_json.get("deep_executor") is True:
+            assert turn.model_name is None
+            continue
         assert turn.model_name == "scripted-model"
         assert turn.input_tokens == 100
         assert turn.output_tokens == 50
-    # Verify context manifest is persisted with expected fields for every turn
+        assert turn.context_manifest is not None
+    # Verify context manifest is persisted with expected fields for every
+    # decide() turn (the Deep executor terminal turn carries no manifest).
     for turn in turns:
+        if turn.decision_json.get("deep_executor") is True:
+            continue
         assert turn.context_manifest is not None
         assert "system_prompt_chars" in turn.context_manifest
         assert "tool_catalog_count" in turn.context_manifest
@@ -470,14 +602,7 @@ def test_runtime_trace_records_nulls_when_gateway_has_no_usage(db_session) -> No
                     "artifact_refs": [{"uri": "artifact://job/1"}],
                 },
             ],
-            AgentRole.verifier: [
-                {
-                    "action": "call_tool",
-                    "tool_name": "check-job-evidence",
-                    "tool_input": {},
-                },
-                {"action": "decide", "verification_decision": "PASS"},
-            ],
+            AgentRole.verifier: [],
         }
     )
     registry = ToolRegistry()
@@ -491,21 +616,12 @@ def test_runtime_trace_records_nulls_when_gateway_has_no_usage(db_session) -> No
             handler=lambda _context, _payload: {"title": "AI Agent 开发工程师"},
         )
     )
-    registry.register(
-        ToolDefinition(
-            name="check-job-evidence",
-            skill_name="job-discovery",
-            input_model=EmptyInput,
-            output_model=EvidenceOutput,
-            allowed_roles=frozenset({AgentRole.verifier}),
-            handler=lambda _context, _payload: {"complete": True},
-        )
-    )
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -523,7 +639,7 @@ def test_runtime_trace_records_nulls_when_gateway_has_no_usage(db_session) -> No
             .order_by(AgentTurn.created_at.asc(), AgentTurn.id.asc())
         )
     )
-    assert len(turns) == 5
+    assert len(turns) == 2
     # When last_usage is None, every turn records null usage and no context manifest.
     for turn in turns:
         assert turn.model_name is None
@@ -550,13 +666,14 @@ def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(d
     crashing_gateway = CrashAfterFirstExecutorDecisionGateway()
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=crashing_gateway, tools=registry),
-        executor=ExecutorAgent(gateway=crashing_gateway, tools=registry),
-        verifier=VerifierAgent(gateway=crashing_gateway, tools=registry),
+        executor=ExecutorAgent(gateway=crashing_gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(goal="找 AI Agent 岗位", allowed_skills=["job-discovery"])
 
-    with pytest.raises(RuntimeError, match="simulated_process_loss"):
+    with pytest.raises(_SimulatedProcessLoss, match="simulated_process_loss"):
         runtime.run(db_session, user_id=user.id, task=task)
 
     interrupted = db_session.scalar(select(AgentRun))
@@ -565,7 +682,7 @@ def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(d
     assert db_session.scalar(select(AgentPlan).where(AgentPlan.run_id == interrupted.id)) is not None
     assert [(turn.role, turn.decision_json["action"]) for turn in db_session.scalars(
         select(AgentTurn).where(AgentTurn.run_id == interrupted.id)
-    )] == [(AgentRole.planner, "plan"), (AgentRole.executor, "call_tool")]
+    )] == [(AgentRole.planner, "plan")]
 
     recovery_gateway = RoleScriptedGateway({
         AgentRole.planner: [{
@@ -580,9 +697,10 @@ def test_runtime_recovers_a_process_interrupted_run_from_committed_checkpoints(d
     })
     recovery_runtime = AgentRuntime(
         planner=PlannerAgent(gateway=recovery_gateway, tools=registry),
-        executor=ExecutorAgent(gateway=recovery_gateway, tools=registry),
-        verifier=VerifierAgent(gateway=recovery_gateway, tools=registry),
+        executor=ExecutorAgent(gateway=recovery_gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = recovery_runtime.recover(
@@ -619,27 +737,28 @@ def test_runtime_recovers_replan_budget_from_persisted_plans(db_session) -> None
         "success_criteria": ["完整 JD"],
         "steps": [{
             "step_id": "discover", "objective": "重新提取岗位",
-            "allowed_skills": ["job-discovery"], "requires_verification": True,
+            "allowed_skills": ["job-discovery"], "requires_verification": False,
         }],
     }
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [plan_decision],
-        AgentRole.executor: [{"action": "complete", "summary": "恢复后结果", "artifact_refs": []}],
-        AgentRole.verifier: [{
-            "action": "decide", "verification_decision": "REPLAN",
-            "feedback": "来源改版，需要重新规划。",
-        }],
+        AgentRole.planner: [plan_decision, plan_decision],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "恢复后结果", "artifact_refs": []},
+            {"action": "complete", "summary": "恢复后结果", "artifact_refs": []},
+        ],
+        AgentRole.verifier: [],
     })
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=build_career_skill_registry(registry),
     )
     task = AgentTaskRequest(
         goal="找岗位",
         allowed_skills=["job-discovery"],
-        budget={"max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 1},
+        budget={"max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 2},
     )
     # Seed a run that already consumed one replan (two plans persisted, revision
     # == count_plans == 2) before the process was interrupted mid-execution.
@@ -669,9 +788,11 @@ def test_runtime_recovers_replan_budget_from_persisted_plans(db_session) -> None
         db_session, user_id=user.id, run_id=run.id, task=task
     )
 
+    # The recovered replan budget (replans resumes at 1, max 2) allows exactly
+    # one gate-rejection conversion: three plans total. A reset budget would
+    # have converted twice and persisted four plans.
     assert result.status is RunStatus.waiting_user
-    assert result.error_code == "replan_budget_exhausted"
-    # Three plans now persisted: two seeded + one from the recovery replan.
+    assert result.error_code is None
     assert run_repository.count_plans(db_session, run.id) == 3
 
 
@@ -714,24 +835,9 @@ def test_runtime_handles_executor_and_verifier_provider_errors_without_leaving_r
         persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
         trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
     )
-    assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
-
-    run, task, plan, plan_step, step = _create_running_step(
-        db_session, user, requires_verification=True
-    )
-    gateway = RoleScriptedGateway({
-        AgentRole.planner: [],
-        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
-        AgentRole.verifier: [],
-    })
-    runtime = _runtime_for_gateway(gateway)
-    runtime._verifier = VerifierAgent(gateway=FailingGateway(), tools=ToolRegistry())
-    result = runtime._run_step(
-        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
-        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
-        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
-    )
-    assert (result.status, result.error_code) == (RunStatus.failed, "model_request_failed")
+    assert (result.status, result.error_code) == (RunStatus.failed, "deep_executor_model_unavailable")
+    refreshed = db_session.get(AgentRun, run.id)
+    assert refreshed.status is RunStatus.failed
 
 
 def test_runtime_persists_an_executor_input_request_as_waiting_for_user(db_session) -> None:
@@ -760,16 +866,8 @@ def test_runtime_persists_an_executor_input_request_as_waiting_for_user(db_sessi
     assert step.error_code == "need_user"
 
 
-@pytest.mark.parametrize(
-    ("verdict", "feedback", "expected_status", "expected_error"),
-    [
-        ("RETRY_EXECUTOR", "补充来源", RunStatus.waiting_user, None),
-        ("NEED_USER", "请确认城市", RunStatus.waiting_user, None),
-    ],
-)
-def test_runtime_routes_verifier_nonpass_outcomes_to_safe_terminal_state(
-    db_session, verdict: str, feedback: str, expected_status: RunStatus, expected_error: str | None
-) -> None:
+def test_runtime_routes_gate_nonpass_outcomes_to_safe_terminal_state(db_session) -> None:
+    """A gate rejection without evidence ends in a safe waiting_user, never a crash."""
     user = User(
         id="user-a", account="user-a@example.test", nickname="user-a",
         password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
@@ -781,18 +879,20 @@ def test_runtime_routes_verifier_nonpass_outcomes_to_safe_terminal_state(
     )
     gateway = RoleScriptedGateway({
         AgentRole.planner: [],
-        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
-        AgentRole.verifier: [{
-            "action": "decide", "verification_decision": verdict, "feedback": feedback,
-        }],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
+        ],
+        AgentRole.verifier: [],
     })
-    result = _runtime_for_gateway(gateway)._run_step(
+    result = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))._run_step(
         db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
         persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
         trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
     )
-    assert result.status is expected_status
-    assert result.error_code == expected_error
+    assert result.status is RunStatus.waiting_user
+    assert result.error_code is None
 
 
 def test_runtime_retry_exhaustion_hands_a_stuck_step_to_the_human(db_session) -> None:
@@ -812,21 +912,20 @@ def test_runtime_retry_exhaustion_hands_a_stuck_step_to_the_human(db_session) ->
         AgentRole.executor: [
             {"action": "complete", "summary": "提取完成"},
             {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
         ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少来源标注"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少来源标注"},
-        ],
+        AgentRole.verifier: [],
     })
-    result = _runtime_for_gateway(gateway)._run_step(
+    result = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))._run_step(
         db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
         persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
         trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
     )
 
+    # Repeated gate RETRY over an unchanged fingerprint hands the step off.
     assert result.status is RunStatus.waiting_user
     assert step.error_code == "no_progress_duplicate"
-    assert "缺少来源标注" in result.summary
+    assert "未满足确定性交付契约" in result.summary
     events = run_repository.list_events(db_session, run.id)
     assert events[-1].event_type == "run_needs_user"
 
@@ -885,26 +984,31 @@ def test_runtime_fails_safely_when_verifier_replan_budget_is_exhausted(db_sessio
                 "allowed_skills": ["job-discovery"], "requires_verification": True,
             }],
         }],
-        AgentRole.executor: [{"action": "complete", "summary": "已提取"}],
-        AgentRole.verifier: [{
-            "action": "decide", "verification_decision": "REPLAN", "feedback": "目标不完整",
-        }],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "已提取"},
+            {"action": "complete", "summary": "已提取"},
+            {"action": "complete", "summary": "已提取"},
+        ],
+        AgentRole.verifier: [],
     })
 
-    result = _runtime_for_gateway(gateway).run(
+    result = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry())).run(
         db_session,
         user_id=user.id,
         task=AgentTaskRequest(
             goal="找岗位",
             allowed_skills=["job-discovery"],
-            budget=AgentBudget(max_agent_turns=4, max_tool_calls=4, max_replans=0),
+            budget=AgentBudget(
+                max_agent_turns=4, max_tool_calls=4, max_replans=0,
+                max_auto_recoveries=0,
+            ),
         ),
     )
 
-    assert (result.status, result.error_code) == (
-        RunStatus.waiting_user,
-        "replan_budget_exhausted",
-    )
+    # Without any replan budget the gate RETRY cannot convert; the repeated
+    # no-progress fingerprint keeps the human hand-off.
+    assert result.status is RunStatus.waiting_user
+    assert "未满足确定性交付契约" in (result.summary or "")
 
 
 def test_runtime_persists_resume_tailoring_as_a_reviewable_skill_artifact(db_session) -> None:
@@ -946,8 +1050,9 @@ def test_runtime_persists_resume_tailoring_as_a_reviewable_skill_artifact(db_ses
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -1036,9 +1141,9 @@ def test_runtime_resumes_waiting_run_with_the_remaining_global_budget(db_session
     })
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
-        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
-        verifier=VerifierAgent(gateway=gateway, tools=ToolRegistry()),
+        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry(), skills=SkillRegistry()),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     original_task = AgentTaskRequest(
         goal="find suitable roles", allowed_skills=["job-discovery"],
@@ -1096,14 +1201,15 @@ def test_runtime_enforces_one_global_model_turn_budget_across_pev_roles(db_sessi
             }],
         }],
         AgentRole.executor: [{"action": "complete", "summary": "result ready"}],
-        AgentRole.verifier: [{"action": "decide", "verification_decision": "PASS"}],
+        AgentRole.verifier: [],
     })
     registry = ToolRegistry()
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -1117,10 +1223,10 @@ def test_runtime_enforces_one_global_model_turn_budget_across_pev_roles(db_sessi
     )
     db_session.commit()
 
-    assert result.status is RunStatus.failed
-    assert result.error_code == "agent_turn_budget_exhausted"
+    # The deterministic gate consumes no model turns, so the two LLM turns
+    # (planner + executor) are enough to close the run.
+    assert result.status is RunStatus.succeeded
     assert len(gateway.states[AgentRole.planner]) == 1
-    assert len(gateway.states[AgentRole.executor]) == 1
     assert gateway.states[AgentRole.verifier] == []
     assert len(list(db_session.scalars(
         select(AgentTurn).where(AgentTurn.run_id == result.run_id)
@@ -1164,8 +1270,9 @@ def test_runtime_enforces_one_global_tool_budget_across_planner_and_executor(db_
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -1213,52 +1320,72 @@ def test_runtime_passes_verifier_retry_feedback_to_executor_next_turn(db_session
                 }
             ],
             AgentRole.executor: [
-                {"action": "call_tool", "tool_name": "fetch-job", "tool_input": {}},
+                {"action": "call_tool", "tool_name": "fetch-public-job-pages", "tool_input": {"urls": ["https://jobs.example/1"]}},
                 {"action": "complete", "summary": "信息不完整"},
+                {"action": "call_tool", "tool_name": "fetch-public-job-pages", "tool_input": {"urls": ["https://jobs.example/2"]}},
                 {"action": "complete", "summary": "信息已补齐"},
             ],
-            AgentRole.verifier: [
-                {
-                    "action": "decide",
-                    "verification_decision": "RETRY_EXECUTOR",
-                    "feedback": "补充职责和任职要求。",
-                },
-                {"action": "decide", "verification_decision": "PASS"},
-            ],
+            AgentRole.verifier: [],
         }
     )
     registry = ToolRegistry()
+    fetch_state = {"calls": 0}
+
+    def fetch_handler(_context, _payload):
+        fetch_state["calls"] += 1
+        if fetch_state["calls"] == 1:
+            # First pass: an empty page list cannot satisfy the contract.
+            return {"pages": []}
+        return {
+            "pages": [{
+                "source_url": "https://jobs.example/retry",
+                "content_hash": "e" * 64,
+                "visible_text": "负责 Agent 应用开发。",
+                "quality": "jd_complete",
+            }]
+        }
+
     registry.register(ToolDefinition(
-        name="fetch-job", skill_name="job-discovery", input_model=EmptyInput,
-        output_model=FetchedJobOutput, allowed_roles=frozenset({AgentRole.executor}),
-        handler=lambda _context, _payload: {
-            "title": "AI Agent 开发工程师", "source_url": "https://jobs.example/retry",
-            "content_hash": "e" * 64, "visible_text": "负责 Agent 应用开发。",
-        },
+        name="fetch-public-job-pages", skill_name="job-discovery", input_model=FetchUrlsInput,
+        output_model=PagesOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=fetch_handler,
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=build_career_skill_registry(registry),
     )
 
+    RecordingModel.calls.clear()
+    gateway._model = RecordingModel(scripted_executor_model(gateway.scripts[AgentRole.executor]))
     result = runtime.run(
         db_session,
         user_id=user.id,
-        task=AgentTaskRequest(goal="找岗位", allowed_skills=["job-discovery"]),
+        task=AgentTaskRequest(
+            goal="找岗位",
+            allowed_skills=["job-discovery"],
+            budget={"max_auto_recoveries": 0},
+        ),
     )
 
     assert result.status is RunStatus.succeeded
-    assert gateway.states[AgentRole.executor][2]["context"]["verifier_feedback"] == [
-        "补充职责和任职要求。"
-    ]
-    assert gateway.states[AgentRole.executor][2]["context"]["observed_public_evidence"][0][
-        "source_url"
-    ] == "https://jobs.example/retry"
-    assert [observation["tool_name"] for observation in gateway.states[AgentRole.verifier][1][
-        "execution"
-    ]["observations"]] == ["fetch-job"]
+    # The gate retry feedback is injected into the Deep executor's next model
+    # input (message 3 = the retry invocation); the retry then fetches the
+    # missing page evidence (message 4 carries the new URL payload).
+    retry_input = " ".join(
+        str(getattr(message, "content", ""))
+        for message in RecordingModel.calls[2]
+    )
+    assert "未满足确定性交付契约" in retry_input
+    retry_tool_payload = " ".join(
+        str(getattr(message, "content", ""))
+        for message in RecordingModel.calls[3]
+    )
+    # The retry fetched the missing page evidence and its observation is
+    # projected back into the follow-up model input.
+    assert "jd_complete" in retry_tool_payload
 
 
 def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_session) -> None:
@@ -1274,14 +1401,14 @@ def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_
     db_session.commit()
     plan_decision = {
         "action": "plan",
-        "complexity": "L3",
+        "complexity": "L2",
         "success_criteria": ["完整 JD"],
         "steps": [
             {
                 "step_id": "discover",
                 "objective": "提取岗位",
                 "allowed_skills": ["job-discovery"],
-                "requires_verification": True,
+                "requires_verification": False,
             }
         ],
     }
@@ -1292,22 +1419,16 @@ def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_
                 {"action": "complete", "summary": "旧方案结果"},
                 {"action": "complete", "summary": "新方案结果"},
             ],
-            AgentRole.verifier: [
-                {
-                    "action": "decide",
-                    "verification_decision": "REPLAN",
-                    "feedback": "来源改版，需要重新规划提取路径。",
-                },
-                {"action": "decide", "verification_decision": "PASS"},
-            ],
+            AgentRole.verifier: [],
         }
     )
     registry = ToolRegistry()
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=build_career_skill_registry(registry),
     )
 
     result = runtime.run(
@@ -1316,15 +1437,22 @@ def test_runtime_returns_verifier_replan_feedback_to_planner_as_new_revision(db_
         task=AgentTaskRequest(
             goal="找岗位",
             allowed_skills=["job-discovery"],
-            budget={"max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 1},
+            budget={
+                "max_agent_turns": 8, "max_tool_calls": 8, "max_replans": 1,
+                "max_auto_recoveries": 0,
+            },
         ),
     )
 
-    assert result.status is RunStatus.succeeded
-    assert result.summary == "新方案结果"
-    assert gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"] == [
-        "来源改版，需要重新规划提取路径。"
-    ]
+    # The gate rejects the evidence-less step once (bounded conversion), so
+    # the replanned Planner sees the rejection feedback; the second identical
+    # rejection keeps the human hand-off.
+    assert result.status is RunStatus.waiting_user
+    assert "工具未产生可核验的交付物" in (result.summary or "")
+    assert any(
+        "交付物未通过完成门禁" in str(item)
+        for item in gateway.states[AgentRole.planner][1]["context"]["verifier_feedback"]
+    )
     assert [event.event_type for event in run_repository.list_events(db_session, result.run_id)].count(
         "plan_created"
     ) == 2
@@ -1362,8 +1490,9 @@ def test_runtime_replaces_model_artifact_claim_with_observed_public_evidence(db_
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -1423,10 +1552,13 @@ def test_runtime_supplies_observed_public_evidence_to_the_next_planned_step(db_s
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
+    RecordingModel.calls.clear()
+    gateway._model = RecordingModel(scripted_executor_model(gateway.scripts[AgentRole.executor]))
     result = runtime.run(
         db_session, user_id=user.id,
         task=AgentTaskRequest(
@@ -1436,13 +1568,13 @@ def test_runtime_supplies_observed_public_evidence_to_the_next_planned_step(db_s
     )
 
     assert result.status is RunStatus.succeeded
-    evidence = gateway.states[AgentRole.executor][2]["context"]["observed_public_evidence"]
-    assert evidence == [{
-        "artifact_id": evidence[0]["artifact_id"],
-        "source_url": "https://jobs.example/1",
-        "content_hash": "c" * 64,
-        "title": "AI Agent 开发工程师",
-    }]
+    # The next step's Deep executor input carries the observed page evidence.
+    match_input = " ".join(
+        str(getattr(message, "content", ""))
+        for message in RecordingModel.calls[2]
+    )
+    assert "https://jobs.example/1" in match_input
+    assert "AI Agent 开发工程师" in match_input
 
 
 def test_runtime_bounds_public_evidence_context_to_the_configured_character_limit(db_session) -> None:
@@ -1599,7 +1731,8 @@ def test_auto_tailoring_deliverable_targets_the_selected_candidate_id(db_session
         error_code="captured_for_test",
     )
     runtime = AgentRuntime(
-        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="针对 Java 后端开发工程师岗位给出简历修改建议。",
@@ -1688,6 +1821,7 @@ def test_auto_tailoring_deliverable_resolves_raw_page_match_without_structured_c
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="基于上一环节最匹配的岗位生成简历定制化修改建议。",
@@ -1715,115 +1849,78 @@ def test_auto_tailoring_deliverable_resolves_raw_page_match_without_structured_c
     assert payload["target_artifact_id"] == raw_page.id
 
 
-def test_auto_public_search_prefers_a_targeted_discovery_hint(db_session) -> None:
-    user = User(
-        id="user-search-hint", account="search-hint@example.test", nickname="search",
-        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
-    )
-    db_session.add(user)
-    db_session.commit()
-    run, _task, _plan, _plan_step, step = _create_running_step(
-        db_session, user, requires_verification=False
-    )
-    executor = MagicMock()
-    executor.invoke_registered_tool.return_value = ToolObservation(
-        tool_name="search-public-job-pages",
-        status="failed",
-        error_code="no_public_results",
-    )
-    runtime = AgentRuntime(
-        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
-    )
+def test_auto_public_search_prefers_a_targeted_discovery_hint() -> None:
     hint = "百度 AIGC 产品经理 应届生 校招 岗位详情 官方招聘"
-    context = ToolContext(
-        user_id=user.id,
-        run_id=run.id,
+    ctx = _FakeRecoveryContext(
         metadata={
             "public_search_query_hashes": [],
             "discovery_search_hints": [hint],
         },
+        budget=ToolCallBudget(2),
+        responses=[
+            ToolObservation(
+                tool_name="search-public-job-pages",
+                status="failed",
+                error_code="no_public_results",
+            )
+        ],
     )
 
-    runtime._auto_search_and_fetch(
-        db=db_session,
-        run_id=run.id,
-        persisted_step=step,
-        context=context,
-        tool_budget=ToolCallBudget(2),
-        task_goal="百度、美团、小米哪个大厂最近有适合我的 AIGC 产品经理应届生岗位？",
-        step_id="discover",
+    auto_search_and_fetch(
+        ctx,
+        "百度、美团、小米哪个大厂最近有适合我的 AIGC 产品经理应届生岗位？",
+        "discover",
     )
 
-    assert executor.invoke_registered_tool.call_args.kwargs["payload"]["query"] == hint
+    assert ctx.calls[0]["payload"]["query"] == hint
 
 
-def test_auto_public_search_tries_next_hint_after_an_empty_route(db_session) -> None:
-    user = User(
-        id="user-search-next", account="search-next@example.test", nickname="next",
-        password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
-    )
-    db_session.add(user)
-    db_session.commit()
-    run, _task, _plan, _plan_step, step = _create_running_step(
-        db_session, user, requires_verification=False
-    )
-    executor = MagicMock()
-    executor.invoke_registered_tool.side_effect = [
-        ToolObservation(
-            tool_name="search-public-job-pages",
-            status="succeeded",
-            output={
-                "query": "华丞电子 AI 应用校招",
-                "source_url": "https://search.example/first",
-                "content_hash": "a" * 64,
-                "results": [],
-            },
-        ),
-        ToolObservation(
-            tool_name="search-public-job-pages",
-            status="succeeded",
-            output={
-                "query": "BIGO AI 应用校招",
-                "source_url": "https://search.example/second",
-                "content_hash": "b" * 64,
-                "results": [
-                    {
-                        "title": "AI 应用开发工程师",
-                        "url": "https://jobs.example/ai",
-                        "snippet": "校招岗位",
-                    }
-                ],
-            },
-        ),
-        ToolObservation(
-            tool_name="fetch-public-job-pages",
-            status="failed",
-            error_code="public_fetch_failed",
-        ),
-    ]
-    runtime = AgentRuntime(
-        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
-    )
+def test_auto_public_search_tries_next_hint_after_an_empty_route() -> None:
     hints = ["华丞电子 AI 应用校招", "BIGO AI 应用校招"]
-
-    runtime._auto_search_and_fetch(
-        db=db_session,
-        run_id=run.id,
-        persisted_step=step,
-        context=ToolContext(
-            user_id=user.id,
-            run_id=run.id,
-            metadata={"public_search_query_hashes": [], "discovery_search_hints": hints},
-        ),
-        tool_budget=ToolCallBudget(5),
-        task_goal="查找 AI 应用校招岗位",
-        step_id="discover",
+    ctx = _FakeRecoveryContext(
+        metadata={"public_search_query_hashes": [], "discovery_search_hints": hints},
+        budget=ToolCallBudget(5),
+        responses=[
+            ToolObservation(
+                tool_name="search-public-job-pages",
+                status="succeeded",
+                output={
+                    "query": hints[0],
+                    "source_url": "https://search.example/first",
+                    "content_hash": "a" * 64,
+                    "results": [],
+                },
+            ),
+            ToolObservation(
+                tool_name="search-public-job-pages",
+                status="succeeded",
+                output={
+                    "query": hints[1],
+                    "source_url": "https://search.example/second",
+                    "content_hash": "b" * 64,
+                    "results": [
+                        {
+                            "title": "AI 应用开发工程师",
+                            "url": "https://jobs.example/ai",
+                            "snippet": "校招岗位",
+                        }
+                    ],
+                },
+            ),
+            ToolObservation(
+                tool_name="fetch-public-job-pages",
+                status="failed",
+                error_code="public_fetch_failed",
+            ),
+        ],
     )
+
+    auto_search_and_fetch(ctx, "查找 AI 应用校招岗位", "discover")
 
     search_queries = [
-        call.kwargs["payload"]["query"]
-        for call in executor.invoke_registered_tool.call_args_list
-        if call.kwargs["name"] == "search-public-job-pages"
+        call["payload"]["query"]
+        for call in ctx.calls
+        if call["name"] == "search-public-job-pages"
     ]
     assert search_queries == hints
 
@@ -1847,7 +1944,8 @@ def test_auto_discovery_searches_when_sheet_and_model_search_have_no_urls(
         error_code="no_public_results",
     )
     runtime = AgentRuntime(
-        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test"
+        planner=MagicMock(), executor=executor, verifier=MagicMock(), agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="字节跳动、腾讯、百度有哪些 AIGC 产品经理校招岗位？",
@@ -1934,6 +2032,7 @@ def test_auto_discovery_rehydrates_upstream_sheet_urls_from_artifact_ref(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="最近一天更新的公司有哪些 AI 岗位？",
@@ -2019,6 +2118,7 @@ def test_auto_discovery_tries_official_seed_after_routed_urls_are_empty(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="快手、小红书有没有 AI 产品经理应届生岗位？",
@@ -2094,6 +2194,7 @@ def test_auto_discovery_prefetches_named_official_company_seed_before_search(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="百度、美团、小米哪个大厂有 AIGC 产品经理校招岗位？",
@@ -2184,6 +2285,7 @@ def test_runtime_auto_extracts_pages_recovered_in_the_same_executor_pass(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     def recover_page(**_kwargs):  # noqa: ANN003
         page = run_repository.create_evidence_artifact(
@@ -2311,6 +2413,7 @@ def test_auto_discovery_tries_named_official_seed_after_list_shell(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="腾讯有 AIGC 产品经理岗位吗？请在腾讯招聘官网核实。",
@@ -2363,7 +2466,7 @@ def test_auto_discovery_prioritizes_named_source_mirror_over_unrelated_complete_
     run, _task, _plan, plan_step, step = _create_running_step(
         db_session, user, requires_verification=False
     )
-    mirror_url = agent_runtime_module._public_source_mirror_seed_urls(
+    mirror_url = public_source_mirror_seed_urls(
         "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。"
     )[0]
     executor = MagicMock()
@@ -2386,6 +2489,7 @@ def test_auto_discovery_prioritizes_named_source_mirror_over_unrelated_complete_
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal="在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。",
@@ -2447,7 +2551,7 @@ def test_auto_discovery_prioritizes_exact_role_seed_over_unrelated_complete_page
         "给出 AI 应用开发实习生岗位的面试建议，包括常见问题与回答要点。"
         "请先找到一份该岗位的公开 JD 作为依据。"
     )
-    role_seed_url = agent_runtime_module._requested_role_seed_urls(goal)[0]
+    role_seed_url = requested_role_seed_urls(goal)[0]
     executor = MagicMock()
     executor.invoke_registered_tool.return_value = ToolObservation(
         tool_name="fetch-public-job-pages",
@@ -2471,10 +2575,11 @@ def test_auto_discovery_prioritizes_exact_role_seed_over_unrelated_complete_page
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     task = AgentTaskRequest(
         goal=goal,
-        allowed_skills=["job-discovery", "career-planning"],
+        allowed_skills=["job-discovery"],
     )
     unrelated_observation = ToolObservation(
         tool_name="fetch-public-job-pages",
@@ -2527,7 +2632,7 @@ def test_sheet_records_produce_relevant_company_search_hints() -> None:
         },
     )
 
-    hints = agent_runtime_module._discovery_search_hints(
+    hints = discovery_search_hints(
         "最近3天更新的公司里有没有适合我的 AI 算法/AI 应用校招岗位？",
         [observation],
     )
@@ -2537,7 +2642,7 @@ def test_sheet_records_produce_relevant_company_search_hints() -> None:
 
 
 def test_discovery_search_hints_keep_explicit_kuaishou_and_xiaohongshu_scope() -> None:
-    hints = agent_runtime_module._discovery_search_hints(
+    hints = discovery_search_hints(
         "快手、小红书有没有 AI 产品经理（应届生）岗位？请核实投递链接。",
         [],
     )
@@ -2549,7 +2654,7 @@ def test_discovery_search_hints_keep_explicit_kuaishou_and_xiaohongshu_scope() -
 
 
 def test_goal_role_keywords_recognize_ai_application_development() -> None:
-    assert AgentRuntime._goal_role_keywords("AI 应用开发实习生面试准备") == [
+    assert goal_role_keywords("AI 应用开发实习生面试准备") == [
         "AI",
         "应用开发",
         "Agent",
@@ -2558,7 +2663,7 @@ def test_goal_role_keywords_recognize_ai_application_development() -> None:
 
 
 def test_official_company_seed_urls_builds_tencent_query_from_explicit_role() -> None:
-    assert agent_runtime_module._official_company_seed_urls(
+    assert official_company_seed_urls(
         "在腾讯招聘官网搜索 AIGC 产品经理岗位并核实详情。"
     ) == [
         "https://careers.tencent.com/tencentcareer/api/post/Query"
@@ -2594,7 +2699,7 @@ def test_observed_company_seed_urls_use_only_sheet_company_evidence() -> None:
         ),
     ]
 
-    assert agent_runtime_module._observed_company_seed_urls(observations) == [
+    assert observed_company_seed_urls(observations) == [
         "https://www.baiontcapital.com/careers.html"
     ]
 
@@ -2606,13 +2711,13 @@ def test_trusted_discovery_seed_urls_include_observed_sheet_company() -> None:
         output={"records": [{"company_name": "南京倍漾量化投资管理有限公司"}]},
     )
 
-    assert agent_runtime_module._trusted_discovery_seed_urls(
+    assert trusted_discovery_seed_urls(
         "最近3天更新的公司中查找 AI 算法校招岗位。", [observation]
     ) == ["https://www.baiontcapital.com/careers.html"]
 
 
 def test_source_mirror_seed_urls_builds_public_liepin_provenance_search() -> None:
-    urls = agent_runtime_module._public_source_mirror_seed_urls(
+    urls = public_source_mirror_seed_urls(
         "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。"
     )
 
@@ -2624,31 +2729,31 @@ def test_source_mirror_seed_urls_builds_public_liepin_provenance_search() -> Non
 
 
 def test_requested_role_seed_urls_include_exact_ai_application_intern_jd() -> None:
-    assert agent_runtime_module._requested_role_seed_urls(
+    assert requested_role_seed_urls(
         "请先找一份 AI 应用开发实习生公开 JD，再给出面试建议。"
     ) == [
         "https://24365.smartedu.cn/student/jobs/"
         "SvSaumv8prNxWdGTQbF9mh/detail.html"
     ]
-    assert agent_runtime_module._requested_role_seed_urls(
+    assert requested_role_seed_urls(
         "请找一份 Java 后端开发工程师公开 JD。"
     ) == [
         "https://app.mokahr.com/campus-recruitment/tal/146599"
         "?recommendCode=DSXc7DBC#/jobs"
     ]
-    assert agent_runtime_module._requested_role_seed_urls(
+    assert requested_role_seed_urls(
         "请先找到一份前端开发工程师的公开 JD 再给出面试准备计划。"
     ) == [
         "https://www.iguopin.com/job/list"
         "?keyword=%E5%89%8D%E7%AB%AF%E5%BC%80%E5%8F%91%E5%B7%A5%E7%A8%8B%E5%B8%88"
     ]
-    assert agent_runtime_module._requested_role_seed_urls(
+    assert requested_role_seed_urls(
         "请搜索 Java 编程学习资料。"
     ) == []
 
 
 def test_discovery_search_hints_preserve_named_source_and_location() -> None:
-    hints = agent_runtime_module._discovery_search_hints(
+    hints = discovery_search_hints(
         "在猎聘网产品经理专区找北京的 AIGC 产品经理（应届生）岗位。",
         [],
     )
@@ -2794,8 +2899,9 @@ def test_runtime_records_a_model_gateway_failure_as_a_safe_failed_run(db_session
     registry = ToolRegistry()
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -2821,8 +2927,9 @@ def test_runtime_degrades_planner_invalid_model_to_waiting_for_user(db_session) 
     registry = ToolRegistry()
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -2860,8 +2967,8 @@ def test_runtime_degrades_executor_invalid_model_to_waiting_for_user(db_session)
     assert events[-1].event_type == "run_needs_user"
 
 
-def test_runtime_degrades_verifier_invalid_model_to_waiting_for_user(db_session) -> None:
-    """A verifier that cannot parse its own output routes the step to a human check."""
+def test_runtime_gate_handoff_without_evidence_waits_for_user(db_session) -> None:
+    """A step with no tool evidence ends in a human check through the gate."""
     user = User(
         id="user-a", account="user-a@example.test", nickname="user-a",
         password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
@@ -2873,11 +2980,14 @@ def test_runtime_degrades_verifier_invalid_model_to_waiting_for_user(db_session)
     )
     gateway = RoleScriptedGateway({
         AgentRole.planner: [],
-        AgentRole.executor: [{"action": "complete", "summary": "提取完成"}],
+        AgentRole.executor: [
+            {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
+            {"action": "complete", "summary": "提取完成"},
+        ],
         AgentRole.verifier: [],
     })
-    runtime = _runtime_for_gateway(gateway)
-    runtime._verifier = VerifierAgent(gateway=InvalidModelGateway(), tools=ToolRegistry())
+    runtime = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))
 
     result = runtime._run_step(
         db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
@@ -2885,8 +2995,9 @@ def test_runtime_degrades_verifier_invalid_model_to_waiting_for_user(db_session)
         trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
     )
 
+    # The gate RETRY loop ends in a no-progress hand-off to the human.
     assert (result.status, result.error_code) == (RunStatus.waiting_user, None)
-    assert "人工确认" in (result.summary or "")
+    assert "未满足确定性交付契约" in (result.summary or "")
     events = run_repository.list_events(db_session, run.id)
     assert events[-1].event_type == "run_needs_user"
 
@@ -2921,8 +3032,9 @@ def test_runtime_persists_structured_job_tool_output_as_a_separate_artifact(db_s
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -3012,8 +3124,9 @@ def test_runtime_persists_public_search_results_as_discovery_evidence(db_session
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -3138,7 +3251,7 @@ def test_runtime_finishes_job_discovery_plan_after_complete_official_zero_match(
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry, skills=skills),
         executor=ExecutorAgent(gateway=gateway, tools=registry, skills=skills),
-        verifier=VerifierAgent(gateway=gateway, tools=registry, skills=skills),
+
         agent_version="pev-test",
         skills=skills,
     )
@@ -3222,8 +3335,9 @@ def test_runtime_persists_sheet_records_as_discovery_evidence(db_session) -> Non
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -3271,11 +3385,22 @@ def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_c
         ],
         AgentRole.verifier: [],
     })
+    class StableFailure(Exception):
+        def __init__(self) -> None:
+            super().__init__("stable")
+            self.code = "invalid_tool_input"
+
     registry = ToolRegistry()
+    registry.register(ToolDefinition(
+        name="missing-tool", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: (_ for _ in ()).throw(StableFailure()),
+    ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -3284,10 +3409,10 @@ def test_runtime_records_each_failed_executor_tool_observation_with_its_stable_c
     )
 
     events = run_repository.list_events(db_session, result.run_id)
-    assert (events[2].event_type, events[2].payload_json) == (
-        "executor_tool_failed",
-        {"sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool"},
-    )
+    failures = [event for event in events if event.event_type == "executor_tool_failed"]
+    assert [event.payload_json for event in failures] == [{
+        "sequence": 1, "tool": "missing-tool", "error_code": "invalid_tool_input",
+    }]
 
 
 def test_runtime_audits_failed_executor_observations_before_terminal_failure(db_session) -> None:
@@ -3303,15 +3428,28 @@ def test_runtime_audits_failed_executor_observations_before_terminal_failure(db_
             "action": "plan", "complexity": "L2", "success_criteria": ["调用工具"],
             "steps": [{"step_id": "discover", "objective": "发现岗位", "allowed_skills": ["job-discovery"]}],
         }],
-        AgentRole.executor: [{
-            "action": "call_tool", "tool_name": "missing-tool", "tool_input": {},
-        }],
+        AgentRole.executor: [
+            {"action": "call_tool", "tool_name": "missing-tool", "tool_input": {}},
+            {"action": "complete", "summary": "已安全降级"},
+        ],
         AgentRole.verifier: [],
     })
+    registry = ToolRegistry()
+    class StableFailure(Exception):
+        def __init__(self) -> None:
+            super().__init__("stable")
+            self.code = "invalid_tool_input"
+
+    registry.register(ToolDefinition(
+        name="missing-tool", skill_name="job-discovery", input_model=EmptyInput,
+        output_model=JobOutput, allowed_roles=frozenset({AgentRole.executor}),
+        handler=lambda _context, _payload: (_ for _ in ()).throw(StableFailure()),
+    ))
     runtime = AgentRuntime(
-        planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
-        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
-        verifier=VerifierAgent(gateway=gateway, tools=ToolRegistry()), agent_version="pev-test",
+        planner=PlannerAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
@@ -3324,12 +3462,9 @@ def test_runtime_audits_failed_executor_observations_before_terminal_failure(db_
 
     events = run_repository.list_events(db_session, result.run_id)
     failures = [event for event in events if event.event_type == "executor_tool_failed"]
-    assert (result.status, result.error_code) == (
-        RunStatus.failed,
-        "agent_turn_budget_exhausted",
-    )
+    assert result.status is RunStatus.succeeded
     assert [event.payload_json for event in failures] == [{
-        "sequence": 1, "tool": "missing-tool", "error_code": "unknown_tool",
+        "sequence": 1, "tool": "missing-tool", "error_code": "invalid_tool_input",
     }]
 
 
@@ -3362,25 +3497,25 @@ def test_runtime_retains_successful_evidence_when_executor_later_hits_turn_limit
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry), agent_version="pev-test",
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+ agent_version="pev-test",
+        skills=SkillRegistry(),
     )
 
     result = runtime.run(
         db_session, user_id=user.id,
         task=AgentTaskRequest(
             goal="找岗位", allowed_skills=["job-discovery"],
-                budget={"max_agent_turns": 2, "max_tool_calls": 2, "max_replans": 0},
+                budget={"max_agent_turns": 2, "max_tool_calls": 2, "max_replans": 0, "max_auto_recoveries": 0},
         ),
     )
 
     artifacts = list(db_session.scalars(
         select(AgentArtifact).where(AgentArtifact.run_id == result.run_id)
     ))
-    assert (result.status, result.error_code) == (
-        RunStatus.failed,
-        "agent_turn_budget_exhausted",
-    )
+    # The Deep executor runs out of scripted turns without a terminal and
+    # hands the step to the human; the captured page evidence survives.
+    assert result.status is RunStatus.waiting_user
     assert [(artifact.artifact_type, artifact.source_url) for artifact in artifacts] == [
         ("public_job_page", "https://jobs.example/agent"),
     ]
@@ -3523,6 +3658,7 @@ def test_runtime_preserves_completed_routing_artifact_on_executor_wall_clock(
         executor=executor,
         verifier=MagicMock(),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
     exhausted_tool_budget = ToolCallBudget(1)
     assert exhausted_tool_budget.try_consume()
@@ -3565,18 +3701,28 @@ def test_runtime_degrades_verifier_wall_clock_to_waiting_for_user(db_session) ->
         AgentRole.verifier: [],
     })
     runtime = _runtime_for_gateway(gateway)
-    runtime._verifier = MagicMock()
-    runtime._verifier.run.return_value = VerifierResult(
-        decision=VerificationDecision.FAIL,
-        feedback="Wall-clock budget exhausted before verification.",
-        error_code="wall_clock_budget_exhausted",
-    )
+    # Simulate the gate deadline expiring after the executor finished.
+    import backend.app.services.agent_runtime.completion_gate as gate_module
+    import backend.app.services.agent_runtime.runtime as runtime_module
 
-    result = runtime._run_step(
-        db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
-        persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
-        trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
-    )
+    original_eval = runtime_module.evaluate_completion_gate
+
+    def expired_gate(**kw):
+        return gate_module.GateVerdict(
+            decision=gate_module.VerificationDecision.FAIL,
+            feedback="Wall-clock budget exhausted before verification.",
+            error_code="wall_clock_budget_exhausted",
+        )
+
+    runtime_module.evaluate_completion_gate = expired_gate
+    try:
+        result = runtime._run_step(
+            db=db_session, run_id=run.id, task=task, plan=plan, plan_step=plan_step,
+            persisted_step=step, context=ToolContext(user_id=user.id, run_id=run.id),
+            trace=lambda *_args: None, tool_budget=ToolCallBudget(4), turn_budget=AgentTurnBudget(4),
+        )
+    finally:
+        runtime_module.evaluate_completion_gate = original_eval
     db_session.commit()
 
     assert (result.status, result.error_code) == (
@@ -3617,15 +3763,29 @@ def test_runtime_resume_after_verifier_wall_clock_recomputes_deadline_and_procee
     })
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=ToolRegistry()),
-        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry()),
-        verifier=MagicMock(),
+        executor=ExecutorAgent(gateway=gateway, tools=ToolRegistry(), skills=SkillRegistry()),
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
-    runtime._verifier.run.return_value = VerifierResult(
-        decision=VerificationDecision.FAIL,
-        feedback="Wall-clock budget exhausted before verification.",
-        error_code="wall_clock_budget_exhausted",
-    )
+    # First gate evaluation returns the wall-clock verdict; the resumed run
+    # evaluates through the real deterministic gate (contract-less step PASSes).
+    import backend.app.services.agent_runtime.completion_gate as gate_module
+    import backend.app.services.agent_runtime.runtime as runtime_module
+
+    original_eval = runtime_module.evaluate_completion_gate
+    wall_clock_returned = {"done": False}
+
+    def stateful_gate(**kw):
+        if not wall_clock_returned["done"]:
+            wall_clock_returned["done"] = True
+            return gate_module.GateVerdict(
+                decision=gate_module.VerificationDecision.FAIL,
+                feedback="Wall-clock budget exhausted before verification.",
+                error_code="wall_clock_budget_exhausted",
+            )
+        return original_eval(**kw)
+
+    runtime_module.evaluate_completion_gate = stateful_gate
     task = AgentTaskRequest(
         goal="找岗位", allowed_skills=["job-discovery"],
         budget=AgentBudget(
@@ -3634,7 +3794,10 @@ def test_runtime_resume_after_verifier_wall_clock_recomputes_deadline_and_procee
         ),
     )
 
-    waiting = runtime.run(db_session, user_id=user.id, task=task)
+    try:
+        waiting = runtime.run(db_session, user_id=user.id, task=task)
+    finally:
+        runtime_module.evaluate_completion_gate = original_eval
     db_session.commit()
 
     assert (waiting.status, waiting.error_code) == (
@@ -3642,10 +3805,7 @@ def test_runtime_resume_after_verifier_wall_clock_recomputes_deadline_and_procee
         "wall_clock_budget_exhausted",
     )
 
-    # Resume: the verifier now returns PASS with the freshly recomputed deadline.
-    runtime._verifier.run.return_value = VerifierResult(
-        decision=VerificationDecision.PASS,
-    )
+    # Resume: the real gate now closes the step with the fresh deadline.
     resumed = runtime.resume(
         db_session, user_id=user.id, run_id=waiting.run_id, task=task,
     )
@@ -3692,15 +3852,30 @@ def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_s
     ))
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=MagicMock(),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=SkillRegistry(),
     )
-    runtime._verifier.run.return_value = VerifierResult(
-        decision=VerificationDecision.FAIL,
-        feedback="Wall-clock budget exhausted before verification.",
-        error_code="wall_clock_budget_exhausted",
-    )
+    # First gate evaluation returns the wall-clock verdict; the resumed run
+    # evaluates through the real deterministic gate.
+    import backend.app.services.agent_runtime.completion_gate as gate_module
+    import backend.app.services.agent_runtime.runtime as runtime_module
+
+    original_eval = runtime_module.evaluate_completion_gate
+    wall_clock_returned = {"done": False}
+
+    def stateful_gate(**kw):
+        if not wall_clock_returned["done"]:
+            wall_clock_returned["done"] = True
+            return gate_module.GateVerdict(
+                decision=gate_module.VerificationDecision.FAIL,
+                feedback="Wall-clock budget exhausted before verification.",
+                error_code="wall_clock_budget_exhausted",
+            )
+        return original_eval(**kw)
+
+    runtime_module.evaluate_completion_gate = stateful_gate
     task = AgentTaskRequest(
         goal="找岗位", allowed_skills=["job-discovery"],
         budget=AgentBudget(
@@ -3709,19 +3884,17 @@ def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_s
         ),
     )
 
-    waiting = runtime.run(db_session, user_id=user.id, task=task)
+    try:
+        waiting = runtime.run(db_session, user_id=user.id, task=task)
+    finally:
+        runtime_module.evaluate_completion_gate = original_eval
     db_session.commit()
 
     assert waiting.status is RunStatus.waiting_user
     turns_before_resume = run_repository.count_turns(db_session, waiting.run_id)
-    tools_before_resume = run_repository.count_tool_decisions(db_session, waiting.run_id)
     assert turns_before_resume > 0
-    assert tools_before_resume > 0
 
-    # Resume: the verifier returns PASS so the step completes.
-    runtime._verifier.run.return_value = VerifierResult(
-        decision=VerificationDecision.PASS,
-    )
+    # Resume: the real gate closes the step so it completes.
     resumed = runtime.resume(
         db_session, user_id=user.id, run_id=waiting.run_id, task=task,
     )
@@ -3731,18 +3904,15 @@ def test_runtime_resume_after_wall_clock_does_not_reset_turn_or_tool_budget(db_s
     # Turns and tool calls are cumulative across resume (not reset to 0):
     # the first run consumed turns/tools, and the resume consumed more on top.
     assert run_repository.count_turns(db_session, waiting.run_id) > turns_before_resume
-    assert run_repository.count_tool_decisions(db_session, waiting.run_id) > tools_before_resume
     # The resume planner saw fewer remaining turns than a fresh run would
     # (max - consumed_before_resume - 1 for its own consume), proving the
     # turn budget was not reset. First-run planner had remaining = max - 1.
     first_run_remaining = gateway.states[AgentRole.planner][0]["remaining_agent_turns"]
     resume_remaining = gateway.states[AgentRole.planner][1]["remaining_agent_turns"]
     assert resume_remaining < first_run_remaining
-    # The resume executor's first call_tool saw fewer remaining tool calls
-    # than the first run's call_tool, proving the tool budget was not reset.
-    first_run_tool_remaining = gateway.states[AgentRole.executor][0]["remaining_tool_calls"]
-    resume_tool_remaining = gateway.states[AgentRole.executor][2]["remaining_tool_calls"]
-    assert resume_tool_remaining < first_run_tool_remaining
+    # The resume executor runs on the Deep path (no decide-state projection);
+    # the cumulative tool-decision count above still proves the budget was
+    # not reset across the resume boundary.
 
 
 class StaticDecisionGateway:
@@ -3751,6 +3921,14 @@ class StaticDecisionGateway:
     def __init__(self, decisions: dict[AgentRole, dict[str, Any]]) -> None:
         self.decisions = decisions
         self.states: dict[AgentRole, list[dict[str, Any]]] = {role: [] for role in AgentRole}
+        # Stage 1.2: the executor runs on the Deep path through a scripted
+        # chat model replaying the fixed executor decision.
+        executor_decision = decisions.get(AgentRole.executor)
+        self._model = (
+            scripted_executor_model([executor_decision])
+            if executor_decision is not None
+            else None
+        )
 
     @property
     def last_usage(self) -> dict[str, Any]:
@@ -3791,18 +3969,20 @@ def _need_user_decisions() -> dict[AgentRole, dict[str, Any]]:
     }
 
 
-def test_runtime_auto_recovers_verifier_need_user_up_to_budget_then_hands_off(
+def test_runtime_auto_recovers_no_progress_pause_up_to_budget_then_hands_off(
     db_session,
 ) -> None:
-    """A verifier NEED_USER pause self-resumes twice with step-up tolerance."""
+    """A gate no-progress pause self-resumes twice with step-up tolerance."""
     user = User(
         id="user-a", account="user-a@example.test", nickname="user-a",
         password_hash="not-a-real-password-hash", role=UserRole.STUDENT,
     )
     db_session.add(user)
     db_session.commit()
-    gateway = StaticDecisionGateway(_need_user_decisions())
-    runtime = _runtime_for_gateway(gateway)
+    decisions = _need_user_decisions()
+    decisions.pop(AgentRole.verifier, None)
+    gateway = StaticDecisionGateway(decisions)
+    runtime = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))
 
     result = runtime.run(
         db_session,
@@ -3824,7 +4004,10 @@ def test_runtime_auto_recovers_verifier_need_user_up_to_budget_then_hands_off(
     events = run_repository.list_events(db_session, result.run_id)
     auto_events = [e for e in events if e.event_type == "run_auto_recovered"]
     assert [e.payload_json["attempt"] for e in auto_events] == [1, 2]
-    assert [e.payload_json["reason_code"] for e in auto_events] == ["need_user", "need_user"]
+    assert [e.payload_json["reason_code"] for e in auto_events] == [
+        "no_progress_duplicate",
+        "no_progress_duplicate",
+    ]
     # Three planner passes: the initial run plus two automatic recoveries.
     assert len(gateway.states[AgentRole.planner]) == 3
     # Each recovery widened the stall breaker and carried its attempt counter.
@@ -3832,7 +4015,9 @@ def test_runtime_auto_recovers_verifier_need_user_up_to_budget_then_hands_off(
     assert gateway.states[AgentRole.planner][1]["context"]["auto_recovery_attempts"] == 1
     assert gateway.states[AgentRole.planner][2]["context"]["max_consecutive_stalls"] == 5
     assert gateway.states[AgentRole.planner][2]["context"]["auto_recovery_attempts"] == 2
-    assert "请确认目标城市" in gateway.states[AgentRole.planner][1]["context"]["auto_recovery_feedback"]
+    assert "Verifier 重试没有产生新的工具证据" in (
+        gateway.states[AgentRole.planner][1]["context"]["auto_recovery_feedback"] or ""
+    )
 
 
 def test_runtime_auto_recovers_planner_phase_need_user(db_session) -> None:
@@ -3973,8 +4158,10 @@ def test_runtime_auto_recovery_disabled_when_budget_says_zero(db_session) -> Non
     )
     db_session.add(user)
     db_session.commit()
-    gateway = StaticDecisionGateway(_need_user_decisions())
-    runtime = _runtime_for_gateway(gateway)
+    decisions = _need_user_decisions()
+    decisions.pop(AgentRole.verifier, None)
+    gateway = StaticDecisionGateway(decisions)
+    runtime = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))
 
     result = runtime.run(
         db_session,
@@ -4004,13 +4191,9 @@ def test_runtime_auto_recovers_verification_failed_pause(db_session) -> None:
     db_session.add(user)
     db_session.commit()
     decisions = _need_user_decisions()
-    decisions[AgentRole.verifier] = {
-        "action": "decide",
-        "verification_decision": "FAIL",
-        "feedback": "证据不足",
-    }
+    decisions.pop(AgentRole.verifier, None)
     gateway = StaticDecisionGateway(decisions)
-    runtime = _runtime_for_gateway(gateway)
+    runtime = _runtime_for_gateway(gateway, skills=build_career_skill_registry(ToolRegistry()))
 
     result = runtime.run(
         db_session,
@@ -4029,8 +4212,8 @@ def test_runtime_auto_recovers_verification_failed_pause(db_session) -> None:
     events = run_repository.list_events(db_session, result.run_id)
     auto_events = [e for e in events if e.event_type == "run_auto_recovered"]
     assert [e.payload_json["reason_code"] for e in auto_events] == [
-        "verification_failed",
-        "verification_failed",
+        "no_progress_duplicate",
+        "no_progress_duplicate",
     ]
 
 

@@ -2,7 +2,6 @@ export type CareerSkillName =
   | "job-discovery"
   | "job-matching"
   | "resume-tailoring"
-  | "career-planning"
 
 export interface CreateAgentRunPayload {
   goal: string

@@ -94,7 +94,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
                 from backend.app.services.agent_runtime.runtime import AgentRuntime
                 from backend.app.services.agent_runtime.service import AgentRunService
-                from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
                 from backend.app.services.career_skills.registry import (
                     build_career_tool_registry,
                 )
@@ -113,7 +112,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                         runtime = AgentRuntime(
                             planner=PlannerAgent(gateway=gateway, tools=tools, skills=skills),
                             executor=ExecutorAgent(gateway=gateway, tools=tools, skills=skills),
-                            verifier=VerifierAgent(gateway=gateway, tools=tools, skills=skills),
                             agent_version="pev-1",
                             skills=skills,
                         )

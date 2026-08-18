@@ -61,7 +61,6 @@ from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.provider_config import load_project_env
 from backend.app.services.agent_runtime.runtime import AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
-from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 from backend.app.services.career_skills.registry import build_career_tool_registry
 from backend.app.services.career_skills.manifest import build_career_skill_registry
 from backend.app.services.profile_parser import extract_evidence_candidates
@@ -69,7 +68,7 @@ from tests.conftest import settings_override
 from tests.question.eval_policy import audit_success_record, failure_trace, root_cause
 
 QUESTION_DIR = pathlib.Path(__file__).resolve().parent
-ALL_SKILLS = ["job-discovery", "job-matching", "resume-tailoring", "career-planning"]
+ALL_SKILLS = ["job-discovery", "job-matching", "resume-tailoring"]
 DEFAULT_BUDGET = AgentBudget(
     max_agent_turns=36,
     # 32 -> 64: R002/R013 逐公司扫描在一次 deep-executor 调用内烧穿 32 次
@@ -312,7 +311,7 @@ def run_question(
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=tools, skills=skills),
         executor=ExecutorAgent(gateway=gateway, tools=tools, skills=skills),
-        verifier=VerifierAgent(gateway=gateway, tools=tools, skills=skills),
+
         agent_version="pev-eval",
         skills=skills,
     )

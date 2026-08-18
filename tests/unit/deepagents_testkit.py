@@ -19,7 +19,8 @@ responses) and:
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+import json
+from typing import Any, ClassVar, Sequence
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
@@ -56,3 +57,78 @@ class ScriptedModel(GenericFakeChatModel):
         self._i = (self._i + 1) % len(self._msgs)
         message = AIMessage(content=item) if isinstance(item, str) else item
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+def scripted_executor_model(script: list[dict]) -> ScriptedModel:
+    """Convert legacy decide-style executor scripts to Deep-path model responses.
+
+    Each 'call_tool' decision becomes an AIMessage tool call; each
+    'complete' / 'need_user' decision becomes a terminal JSON string the
+    Deep harness parses into its structured response channel. This lets the
+    pre-Stage-1.2 executor tests drive the production Deep loop without
+    re-authoring every script.
+    """
+    responses: list[Any] = []
+    for index, item in enumerate(script, 1):
+        action = item.get("action")
+        if action == "call_tool":
+            responses.append(
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": item["tool_name"],
+                            "args": item.get("tool_input") or {},
+                            "id": f"call-{index}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            )
+        elif action == "complete":
+            payload: dict[str, Any] = {
+                "status": "succeeded",
+                "summary": item.get("summary", ""),
+            }
+            if item.get("artifact_refs") is not None:
+                payload["artifact_refs"] = item["artifact_refs"]
+            responses.append(json.dumps(payload, ensure_ascii=False))
+        elif action == "need_user":
+            responses.append(
+                json.dumps(
+                    {
+                        "status": "needs_user",
+                        "summary": item.get("summary", ""),
+                        "user_question": item.get("user_question"),
+                        "artifact_refs": item.get("artifact_refs", []),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            raise ValueError(f"unsupported executor script action: {action}")
+    return ScriptedModel(responses)
+
+
+class RecordingModel(ScriptedModel):
+    """ScriptedModel that records every generation for assertion support."""
+
+    calls: ClassVar[list[list[Any]]] = []
+
+    def __init__(self, responses: list[Any]) -> None:
+        # Accept either a response list or the ScriptedModel produced by
+        # scripted_executor_model (iterating a model yields (name, value)
+        # pairs, not responses).
+        if isinstance(responses, ScriptedModel):
+            responses = list(responses._msgs)
+        super().__init__(responses)
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        type(self).calls.append(list(messages))
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class DeepGateway:
+    """Deterministic model boundary exposing a scripted chat model."""
+
+    def __init__(self, model: ScriptedModel) -> None:
+        self._model = model

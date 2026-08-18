@@ -27,7 +27,6 @@ const skills: Array<{ name: CareerSkillName; label: string; detail: string }> = 
   { name: "job-discovery", label: "岗位发现", detail: "抓取、提取与证据化 JD" },
   { name: "job-matching", label: "岗位匹配", detail: "基于已确认事实排序" },
   { name: "resume-tailoring", label: "简历定制", detail: "只给出有事实依据的修改" },
-  { name: "career-planning", label: "求职计划", detail: "给出面试与行动建议" },
 ]
 
 const goal = ref("")
@@ -51,15 +50,6 @@ interface ResumeDiffPreview {
   section: string
   fact_ref: string
   change_summary: string
-}
-
-interface PreparationPlanItemPreview {
-  topic: string
-  priority: string
-  time_budget_hours: number
-  due_date: string
-  completion_criteria: string
-  review_checkpoint: string
 }
 
 const canSubmit = computed(() => Boolean(
@@ -208,9 +198,9 @@ function eventLabel(event: AgentEventResponse): string {
     executor_structured_artifact: "Executor 已结构化 JD",
     executor_skill_artifact: "Executor 已生成求职工件",
     executor_tool_failed: "Executor 工具调用未成功",
-    verification_passed: "Verifier 已通过核验",
-    verification_retry_executor: "Verifier 请求补充执行",
-    verification_replan: "Verifier 请求重新规划",
+    verification_passed: "已完成确定性核验",
+    verification_retry_executor: "门禁请求补充执行",
+    verification_replan: "门禁请求重新规划",
     step_succeeded: "计划步骤完成",
     run_succeeded: "任务完成",
     run_failed: "任务未完成",
@@ -231,7 +221,6 @@ function artifactTitle(artifact: AgentArtifactResponse): string {
     job_search_results: "岗位搜索结果",
     job_matching_report: "岗位匹配报告",
     resume_tailoring_brief: "简历定制修改建议",
-    career_preparation_plan: "面试准备计划",
   }
   return titles[artifact.artifact_type] ?? "公开岗位页面"
 }
@@ -243,10 +232,6 @@ function artifactDetail(artifact: AgentArtifactResponse): string {
   if (Array.isArray(candidates)) return `已提取 ${candidates.length} 个结构化岗位条目。`
   const proposedDiffs = artifact.content.proposed_diffs
   if (Array.isArray(proposedDiffs)) return `已生成 ${proposedDiffs.length} 条可审核的简历修改操作。`
-  const planItems = artifact.content.plan_items
-  if (Array.isArray(planItems)) return `已生成 ${planItems.length} 项带优先级和复盘节点的准备计划。`
-  const topics = artifact.content.jd_topics
-  if (Array.isArray(topics)) return `围绕 JD 中的 ${topics.length} 个主题生成准备计划。`
   return "该工件没有可展示的文本摘要。"
 }
 
@@ -262,31 +247,6 @@ function resumeDiffs(artifact: AgentArtifactResponse): ResumeDiffPreview[] {
       || typeof diff.change_summary !== "string"
     ) return []
     return [{ section: diff.section, fact_ref: diff.fact_ref, change_summary: diff.change_summary }]
-  })
-}
-
-function preparationPlanItems(artifact: AgentArtifactResponse): PreparationPlanItemPreview[] {
-  const rawItems = artifact.content.plan_items
-  if (!Array.isArray(rawItems)) return []
-  return rawItems.flatMap((item) => {
-    if (!item || typeof item !== "object") return []
-    const planItem = item as Record<string, unknown>
-    if (
-      typeof planItem.topic !== "string"
-      || typeof planItem.priority !== "string"
-      || typeof planItem.time_budget_hours !== "number"
-      || typeof planItem.due_date !== "string"
-      || typeof planItem.completion_criteria !== "string"
-      || typeof planItem.review_checkpoint !== "string"
-    ) return []
-    return [{
-      topic: planItem.topic,
-      priority: planItem.priority,
-      time_budget_hours: planItem.time_budget_hours,
-      due_date: planItem.due_date,
-      completion_criteria: planItem.completion_criteria,
-      review_checkpoint: planItem.review_checkpoint,
-    }]
   })
 }
 
@@ -306,7 +266,7 @@ defineExpose({ selectRun, startEventStream, recoverActiveRun })
     <section class="masthead">
       <p class="kicker">PERSONAL CAREER DESK</p>
       <h1>把求职目标，变成一条可核验的行动路径。</h1>
-      <p class="masthead-copy">Planner 负责拆解，Executor 调用已授权的求职技能，Verifier 在复杂任务中检查来源和结果。</p>
+      <p class="masthead-copy">Planner 负责拆解，Executor 调用已授权的求职技能，确定性完成门禁检查来源和结果。</p>
     </section>
 
     <section class="task-composer" aria-labelledby="task-heading">
@@ -396,7 +356,7 @@ defineExpose({ selectRun, startEventStream, recoverActiveRun })
                   <ol>
                     <li v-for="step in plan.steps" :key="step.id">
                       <strong>{{ step.objective }}</strong>
-                      <small>{{ step.allowed_skills.join("、") }} · {{ step.requires_verification ? "需 Verifier 核验" : "确定性校验" }}</small>
+                      <small>{{ step.allowed_skills.join("、") }} · {{ step.requires_verification ? "需完成门禁核验" : "确定性校验" }}</small>
                     </li>
                   </ol>
                 </article>
@@ -423,13 +383,6 @@ defineExpose({ selectRun, startEventStream, recoverActiveRun })
                   <li v-for="(diff, index) in resumeDiffs(artifact)" :key="`${diff.fact_ref}-${index}`">
                     <strong>{{ diff.change_summary }}</strong>
                     <small>事实字段：{{ diff.fact_ref }} · 修改位置：{{ diff.section }}</small>
-                  </li>
-                </ul>
-                <ul v-if="preparationPlanItems(artifact).length" class="artifact-actions" aria-label="带复盘的准备计划">
-                  <li v-for="(item, index) in preparationPlanItems(artifact)" :key="`${item.topic}-${index}`">
-                    <strong>{{ item.priority }} · {{ item.topic }} · {{ item.time_budget_hours }} 小时 · 截止 {{ item.due_date }}</strong>
-                    <small>完成：{{ item.completion_criteria }}</small>
-                    <small>复盘：{{ item.review_checkpoint }}</small>
                   </li>
                 </ul>
                 <a :href="artifact.source_url" target="_blank" rel="noreferrer">查看来源证据 ↗</a>

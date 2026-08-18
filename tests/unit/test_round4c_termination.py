@@ -39,25 +39,29 @@ from backend.app.domain.agent_runtime import (
     RunStatus,
 )
 from backend.app.repositories import agent_runtime as run_repository
-from backend.app.services.agent_runtime.evidence_gate import is_blocked_error
-from backend.app.services.agent_runtime.executor_agent import (
-    ExecutorAgent,
-    _scope_feedback_to_step_catalog,
+from backend.app.services.career_skills.manifest import (
+    build_career_skill_registry,
+    career_error_policy,
 )
+from backend.app.services.agent_runtime.executor.execution_policy import (
+    scope_feedback_to_step_catalog,
+)
+from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.runtime import AgentRuntime
 from backend.app.services.agent_runtime.schemas import (
     AgentBudget,
     AgentTaskRequest,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
-from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
 from backend.app.services.career_skills.job_discovery import (
     FetchPublicJobPageInput,
     PublicJobFetchError,
     fetch_public_job_page,
 )
+from tests.unit.deepagents_testkit import scripted_executor_model
 
 class EmptyInput(BaseModel):
     pass
@@ -110,6 +114,17 @@ class RoleScriptedGateway:
             "input_tokens": 100,
             "output_tokens": 50,
         }
+        # Stage 1.2: the executor runs on the production Deep path, so the
+        # scripted executor decisions are exposed through a chat model for the
+        # Deep loop instead of the removed legacy decide() seam. Tests that
+        # never drive the executor (verifier-only or stub-executor flows)
+        # leave _model None, which the Deep executor reports as unavailable.
+        executor_script = scripts.get(AgentRole.executor) or []
+        self._model = (
+            scripted_executor_model(list(executor_script))
+            if executor_script
+            else None
+        )
 
     def decide(
         self,
@@ -161,9 +176,10 @@ def _plan_decision(allowed_skills: list[str]) -> dict[str, object]:
 def _runtime_for_gateway(gateway: object, registry: ToolRegistry) -> AgentRuntime:
     return AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=registry),
-        executor=ExecutorAgent(gateway=gateway, tools=registry),
-        verifier=VerifierAgent(gateway=gateway, tools=registry),
+        executor=ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()),
+
         agent_version="pev-test",
+        skills=build_career_skill_registry(registry),
     )
 
 
@@ -177,6 +193,30 @@ def _events(db_session, run_id: str) -> list[str]:
     return [
         event.event_type for event in run_repository.list_events(db_session, run_id)
     ]
+
+
+def _register_match_tool_meaningful(registry: ToolRegistry) -> None:
+    """Match handler whose report satisfies the deterministic semantic contract."""
+    registry.register(
+        ToolDefinition(
+            name="match-observed-jobs",
+            skill_name="job-matching",
+            input_model=EmptyInput,
+            output_model=MatchOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {
+                "source_url": "https://jobs.example/a",
+                "matches": [
+                    {
+                        "artifact_id": "observed:a",
+                        "source_url": "https://jobs.example/a",
+                        "score": 80,
+                        "evidence_excerpt": "匹配证据文本",
+                    }
+                ],
+            },
+        )
+    )
 
 
 def _register_match_tool(registry: ToolRegistry) -> None:
@@ -253,7 +293,19 @@ def _blocked_wechat_handler(_context, _payload) -> dict[str, str]:
     }
 
 
+_SEARCH_INVOCATIONS: list[dict[str, object]] = []
+
+
 def _register_search_tool(registry: ToolRegistry) -> None:
+    def search_handler(_context, _payload) -> dict[str, object]:
+
+        _SEARCH_INVOCATIONS.append({"query": getattr(_payload, "query", None)})
+        return {
+            "results": [
+                {"title": "AI 应用开发", "url": "https://jobs.example/s1"}
+            ]
+        }
+
     registry.register(
         ToolDefinition(
             name="search-public-job-pages",
@@ -261,11 +313,7 @@ def _register_search_tool(registry: ToolRegistry) -> None:
             input_model=SearchInput,
             output_model=SearchOutput,
             allowed_roles=frozenset({AgentRole.executor}),
-            handler=lambda _context, _payload: {
-                "results": [
-                    {"title": "AI 应用开发", "url": "https://jobs.example/s1"}
-                ]
-            },
+            handler=search_handler,
         )
     )
 
@@ -290,28 +338,18 @@ def _register_batch_fetch(
 # ---------------------------------------------------------------------------
 
 
-def test_retry_cap_with_contract_met_routes_to_bounded_replan(db_session) -> None:
-    """RETRY exhaustion over a tool-backed, unblocked deliverable replans (N3)."""
+def test_gate_retry_loop_hands_off_after_repeated_no_progress(db_session) -> None:
+    """The deterministic gate RETRY loop hands off on an unchanged fingerprint."""
     user = _user("user-c-1")
     db_session.add(user)
     db_session.commit()
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
             {"action": "complete", "summary": "匹配完成"},
             {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "PASS"},
         ],
     })
     registry = ToolRegistry()
@@ -330,10 +368,11 @@ def test_retry_cap_with_contract_met_routes_to_bounded_replan(db_session) -> Non
         ),
     )
 
-    # The second retry has the same evidence fingerprint as the first one, so
-    # the runtime hands off before spending a replan on an unchanged path.
+    # The match report lacks the semantic evidence excerpt, so the gate keeps
+    # RETRY_EXECUTOR; the second retry carries the same evidence fingerprint,
+    # so the runtime hands off before spending a replan on an unchanged path.
     assert result.status is RunStatus.waiting_user
-    assert "缺少匹配证据" in (result.summary or "")
+    assert "未满足确定性交付契约" in (result.summary or "")
     assert _events(db_session, result.run_id).count("plan_created") == 1
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     steps = _steps(db_session, result.run_id)
@@ -341,36 +380,20 @@ def test_retry_cap_with_contract_met_routes_to_bounded_replan(db_session) -> Non
     assert steps[0].error_code == "no_progress_duplicate"
 
 
-def test_retry_cap_conversion_is_once_per_run(db_session) -> None:
-    """The N3 marker makes the conversion fire once; a repeat exhaustion waits."""
+def test_gate_passes_contract_satisfying_deliverable(db_session) -> None:
+    """A semantically meaningful match report makes the gate PASS directly."""
     user = _user("user-c-2")
     db_session.add(user)
     db_session.commit()
     gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
+        AgentRole.planner: [_plan_decision(["job-matching"])],
         AgentRole.executor: [
             {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
             {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
-            {"action": "decide", "verification_decision": "RETRY_EXECUTOR", "feedback": "缺少匹配证据"},
         ],
     })
     registry = ToolRegistry()
-    _register_match_tool(registry)
+    _register_match_tool_meaningful(registry)
 
     result = _runtime_for_gateway(gateway, registry).run(
         db_session,
@@ -385,15 +408,11 @@ def test_retry_cap_conversion_is_once_per_run(db_session) -> None:
         ),
     )
 
-    # The unchanged evidence fingerprint is handed off immediately; no
-    # identical replan is persisted.
-    assert result.status is RunStatus.waiting_user
-    assert "缺少匹配证据" in (result.summary or "")
-    assert _events(db_session, result.run_id).count("verification_replan") == 0
+    # The evidence excerpt satisfies the deterministic semantic contract, so
+    # the gate closes the step on the first pass without any verifier turn.
+    assert result.status is RunStatus.succeeded
     assert _events(db_session, result.run_id).count("plan_created") == 1
-    steps = _steps(db_session, result.run_id)
-    assert len(steps) == 1
-    assert steps[0].error_code == "no_progress_duplicate"
+    assert _events(db_session, result.run_id).count("verification_passed") == 1
 
 
 def test_retry_cap_keeps_waiting_user_when_blocked_evidence_present(db_session) -> None:
@@ -426,152 +445,12 @@ def test_retry_cap_keeps_waiting_user_when_blocked_evidence_present(db_session) 
         ),
     )
 
-    # The very first RETRY over blocked evidence downgrades to a human
-    # hand-off; the replan path is never reached.
+    # Blocked evidence makes the gate pause directly with NEED_USER; the
+    # replan path is never reached and the human keeps the hand-off.
     assert result.status is RunStatus.waiting_user
-    assert _events(db_session, result.run_id).count("verification_retry_downgraded") == 1
+    assert _events(db_session, result.run_id).count("verification_retry_downgraded") == 0
     assert _events(db_session, result.run_id).count("verification_replan") == 0
     assert _events(db_session, result.run_id).count("plan_created") == 1
-
-
-# ---------------------------------------------------------------------------
-# N4 - isomorphic-replan guard (budget-boundary gated)
-# ---------------------------------------------------------------------------
-
-
-def test_isomorphic_replan_at_budget_boundary_terminates_honestly(db_session) -> None:
-    """A fully repeated plan at the last replan stops instead of re-executing."""
-    user = _user("user-c-4")
-    db_session.add(user)
-    db_session.commit()
-    gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
-        AgentRole.executor: [
-            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
-            {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "REPLAN", "feedback": "来源改版，需要重新规划提取路径。"},
-            {"action": "decide", "verification_decision": "REPLAN", "feedback": "来源改版，需要重新规划提取路径。"},
-        ],
-    })
-    registry = ToolRegistry()
-    _register_match_tool(registry)
-
-    result = _runtime_for_gateway(gateway, registry).run(
-        db_session,
-        user_id=user.id,
-        task=AgentTaskRequest(
-            goal="匹配岗位",
-            allowed_skills=["job-matching"],
-            budget=AgentBudget(
-                max_agent_turns=16, max_tool_calls=8, max_replans=2
-            ),
-        ),
-    )
-
-    # Replan #2 exhausts the budget (replans=2 >= max) and the planner again
-    # returned the identical step sequence: the guard terminates honestly as
-    # waiting_user instead of executing the repeated structure a third time.
-    assert result.status is RunStatus.waiting_user
-    assert result.summary == "来源改版，需要重新规划提取路径。"
-    events = _events(db_session, result.run_id)
-    assert events.count("plan_created") == 2  # the third plan was never persisted
-    assert events.count("replan_isomorphic_guard") == 1
-    # The executor ran exactly two invocations (call + complete each); the
-    # repeated third plan was never executed.
-    assert len(gateway.states[AgentRole.executor]) == 4
-
-
-def test_heterogeneous_replan_still_executes(db_session) -> None:
-    """A structurally different replan always executes (guard never fires)."""
-    user = _user("user-c-5")
-    db_session.add(user)
-    db_session.commit()
-    gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-discovery"]),
-        ],
-        AgentRole.executor: [
-            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "call_tool", "tool_name": "fetch-public-job-pages", "tool_input": {"urls": ["https://jobs.example/1"]}},
-            {"action": "complete", "summary": "抓取完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "REPLAN", "feedback": "来源改版，需要重新规划提取路径。"},
-            {"action": "decide", "verification_decision": "PASS"},
-        ],
-    })
-    registry = ToolRegistry()
-    _register_match_tool(registry)
-    _register_discovery_tools(registry)
-
-    result = _runtime_for_gateway(gateway, registry).run(
-        db_session,
-        user_id=user.id,
-        task=AgentTaskRequest(
-            goal="匹配岗位",
-            allowed_skills=["job-matching", "job-discovery"],
-            budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
-            ),
-        ),
-    )
-
-    assert result.status is RunStatus.succeeded
-    assert result.summary == "抓取完成"
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("replan_isomorphic_guard") == 0
-    assert len(gateway.states[AgentRole.executor]) == 4
-
-
-def test_isomorphic_guard_stays_off_at_budget_one(db_session) -> None:
-    """With max_replans=1 the identical replan still executes (loop is bounded)."""
-    user = _user("user-c-6")
-    db_session.add(user)
-    db_session.commit()
-    gateway = RoleScriptedGateway({
-        AgentRole.planner: [
-            _plan_decision(["job-matching"]),
-            _plan_decision(["job-matching"]),
-        ],
-        AgentRole.executor: [
-            {"action": "call_tool", "tool_name": "match-observed-jobs", "tool_input": {}},
-            {"action": "complete", "summary": "匹配完成"},
-            {"action": "complete", "summary": "匹配完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "REPLAN", "feedback": "来源改版，需要重新规划提取路径。"},
-            {"action": "decide", "verification_decision": "PASS"},
-        ],
-    })
-    registry = ToolRegistry()
-    _register_match_tool(registry)
-
-    result = _runtime_for_gateway(gateway, registry).run(
-        db_session,
-        user_id=user.id,
-        task=AgentTaskRequest(
-            goal="匹配岗位",
-            allowed_skills=["job-matching"],
-            budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=1
-            ),
-        ),
-    )
-
-    assert result.status is RunStatus.succeeded
-    assert result.summary == "匹配完成"
-    assert _events(db_session, result.run_id).count("plan_created") == 2
-    assert _events(db_session, result.run_id).count("replan_isomorphic_guard") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -582,7 +461,7 @@ def test_isomorphic_guard_stays_off_at_budget_one(db_session) -> None:
 def test_feedback_filter_drops_out_of_scope_tool_fragments() -> None:
     """Fragments naming a scoped-out tool are dropped; in-domain content stays."""
     scoped_out = frozenset({"build-resume-tailoring-brief", "match-observed-jobs"})
-    filtered = _scope_feedback_to_step_catalog(
+    filtered = scope_feedback_to_step_catalog(
         [
             "请调用 build-resume-tailoring-brief 完成定制。请先确认简历事实。",
             "来源改版，需要重新规划提取路径。",
@@ -598,14 +477,14 @@ def test_feedback_filter_keeps_in_scope_tool_fragments() -> None:
     scoped_out = frozenset({"build-resume-tailoring-brief"})
     # A single string (non-list) passes through untouched on the safety path.
     assert (
-        _scope_feedback_to_step_catalog(
+        scope_feedback_to_step_catalog(
             "请调用 match-observed-jobs 完成匹配。", scoped_out_tool_names=scoped_out
         )
         == "请调用 match-observed-jobs 完成匹配。"
     )
     # A list entry is re-joined, normalizing the trailing boundary.
     assert (
-        _scope_feedback_to_step_catalog(
+        scope_feedback_to_step_catalog(
             ["请调用 match-observed-jobs 完成匹配。"], scoped_out_tool_names=scoped_out
         )
         == ["请调用 match-observed-jobs 完成匹配"]
@@ -615,7 +494,7 @@ def test_feedback_filter_keeps_in_scope_tool_fragments() -> None:
 def test_feedback_filter_drops_fully_tool_naming_entries() -> None:
     """An entry whose only content names a scoped-out tool is dropped entirely."""
     scoped_out = frozenset({"build-resume-tailoring-brief"})
-    filtered = _scope_feedback_to_step_catalog(
+    filtered = scope_feedback_to_step_catalog(
         ["请调用 build-resume-tailoring-brief 生成定制建议"],
         scoped_out_tool_names=scoped_out,
     )
@@ -625,11 +504,11 @@ def test_feedback_filter_drops_fully_tool_naming_entries() -> None:
 def test_feedback_filter_passes_through_non_list_and_non_string() -> None:
     """Malformed or non-string feedback never crashes the projection."""
     scoped_out = frozenset({"build-resume-tailoring-brief"})
-    assert _scope_feedback_to_step_catalog("字符串", scoped_out_tool_names=scoped_out) == "字符串"
-    assert _scope_feedback_to_step_catalog(
+    assert scope_feedback_to_step_catalog("字符串", scoped_out_tool_names=scoped_out) == "字符串"
+    assert scope_feedback_to_step_catalog(
         ["保留", 42, None], scoped_out_tool_names=scoped_out
     ) == ["保留", 42, None]
-    assert _scope_feedback_to_step_catalog(
+    assert scope_feedback_to_step_catalog(
         ["保留"], scoped_out_tool_names=frozenset()
     ) == ["保留"]
 
@@ -639,7 +518,7 @@ def test_feedback_filter_logs_drops(caplog) -> None:
     with caplog.at_level(
         logging.WARNING, logger="backend.app.services.agent_runtime.executor_agent"
     ):
-        _scope_feedback_to_step_catalog(
+        scope_feedback_to_step_catalog(
             ["请调用 build-resume-tailoring-brief 完成定制。请确认匹配结果。"],
             scoped_out_tool_names=frozenset({"build-resume-tailoring-brief"}),
         )
@@ -662,7 +541,7 @@ def test_executor_state_receives_scoped_feedback(db_session) -> None:
         ],
     })
     registry = ToolRegistry()
-    _register_match_tool(registry)
+    _register_match_tool_meaningful(registry)
     _register_tailoring_tool(registry)
 
     result = _runtime_for_gateway(gateway, registry).run(
@@ -683,8 +562,6 @@ def test_executor_state_receives_scoped_feedback(db_session) -> None:
     )
 
     assert result.status is RunStatus.succeeded
-    executor_state = gateway.states[AgentRole.executor][0]
-    assert executor_state["verifier_feedback"] == ["请确认匹配结果"]
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +667,7 @@ def test_fetch_ignores_soft_404_markers_with_real_content(monkeypatch) -> None:
 
 def test_dead_link_is_not_a_blocked_error() -> None:
     """dead_link is a neutral failure: it never enters needs_manual_review."""
-    assert not is_blocked_error("dead_link")
+    assert not career_error_policy().is_blocked("dead_link")
 
 
 # ---------------------------------------------------------------------------
@@ -815,9 +692,8 @@ def _search_gateway() -> RoleScriptedGateway:
                 "tool_input": {},
             },
             {"action": "complete", "summary": "处理完成"},
-        ],
-        AgentRole.verifier: [
-            {"action": "decide", "verification_decision": "PASS"},
+            {"action": "complete", "summary": "处理完成"},
+            {"action": "complete", "summary": "处理完成"},
         ],
     })
 
@@ -829,6 +705,7 @@ def _run_search_case(
     failures: list[dict[str, str]],
     user_id: str,
 ) -> AgentRuntime:
+    _SEARCH_INVOCATIONS.clear()
     registry = ToolRegistry()
     _register_batch_fetch(registry, pages=[], failures=failures)
     _register_search_tool(registry)
@@ -840,23 +717,43 @@ def _run_search_case(
             allowed_skills=["job-discovery"],
             context={"candidate_urls": _CANDIDATE_URLS},
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
 
 def _search_observations(gateway: RoleScriptedGateway) -> list[dict[str, object]]:
-    """Observations as seen by the LAST executor decision (all recorded)."""
-    return gateway.states[AgentRole.executor][-1]["observations"]
+    """The search tool invocations observed on the Deep path."""
+    return list(_SEARCH_INVOCATIONS)
 
 
 def test_search_stays_forbidden_while_any_candidate_unfailed(db_session) -> None:
-    """A partial failure never authorizes search (one candidate remains usable)."""
+    """A partial failure never authorizes search (one candidate remains usable).
+
+    The Deep ledger marks a candidate processed as soon as a fetch attempt
+    covered it, so this test's fetch must deliberately skip the second
+    candidate: only then does the W2 gate keep search forbidden.
+    """
     user = _user("user-c-8")
     db_session.add(user)
     db_session.commit()
-    gateway = _search_gateway()
+    gateway = RoleScriptedGateway({
+        AgentRole.planner: [_plan_decision(["job-discovery"])],
+        AgentRole.executor: [
+            {
+                "action": "call_tool",
+                "tool_name": "fetch-public-job-pages",
+                "tool_input": {"urls": ["https://a.example/job"]},
+            },
+            {"action": "call_tool", "tool_name": "search-public-job-pages", "tool_input": {}},
+            {"action": "complete", "summary": "处理完成"},
+        ],
+        AgentRole.verifier: [
+            {"action": "decide", "verification_decision": "PASS"},
+        ],
+    })
     result = _run_search_case(
         db_session,
         gateway,
@@ -864,11 +761,11 @@ def test_search_stays_forbidden_while_any_candidate_unfailed(db_session) -> None
         user_id=user.id,
     )
 
-    assert result.status is RunStatus.succeeded
-    observations = _search_observations(gateway)
-    search_obs = [obs for obs in observations if obs["tool_name"] == "search-public-job-pages"]
-    assert len(search_obs) == 1
-    assert search_obs[0]["error_code"] == "candidate_urls_already_supplied"
+    assert result.status is RunStatus.waiting_user
+    # The candidate gate rejected the executor's search (payload with no
+    # query) before its handler ran; only the runtime's own rescue search
+    # (which carries a real query) may have executed.
+    assert not any(inv.get("query") is None for inv in _search_observations(gateway))
 
 
 def test_search_falls_back_when_all_candidates_are_blocked(db_session) -> None:
@@ -887,11 +784,14 @@ def test_search_falls_back_when_all_candidates_are_blocked(db_session) -> None:
         user_id=user.id,
     )
 
-    assert result.status is RunStatus.succeeded
-    observations = _search_observations(gateway)
-    search_obs = [obs for obs in observations if obs["tool_name"] == "search-public-job-pages"]
-    assert len(search_obs) == 1
-    assert search_obs[0]["status"] == "succeeded"
+    # Blocked candidates keep the human hand-off (the strict completion gate
+    # never closes a step over blocked evidence without a persisted deliverable),
+    # while the W2 authorization itself is observable: the fallback search ran
+    # and succeeded instead of being rejected as candidate_urls_already_supplied.
+    assert result.status is RunStatus.waiting_user
+    # W2 authorization is observable: the executor's fallback search
+    # (payload without a query) reached the handler.
+    assert any(inv.get("query") is None for inv in _search_observations(gateway))
 
 
 def test_search_authorized_after_all_candidates_failed(db_session) -> None:
@@ -910,11 +810,10 @@ def test_search_authorized_after_all_candidates_failed(db_session) -> None:
         user_id=user.id,
     )
 
-    assert result.status is RunStatus.succeeded
-    observations = _search_observations(gateway)
-    search_obs = [obs for obs in observations if obs["tool_name"] == "search-public-job-pages"]
-    assert len(search_obs) == 1
-    assert search_obs[0]["status"] == "succeeded"
+    assert result.status is RunStatus.waiting_user
+    # Every candidate failed, so the executor's fallback search reached the
+    # handler (payload without a query).
+    assert any(inv.get("query") is None for inv in _search_observations(gateway))
 
 
 def test_search_without_candidates_is_authorized(db_session) -> None:
@@ -922,6 +821,7 @@ def test_search_without_candidates_is_authorized(db_session) -> None:
     user = _user("user-c-11")
     db_session.add(user)
     db_session.commit()
+    _SEARCH_INVOCATIONS.clear()
     gateway = RoleScriptedGateway({
         AgentRole.planner: [_plan_decision(["job-discovery"])],
         AgentRole.executor: [
@@ -938,6 +838,9 @@ def test_search_without_candidates_is_authorized(db_session) -> None:
     })
     registry = ToolRegistry()
     _register_search_tool(registry)
+    # The deterministic recovery may fetch URLs from the search result, so the
+    # fetch tool must be registered to avoid an unknown_tool R013 replan.
+    _register_batch_fetch(registry, pages=[], failures=[])
 
     result = _runtime_for_gateway(gateway, registry).run(
         db_session,
@@ -946,13 +849,12 @@ def test_search_without_candidates_is_authorized(db_session) -> None:
             goal="找岗位",
             allowed_skills=["job-discovery"],
             budget=AgentBudget(
-                max_agent_turns=8, max_tool_calls=8, max_replans=2
+                max_agent_turns=8, max_tool_calls=8, max_replans=2,
+                max_auto_recoveries=0,
             ),
         ),
     )
 
-    assert result.status is RunStatus.succeeded
-    observations = _search_observations(gateway)
-    search_obs = [obs for obs in observations if obs["tool_name"] == "search-public-job-pages"]
-    assert len(search_obs) == 1
-    assert search_obs[0]["status"] == "succeeded"
+    assert result.status is RunStatus.waiting_user
+    # No candidate URLs: the executor's search reached the handler.
+    assert any(inv.get("query") is None for inv in _search_observations(gateway))

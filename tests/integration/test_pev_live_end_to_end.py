@@ -15,7 +15,7 @@ from backend.app.services.agent_runtime.model_gateway import build_agent_model_g
 from backend.app.services.agent_runtime.planner_agent import PlannerAgent
 from backend.app.services.agent_runtime.runtime import AgentRuntime
 from backend.app.services.agent_runtime.schemas import AgentBudget, AgentTaskRequest
-from backend.app.services.agent_runtime.verifier_agent import VerifierAgent
+from backend.app.services.career_skills.manifest import build_career_skill_registry
 from backend.app.services.career_skills.registry import build_career_tool_registry
 from backend.app.services.profile_parser import (
     extract_evidence_candidates,
@@ -66,13 +66,14 @@ def test_natural_language_agent_workflow_uses_real_model_and_real_public_jds(db_
     runtime = AgentRuntime(
         planner=PlannerAgent(gateway=gateway, tools=tools),
         executor=ExecutorAgent(gateway=gateway, tools=tools),
-        verifier=VerifierAgent(gateway=gateway, tools=tools),
+
         agent_version="pev-live-e2e",
+        skills=build_career_skill_registry(tools),
     )
     task = AgentTaskRequest(
         goal=(
             "请基于近三天可公开验证的国企或民营 AI 应用开发、Agent 开发岗位，"
-            "给我完整 JD、最优薪资推荐、针对该岗位的简历修改建议和面试准备计划。"
+            "给我完整 JD、最优薪资推荐、针对该岗位的简历修改建议。"
             "必须只使用公开证据；页面没有发布日期、公司类型或薪资时明确标注未验证，"
             "不得推断。优先检查候选官方 JD。"
         ),
@@ -80,7 +81,6 @@ def test_natural_language_agent_workflow_uses_real_model_and_real_public_jds(db_
             "job-discovery",
             "job-matching",
             "resume-tailoring",
-            "career-planning",
         ],
         context={"candidate_urls": list(OFFICIAL_AI_AGENT_JOB_URLS)},
         private_context={"confirmed_profile_facts": confirmed_facts},
@@ -110,4 +110,3 @@ def test_natural_language_agent_workflow_uses_real_model_and_real_public_jds(db_
     assert "public_job_page" in artifact_types
     assert "job_matching_report" in artifact_types
     assert "resume_tailoring_brief" in artifact_types
-    assert "career_preparation_plan" in artifact_types

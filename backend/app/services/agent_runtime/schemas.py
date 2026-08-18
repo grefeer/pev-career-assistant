@@ -91,8 +91,8 @@ class AgentBudget(BaseModel):
     # a verifier/model-decision reason (never a source-access block), the
     # harness may resume the same run itself — with a step-up budget and a
     # relaxed stall breaker — up to this many times before handing back to
-    # the human. 2 = first run + up to 2 automatic re-runs (3 attempts total).
-    max_auto_recoveries: int = Field(default=2, ge=0, le=5)
+    # the human. 1 = first run + 1 automatic re-run (2 attempts total).
+    max_auto_recoveries: int = Field(default=1, ge=0, le=5)
     # Physical model ceilings.  Turn count limits lifecycle decisions; these
     # limits bound provider requests and measured token consumption separately.
     max_model_requests: int = Field(default=128, ge=1, le=500)
@@ -392,7 +392,14 @@ class _DecisionAttributeProxy:
         return getattr(self.root, "feedback", None)
 
 
-class PlannerCallToolDecision(BaseModel):
+class CallToolDecision(BaseModel):
+    """Role-agnostic tool-call decision shared by Planner, Executor, Verifier.
+
+    Stage 1.5 collapsed the three role-prefixed copies of this schema into a
+    single canonical model. The role-prefixed names are preserved as
+    type aliases so any external import keeps working.
+    """
+
     model_config = {"extra": "forbid"}
 
     action: Literal["call_tool"]
@@ -408,6 +415,12 @@ class PlannerCallToolDecision(BaseModel):
         return value
 
 
+# Backward-compatible aliases (Stage 1.5). All three were byte-identical
+# definitions; the canonical class is ``CallToolDecision``.
+PlannerCallToolDecision = CallToolDecision
+ExecutorCallToolDecision = CallToolDecision
+
+
 class PlannerPlanDecision(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -417,7 +430,13 @@ class PlannerPlanDecision(BaseModel):
     steps: list[PlanStep] = Field(min_length=1, max_length=20)
 
 
-class PlannerNeedUserDecision(BaseModel):
+class NeedUserDecision(BaseModel):
+    """Role-agnostic hand-off decision shared by Planner and Executor.
+
+    Stage 1.5 collapsed the role-prefixed copies into a single canonical
+    model. The role-prefixed names are preserved as type aliases.
+    """
+
     model_config = {"extra": "forbid"}
 
     action: Literal["need_user"]
@@ -430,6 +449,11 @@ class PlannerNeedUserDecision(BaseModel):
         if not value:
             raise ValueError("need_user requires user_question")
         return value
+
+
+# Backward-compatible aliases (Stage 1.5).
+PlannerNeedUserDecision = NeedUserDecision
+ExecutorNeedUserDecision = NeedUserDecision
 
 
 class PlannerDecision(
@@ -466,22 +490,6 @@ class PlannerResult(BaseModel):
         return self
 
 
-class ExecutorCallToolDecision(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    action: Literal["call_tool"]
-    tool_name: str = Field(min_length=1)
-    tool_input: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("tool_name")
-    @classmethod
-    def normalize_tool_name(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("call_tool requires tool_name")
-        return value
-
-
 class ExecutorCompleteDecision(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -495,21 +503,6 @@ class ExecutorCompleteDecision(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("complete requires summary")
-        return value
-
-
-class ExecutorNeedUserDecision(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    action: Literal["need_user"]
-    user_question: str = Field(min_length=1)
-
-    @field_validator("user_question")
-    @classmethod
-    def normalize_question(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("need_user requires user_question")
         return value
 
 
@@ -551,63 +544,4 @@ class ExecutorResult(BaseModel):
             raise ValueError("needs_user executor result requires user_question")
         if self.status not in {"succeeded", "needs_user", "failed"}:
             raise ValueError("unknown executor result status")
-        return self
-
-
-class VerifierCallToolDecision(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    action: Literal["call_tool"]
-    tool_name: str = Field(min_length=1)
-    tool_input: dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("tool_name")
-    @classmethod
-    def normalize_tool_name(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("call_tool requires tool_name")
-        return value
-
-
-class VerifierDecideDecision(BaseModel):
-    model_config = {"extra": "forbid"}
-
-    action: Literal["decide"]
-    verification_decision: VerificationDecision
-    feedback: str | None = None
-
-    @model_validator(mode="after")
-    def validate_feedback(self) -> "VerifierDecideDecision":
-        if self.verification_decision is not VerificationDecision.PASS and not self.feedback:
-            raise ValueError("non-PASS verifier decisions require feedback")
-        return self
-
-
-class VerifierDecision(
-    _DecisionAttributeProxy,
-    RootModel[
-        Annotated[
-            VerifierCallToolDecision | VerifierDecideDecision,
-            Field(discriminator="action"),
-        ]
-    ],
-):
-    """Discriminated Verifier action union exposed as a gateway response model."""
-
-
-class VerifierResult(BaseModel):
-    """Verified decision plus independent evidence observations."""
-
-    model_config = {"extra": "forbid"}
-
-    decision: VerificationDecision
-    feedback: str | None = None
-    observations: list[ToolObservation] = Field(default_factory=list)
-    error_code: str | None = None
-
-    @model_validator(mode="after")
-    def validate_result_shape(self) -> "VerifierResult":
-        if self.decision is not VerificationDecision.PASS and not self.feedback:
-            raise ValueError("non-PASS verifier result requires feedback")
         return self

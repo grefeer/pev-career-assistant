@@ -107,18 +107,17 @@ def test_post_agent_run_scales_hard_turn_ceiling_for_multi_skill_work() -> None:
         "/api/agent-runs",
         headers=_headers(app),
         json={
-            "goal": "找岗位并完成匹配、简历优化和面试计划",
+            "goal": "找岗位并完成匹配和简历优化",
             "allowed_skills": [
                 "job-discovery",
                 "job-matching",
                 "resume-tailoring",
-                "career-planning",
             ],
         },
     )
 
     assert response.status_code == 201
-    assert service.queue_run.call_args.kwargs["task"].budget.max_agent_turns == 36
+    assert service.queue_run.call_args.kwargs["task"].budget.max_agent_turns == 28
 
 
 def test_post_agent_run_rejects_unknown_input_and_disabled_harness() -> None:

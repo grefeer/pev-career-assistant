@@ -10,13 +10,12 @@ from backend.app.services.career_skills.manifest import (
 from backend.app.services.career_skills.registry import build_career_tool_registry
 
 
-def test_manifest_exposes_exactly_four_agent_selectable_business_skills() -> None:
+def test_manifest_exposes_exactly_three_agent_selectable_business_skills() -> None:
     """Company research and tracking cannot accidentally become extra Agents."""
     assert set(CAREER_SKILL_MANIFESTS) == {
         "job-discovery",
         "job-matching",
         "resume-tailoring",
-        "career-planning",
     }
     assert get_career_skill_manifest("job-discovery").requires_evidence is True
     assert get_career_skill_manifest("resume-tailoring").requires_evidence is True

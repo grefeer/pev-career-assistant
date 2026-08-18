@@ -27,12 +27,14 @@ import pytest
 from pydantic import BaseModel
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
-from backend.app.services.agent_runtime.executor_agent import (
-    ExecutorAgent,
-    _input_hash,
-    _load_stable_failed_calls,
-    _snapshot_execution_state,
+from backend.app.services.agent_runtime.executor.execution_state import (
+    input_hash,
+    load_stable_failed_calls,
+    snapshot_execution_state,
 )
+from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
+from tests.unit.deepagents_testkit import DeepGateway, scripted_executor_model
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -222,27 +224,6 @@ class BlockedError(Exception):
         self.code = "login_required"
 
 
-class ScriptedGateway:
-    """Deterministic model boundary double; executor and registry remain real."""
-
-    def __init__(self, responses: list[dict[str, Any]]) -> None:
-        self.responses = responses
-        self.states: list[dict[str, Any]] = []
-
-    def decide(
-        self,
-        *,
-        role: AgentRole,
-        instruction: str,
-        state: dict[str, Any],
-        response_model: type[BaseModel],
-    ) -> BaseModel:
-        assert role is AgentRole.executor
-        assert instruction
-        self.states.append(state)
-        return response_model.model_validate(self.responses.pop(0))
-
-
 def _discovery_task(**updates) -> AgentTaskRequest:
     return AgentTaskRequest(goal="抓取 JD", allowed_skills=["job-discovery"], **updates)
 
@@ -272,17 +253,22 @@ def _sheet_registry(*, handler) -> ToolRegistry:
     return registry
 
 
-def test_executor_dedups_identical_reissue_after_stable_failure_without_waste() -> None:
-    """A repeat of an identical call that failed with sheet_rate_limited is
-    deduped as duplicate_tool_call WITHOUT incrementing total_wasted_turns and
-    WITHOUT consuming budget (the round-3 rate-limit mislabel fix)."""
+def _deep_gateway(script: list[dict]) -> DeepGateway:
+    return DeepGateway(scripted_executor_model(script))
+
+
+def test_executor_identical_reissue_after_stable_failure_circuit_breaks() -> None:
+    """A repeat of an identical sheet_rate_limited call trips the run-wide
+    circuit breaker (the Deep ledger marks the route unavailable), so the
+    model cannot burn budget re-issuing the doomed call; the step hands to
+    the user with the availability question instead."""
     invocations = {"count": 0}
 
     def rate_limited_handler(_context, _payload):
         invocations["count"] += 1
         raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
@@ -290,7 +276,9 @@ def test_executor_dedups_identical_reissue_after_stable_failure_without_waste() 
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -300,21 +288,16 @@ def test_executor_dedups_identical_reissue_after_stable_failure_without_waste() 
         tool_budget=ToolCallBudget(1),
     )
 
-    assert result.status == "succeeded"
+    assert result.status == "needs_user"
+    assert result.error_code == "executor_stalled"
     assert invocations["count"] == 1
     assert [obs.error_code for obs in result.observations] == [
         "sheet_rate_limited",
-        "duplicate_tool_call",
     ]
     # The rate-limit observation itself carries the authorized fallback hint.
     assert "search-public-job-pages" in (result.observations[0].error_message or "")
-    # Only the ORIGINAL failure counted toward the waste budget (1); the
-    # deduped re-issue did not increment it.
-    assert result.execution_state["total_wasted_turns"] == 1
-    # The stable failure is persisted so a verifier RETRY also dedups it.
-    assert result.execution_state["stable_failed_calls"] == [
-        {"tool": "query-sheet", "hash": _input_hash({"query": "字节"})}
-    ]
+    # The rate-limited route is persisted run-wide unavailable.
+    assert result.execution_state["unavailable_tools"] == ["query-sheet"]
 
 
 def test_executor_circuit_breaks_different_payloads_after_sheet_outage() -> None:
@@ -325,14 +308,16 @@ def test_executor_circuit_breaks_different_payloads_after_sheet_outage() -> None
         invocations["count"] += 1
         raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "腾讯"}},
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -341,38 +326,10 @@ def test_executor_circuit_breaks_different_payloads_after_sheet_outage() -> None
     )
 
     assert result.status == "needs_user"
+    assert result.error_code == "executor_stalled"
     assert invocations["count"] == 1
-    assert [obs.error_code for obs in result.observations] == [
-        "sheet_rate_limited",
-        "source_unavailable",
-    ]
+    assert [obs.error_code for obs in result.observations] == ["sheet_rate_limited"]
     assert result.execution_state["unavailable_tools"] == ["query-sheet"]
-
-
-def test_executor_dedups_identical_reissue_after_unknown_tool_failure() -> None:
-    """unknown_tool is a stable failure: its identical re-issue is deduped."""
-    gateway = ScriptedGateway(
-        [
-            {"action": "call_tool", "tool_name": "missing-tool", "tool_input": {}},
-            {"action": "call_tool", "tool_name": "missing-tool", "tool_input": {}},
-            {"action": "complete", "summary": "已改用已注册工具"},
-        ]
-    )
-    task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=ToolRegistry()).run(
-        task=task,
-        plan=_single_step_plan(task),
-        step=_single_step_plan(task).steps[0],
-        context=ToolContext(user_id="user-a", run_id="run-a"),
-        tool_budget=ToolCallBudget(1),
-    )
-
-    assert result.status == "succeeded"
-    assert [obs.error_code for obs in result.observations] == [
-        "unknown_tool",
-        "duplicate_tool_call",
-    ]
-    assert result.execution_state["total_wasted_turns"] == 1
 
 
 def test_executor_identical_reissue_after_success_still_dedups_as_today() -> None:
@@ -383,7 +340,7 @@ def test_executor_identical_reissue_after_success_still_dedups_as_today() -> Non
         invocations["count"] += 1
         return {"records": [{"a": 1}]}
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
@@ -391,7 +348,9 @@ def test_executor_identical_reissue_after_success_still_dedups_as_today() -> Non
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -402,7 +361,7 @@ def test_executor_identical_reissue_after_success_still_dedups_as_today() -> Non
     assert result.status == "succeeded"
     assert invocations["count"] == 1
     assert [obs.error_code for obs in result.observations] == [None, "duplicate_tool_call"]
-    # Today's semantics: a duplicate of a SUCCEEDED call counts as wasted.
+    # A duplicate of a SUCCEEDED call counts as wasted in the Deep ledger too.
     assert result.execution_state["total_wasted_turns"] == 1
     assert result.execution_state["stable_failed_calls"] == []
 
@@ -417,7 +376,7 @@ def test_executor_does_not_dedup_transient_failure_reissue() -> None:
             raise RuntimeError("transient failure")
         return {"records": [{"a": 1}]}
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
@@ -425,7 +384,9 @@ def test_executor_does_not_dedup_transient_failure_reissue() -> None:
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=flaky)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=flaky), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -447,7 +408,7 @@ def test_executor_does_not_dedup_blocked_code_reissue() -> None:
         invocations["count"] += 1
         raise BlockedError()
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
@@ -455,7 +416,9 @@ def test_executor_does_not_dedup_blocked_code_reissue() -> None:
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=blocked_handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=blocked_handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -469,16 +432,16 @@ def test_executor_does_not_dedup_blocked_code_reissue() -> None:
     assert result.execution_state["stable_failed_calls"] == []
 
 
-def test_executor_hands_repeating_stable_failure_to_user_on_consecutive_cap() -> None:
-    """Repeated re-issues of a stable-failed call are a genuine stall: the
-    consecutive-stall cap hands the step to the user."""
+def test_executor_hands_repeating_stable_failure_to_user() -> None:
+    """Re-issuing a stable-failed call hands the step to the user: the Deep
+    ledger's run-wide circuit breaker stops the doomed call immediately."""
     invocations = {"count": 0}
 
     def rate_limited_handler(_context, _payload):
         invocations["count"] += 1
         raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
 
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
@@ -487,7 +450,9 @@ def test_executor_hands_repeating_stable_failure_to_user_on_consecutive_cap() ->
         ]
     )
     task = _discovery_task()
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -496,15 +461,11 @@ def test_executor_hands_repeating_stable_failure_to_user_on_consecutive_cap() ->
     )
 
     assert result.status == "needs_user"
+    assert result.error_code == "executor_stalled"
     assert invocations["count"] == 1
-    assert "连续重复调用" in result.user_question
     assert [obs.error_code for obs in result.observations] == [
         "sheet_rate_limited",
-        "duplicate_tool_call",
-        "duplicate_tool_call",
     ]
-    # The waste budget was never tripped: only the single real failure counted.
-    assert result.execution_state["total_wasted_turns"] == 1
 
 
 def test_executor_dedups_stable_failure_across_invocations() -> None:
@@ -515,7 +476,7 @@ def test_executor_dedups_stable_failure_across_invocations() -> None:
         invocations["count"] += 1
         raise SheetQueryError("sheet_rate_limited", _SHEET_RATE_LIMITED_MESSAGE)
 
-    prior_state = _snapshot_execution_state(
+    prior_state = snapshot_execution_state(
         succeeded_calls=[],
         prior_succeeded_calls=[],
         consecutive_stalls=0,
@@ -524,14 +485,16 @@ def test_executor_dedups_stable_failure_across_invocations() -> None:
         prior_stable_failed_calls=[],
     )
     task = _discovery_task(execution_state=prior_state)
-    gateway = ScriptedGateway(
+    gateway = _deep_gateway(
         [
             {"action": "call_tool", "tool_name": "query-sheet", "tool_input": {"query": "字节"}},
             {"action": "complete", "summary": "已切换到公开搜索"},
         ]
     )
 
-    result = ExecutorAgent(gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler)).run(
+    result = ExecutorAgent(
+        gateway=gateway, tools=_sheet_registry(handler=rate_limited_handler), skills=SkillRegistry()
+    ).run(
         task=task,
         plan=_single_step_plan(task),
         step=_single_step_plan(task).steps[0],
@@ -542,8 +505,11 @@ def test_executor_dedups_stable_failure_across_invocations() -> None:
     assert result.status == "succeeded"
     assert invocations["count"] == 0  # never re-hit the doomed call
     assert [obs.error_code for obs in result.observations] == ["duplicate_tool_call"]
-    # The waste counter was carried as-is: the dedup did not increment it.
-    assert result.execution_state["total_wasted_turns"] == 1
+    # The carried waste (1) plus the deduped re-issue (1) = 2 in the Deep
+    # ledger; the doomed call itself was never re-invoked.
+    assert result.execution_state["total_wasted_turns"] == 2
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -562,11 +528,11 @@ def test_load_stable_failed_calls_drops_malformed_entries() -> None:
             ],
         }
     )
-    assert _load_stable_failed_calls(task) == [{"tool": "ok", "hash": "h" * 64}]
+    assert load_stable_failed_calls(task) == [{"tool": "ok", "hash": "h" * 64}]
 
 
 def test_snapshot_execution_state_merges_prior_stable_failures_before_current() -> None:
-    snapshot = _snapshot_execution_state(
+    snapshot = snapshot_execution_state(
         succeeded_calls=[],
         prior_succeeded_calls=[],
         consecutive_stalls=0,
@@ -576,13 +542,13 @@ def test_snapshot_execution_state_merges_prior_stable_failures_before_current() 
     )
     assert snapshot["stable_failed_calls"] == [
         {"tool": "query-sheet", "hash": "a" * 64},
-        {"tool": "query-sheet", "hash": _input_hash({"query": "新"})},
+        {"tool": "query-sheet", "hash": input_hash({"query": "新"})},
     ]
 
 
 def test_snapshot_execution_state_caps_stable_failure_entries_keeping_most_recent() -> None:
     calls = [("query-sheet", {"query": f"q{i}"}) for i in range(45)]
-    snapshot = _snapshot_execution_state(
+    snapshot = snapshot_execution_state(
         succeeded_calls=[],
         prior_succeeded_calls=[],
         consecutive_stalls=0,
@@ -592,5 +558,5 @@ def test_snapshot_execution_state_caps_stable_failure_entries_keeping_most_recen
     )
     entries = snapshot["stable_failed_calls"]
     assert len(entries) == 40
-    assert entries[0]["hash"] == _input_hash({"query": "q5"})
-    assert entries[-1]["hash"] == _input_hash({"query": "q44"})
+    assert entries[0]["hash"] == input_hash({"query": "q5"})
+    assert entries[-1]["hash"] == input_hash({"query": "q44"})

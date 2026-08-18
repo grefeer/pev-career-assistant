@@ -22,6 +22,8 @@ from pydantic import BaseModel, ValidationError
 
 from backend.app.domain.agent_runtime import AgentRole, ComplexityLevel
 from backend.app.services.agent_runtime.executor_agent import ExecutorAgent
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
+from tests.unit.deepagents_testkit import DeepGateway, scripted_executor_model
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
@@ -246,18 +248,17 @@ def _registry_with_match_tool(
     return registry, captured
 
 
-def test_executor_dedups_identical_invalid_tool_input_reissue() -> None:
-    """Re-issuing the SAME bad payload is a doomed repeat: deduped, no extra waste.
-
-    Without the stable-failure treatment each identical re-issue would waste
-    one more turn and three wastes would end the run as waiting_user. With
-    ``invalid_tool_input`` in ``_STABLE_FAILURE_ERROR_CODES`` the first failure
-    counts one wasted turn and identical re-issues become duplicate_tool_call.
+def test_invalid_tool_args_never_reach_the_handler_on_the_deep_path() -> None:
+    """Invalid tool args are rejected at the structured-tool boundary on the
+    Deep path: no observation, no handler invocation, and no wasted turn --
+    the run continues with the model's next decision instead of burning
+    budget on doomed re-issues (the legacy invalid_tool_input dedup seam is
+    unreachable because the wrapped tool validates before the registry).
     """
     invocations = {"count": 0}
     registry, _captured = _registry_with_match_tool(invocations)
     task = _matching_task()
-    gateway = ScriptedGateway([
+    gateway = DeepGateway(scripted_executor_model([
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"ranking_criteria": ["综合评分"]}},
         {"action": "call_tool", "tool_name": "match-jobs",
@@ -265,9 +266,9 @@ def test_executor_dedups_identical_invalid_tool_input_reissue() -> None:
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"ranking_criteria": ["综合评分"]}},
         {"action": "complete", "summary": "匹配完成"},
-    ])
+    ]))
 
-    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+    result = ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()).run(
         task=task, plan=_single_step_plan(task), step=_single_step_plan(task).steps[0],
         context=ToolContext(user_id="user-a", run_id="run-a"),
         tool_budget=ToolCallBudget(4),
@@ -275,29 +276,25 @@ def test_executor_dedups_identical_invalid_tool_input_reissue() -> None:
 
     assert result.status == "succeeded"
     assert invocations["count"] == 0
-    assert [obs.error_code for obs in result.observations] == [
-        "invalid_tool_input", "duplicate_tool_call", "duplicate_tool_call",
-    ]
-    # The identical re-issues burned no budget/waste; only the first call did.
-    assert result.execution_state["total_wasted_turns"] == 1
-    assert result.execution_state["consecutive_stalls"] == 2
+    assert result.observations == []
 
 
-def test_executor_stops_repeated_invalid_input_signature_before_waste_cap() -> None:
-    """Equivalent field failures stop after one bounded correction attempt."""
+def test_repeated_invalid_inputs_stop_at_the_tool_boundary() -> None:
+    """Invalid args never become observations or invoke the handler; the
+    run continues until the scripted decisions are exhausted."""
     invocations = {"count": 0}
     registry, _captured = _registry_with_match_tool(invocations)
     task = _matching_task()
-    gateway = ScriptedGateway([
+    gateway = DeepGateway(scripted_executor_model([
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"ranking_criteria": ["综合评分"]}},
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"ranking_criteria": ["不存在的标准"]}},
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"profile_keywords": [123]}},
-    ])
+    ]))
 
-    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+    result = ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()).run(
         task=task, plan=_single_step_plan(task), step=_single_step_plan(task).steps[0],
         context=ToolContext(user_id="user-a", run_id="run-a"),
         tool_budget=ToolCallBudget(4),
@@ -305,11 +302,8 @@ def test_executor_stops_repeated_invalid_input_signature_before_waste_cap() -> N
 
     assert result.status == "needs_user"
     assert invocations["count"] == 0
-    assert [obs.error_code for obs in result.observations] == [
-        "invalid_tool_input", "invalid_tool_input",
-    ]
-    assert "字段契约" in result.user_question
-    assert result.execution_state["total_wasted_turns"] == 1
+    # No observations: every invalid call was rejected at the tool boundary.
+    assert result.observations == []
 
 
 def test_executor_tolerated_payload_succeeds_and_records_normalization() -> None:
@@ -321,13 +315,13 @@ def test_executor_tolerated_payload_succeeds_and_records_normalization() -> None
     invocations = {"count": 0}
     registry, captured = _registry_with_match_tool(invocations)
     task = _matching_task()
-    gateway = ScriptedGateway([
+    gateway = DeepGateway(scripted_executor_model([
         {"action": "call_tool", "tool_name": "match-jobs",
          "tool_input": {"profile_keywords": "Python, RAG", "ranking_criteria": ["技能", "Salary"]}},
         {"action": "complete", "summary": "匹配完成"},
-    ])
+    ]))
 
-    result = ExecutorAgent(gateway=gateway, tools=registry).run(
+    result = ExecutorAgent(gateway=gateway, tools=registry, skills=SkillRegistry()).run(
         task=task, plan=_single_step_plan(task), step=_single_step_plan(task).steps[0],
         context=ToolContext(user_id="user-a", run_id="run-a"),
         tool_budget=ToolCallBudget(4),

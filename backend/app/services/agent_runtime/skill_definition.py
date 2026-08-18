@@ -396,7 +396,6 @@ class SkillRegistry:
         if artifact_type in {
             "job_matching_report",
             "resume_tailoring_brief",
-            "career_preparation_plan",
         }:
             # These refs are persisted after the deterministic semantic check.
             # A bare model/tool-shaped ref must not rescue an empty report.
@@ -436,6 +435,19 @@ class SkillRegistry:
             return False
         return complexity in {"L3", "L4"} or step.requires_verification
 
+    def goal_requests_deliverable(self, skill_name: str, goal: str) -> bool:
+        """Return true when a user goal explicitly names a skill deliverable.
+
+        Single source for the Planner fallback/trim/repair marker vocabulary:
+        the markers live in the career-skills manifest, never in the harness.
+        "适合我的岗位" wording deliberately never matches, so a
+        discovery question is not inflated into a matching deliverable.
+        """
+        if self.get(skill_name) is None:
+            return False
+        lowered = goal.lower()
+        return any(marker in lowered for marker in _goal_markers(skill_name))
+
     @classmethod
     def from_tool_registry(cls, tools: ToolRegistry) -> "SkillRegistry":
         """Build a compatibility registry from executable tool metadata.
@@ -471,6 +483,19 @@ class SkillRegistry:
                 )
             )
         return cls(definitions)
+
+
+def _goal_markers(skill_name: str) -> tuple[str, ...]:
+    """Load the deliverable goal-marker vocabulary for one skill name.
+
+    The markers are declared in the career-skills manifest (single source of
+    truth); this indirection keeps skill_definition free of career data.
+    """
+    from backend.app.services.career_skills.manifest import (  # noqa: PLC0415
+        DELIVERABLE_GOAL_MARKERS,
+    )
+
+    return DELIVERABLE_GOAL_MARKERS.get(skill_name, ())
 
 
 def _output_blocked(output: Mapping[str, Any]) -> bool:

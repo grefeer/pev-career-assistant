@@ -8,10 +8,6 @@ from pathlib import Path
 import pytest
 
 from backend.app.services.agent_runtime.tool_context import ToolContext
-from backend.app.services.career_skills.career_planning import (
-    BuildPreparationPlanInput,
-    build_preparation_plan,
-)
 from backend.app.services.career_skills.job_discovery import (
     FetchPublicJobPageInput,
     fetch_public_job_page,
@@ -79,21 +75,9 @@ def test_local_resume_has_only_fact_grounded_tailoring_for_seven_real_jds() -> N
                     target_keywords=["Agent", "Python", "LLM", "RAG", "FastAPI"],
             ),
         )
-        plan = build_preparation_plan(
-            context,
-            BuildPreparationPlanInput(
-                target_artifact_id=page.artifact_id,
-                    focus_keywords=["Agent", "Python", "LLM", "RAG", "FastAPI"],
-                time_budget_hours=6,
-            ),
-        )
-
         assert tailoring.source_url == page.source_url
         assert all(diff.fact_ref in confirmed_facts for diff in tailoring.proposed_diffs)
         assert all(diff.target_evidence_ref == page.artifact_id for diff in tailoring.proposed_diffs)
         if tailoring.missing_keywords:
             assert any("不得虚构" in action for action in tailoring.safe_actions)
-        assert plan.source_url == page.source_url
-        assert plan.plan_items
-        assert sum(item.time_budget_hours for item in plan.plan_items) == 6
-        assert all(item.review_checkpoint for item in plan.plan_items)
+

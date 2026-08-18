@@ -13,7 +13,7 @@ describe("login page", () => {
 
   it("describes the evidence-first PEV assistant instead of a legacy graph product", () => {
     const wrapper = mount(LoginPage);
-    expect(wrapper.text()).toContain("Planner、Executor、Verifier");
+    expect(wrapper.text()).toContain("Planner 与 Executor");
     expect(wrapper.text()).not.toContain("LangGraph");
     expect(wrapper.text()).not.toContain("SQLite checkpoint");
   });

@@ -95,36 +95,6 @@ EXECUTOR_RUNTIME_RULES = (
 )
 
 
-VERIFIER_RUNTIME_RULES = (
-    "## Verifier 决策表\n"
-    "PASS 的必要条件是：步骤 success_criteria 全部被真实 observation/artifact 满足，"
-    "artifact 类型、来源和质量符合 Skill contract，且没有被阻断或未验证的关键条件。\n"
-    "选择 RETRY_EXECUTOR 的前提是：存在明确的、当前权限内且尚未尝试的动作，并且该动作 "
-    "有理由产生新证据；没有新动作时不得 RETRY。\n"
-    "选择 REPLAN 的前提是：当前计划结构本身阻止完成，且可以提出不同的步骤/权限结构；"
-    "单个来源失败、同一证据不足或模型不喜欢当前结果不是 REPLAN 理由。\n"
-    "所有允许路线已耗尽、关键来源被访问控制阻断、或必需用户输入缺失时选择 NEED_USER；"
-    "只有确定不可恢复的契约/安全问题才选择 FAIL。\n"
-    "不要因为 Executor 的 complete 或 summary 就 PASS，也不要因为一个辅助工具失败就 "
-    "否定已经满足完整 contract 的主交付物。\n"
-    "验证必须针对当前 step 的输出端口和 success criteria；不要把后续 step 的产物、可选字段或"
-    "辅助来源失败提前升级为当前 step 失败。若主 artifact 已满足 contract，直接 PASS。\n"
-    "structured artifact 只有在来源、content_hash/evidence_refs 和必要字段可追溯时才算有效；"
-    "若目标是存在性问题，且可信 evidence 已充分覆盖所要求范围、contract 允许空结果，"
-    "则真实负结论也是完整交付，应 PASS；若覆盖不足或目标明确要求交付至少一个候选，"
-    "保持 NEED_USER 并说明缺口。任何情况下都不得为了提高 success 虚构匹配。\n"
-    "除非 success criteria 明确要求多源或全量，否则按‘至少一个有效主 artifact’判定当前证据"
-    "步骤；辅助 observation 的失败不能否定已经满足端口的主 observation。\n"
-    "RETRY_EXECUTOR 必须给出一个唯一、具体、尚未执行且能改变证据状态的动作；Verifier 不得"
-    "只因为 summary 不完整就 RETRY，也不得在没有新动作时重复 PASS/RETRY。\n"
-    "如果剩余预算不足以完成一次新动作及其验证，不得 RETRY_EXECUTOR；保留已有 evidence，"
-    "按可恢复 NEED_USER 输出缺失项。\n"
-    "若下游工具因缺失 artifact reference 失败，验证结论应指出上游端口缺口，不要要求 Executor"
-    "重复调用下游工具；只有重新取得真实上游 artifact 才允许继续。\n"
-    "验证匹配或交付物时，用户明确的约束是硬条件而非建议；任一关键约束未被证据满足时不得"
-    "PASS，也不得用相似标题、同公司或同领域结果替代。\n"
-)
-
 
 def json_repair_rules(role: str) -> str:
     """Return a compact, role-aware repair instruction for malformed output."""

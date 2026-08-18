@@ -75,7 +75,24 @@ _PLANNER_INSTRUCTION = (
     + PLANNER_RUNTIME_RULES
 )
 
-_MAX_INVALID_PLAN_RETRIES = 3
+def _goal_requests_deliverable(
+    skills: SkillRegistry | None, skill_name: str, goal: str
+) -> bool:
+    """Ask the Skill registry whether a goal names a skill deliverable.
+
+    The marker vocabulary lives in the career-skills manifest (single source
+    of truth); the registry method is used when available, with a direct
+    manifest lookup as the skills-less fallback (test seams).
+    """
+    if skills is not None:
+        return skills.goal_requests_deliverable(skill_name, goal)
+    from backend.app.services.agent_runtime.skill_definition import _goal_markers
+
+    lowered = goal.lower()
+    return any(marker in lowered for marker in _goal_markers(skill_name))
+
+
+_MAX_INVALID_PLAN_RETRIES = 2
 
 
 class PlannerAgent:
@@ -330,9 +347,34 @@ class PlannerAgent:
                         )
                 plan = self._trim_unrequested_trailing_steps(task, plan)
                 plan = self._ensure_requested_deliverable_steps(task, plan)
-                return PlannerResult(
-                    status="planned", plan=plan, observations=observations
-                )
+                try:
+                    return PlannerResult(
+                        status="planned", plan=plan, observations=observations
+                    )
+                except ValidationError:
+                    # Trimming an unrequested deliverable can leave a plan that
+                    # violates the already-collected guard (candidate URLs +
+                    # collected-goal markers require a deliverable step beyond
+                    # job-discovery). Degrade instead of letting the exception
+                    # escape the runtime: fall back, then hand the run to the
+                    # user when no available skill can satisfy the goal.
+                    fallback = self._build_seeded_career_fallback(task)
+                    if fallback is not None:
+                        return PlannerResult(
+                            status="planned",
+                            plan=fallback,
+                            observations=observations,
+                        )
+                    return PlannerResult(
+                        status="needs_user",
+                        observations=observations,
+                        user_question=(
+                            "当前可用技能范围内无法为该目标生成满足运行约束的"
+                            "执行计划（已收集岗位目标需要匹配/简历定制等交付"
+                            "步骤），请补充说明或改用可用技能。"
+                        ),
+                        error_code="invalid_execution_plan",
+                    )
             if (
                 available_executor_tools
                 and premature_need_user_retries < 1
@@ -402,18 +444,11 @@ class PlannerAgent:
         goal = task.goal
         needs_matching = (
             "job-matching" in permitted
-            and any(
-                marker in goal
-                for marker in ("匹配", "筛选", "最适合", "最匹配")
-            )
+            and _goal_requests_deliverable(self._skills, "job-matching", goal)
         )
         needs_tailoring = (
             "resume-tailoring" in permitted
-            and any(marker in goal for marker in ("简历", "定制", "修改建议"))
-        )
-        needs_planning = (
-            "career-planning" in permitted
-            and any(marker in goal for marker in ("面试", "准备", "计划", "回答要点"))
+            and _goal_requests_deliverable(self._skills, "resume-tailoring", goal)
         )
         if needs_matching:
             steps.append(
@@ -467,30 +502,6 @@ class PlannerAgent:
             )
             previous_step = "tailor_resume"
             previous_artifact = "resume_tailoring_brief"
-        if needs_planning:
-            steps.append(
-                PlanStep(
-                    step_id="prepare_interview",
-                    objective="基于有效 JD 生成岗位相关的面试准备计划。",
-                    allowed_skills=["career-planning"],
-                    success_criteria=["产出带岗位证据的准备计划"],
-                    depends_on=[previous_step],
-                    inputs=[
-                        StepInputRef(
-                            kind="artifact",
-                            name=previous_artifact,
-                            from_step=previous_step,
-                            artifact_type=previous_artifact,
-                        )
-                    ],
-                    outputs=[
-                        StepOutputRef(
-                            name="career_preparation_plan",
-                            artifact_type="career_preparation_plan",
-                        )
-                    ],
-                )
-            )
         try:
             return ExecutionPlan(
                 task=task,
@@ -526,24 +537,11 @@ class PlannerAgent:
         repair never rewrites dependencies for an earlier requested step.
         """
         goal = task.goal.lower()
-        wants_tailoring = any(
-            marker in goal for marker in ("简历", "定制", "修改建议", "resume", "tailor")
+        wants_tailoring = _goal_requests_deliverable(
+            None, "resume-tailoring", goal
         )
-        wants_planning = any(
-            marker in goal
-            for marker in ("面试", "准备", "计划", "回答要点", "career preparation", "interview")
-        )
-        wants_matching = any(
-            marker in goal
-            for marker in (
-                "匹配",
-                "匹配度",
-                "排序",
-                "排名",
-                "筛选",
-                "最适合",
-                "最匹配",
-            )
+        wants_matching = _goal_requests_deliverable(
+            None, "job-matching", goal
         )
         steps = list(plan.steps)
         if not wants_matching:
@@ -566,9 +564,6 @@ class PlannerAgent:
         while steps:
             skills = set(steps[-1].allowed_skills)
             if "resume-tailoring" in skills and not wants_tailoring:
-                steps.pop()
-                continue
-            if "career-planning" in skills and not wants_planning:
                 steps.pop()
                 continue
             if (
@@ -600,9 +595,8 @@ class PlannerAgent:
         traceable job-evidence artifact.  No source or candidate is invented.
         """
         goal = task.goal.lower()
-        wants_tailoring = any(
-            marker in goal
-            for marker in ("简历", "定制", "修改建议", "resume", "tailor")
+        wants_tailoring = _goal_requests_deliverable(
+            None, "resume-tailoring", goal
         )
         if (
             not wants_tailoring

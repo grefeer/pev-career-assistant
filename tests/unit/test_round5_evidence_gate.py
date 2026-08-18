@@ -1,7 +1,11 @@
 """Round 5 regression tests for evidence-backed completion honesty."""
 
-from backend.app.services.agent_runtime.evidence_gate import completion_evidence_gate
 from backend.app.services.agent_runtime.schemas import PlanStep, ToolObservation
+from backend.app.services.career_skills.manifest import build_career_skill_registry
+from backend.app.services.career_skills.registry import build_career_tool_registry
+
+
+_REGISTRY = build_career_skill_registry(build_career_tool_registry())
 
 
 def test_completion_gate_rejects_a_job_discovery_summary_without_evidence() -> None:
@@ -11,7 +15,7 @@ def test_completion_gate_rejects_a_job_discovery_summary_without_evidence() -> N
         allowed_skills=["job-discovery"],
     )
 
-    assert not completion_evidence_gate(
+    assert not _REGISTRY.completion_evidence_gate(
         step,
         [
             ToolObservation(
@@ -31,7 +35,7 @@ def test_completion_gate_rejects_a_search_index_without_a_job_page() -> None:
         allowed_skills=["job-discovery"],
     )
 
-    assert not completion_evidence_gate(
+    assert not _REGISTRY.completion_evidence_gate(
         step,
         [
             ToolObservation(

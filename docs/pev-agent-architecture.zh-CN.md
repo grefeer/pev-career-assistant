@@ -61,7 +61,6 @@ flowchart TD
         S1[job-discovery 5 工具]
         S2[job-matching 1 工具]
         S3[resume-tailoring 1 工具]
-        S4[career-planning 1 工具]
     end
 
     subgraph Persist[持久化 repositories/agent_runtime.py]
@@ -130,7 +129,7 @@ ExecutorPlan.validate_plan_authority: step.allowed_skills ⊆ task.allowed_skill
 
 ### 3.3 Verifier
 
-独立审视 `execution.observations` 与 `artifact_refs`，**不把执行器的声明当作证据**。对于承诺了「排序推荐 / 最佳待遇 / 最佳匹配」的结果，未见到 `match-observed-jobs` 观测不得 PASS；承诺简历修改须有 `build-resume-tailoring-brief`；承诺准备计划须有 `build-preparation-plan`。
+独立审视 `execution.observations` 与 `artifact_refs`，**不把执行器的声明当作证据**。对于承诺了「排序推荐 / 最佳待遇 / 最佳匹配」的结果，未见到 `match-observed-jobs` 观测不得 PASS；承诺简历修改须有 `build-resume-tailoring-brief`。
 
 ```python
 VerifierDecision: action ∈ {call_tool, decide}
@@ -152,7 +151,6 @@ VerifierDecision: action ∈ {call_tool, decide}
 | | `extract-observed-job-details(-batch)` | executor, verifier | 把已观察页面证据规范化为详细 JD；**不接受模型生成的正文** |
 | job-matching | `match-observed-jobs` | executor, verifier | 按已确认能力/地点/可验证待遇做透明排序；推荐任务必须调用 |
 | resume-tailoring | `build-resume-tailoring-brief` | executor, verifier | 基于已确认简历事实与单个 JD 生成**不可虚构**的修改建议 |
-| career-planning | `build-preparation-plan` | executor, verifier | 基于单个 JD 生成带截止日期与复盘点的面试准备计划 |
 
 Skill 元数据见 [manifest.py](../../backend/app/services/career_skills/manifest.py)（`requires_evidence` / `supports_user_data`）。
 
@@ -201,7 +199,7 @@ stateDiagram-v2
 
 - `_persist_observed_evidence`：只持久化**工具产出**的公开证据（`public_job_page`、`job_search_results`、`structured_job_details`），**从不**接受模型自报的 URI。
 - `_with_observed_public_evidence`：在 Planner 起始、每步之间、重试与恢复时，把已落库的 `visible_text` 证据（48k 字符预算）回灌进后续 Agent 轮次。
-- Skill 产物（`job_matching_report` / `resume_tailoring_brief` / `career_preparation_plan`）以独立 artifact_type 持久化。
+- Skill 产物（`job_matching_report` / `resume_tailoring_brief`）以独立 artifact_type 持久化。
 
 ---
 
@@ -404,5 +402,5 @@ flowchart LR
 
 - **后端覆盖**：`tests/unit/` 全量 100% 分支覆盖（`fail_under=100`）。
 - **前端覆盖**：`frontend/` Vitest 100%（语句/分支/函数/行）。
-- **端到端 NL 验收**：`tests/integration/test_pev_live_end_to_end.py`（`RUN_LIVE_PEV_E2E=1` + `LIVE_RESUME_PDF`），断言 `RunStatus.succeeded` 且 4 类产物齐全：`public_job_page` / `job_matching_report` / `resume_tailoring_brief` / `career_preparation_plan`。
+- **端到端 NL 验收**：`tests/integration/test_pev_live_end_to_end.py`（`RUN_LIVE_PEV_E2E=1` + `LIVE_RESUME_PDF`），断言 `RunStatus.succeeded` 且 3 类产物齐全：`public_job_page` / `job_matching_report` / `resume_tailoring_brief`。
 - 简历 PDF 仅在本地受控测试中**内存读取**，从不拷入仓库、不提交/打印/上传原文；验收记录只含摘要/哈希/判定。

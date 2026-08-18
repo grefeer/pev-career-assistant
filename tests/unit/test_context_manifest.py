@@ -12,7 +12,6 @@ from backend.app.services.agent_runtime.context_manifest import (
 )
 from backend.app.services.agent_runtime.executor_agent import _EXECUTOR_INSTRUCTION
 from backend.app.services.agent_runtime.planner_agent import _PLANNER_INSTRUCTION
-from backend.app.services.agent_runtime.verifier_agent import _VERIFIER_INSTRUCTION
 
 
 def test_compute_evidence_chars_sums_visible_text_lengths() -> None:
@@ -304,32 +303,12 @@ def test_planner_instruction_preserved_after_header_strip() -> None:
     assert "流程" in stats
 
 
-def test_verifier_instruction_preserved_after_header_strip() -> None:
-    """Stripping headers from verifier instruction recovers the original content."""
-    sectioned = _VERIFIER_INSTRUCTION
-    stripped = _strip_headers(sectioned)
-
-    key_phrases = [
-        "generic Planner-Executor-Verifier runtime",
-        "step contract",
-        "tool observations",
-        "persisted artifact references",
-        "RETRY_EXECUTOR",
-    ]
-    for phrase in key_phrases:
-        assert phrase in stripped, f"Missing phrase: {phrase}"
-
-    stats = prompt_section_stats(sectioned)
-    assert "角色" in stats
-    assert "行为规则" in stats
-
 
 def test_sectioned_instructions_have_valid_sections() -> None:
     """Each sectioned instruction has valid section headers with non-zero content."""
     for name, instruction in [
         ("executor", _EXECUTOR_INSTRUCTION),
         ("planner", _PLANNER_INSTRUCTION),
-        ("verifier", _VERIFIER_INSTRUCTION),
     ]:
         stats = prompt_section_stats(instruction)
         # All sections have positive char counts

@@ -50,18 +50,36 @@ CAREER_SKILL_MANIFESTS: dict[str, CareerSkillManifest] = {
         requires_evidence=True,
         supports_user_data=True,
     ),
-    "career-planning": CareerSkillManifest(
-        name="career-planning",
-        description="Create JD-grounded search, preparation and interview plans.",
-        requires_evidence=True,
-        supports_user_data=True,
-    ),
 }
 
 
 def get_career_skill_manifest(name: str) -> CareerSkillManifest | None:
     """Return only an explicitly reviewed business Skill."""
     return CAREER_SKILL_MANIFESTS.get(name)
+
+
+#: Single source of truth for goal-marker -> deliverable inference. The
+#: Planner fallback/trim/repair all ask "does this goal request this skill's
+#: deliverable?" through SkillRegistry.goal_requests_deliverable; no marker
+#: vocabulary lives in the runtime harness.
+DELIVERABLE_GOAL_MARKERS: dict[str, tuple[str, ...]] = {
+    "job-matching": (
+        "匹配",
+        "匹配度",
+        "排序",
+        "排名",
+        "筛选",
+        "最适合",
+        "最匹配",
+    ),
+    "resume-tailoring": (
+        "简历",
+        "定制",
+        "修改建议",
+        "resume",
+        "tailor",
+    ),
+}
 
 
 _DISCOVERY_EVIDENCE_TOOLS = frozenset(
@@ -168,14 +186,6 @@ def _tailoring_observation_is_meaningful(observation: ToolObservation) -> bool:
     ) and isinstance(output.get("safe_actions"), list) and bool(output["safe_actions"])
 
 
-def _planning_observation_is_meaningful(observation: ToolObservation) -> bool:
-    output = observation.output or {}
-    return all(
-        isinstance(output.get(key), list) and bool(output[key])
-        for key in ("jd_topics", "actions", "plan_items")
-    )
-
-
 def skill_observation_is_semantically_valid(
     tool_name: str, output: dict[str, Any] | None
 ) -> bool:
@@ -185,7 +195,6 @@ def skill_observation_is_semantically_valid(
         "search-public-job-pages": _discovery_observation_is_valid,
         "match-observed-jobs": _matching_observation_is_meaningful,
         "build-resume-tailoring-brief": _tailoring_observation_is_meaningful,
-        "build-preparation-plan": _planning_observation_is_meaningful,
     }
     checker = checks.get(tool_name)
     return checker(observation) if checker else True
@@ -258,10 +267,8 @@ def build_career_skill_registry(
             deliverable_tools = frozenset({"build-resume-tailoring-brief"})
             checker = None
             semantic_checker = _tailoring_observation_is_meaningful
-        else:
-            deliverable_tools = frozenset({"build-preparation-plan"})
-            checker = None
-            semantic_checker = _planning_observation_is_meaningful
+        else:  # pragma: no cover - defensive for an unregistered skill name
+            raise ValueError(f"unregistered skill: {name}")
         package = packages.get(name)
         definitions.append(
             SkillDefinition(
@@ -304,7 +311,7 @@ def _skill_input_ports(name: str) -> tuple[ArtifactPort, ...]:
     """Compile the reviewed cross-Skill artifact contract at startup."""
     if name == "job-matching":
         return (ArtifactPort("job-evidence", frozenset({"public_job_page", "structured_job_details"})),)
-    if name in {"resume-tailoring", "career-planning"}:
+    if name == "resume-tailoring":
         return (
             ArtifactPort(
                 "job-evidence",
@@ -326,8 +333,6 @@ def _skill_output_ports(name: str) -> tuple[ArtifactPort, ...]:
         return (ArtifactPort("match-report", frozenset({"job_matching_report"})),)
     if name == "resume-tailoring":
         return (ArtifactPort("tailoring-brief", frozenset({"resume_tailoring_brief"})),)
-    if name == "career-planning":
-        return (ArtifactPort("preparation-plan", frozenset({"career_preparation_plan"})),)
     return ()
 
 

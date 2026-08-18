@@ -11,6 +11,8 @@ from backend.app.services.agent_runtime.executor_agent import (
     ExecutorAgent,
     _EXECUTOR_INSTRUCTION,
 )
+from backend.app.services.agent_runtime.skill_definition import SkillRegistry
+from tests.unit.deepagents_testkit import DeepGateway, scripted_executor_model
 from backend.app.services.agent_runtime.error_policy import (
     FailureClass,
     build_terminal_contract,
@@ -22,15 +24,10 @@ from backend.app.services.agent_runtime.planner_agent import (
 from backend.app.services.agent_runtime.schemas import (
     AgentTaskRequest,
     ExecutionPlan,
-    ExecutorResult,
     PlanStep,
 )
 from backend.app.services.agent_runtime.tool_context import ToolContext
 from backend.app.services.agent_runtime.tool_registry import ToolDefinition, ToolRegistry
-from backend.app.services.agent_runtime.verifier_agent import (
-    VerifierAgent,
-    _VERIFIER_INSTRUCTION,
-)
 
 
 class EmptyInput(BaseModel):
@@ -92,7 +89,7 @@ def _plan(task: AgentTaskRequest) -> ExecutionPlan:
 
 
 def test_runtime_prompts_contain_decision_table_without_domain_workflow() -> None:
-    for prompt in (_PLANNER_INSTRUCTION, _EXECUTOR_INSTRUCTION, _VERIFIER_INSTRUCTION):
+    for prompt in (_PLANNER_INSTRUCTION, _EXECUTOR_INSTRUCTION):
         assert "通用运行时硬规则" in prompt
         assert "progress_ledger" in prompt
         assert "来源、搜索" not in prompt
@@ -100,9 +97,6 @@ def test_runtime_prompts_contain_decision_table_without_domain_workflow() -> Non
 
     assert "只有在没有任何允许路径" in _PLANNER_INSTRUCTION
     assert "工具成功不等于步骤完成" in _EXECUTOR_INSTRUCTION
-    assert "RETRY_EXECUTOR 的前提" in _VERIFIER_INSTRUCTION
-    assert "存在性问题" in _VERIFIER_INSTRUCTION
-    assert "真实负结论" in _VERIFIER_INSTRUCTION
 
 
 def test_planner_need_user_is_not_mislabeled_as_invalid_model_output() -> None:
@@ -144,42 +138,48 @@ def test_planner_corrects_premature_need_user_when_a_tool_is_available() -> None
     assert gateway.states[0]["available_executor_tools"][0]["name"] == "tool-planner"
 
 
-def test_executor_corrects_premature_need_user_when_no_terminal_block_exists() -> None:
-    task = _task()
-    plan = _plan(task)
-    gateway = ScriptedGateway(
-        [
-            {"action": "need_user", "user_question": "请提供信息"},
-            {"action": "complete", "summary": "已完成"},
-        ]
+def test_executor_honors_a_model_need_user_terminal() -> None:
+    """The Deep executor trusts the model's terminal decision: a scripted
+    need_user hands the step to the human directly (the legacy loop's
+    premature-need-user correction is not part of the Deep path)."""
+    # The Deep executor requires an existing skill package directory, so the
+    # generic-skill fixture is not usable here; job-discovery owns the tool.
+    task = AgentTaskRequest(goal="完成当前步骤", allowed_skills=["job-discovery"])
+    plan = ExecutionPlan(
+        task=task,
+        created_by=AgentRole.planner,
+        complexity=ComplexityLevel.L1,
+        success_criteria=["完成"],
+        steps=[PlanStep(step_id="step-1", objective="完成", allowed_skills=["job-discovery"])],
     )
-    result = ExecutorAgent(gateway=gateway, tools=_registry(AgentRole.executor)).run(
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="tool-executor",
+            skill_name="job-discovery",
+            input_model=EmptyInput,
+            output_model=EmptyOutput,
+            allowed_roles=frozenset({AgentRole.executor}),
+            handler=lambda _context, _payload: {"value": "ok"},
+        )
+    )
+    gateway = DeepGateway(
+        scripted_executor_model(
+            [
+                {"action": "need_user", "user_question": "请提供信息"},
+            ]
+        )
+    )
+    result = ExecutorAgent(
+        gateway=gateway, tools=registry, skills=SkillRegistry()
+    ).run(
         task=task,
         plan=plan,
         step=plan.steps[0],
         context=ToolContext(user_id="u", run_id="r"),
     )
 
-    assert result.status == "succeeded"
-    assert "runtime_feedback" in gateway.states[1]
+    assert result.status == "needs_user"
+    assert result.user_question == "请提供信息"
 
 
-def test_verifier_corrects_premature_need_user_when_verifier_tool_remains() -> None:
-    task = _task()
-    plan = _plan(task)
-    gateway = ScriptedGateway(
-        [
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "补充"},
-            {"action": "decide", "verification_decision": "NEED_USER", "feedback": "仍缺失"},
-        ]
-    )
-    result = VerifierAgent(gateway=gateway, tools=_registry(AgentRole.verifier)).run(
-        task=task,
-        plan=plan,
-        step=plan.steps[0],
-        execution=ExecutorResult(status="succeeded", summary="已完成"),
-        context=ToolContext(user_id="u", run_id="r"),
-    )
-
-    assert result.decision.value == "NEED_USER"
-    assert "runtime_feedback" in gateway.states[1]

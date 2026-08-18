@@ -103,7 +103,6 @@ describe("AgentWorkspace", () => {
         "job-discovery",
         "job-matching",
         "resume-tailoring",
-        "career-planning",
       ],
       candidate_urls: ["https://jobs.example/1"],
     })
@@ -164,7 +163,7 @@ describe("AgentWorkspace", () => {
 
     expect(wrapper.text()).toContain("Planner 计划")
     expect(wrapper.text()).toContain("基于证据匹配")
-    expect(wrapper.text()).toContain("需 Verifier 核验")
+    expect(wrapper.text()).toContain("需完成门禁核验")
     expect(wrapper.text()).not.toContain("private_context")
   })
 
@@ -189,28 +188,6 @@ describe("AgentWorkspace", () => {
     expect(wrapper.text()).toContain("1 条可审核的简历修改操作")
     expect(wrapper.text()).toContain("将已确认的 Agent 事实前置到技能部分。")
     expect(wrapper.text()).toContain("事实字段：skills")
-  })
-
-  it("renders a prioritized, reviewable preparation plan instead of only a count", async () => {
-    api.fetchAgentRuns.mockResolvedValue({ items: [run] })
-    api.fetchAgentRunArtifacts.mockResolvedValue({
-      items: [{
-        id: "artifact-plan", artifact_type: "career_preparation_plan",
-        source_url: "https://jobs.example/1", content_hash: "c".repeat(64),
-        content: { plan_items: [{
-          topic: "agent", priority: "P0", time_budget_hours: 3,
-          due_date: "2026-08-09",
-          completion_criteria: "准备一个可核验项目案例。",
-          review_checkpoint: "按 JD 的 Agent 要求复盘。",
-        }] }, created_at: run.created_at,
-      }],
-    })
-    const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
-    await flushPromises()
-
-    expect(wrapper.text()).toContain("P0 · agent · 3 小时 · 截止 2026-08-09")
-    expect(wrapper.text()).toContain("准备一个可核验项目案例。")
-    expect(wrapper.text()).toContain("按 JD 的 Agent 要求复盘。")
   })
 
   it("maps an unavailable runtime to a user-readable safe error", async () => {
@@ -318,10 +295,6 @@ describe("AgentWorkspace", () => {
           id: "malformed", artifact_type: "resume_tailoring_brief", source_url: "https://jobs.example/5",
           content_hash: "g".repeat(64), content: { proposed_diffs: [null, { section: "skills" }] }, created_at: run.created_at,
         },
-        {
-          id: "bad-plan", artifact_type: "career_preparation_plan", source_url: "https://jobs.example/6",
-          content_hash: "h".repeat(64), content: { plan_items: [null, { topic: "Agent" }] }, created_at: run.created_at,
-        },
       ],
     })
     const wrapper = mount(AgentWorkspace, { props: { token: "student-token" } })
@@ -330,11 +303,9 @@ describe("AgentWorkspace", () => {
     expect(wrapper.text()).toContain("future_event")
     expect(wrapper.text()).toContain("候选岗位")
     expect(wrapper.text()).toContain("已提取 1 个结构化岗位条目")
-    expect(wrapper.text()).toContain("围绕 JD 中的 2 个主题生成准备计划")
     expect(wrapper.text()).toContain("岗位匹配报告")
     expect(wrapper.text()).toContain("该工件没有可展示的文本摘要")
     expect(wrapper.find('[aria-label="可审核的简历修改"]').exists()).toBe(false)
-    expect(wrapper.find('[aria-label="带复盘的准备计划"]').exists()).toBe(false)
   })
 
   it("aborts selectRun and startEventStream when the token is cleared mid-session", async () => {
